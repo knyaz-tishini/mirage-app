@@ -1,6 +1,8 @@
 //! Shared color constants, SVG icons, and drawing helpers for Mirage VPN UI.
 //! Follows AmneziaVPN's exact dark palette.
 
+use std::f64::consts::PI;
+
 use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
 use uzor::input::{InputState, Sense};
 use uzor::types::{Rect, WidgetId};
@@ -20,6 +22,7 @@ pub const TEXT_PRIMARY: &str = "#D7D8DB";  // paleGray
 pub const TEXT_MUTED: &str = "#878B91";    // mutedGray
 pub const SEPARATOR: &str = "#2C2D30";     // slateGray
 pub const NAV_BG: &str = "#1C1D21";       // onyxBlack
+pub const SUCCESS: &str = "#4CAF50";       // green for connected/success logs
 
 // =============================================================================
 // SVG icon constants — from uzor UI icon library (Feather/Lucide style)
@@ -307,3 +310,265 @@ pub fn draw_settings_row(
 ) -> bool {
     draw_list_item(ctx, input, state, row_id, icon_svg, title, "", x, y, w, h)
 }
+
+// =============================================================================
+// Interactive components (Phase 2)
+// =============================================================================
+
+/// Draw an interactive toggle pill (44×26 px).
+///
+/// ON: orange (`ACCENT`) background. OFF: dark (`SURFACE_2`) background.
+/// Reads and writes `state.toggles[id]`. Returns `true` if the value changed this frame.
+pub fn draw_toggle(
+    ctx: &mut dyn RenderContext,
+    input: &InputState,
+    state: &mut AppState,
+    id: &str,
+    x: f64,
+    y: f64,
+) -> bool {
+    let pill_w = 44.0;
+    let pill_h = 26.0;
+    let radius = pill_h / 2.0;
+    let knob_r = 10.0; // 20px diameter knob
+    let padding = 3.0;
+
+    let click_rect = Rect::new(x - 4.0, y - 4.0, pill_w + 8.0, pill_h + 8.0);
+    let widget_id = WidgetId::new(format!("toggle_{id}"));
+    state.coordinator.register(widget_id.clone(), click_rect, Sense::CLICK);
+    let is_hovered = state.coordinator.is_hovered(&widget_id);
+    let clicked = input.is_clicked();
+
+    let is_on = state.toggle_get(id);
+    let mut changed = false;
+
+    if clicked && is_hovered {
+        state.toggle_flip(id);
+        changed = true;
+    }
+
+    // Re-read after possible flip
+    let is_on = if changed { !is_on } else { is_on };
+
+    // Pill background
+    let bg_color = if is_on { ACCENT } else { SURFACE_2 };
+    ctx.set_fill_color(bg_color);
+    ctx.fill_rounded_rect(x, y, pill_w, pill_h, radius);
+
+    // Subtle hover highlight
+    if is_hovered {
+        ctx.set_fill_color_alpha(TEXT_PRIMARY, 0.08);
+        ctx.fill_rounded_rect(x, y, pill_w, pill_h, radius);
+    }
+
+    // Knob (white circle)
+    let knob_cx = if is_on {
+        x + pill_w - padding - knob_r
+    } else {
+        x + padding + knob_r
+    };
+    let knob_cy = y + pill_h / 2.0;
+
+    ctx.set_fill_color("#FFFFFF");
+    ctx.begin_path();
+    ctx.arc(knob_cx, knob_cy, knob_r, 0.0, 2.0 * PI);
+    ctx.fill();
+
+    changed
+}
+
+/// Draw an editable text input field.
+///
+/// Clicking the field calls `state.focus_field(field_id, initial_value)`.
+/// When focused, draws an accent border and a blinking cursor after the text.
+/// Returns `true` if the field gained focus this frame.
+pub fn draw_text_field(
+    ctx: &mut dyn RenderContext,
+    input: &InputState,
+    state: &mut AppState,
+    field_id: &str,
+    placeholder: &str,
+    initial_value: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> bool {
+    let rect = Rect::new(x, y, w, h);
+    let widget_id = WidgetId::new(format!("textfield_{field_id}"));
+    state.coordinator.register(widget_id.clone(), rect, Sense::CLICK);
+    let is_hovered = state.coordinator.is_hovered(&widget_id);
+    let clicked = input.is_clicked();
+    let is_focused = state.focused_field.as_deref() == Some(field_id);
+    let mut gained_focus = false;
+
+    if clicked && is_hovered {
+        state.focus_field(field_id, initial_value);
+        gained_focus = true;
+    } else if clicked && !is_hovered && is_focused {
+        state.blur_field();
+    }
+
+    // Re-check focus after possible state change
+    let is_focused = state.focused_field.as_deref() == Some(field_id);
+
+    // Background
+    ctx.set_fill_color(SURFACE);
+    ctx.fill_rounded_rect(x, y, w, h, 10.0);
+
+    // Border
+    let border_color = if is_focused { ACCENT } else if is_hovered { TEXT_MUTED } else { SURFACE_2 };
+    ctx.set_stroke_color(border_color);
+    ctx.set_stroke_width(if is_focused { 1.5 } else { 1.0 });
+    ctx.stroke_rounded_rect(x, y, w, h, 10.0);
+
+    let text_x = x + 12.0;
+    let text_cy = y + h / 2.0;
+    let text = state.text_fields.get(field_id).cloned().unwrap_or_default();
+
+    ctx.set_text_align(TextAlign::Left);
+    ctx.set_text_baseline(TextBaseline::Middle);
+
+    if text.is_empty() && !is_focused {
+        // Placeholder
+        ctx.set_fill_color(TEXT_MUTED);
+        ctx.set_font("14px pt root ui");
+        ctx.fill_text(placeholder, text_x, text_cy);
+    } else {
+        // Text value
+        ctx.set_fill_color(TEXT_PRIMARY);
+        ctx.set_font("14px pt root ui");
+        ctx.fill_text(&text, text_x, text_cy);
+    }
+
+    // Blinking cursor when focused
+    if is_focused {
+        // Blink: visible when (animation_phase * 2.0) as u32 % 2 == 0
+        let blink_visible = (state.animation_phase * 2.0) as u32 % 2 == 0;
+        if blink_visible {
+            // Approximate cursor X: 8px per character (simple estimation)
+            let char_count = text.chars().count();
+            let cursor_x = text_x + char_count as f64 * 8.0;
+            ctx.set_fill_color(ACCENT);
+            ctx.fill_rect(cursor_x, y + 6.0, 1.5, h - 12.0);
+        }
+    }
+
+    gained_focus
+}
+
+/// Draw a modal confirmation drawer overlay (slide-up sheet).
+///
+/// Called from `draw_frame` AFTER screen content when `state.confirm_drawer.is_some()`.
+/// Returns `Some(action_id)` if the confirm button was tapped, `None` otherwise.
+/// Caller must call `state.dismiss_confirm()` after receiving `Some`.
+pub fn draw_confirm_drawer(
+    ctx: &mut dyn RenderContext,
+    input: &InputState,
+    state: &mut AppState,
+    w: f64,
+    h: f64,
+) -> Option<String> {
+    let drawer = match &state.confirm_drawer {
+        Some(d) => d.clone(),
+        None => return None,
+    };
+
+    let sheet_h = 260.0;
+    let sheet_y = h - sheet_h;
+
+    // Dim overlay above the sheet
+    ctx.set_fill_color_alpha(BG, 0.7);
+    ctx.fill_rect(0.0, 0.0, w, sheet_y);
+
+    // Sheet background
+    ctx.set_fill_color(SURFACE);
+    ctx.fill_rounded_rect(0.0, sheet_y, w, sheet_h, 16.0);
+    // Fill the bottom corners (rounded_rect leaves them rounded)
+    ctx.fill_rect(0.0, sheet_y + 16.0, w, sheet_h - 16.0);
+
+    // Drag handle
+    ctx.set_fill_color(SURFACE_2);
+    ctx.fill_rounded_rect(w / 2.0 - 20.0, sheet_y + 10.0, 40.0, 4.0, 2.0);
+
+    let margin = 20.0;
+    let content_w = w - margin * 2.0;
+    let mut row_y = sheet_y + 30.0;
+
+    // Title
+    ctx.set_fill_color(TEXT_PRIMARY);
+    ctx.set_font("bold 18px pt root ui");
+    ctx.set_text_align(TextAlign::Center);
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text(&drawer.title, w / 2.0, row_y);
+    row_y += 30.0;
+
+    // Description (only if non-empty)
+    if !drawer.description.is_empty() {
+        ctx.set_fill_color(TEXT_MUTED);
+        ctx.set_font("13px pt root ui");
+        ctx.fill_text(&drawer.description, w / 2.0, row_y);
+        row_y += 24.0;
+    }
+
+    row_y += 8.0;
+
+    let btn_h = 52.0;
+    let btn_gap = 8.0;
+
+    // Confirm button
+    let confirm_rect = Rect::new(margin, row_y, content_w, btn_h);
+    let confirm_id = WidgetId::new("confirm_drawer_ok");
+    state.coordinator.register(confirm_id.clone(), confirm_rect, Sense::CLICK);
+    let confirm_hovered = state.coordinator.is_hovered(&confirm_id);
+
+    let confirm_bg = if confirm_hovered {
+        ctx.set_fill_color_alpha(ACCENT, 0.85);
+        ACCENT
+    } else {
+        ACCENT
+    };
+    ctx.set_fill_color(confirm_bg);
+    ctx.fill_rounded_rect(margin, row_y, content_w, btn_h, 12.0);
+    ctx.set_fill_color(BG);
+    ctx.set_font("bold 15px pt root ui");
+    ctx.set_text_align(TextAlign::Center);
+    ctx.set_text_baseline(TextBaseline::Middle);
+    ctx.fill_text(&drawer.confirm_label, w / 2.0, row_y + btn_h / 2.0);
+
+    row_y += btn_h + btn_gap;
+
+    // Cancel button
+    let cancel_rect = Rect::new(margin, row_y, content_w, btn_h);
+    let cancel_id = WidgetId::new("confirm_drawer_cancel");
+    state.coordinator.register(cancel_id.clone(), cancel_rect, Sense::CLICK);
+    let cancel_hovered = state.coordinator.is_hovered(&cancel_id);
+
+    let cancel_bg = if cancel_hovered { SURFACE_2 } else { SURFACE_2 };
+    ctx.set_fill_color(cancel_bg);
+    ctx.fill_rounded_rect(margin, row_y, content_w, btn_h, 12.0);
+    ctx.set_fill_color(TEXT_PRIMARY);
+    ctx.set_font("15px pt root ui");
+    ctx.fill_text(&drawer.cancel_label, w / 2.0, row_y + btn_h / 2.0);
+
+    // Dim area click = cancel
+    let dim_rect = Rect::new(0.0, 0.0, w, sheet_y);
+    let dim_id = WidgetId::new("confirm_drawer_dim");
+    state.coordinator.register(dim_id.clone(), dim_rect, Sense::CLICK);
+    let dim_hovered = state.coordinator.is_hovered(&dim_id);
+
+    let clicked = input.is_clicked();
+
+    if clicked {
+        if confirm_hovered {
+            return Some(drawer.action_id.clone());
+        }
+        if cancel_hovered || dim_hovered {
+            state.dismiss_confirm();
+        }
+    }
+
+    // Keep drawer alive — caller uses return value to know if confirmed
+    None
+}
+

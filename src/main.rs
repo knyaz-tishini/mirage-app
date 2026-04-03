@@ -10,6 +10,7 @@ use uzor_desktop::winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 use uzor_desktop::winit::dpi::LogicalSize;
@@ -205,6 +206,30 @@ impl ApplicationHandler for MirageHandler {
                     MouseScrollDelta::PixelDelta(pos) => pos.y,
                 };
                 app.mouse.scroll_y += dy;
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Only process key-press events (not release).
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                match &event.logical_key {
+                    Key::Named(NamedKey::Backspace) => {
+                        app.app_state.pending_backspaces += 1;
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        app.app_state.blur_field();
+                    }
+                    Key::Character(s) => {
+                        for c in s.chars() {
+                            // Filter out control characters.
+                            if !c.is_control() {
+                                app.app_state.pending_chars.push(c);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             _ => {}

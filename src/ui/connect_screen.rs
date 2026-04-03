@@ -7,8 +7,8 @@ use uzor::input::{InputState, Sense};
 use crate::app::AppState;
 use super::components::{
     BG, ACCENT, SURFACE, SURFACE_2, TEXT_PRIMARY, TEXT_MUTED, SEPARATOR,
-    ICON_CHEVRON_RIGHT,
-    draw_nav_bar,
+    ICON_CHEVRON_RIGHT, ICON_SERVER, ICON_SETTINGS, ICON_LOGS,
+    draw_nav_bar, draw_text_field,
 };
 
 /// Draw the Quick Connect screen.
@@ -40,55 +40,58 @@ pub fn draw_connect_screen(
     ctx.set_fill_color(TEXT_MUTED);
     ctx.set_font("14px pt root ui");
     ctx.set_text_baseline(TextBaseline::Top);
-    ctx.fill_text(
-        "Вставьте ключ, добавьте файл конфигурации",
+    ctx.fill_text("Вставьте ключ подключения или выберите способ", content_x, 64.0);
+
+    // -------------------------------------------------------------------------
+    // Text field for connection key
+    // -------------------------------------------------------------------------
+    let field_y = 102.0;
+    let field_h = 52.0;
+    draw_text_field(
+        ctx,
+        input,
+        state,
+        "connect_key",
+        "amvpn://...",
+        "",
         content_x,
-        66.0,
+        field_y,
+        content_w,
+        field_h,
     );
-    ctx.fill_text("или отсканируйте QR-код", content_x, 86.0);
 
     // -------------------------------------------------------------------------
-    // Paste key input area
+    // "Вставить из буфера" button — reads clipboard via arboard
     // -------------------------------------------------------------------------
-    let input_y = 122.0;
-    let input_h = 52.0;
-    let btn_w = 90.0;
-    let btn_pad = 8.0;
+    let paste_btn_y = field_y + field_h + 10.0;
+    let paste_btn_h = 44.0;
+    let paste_rect = Rect::new(content_x, paste_btn_y, content_w, paste_btn_h);
+    let paste_id = WidgetId::new("connect_paste_clipboard");
+    state.coordinator.register(paste_id.clone(), paste_rect, Sense::CLICK);
+    let paste_hovered = state.coordinator.is_hovered(&paste_id);
+    let clicked = input.is_clicked();
 
-    ctx.set_fill_color(SURFACE);
-    ctx.fill_rounded_rect(content_x, input_y, content_w, input_h, 12.0);
-    ctx.set_stroke_color(SURFACE_2);
-    ctx.set_stroke_width(1.0);
-    ctx.stroke_rounded_rect(content_x, input_y, content_w, input_h, 12.0);
-
-    ctx.set_fill_color(TEXT_MUTED);
-    ctx.set_font("14px pt root ui");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.fill_text("Вставьте ключ", content_x + 16.0, input_y + input_h / 2.0);
-
-    // Orange "Вставить" button
-    let btn_x = content_x + content_w - btn_w - btn_pad;
-    let btn_y = input_y + (input_h - 36.0) / 2.0;
-    let btn_rect = Rect::new(btn_x, btn_y, btn_w, 36.0);
-    let paste_id = WidgetId::new("connect_paste");
-    state.coordinator.register(paste_id.clone(), btn_rect, Sense::CLICK);
-    let btn_hovered = state.coordinator.is_hovered(&paste_id);
-
-    let btn_color = if btn_hovered { "#f5a550" } else { ACCENT };
-    ctx.set_fill_color(btn_color);
-    ctx.fill_rounded_rect(btn_rect.x, btn_rect.y, btn_rect.width, btn_rect.height, 8.0);
-
-    ctx.set_fill_color("#0E0E11");
-    ctx.set_font("bold 13px pt root ui");
+    let paste_bg = if paste_hovered { "#f5a550" } else { ACCENT };
+    ctx.set_fill_color(paste_bg);
+    ctx.fill_rounded_rect(content_x, paste_btn_y, content_w, paste_btn_h, 10.0);
+    ctx.set_fill_color(BG);
+    ctx.set_font("bold 14px pt root ui");
     ctx.set_text_align(TextAlign::Center);
     ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.fill_text("Вставить", btn_x + btn_w / 2.0, btn_y + 18.0);
+    ctx.fill_text("Вставить из буфера", content_x + content_w / 2.0, paste_btn_y + paste_btn_h / 2.0);
+
+    if clicked && paste_hovered {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            if let Ok(text) = cb.get_text() {
+                state.field_set_text("connect_key", text);
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
-    // "Другие варианты подключения" section
+    // Section label
     // -------------------------------------------------------------------------
-    let section_y = input_y + input_h + 28.0;
+    let section_y = paste_btn_y + paste_btn_h + 24.0;
 
     ctx.set_fill_color(TEXT_MUTED);
     ctx.set_font("11px pt root ui");
@@ -100,6 +103,7 @@ pub fn draw_connect_screen(
     // Option cards
     // -------------------------------------------------------------------------
     struct OptionCard {
+        icon: &'static str,
         title: &'static str,
         subtitle: &'static str,
         id: &'static str,
@@ -107,18 +111,21 @@ pub fn draw_connect_screen(
 
     let options = [
         OptionCard {
-            title: "VPN от Amnezia",
-            subtitle: "Подключайтесь к платным и бесплатным VPN от Amnezia",
-            id: "connect_amnezia",
+            icon: ICON_SERVER,
+            title: "VPN от Mirage",
+            subtitle: "Получите бесплатный VPN-сервер",
+            id: "connect_mirage",
         },
         OptionCard {
+            icon: ICON_SETTINGS,
             title: "Self-hosted VPN",
-            subtitle: "Настроить VPN на собственном сервере",
+            subtitle: "Настройте свой VPN на сервере",
             id: "connect_selfhosted",
         },
         OptionCard {
-            title: "Файл с настройками",
-            subtitle: "Открыть файл конфигурации (.vpn, .conf, .ovpn)",
+            icon: ICON_LOGS,
+            title: "Импорт из файла",
+            subtitle: "Загрузите файл конфигурации",
             id: "connect_file",
         },
     ];
@@ -128,12 +135,10 @@ pub fn draw_connect_screen(
     let cards_total_h = card_h * options.len() as f64;
 
     ctx.set_fill_color(SURFACE);
-    ctx.fill_rounded_rect(content_x, cards_top, content_w, cards_total_h, 12.0);
+    ctx.fill_rounded_rect(content_x, cards_top, content_w, cards_total_h, 14.0);
     ctx.set_stroke_color(SURFACE_2);
     ctx.set_stroke_width(1.0);
-    ctx.stroke_rounded_rect(content_x, cards_top, content_w, cards_total_h, 12.0);
-
-    let clicked = input.is_clicked();
+    ctx.stroke_rounded_rect(content_x, cards_top, content_w, cards_total_h, 14.0);
 
     for (i, option) in options.iter().enumerate() {
         let card_y = cards_top + i as f64 * card_h;
@@ -148,37 +153,47 @@ pub fn draw_connect_screen(
             ctx.fill_rect(content_x, card_y, content_w, card_h);
         }
 
-        let text_pad = 16.0;
+        // Left icon (24×24)
+        let icon_size = 24.0;
+        let icon_x = content_x + 16.0;
+        let icon_y = card_y + (card_h - icon_size) / 2.0;
+        let icon_color = if card_hovered { TEXT_PRIMARY } else { TEXT_MUTED };
+        draw_svg_icon(ctx, option.icon, icon_x, icon_y, icon_size, icon_size, icon_color);
+
+        // Text (title + subtitle)
+        let text_x = content_x + 16.0 + icon_size + 14.0;
+        let text_center = card_y + card_h / 2.0;
 
         ctx.set_fill_color(TEXT_PRIMARY);
         ctx.set_font("bold 15px pt root ui");
         ctx.set_text_align(TextAlign::Left);
-        ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text(option.title, content_x + text_pad, card_y + 14.0);
+        ctx.set_text_baseline(TextBaseline::Bottom);
+        ctx.fill_text(option.title, text_x, text_center - 1.0);
 
         ctx.set_fill_color(TEXT_MUTED);
         ctx.set_font("12px pt root ui");
         ctx.set_text_baseline(TextBaseline::Top);
-        let subtitle = truncate_text(option.subtitle, 52);
-        ctx.fill_text(&subtitle, content_x + text_pad, card_y + 36.0);
+        ctx.fill_text(option.subtitle, text_x, text_center + 3.0);
 
+        // Chevron right
         let chevron_size = 18.0;
         draw_svg_icon(
             ctx,
             ICON_CHEVRON_RIGHT,
-            content_x + content_w - chevron_size - text_pad,
+            content_x + content_w - chevron_size - 14.0,
             card_y + (card_h - chevron_size) / 2.0,
             chevron_size,
             chevron_size,
             TEXT_MUTED,
         );
 
+        // Divider between cards
         if i < options.len().saturating_sub(1) {
             ctx.set_stroke_color(SEPARATOR);
             ctx.set_stroke_width(0.5);
             ctx.begin_path();
-            ctx.move_to(content_x + text_pad, card_y + card_h);
-            ctx.line_to(content_x + content_w - text_pad, card_y + card_h);
+            ctx.move_to(content_x + 16.0, card_y + card_h);
+            ctx.line_to(content_x + content_w - 16.0, card_y + card_h);
             ctx.stroke();
         }
 
@@ -188,14 +203,5 @@ pub fn draw_connect_screen(
     // Nav bar
     if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, 3) {
         state.go_to_tab(tab);
-    }
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(max_chars.saturating_sub(3)).collect();
-        format!("{truncated}...")
     }
 }

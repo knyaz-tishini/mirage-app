@@ -2,15 +2,17 @@
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline};
 use uzor::input::InputState;
-use uzor::types::{Rect, WidgetId};
-use uzor::input::Sense;
+use uzor::types::Rect;
 
 use crate::app::{AppState, Screen};
 use super::components::{
     BG, SURFACE, SURFACE_2, TEXT_PRIMARY, TEXT_MUTED,
-    ICON_SETTINGS, ICON_LOGS,
-    draw_back_header, draw_list_item, draw_divider,
+    ICON_SETTINGS, ICON_LOGS, ICON_CHEVRON_RIGHT,
+    draw_back_header, draw_divider, draw_toggle,
 };
+use uzor::render::draw_svg_icon;
+use uzor::types::WidgetId;
+use uzor::input::Sense;
 
 pub fn draw(
     ctx: &mut dyn RenderContext,
@@ -32,64 +34,47 @@ pub fn draw(
     let margin = 16.0;
     let content_w = w - margin * 2.0;
     let mut y = 80.0;
+    let row_h = 60.0;
+    let clicked = input.is_clicked();
 
-    // Toggle: Use AmneziaDNS
-    let toggle_h = 56.0;
-    ctx.set_fill_color(SURFACE);
-    ctx.fill_rounded_rect(margin, y, content_w, toggle_h, 12.0);
-    ctx.set_stroke_color(SURFACE_2);
-    ctx.set_stroke_width(1.0);
-    ctx.stroke_rounded_rect(margin, y, content_w, toggle_h, 12.0);
-
-    ctx.set_fill_color(TEXT_PRIMARY);
-    ctx.set_font("16px pt root ui");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Bottom);
-    ctx.fill_text("Использовать AmneziaDNS", margin + 16.0, y + toggle_h / 2.0 - 1.0);
-
-    ctx.set_fill_color(TEXT_MUTED);
-    ctx.set_font("13px pt root ui");
-    ctx.set_text_baseline(TextBaseline::Top);
-    ctx.fill_text("Если AmneziaDNS установлен на сервере", margin + 16.0, y + toggle_h / 2.0 + 3.0);
-
-    // Toggle pill (placeholder off)
-    let pill_w = 44.0;
-    let pill_h = 26.0;
-    let pill_x = margin + content_w - pill_w - 16.0;
-    let pill_y = y + (toggle_h - pill_h) / 2.0;
-    ctx.set_fill_color(SURFACE_2);
-    ctx.fill_rounded_rect(pill_x, pill_y, pill_w, pill_h, 13.0);
-
-    y += toggle_h + 12.0;
-
-    // List items
-    struct ConnItem {
+    // ── Section: DNS, Split tunneling, KillSwitch ──────────────────────────
+    struct NavRow {
         icon: &'static str,
         title: &'static str,
         subtitle: &'static str,
         id: &'static str,
+        toggle_id: Option<&'static str>,
         screen: Screen,
     }
 
-    let items: &[ConnItem] = &[
-        ConnItem {
+    let rows: &[NavRow] = &[
+        NavRow {
             icon: ICON_LOGS,
-            title: "DNS-серверы",
-            subtitle: "Когда AmneziaDNS не используется",
-            id: "conn_dns",
+            title: "DNS",
+            subtitle: "Настройка DNS-серверов",
+            id: "conn_row_dns",
+            toggle_id: Some("dns_enabled"),
             screen: Screen::SettingsDns,
         },
-        ConnItem {
+        NavRow {
             icon: ICON_SETTINGS,
-            title: "Сайт-based split tunneling",
-            subtitle: "Раздельное туннелирование по сайтам",
-            id: "conn_split",
+            title: "Раздельное туннелирование",
+            subtitle: "Выборочный маршрут трафика",
+            id: "conn_row_split",
+            toggle_id: None,
             screen: Screen::SettingsSplitTunneling,
+        },
+        NavRow {
+            icon: ICON_SETTINGS,
+            title: "KillSwitch",
+            subtitle: "Блокировка при разрыве VPN",
+            id: "conn_row_ks",
+            toggle_id: Some("killswitch_enabled"),
+            screen: Screen::SettingsKillSwitch,
         },
     ];
 
-    let item_h = 68.0;
-    let list_h = item_h * items.len() as f64;
+    let list_h = row_h * rows.len() as f64;
 
     ctx.set_fill_color(SURFACE);
     ctx.fill_rounded_rect(margin, y, content_w, list_h, 16.0);
@@ -99,38 +84,90 @@ pub fn draw(
 
     let mut navigate_to: Option<Screen> = None;
 
-    for (i, item) in items.iter().enumerate() {
-        let item_y = y + i as f64 * item_h;
+    for (i, row) in rows.iter().enumerate() {
+        let row_y = y + i as f64 * row_h;
+        let icon_size = 24.0;
+        let icon_margin = 16.0;
+        let icon_cy = row_y + row_h / 2.0;
 
-        let clicked = draw_list_item(
+        // Row hit area (excludes toggle area so toggle gets priority)
+        let row_rect = Rect::new(margin, row_y, content_w, row_h);
+        let row_id = WidgetId::new(row.id);
+        state.coordinator.register(row_id.clone(), row_rect, Sense::CLICK);
+        let row_hovered = state.coordinator.is_hovered(&row_id);
+
+        if row_hovered {
+            ctx.set_fill_color_alpha(SURFACE_2, 0.4);
+            ctx.fill_rect(margin, row_y, content_w, row_h);
+        }
+
+        // Left icon
+        draw_svg_icon(
             ctx,
-            input,
-            state,
-            item.id,
-            item.icon,
-            item.title,
-            item.subtitle,
-            margin,
-            item_y,
-            content_w,
-            item_h,
+            row.icon,
+            margin + icon_margin,
+            icon_cy - icon_size / 2.0,
+            icon_size,
+            icon_size,
+            TEXT_MUTED,
         );
 
-        if i < items.len().saturating_sub(1) {
-            draw_divider(ctx, margin + 52.0, item_y + item_h, content_w - 52.0);
+        // Title + subtitle
+        let text_x = margin + icon_margin + icon_size + 14.0;
+        ctx.set_fill_color(TEXT_PRIMARY);
+        ctx.set_font("15px pt root ui");
+        ctx.set_text_align(TextAlign::Left);
+        ctx.set_text_baseline(TextBaseline::Bottom);
+        ctx.fill_text(row.title, text_x, icon_cy - 1.0);
+
+        ctx.set_fill_color(TEXT_MUTED);
+        ctx.set_font("12px pt root ui");
+        ctx.set_text_baseline(TextBaseline::Top);
+        ctx.fill_text(row.subtitle, text_x, icon_cy + 3.0);
+
+        // Right side: toggle (if any) + chevron
+        let chevron_size = 20.0;
+        let right_x = margin + content_w - chevron_size - 14.0;
+
+        if let Some(toggle_id) = row.toggle_id {
+            let pill_w = 44.0;
+            let pill_h = 26.0;
+            let pill_x = right_x - chevron_size - pill_w - 8.0;
+            let pill_y = row_y + (row_h - pill_h) / 2.0;
+            draw_toggle(ctx, input, state, toggle_id, pill_x, pill_y);
         }
 
-        if clicked {
-            navigate_to = Some(item.screen.clone());
+        draw_svg_icon(
+            ctx,
+            ICON_CHEVRON_RIGHT,
+            right_x,
+            icon_cy - chevron_size / 2.0,
+            chevron_size,
+            chevron_size,
+            TEXT_MUTED,
+        );
+
+        if i < rows.len().saturating_sub(1) {
+            draw_divider(ctx, margin + 52.0, row_y + row_h, content_w - 52.0);
+        }
+
+        if clicked && row_hovered {
+            navigate_to = Some(row.screen.clone());
         }
     }
+
+    y += list_h + 20.0;
+
+    // ── Description text ───────────────────────────────────────────────────
+    ctx.set_fill_color(TEXT_MUTED);
+    ctx.set_font("12px pt root ui");
+    ctx.set_text_align(TextAlign::Left);
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text("Настройте параметры безопасного соединения.", margin, y);
 
     if let Some(screen) = navigate_to {
         state.push_screen(screen);
     }
 
-    // Suppress unused
     let _ = h;
-    let _ = WidgetId::new("x");
-    let _ = Sense::CLICK;
 }

@@ -97,7 +97,7 @@ pub fn draw_settings_screen(
     ctx.set_font("11px pt root ui");
     ctx.set_text_align(TextAlign::Center);
     ctx.set_text_baseline(TextBaseline::Bottom);
-    ctx.fill_text("Mirage  v0.1.3", w / 2.0, h - NAV_HEIGHT - 12.0);
+    ctx.fill_text("Mirage  v0.1.4", w / 2.0, h - NAV_HEIGHT - 12.0);
 
     // Nav bar
     if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, 2) {

@@ -1,12 +1,14 @@
 pub mod components;
 pub mod connect_screen;
 pub mod main_screen;
+pub mod protocol_detail_screen;
 pub mod server_info_screen;
 pub mod servers_screen;
 pub mod settings_about;
 pub mod settings_application;
 pub mod settings_connection;
 pub mod settings_dns;
+pub mod settings_killswitch;
 pub mod settings_logs;
 pub mod settings_screen;
 pub mod settings_servers_list;
@@ -25,6 +27,10 @@ pub fn draw_frame(
     viewport: Rect,
     state: &mut AppState,
 ) {
+    // Advance animation, timers, and flush pending keyboard input every frame
+    // regardless of which screen is active.
+    state.tick(input.dt);
+
     let screen = state.current_screen().clone();
 
     match screen {
@@ -57,6 +63,24 @@ pub fn draw_frame(
         }
         Screen::SettingsSplitTunneling => {
             settings_split_tunneling::draw(ctx, &input, viewport, state)
+        }
+        Screen::SettingsKillSwitch => {
+            settings_killswitch::draw(ctx, &input, viewport, state)
+        }
+        Screen::ProtocolDetail { chain_idx, protocol_idx } => {
+            protocol_detail_screen::draw(ctx, &input, viewport, state, chain_idx, protocol_idx)
+        }
+    }
+
+    // Confirmation drawer rendered above everything else (topmost layer).
+    if state.confirm_drawer.is_some() {
+        let w = viewport.width;
+        let h = viewport.height;
+        if let Some(action_id) =
+            components::draw_confirm_drawer(ctx, &input, state, w, h)
+        {
+            state.handle_confirm_action(&action_id);
+            state.dismiss_confirm();
         }
     }
 }
