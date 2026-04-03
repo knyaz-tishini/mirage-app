@@ -20,6 +20,27 @@ use uzor::types::Rect;
 
 use crate::app::{AppState, Screen};
 
+/// Returns the nav bar tab index for the given screen.
+/// Sub-screens inherit the tab index of their parent.
+fn nav_tab_for_screen(screen: &Screen) -> usize {
+    match screen {
+        Screen::Home => 0,
+        Screen::Servers => 1,
+        Screen::ServerInfo { .. } => 1,
+        Screen::SettingsServersList => 1,
+        Screen::Settings => 2,
+        Screen::SettingsConnection => 2,
+        Screen::SettingsApplication => 2,
+        Screen::SettingsLogs => 2,
+        Screen::SettingsAbout => 2,
+        Screen::SettingsDns => 2,
+        Screen::SettingsSplitTunneling => 2,
+        Screen::SettingsKillSwitch => 2,
+        Screen::ProtocolDetail { .. } => 1,
+        Screen::Connect => 3,
+    }
+}
+
 /// Top-level frame dispatch — draws background + current screen + nav bar.
 pub fn draw_frame(
     ctx: &mut dyn RenderContext,
@@ -32,8 +53,9 @@ pub fn draw_frame(
     state.tick(input.dt);
 
     let screen = state.current_screen().clone();
+    let active_tab = nav_tab_for_screen(&screen);
 
-    match screen {
+    match screen.clone() {
         Screen::Home => main_screen::draw_main_screen(ctx, &input, viewport, state),
         Screen::Servers => servers_screen::draw_servers_screen(ctx, &input, viewport, state),
         Screen::Settings => settings_screen::draw_settings_screen(ctx, &input, viewport, state),
@@ -69,6 +91,16 @@ pub fn draw_frame(
         }
         Screen::ProtocolDetail { chain_idx, protocol_idx } => {
             protocol_detail_screen::draw(ctx, &input, viewport, state, chain_idx, protocol_idx)
+        }
+    }
+
+    // Nav bar is drawn AFTER screen content so it always appears on top.
+    // Shown on ALL screens — sub-screens inherit parent tab highlight.
+    {
+        let w = viewport.width;
+        let h = viewport.height;
+        if let Some(new_tab) = components::draw_nav_bar(ctx, &input, state, w, h, active_tab) {
+            state.go_to_tab(new_tab);
         }
     }
 
