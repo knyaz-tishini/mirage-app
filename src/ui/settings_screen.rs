@@ -2,11 +2,10 @@
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline};
 use uzor::input::InputState;
-use uzor::types::Rect;
 
 use crate::app::AppState;
 use super::components::{
-    BG, SURFACE_2, TEXT_PRIMARY, TEXT_MUTED, NAV_HEIGHT,
+    BG, SURFACE, SURFACE_2, TEXT_PRIMARY, TEXT_MUTED, NAV_HEIGHT,
     ICON_SERVER, ICON_SETTINGS, ICON_LOGS,
     draw_nav_bar, draw_divider, draw_settings_row,
 };
@@ -15,13 +14,11 @@ use super::main_screen::navigate_tab;
 pub fn draw_settings_screen(
     ctx: &mut dyn RenderContext,
     input: &InputState,
-    viewport: Rect,
+    viewport: uzor::types::Rect,
     state: &mut AppState,
 ) {
     let w = viewport.width;
     let h = viewport.height;
-    let clicked = input.is_clicked();
-    let mouse = input.pointer.pos;
 
     // Background
     ctx.set_fill_color(BG);
@@ -41,7 +38,7 @@ pub fn draw_settings_screen(
     let list_top = 68.0;
 
     // Settings list card container
-    ctx.set_fill_color(super::components::SURFACE);
+    ctx.set_fill_color(SURFACE);
     ctx.fill_rounded_rect(content_x, list_top, content_w, row_h * 5.0, 16.0);
 
     ctx.set_stroke_color(SURFACE_2);
@@ -67,14 +64,13 @@ pub fn draw_settings_screen(
 
         let _row_clicked = draw_settings_row(
             ctx,
+            input,
             item.icon,
             item.title,
             content_x,
             row_y,
             content_w,
             row_h,
-            mouse,
-            clicked,
         );
 
         // Divider between items (not after last)
@@ -87,7 +83,7 @@ pub fn draw_settings_screen(
     let info_y = list_top + row_h * items.len() as f64 + 20.0;
     let info_h = if state.config.is_some() { 88.0 } else { 44.0 };
 
-    ctx.set_fill_color(super::components::SURFACE);
+    ctx.set_fill_color(SURFACE);
     ctx.fill_rounded_rect(content_x, info_y, content_w, info_h, 12.0);
 
     ctx.set_stroke_color(SURFACE_2);
@@ -126,7 +122,7 @@ pub fn draw_settings_screen(
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text("SOCKS5 PROXY", content_x, socks_y - 18.0);
 
-    ctx.set_fill_color(super::components::SURFACE);
+    ctx.set_fill_color(SURFACE);
     ctx.fill_rounded_rect(content_x, socks_y, content_w, socks_h, 12.0);
 
     ctx.set_stroke_color(SURFACE_2);
@@ -157,7 +153,7 @@ pub fn draw_settings_screen(
 
     // Nav bar
     let active_tab = 2;
-    if let Some(tab) = draw_nav_bar(ctx, w, h, active_tab, mouse, clicked) {
+    if let Some(tab) = draw_nav_bar(ctx, input, w, h, active_tab) {
         navigate_tab(state, tab);
     }
 }

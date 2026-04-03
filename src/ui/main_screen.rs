@@ -23,7 +23,6 @@ pub fn draw_main_screen(
     let w = viewport.width;
     let h = viewport.height;
     let clicked = input.is_clicked();
-    let mouse = input.pointer.pos;
 
     // -------------------------------------------------------------------------
     // Background
@@ -103,9 +102,10 @@ pub fn draw_main_screen(
         ctx.fill_text(line, cx, start_y + i as f64 * line_h);
     }
 
-    // Click detection on the circle
+    // Click detection on the circle — use bounding rect for the hit test area
+    // (circle hit-test uses distance to keep circular feel)
     if clicked {
-        if let Some((mx, my)) = mouse {
+        if let Some((mx, my)) = input.pointer.pos {
             let dx = mx - cx;
             let dy = my - cy;
             if dx * dx + dy * dy <= (r + 4.0) * (r + 4.0) {
@@ -169,9 +169,8 @@ pub fn draw_main_screen(
         .map(|ch| ch.l1.addr.to_string())
         .unwrap_or_else(|| "—".to_string());
 
-    let panel_hovered = mouse
-        .map(|(mx, my)| Rect::new(panel_x, panel_y, panel_w, panel_h).contains(mx, my))
-        .unwrap_or(false);
+    let panel_rect = Rect::new(panel_x, panel_y, panel_w, panel_h);
+    let panel_hovered = input.is_hovered(&panel_rect);
 
     // Panel background (slightly lighter on hover)
     if panel_hovered {
@@ -194,7 +193,7 @@ pub fn draw_main_screen(
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text(chain_name, panel_x + 4.0, panel_y + 10.0);
 
-    // Chevron right SVG (right side)
+    // Chevron right SVG (right side) — uzor built-in icon
     let chevron_size = 16.0;
     draw_svg_icon(
         ctx,
@@ -223,7 +222,7 @@ pub fn draw_main_screen(
     // Nav bar
     // -------------------------------------------------------------------------
     let active_tab = 0;
-    if let Some(tab) = draw_nav_bar(ctx, w, h, active_tab, mouse, clicked) {
+    if let Some(tab) = draw_nav_bar(ctx, input, w, h, active_tab) {
         navigate_tab(state, tab);
     }
 }

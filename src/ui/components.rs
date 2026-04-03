@@ -2,6 +2,7 @@
 //! Follows AmneziaVPN's exact dark palette.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
+use uzor::input::InputState;
 use uzor::types::Rect;
 
 // =============================================================================
@@ -19,8 +20,9 @@ pub const TEXT_PRIMARY: &str = "#D7D8DB";  // paleGray
 pub const TEXT_MUTED: &str = "#878B91";    // mutedGray
 pub const SEPARATOR: &str = "#2C2D30";     // slateGray
 pub const NAV_BG: &str = "#1C1D21";       // onyxBlack
+
 // =============================================================================
-// SVG icon constants
+// SVG icon constants — custom icons uzor doesn't provide
 // =============================================================================
 
 pub const ICON_HOME: &str = r#"<svg viewBox="0 0 24 24"><path d="M3 12l9-9 9 9M5 10v10a1 1 0 001 1h3a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1h3a1 1 0 001-1V10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
@@ -31,9 +33,9 @@ pub const ICON_SERVER: &str = r#"<svg viewBox="0 0 24 24"><rect x="2" y="2" widt
 
 pub const ICON_LOGS: &str = r#"<svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><polyline points="14,2 14,8 20,8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><line x1="16" y1="13" x2="8" y2="13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="16" y1="17" x2="8" y2="17" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><polyline points="10,9 9,9 8,9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>"#;
 
-pub const ICON_CHEVRON_RIGHT: &str = r#"<svg viewBox="0 0 24 24"><polyline points="9,18 15,12 9,6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
-
-pub const ICON_CHECK: &str = r#"<svg viewBox="0 0 24 24"><polyline points="20,6 9,17 4,12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+// Built-in uzor icons used for checkmark and chevron right
+pub use uzor::macos::icons::paths::CHECKMARK as ICON_CHECK;
+pub use uzor::macos::icons::paths::CHEVRON_RIGHT as ICON_CHEVRON_RIGHT;
 
 // =============================================================================
 // Nav bar constants
@@ -46,15 +48,15 @@ pub const NAV_HEIGHT: f64 = 72.0;
 /// Returns `Some(index)` if a tab was clicked this frame, `None` otherwise.
 pub fn draw_nav_bar(
     ctx: &mut dyn RenderContext,
+    input: &InputState,
     width: f64,
     height: f64,
     active_tab: usize,
-    mouse_pos: Option<(f64, f64)>,
-    clicked: bool,
 ) -> Option<usize> {
     let nav_y = height - NAV_HEIGHT;
     let tab_count = 4usize;
     let btn_w = width / tab_count as f64;
+    let clicked = input.is_clicked();
 
     // Background
     ctx.set_fill_color(NAV_BG);
@@ -89,13 +91,11 @@ pub fn draw_nav_bar(
         // SVG icon
         draw_svg_icon(ctx, icons[i], icon_x, icon_y, icon_size, icon_size, icon_color);
 
-        // Hit detection
+        // Hit detection via InputState
         if clicked {
-            if let Some((mx, my)) = mouse_pos {
-                let nav_rect = Rect::new(bx, nav_y, btn_w, NAV_HEIGHT);
-                if nav_rect.contains(mx, my) {
-                    result = Some(i);
-                }
+            let nav_rect = Rect::new(bx, nav_y, btn_w, NAV_HEIGHT);
+            if input.is_hovered(&nav_rect) {
+                result = Some(i);
             }
         }
     }
@@ -118,18 +118,17 @@ pub fn draw_divider(ctx: &mut dyn RenderContext, x: f64, y: f64, w: f64) {
 /// Returns true if this row was clicked.
 pub fn draw_settings_row(
     ctx: &mut dyn RenderContext,
+    input: &InputState,
     icon_svg: &str,
     title: &str,
     x: f64,
     y: f64,
     w: f64,
     h: f64,
-    mouse_pos: Option<(f64, f64)>,
-    clicked: bool,
 ) -> bool {
-    let is_hovered = mouse_pos
-        .map(|(mx, my)| Rect::new(x, y, w, h).contains(mx, my))
-        .unwrap_or(false);
+    let row_rect = Rect::new(x, y, w, h);
+    let is_hovered = input.is_hovered(&row_rect);
+    let clicked = input.is_clicked();
 
     // Hover highlight
     if is_hovered {
@@ -151,7 +150,7 @@ pub fn draw_settings_row(
     ctx.set_text_baseline(TextBaseline::Middle);
     ctx.fill_text(title, x + icon_margin + icon_size + 12.0, y + h / 2.0);
 
-    // Chevron right
+    // Chevron right — uzor built-in icon
     let chevron_size = 16.0;
     draw_svg_icon(
         ctx,

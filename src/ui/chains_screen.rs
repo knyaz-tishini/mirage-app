@@ -21,7 +21,6 @@ pub fn draw_chains_screen(
     let w = viewport.width;
     let h = viewport.height;
     let clicked = input.is_clicked();
-    let mouse = input.pointer.pos;
 
     // Background
     ctx.set_fill_color(BG);
@@ -85,7 +84,7 @@ pub fn draw_chains_screen(
                 ctx.set_stroke_width(1.0);
                 ctx.stroke_rounded_rect(item_margin, item_y, item_w, item_h, 12.0);
 
-                // Checkmark SVG or empty circle indicator
+                // Checkmark or empty circle indicator — use uzor's built-in CHECKMARK icon
                 if *is_selected {
                     let check_size = 18.0;
                     draw_svg_icon(
@@ -127,13 +126,11 @@ pub fn draw_chains_screen(
                 let detail = format!("{protocol}  ·  {addr}");
                 ctx.fill_text(&detail, item_margin + 44.0, item_y + 36.0);
 
-                // Click detection
+                // Click detection via InputState
                 if clicked {
-                    if let Some((mx, my)) = mouse {
-                        let item_rect = Rect::new(item_margin, item_y, item_w, item_h);
-                        if item_rect.contains(mx, my) {
-                            clicked_idx = Some(idx);
-                        }
+                    let item_rect = Rect::new(item_margin, item_y, item_w, item_h);
+                    if input.is_hovered(&item_rect) {
+                        clicked_idx = Some(idx);
                     }
                 }
             }
@@ -165,17 +162,16 @@ pub fn draw_chains_screen(
         ctx.fill_text("Open Settings", w / 2.0, btn_y + btn_h / 2.0);
 
         if clicked {
-            if let Some((mx, my)) = mouse {
-                if Rect::new(btn_x, btn_y, btn_w, btn_h).contains(mx, my) {
-                    state.go_to(Screen::Settings);
-                }
+            let btn_rect = Rect::new(btn_x, btn_y, btn_w, btn_h);
+            if input.is_hovered(&btn_rect) {
+                state.go_to(Screen::Settings);
             }
         }
     }
 
     // Nav bar
     let active_tab = 1;
-    if let Some(tab) = draw_nav_bar(ctx, w, h, active_tab, mouse, clicked) {
+    if let Some(tab) = draw_nav_bar(ctx, input, w, h, active_tab) {
         navigate_tab(state, tab);
     }
 }

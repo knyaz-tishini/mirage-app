@@ -1,4 +1,4 @@
-//! Logs screen — scrollable log viewer.
+//! Logs screen — scrollable log viewer using uzor ScrollState.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline};
 use uzor::types::Rect;
@@ -19,8 +19,6 @@ pub fn draw_logs_screen(
 ) {
     let w = viewport.width;
     let h = viewport.height;
-    let clicked = input.is_clicked();
-    let mouse = input.pointer.pos;
 
     // Background
     ctx.set_fill_color(BG);
@@ -39,23 +37,21 @@ pub fn draw_logs_screen(
     let content_w = w - margin * 2.0;
     let content_h = content_bottom - content_top;
 
-    // Scroll via mouse wheel
-    let scroll_delta = input.scroll_delta.1;
-    if scroll_delta != 0.0 {
-        let in_area = mouse
-            .map(|(mx, my)| Rect::new(margin, content_top, content_w, content_h).contains(mx, my))
-            .unwrap_or(false);
-        if in_area {
-            state.logs_scroll -= scroll_delta * 0.5;
-        }
-    }
-
-    // Clamp scroll
+    // Line metrics
     let line_h = 20.0;
     let lines_count = state.log_lines.len();
     let total_content_h = lines_count as f64 * line_h + 16.0;
-    let max_scroll = (total_content_h - content_h).max(0.0);
-    state.logs_scroll = state.logs_scroll.clamp(0.0, max_scroll);
+
+    // Scroll via uzor ScrollState — handle_wheel applies physics clamping
+    let scroll_delta = input.scroll_delta.1;
+    if scroll_delta != 0.0 {
+        let scroll_area_rect = Rect::new(margin, content_top, content_w, content_h);
+        if input.is_hovered(&scroll_area_rect) {
+            state.logs_scroll.handle_wheel(scroll_delta, total_content_h, content_h);
+        }
+    }
+
+    let scroll_offset = state.logs_scroll.offset;
 
     // Log area background
     ctx.set_fill_color(SURFACE);
@@ -64,7 +60,7 @@ pub fn draw_logs_screen(
     ctx.set_stroke_width(1.0);
     ctx.stroke_rounded_rect(margin, content_top, content_w, content_h, 12.0);
 
-    // Clip to log area — save/restore to limit clip scope
+    // Clip to log area
     ctx.save();
     ctx.clip_rect(margin + 1.0, content_top + 1.0, content_w - 2.0, content_h - 2.0);
 
@@ -72,7 +68,7 @@ pub fn draw_logs_screen(
     let linenum_x = margin + 10.0;
 
     for (i, line) in state.log_lines.iter().enumerate() {
-        let line_y = content_top + 8.0 + i as f64 * line_h - state.logs_scroll;
+        let line_y = content_top + 8.0 + i as f64 * line_h - scroll_offset;
 
         // Skip invisible
         if line_y + line_h < content_top || line_y > content_bottom {
@@ -129,6 +125,7 @@ pub fn draw_logs_screen(
     ctx.restore();
 
     // Scrollbar (if content overflows)
+    let max_scroll = (total_content_h - content_h).max(0.0);
     if total_content_h > content_h {
         let sb_w = 4.0;
         let sb_x = margin + content_w - sb_w - 4.0;
@@ -138,7 +135,7 @@ pub fn draw_logs_screen(
         let thumb_ratio = content_h / total_content_h;
         let thumb_h = (sb_track_h * thumb_ratio).max(20.0);
         let thumb_offset = if max_scroll > 0.0 {
-            (state.logs_scroll / max_scroll) * (sb_track_h - thumb_h)
+            (scroll_offset / max_scroll) * (sb_track_h - thumb_h)
         } else {
             0.0
         };
@@ -154,7 +151,7 @@ pub fn draw_logs_screen(
 
     // Nav bar
     let active_tab = 3;
-    if let Some(tab) = draw_nav_bar(ctx, w, h, active_tab, mouse, clicked) {
+    if let Some(tab) = draw_nav_bar(ctx, input, w, h, active_tab) {
         navigate_tab(state, tab);
     }
 }

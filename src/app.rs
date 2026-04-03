@@ -1,4 +1,5 @@
 use mirage_core::config::{ClientConfig, ProtocolId};
+use uzor::types::ScrollState;
 
 /// Connection status.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,8 +38,8 @@ pub struct AppState {
     pub status_message: String,
     pub screen: Screen,
     pub log_lines: Vec<String>,
-    /// Scroll offset for the logs screen (pixels from top).
-    pub logs_scroll: f64,
+    /// Scroll state for the logs screen — managed by uzor ScrollState.
+    pub logs_scroll: ScrollState,
 }
 
 impl AppState {
@@ -55,7 +56,7 @@ impl AppState {
             status_message: "Ready".to_string(),
             screen: Screen::Main,
             log_lines: vec!["Mirage started".to_string()],
-            logs_scroll: 0.0,
+            logs_scroll: ScrollState::new(),
         }
     }
 
