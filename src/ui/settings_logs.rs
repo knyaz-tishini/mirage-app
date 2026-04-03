@@ -7,7 +7,7 @@ use uzor::input::Sense;
 
 use crate::app::{AppState, ConfirmDrawer};
 use super::components::{
-    BG, SURFACE, SURFACE_2, TEXT_MUTED, ACCENT, ERROR_COLOR, SUCCESS,
+    BG, SURFACE, SURFACE_2, TEXT_MUTED, ACCENT, ERROR_COLOR, SUCCESS, NAV_HEIGHT,
     draw_back_header, draw_divider,
 };
 
@@ -64,7 +64,7 @@ pub fn draw(
 
     let content_w = w - margin * 2.0;
     let log_top = 76.0;
-    let log_bottom = h - 16.0;
+    let log_bottom = h - NAV_HEIGHT - 16.0;
     let log_h = log_bottom - log_top;
 
     // Log container background

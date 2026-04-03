@@ -7,7 +7,7 @@ use uzor::input::{InputState, Sense};
 use crate::app::{AppState, ConfirmDrawer, Screen};
 use super::components::{
     BG, SURFACE, SURFACE_2, ACCENT, ERROR_COLOR,
-    TEXT_PRIMARY, TEXT_MUTED, SEPARATOR, NAV_HEIGHT,
+    TEXT_PRIMARY, TEXT_MUTED, NAV_HEIGHT,
     ICON_CHEVRON_RIGHT, ICON_SETTINGS,
     draw_back_header, draw_tab_bar, draw_divider, draw_toggle,
 };
@@ -93,16 +93,6 @@ pub fn draw_server_info_screen(
         2 => draw_management_tab(ctx, input, state, margin, content_top, content_w, content_h, clicked, server_idx),
         _ => {}
     }
-
-    // Bottom chrome
-    ctx.set_fill_color("#1C1D21");
-    ctx.fill_rect(0.0, h - NAV_HEIGHT, w, NAV_HEIGHT);
-    ctx.set_stroke_color(SEPARATOR);
-    ctx.set_stroke_width(0.5);
-    ctx.begin_path();
-    ctx.move_to(0.0, h - NAV_HEIGHT);
-    ctx.line_to(w, h - NAV_HEIGHT);
-    ctx.stroke();
 }
 
 // ---------------------------------------------------------------------------

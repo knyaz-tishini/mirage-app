@@ -5,10 +5,11 @@ use uzor::types::{Rect, WidgetId};
 use uzor::input::{InputState, Sense};
 
 use crate::app::AppState;
+use crate::api::ApiRequest;
 use super::components::{
     BG, ACCENT, SURFACE, SURFACE_2, TEXT_PRIMARY, TEXT_MUTED, SEPARATOR,
     ICON_CHEVRON_RIGHT, ICON_SERVER, ICON_SETTINGS, ICON_LOGS,
-    draw_nav_bar, draw_text_field,
+    draw_text_field,
 };
 
 /// Draw the Quick Connect screen.
@@ -82,8 +83,13 @@ pub fn draw_connect_screen(
 
     if clicked && paste_hovered {
         if let Ok(mut cb) = arboard::Clipboard::new() {
-            if let Ok(text) = cb.get_text() {
-                state.field_set_text("connect_key", text);
+            if let Ok(pasted_text) = cb.get_text() {
+                state.field_set_text("connect_key", pasted_text.clone());
+                // Treat the pasted text as an API token and authenticate.
+                if !pasted_text.is_empty() {
+                    state.api_token = Some(pasted_text.clone());
+                    state.api.send(ApiRequest::SetToken(pasted_text));
+                }
             }
         }
     }
@@ -198,10 +204,5 @@ pub fn draw_connect_screen(
         }
 
         let _ = clicked && card_hovered;
-    }
-
-    // Nav bar
-    if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, 3) {
-        state.go_to_tab(tab);
     }
 }

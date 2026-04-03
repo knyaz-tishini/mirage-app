@@ -12,7 +12,6 @@ use super::components::{
     BG, ACCENT, SURFACE, SURFACE_2, ERROR_COLOR,
     TEXT_PRIMARY, TEXT_MUTED, SEPARATOR, NAV_HEIGHT,
     ICON_CHEVRON_RIGHT, ICON_CHEVRON_DOWN,
-    draw_nav_bar,
 };
 
 /// Power-off SVG icon (arc + vertical line), 24x24 viewBox.
@@ -307,13 +306,6 @@ pub fn draw_main_screen(
     // Click on server panel toggles the bottom sheet
     if clicked && panel_hovered {
         state.sheet_open = !state.sheet_open;
-    }
-
-    // -------------------------------------------------------------------------
-    // Nav bar
-    // -------------------------------------------------------------------------
-    if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, 0) {
-        state.go_to_tab(tab);
     }
 
     // -------------------------------------------------------------------------

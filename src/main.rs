@@ -1,3 +1,4 @@
+mod api;
 mod app;
 mod platform;
 mod ui;

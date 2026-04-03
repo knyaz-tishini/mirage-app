@@ -11,7 +11,7 @@ use super::components::{
     ACCENT, BG, SURFACE, SURFACE_2, TEXT_PRIMARY, TEXT_MUTED, SEPARATOR, NAV_HEIGHT,
     SUCCESS, ERROR_COLOR,
     ICON_SETTINGS, ICON_PLUS,
-    draw_nav_bar, draw_divider,
+    draw_divider,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,7 +158,169 @@ pub fn draw_servers_screen(
     // -------------------------------------------------------------------------
     // Server list
     // -------------------------------------------------------------------------
-    if let Some(cfg) = &state.config {
+    //
+    // Rendering priority:
+    //   1. Server-managed chains (state.chains from mirage2server API) — shown
+    //      when the server is reachable and the user has authenticated.
+    //   2. Legacy config-based chains (state.config) — shown as fallback.
+    //   3. Empty-state message when neither is available.
+
+    if !state.chains.is_empty() {
+        // -----------------------------------------------------------------
+        // Path 1: render server-managed chains from mirage2server API
+        // -----------------------------------------------------------------
+        let chain_count = state.chains.len();
+        let list_h = item_h * chain_count as f64;
+
+        ctx.set_fill_color(SURFACE);
+        ctx.fill_rounded_rect(margin, list_top, content_w, list_h, 16.0);
+        ctx.set_stroke_color(SURFACE_2);
+        ctx.set_stroke_width(1.0);
+        ctx.stroke_rounded_rect(margin, list_top, content_w, list_h, 16.0);
+
+        // Snapshot data to avoid borrow-checker conflicts during interaction.
+        let chain_data: Vec<(i64, String, String)> = state
+            .chains
+            .iter()
+            .map(|c| (c.id, c.name.clone(), c.status.clone()))
+            .collect();
+
+        let mut clicked_select: Option<usize> = None;
+        let mut clicked_settings: Option<usize> = None;
+
+        for (idx, (chain_id, chain_name, chain_status)) in chain_data.iter().enumerate() {
+            let item_y = list_top + idx as f64 * item_h;
+
+            // Map server status string to display enum.
+            let status = match chain_status.as_str() {
+                "active" => DisplayStatus::Online,
+                "inactive" => DisplayStatus::Offline,
+                "provisioning" | "deploying" => DisplayStatus::Provisioning,
+                _ => DisplayStatus::Degraded,
+            };
+
+            // ---- Row hit area (excluding gear) ----
+            let row_rect = Rect::new(margin, item_y, content_w - 56.0, item_h);
+            let row_id = WidgetId::new(format!("server_row_{idx}"));
+            state.coordinator.register(row_id.clone(), row_rect, Sense::CLICK);
+            let row_hovered = state.coordinator.is_hovered(&row_id);
+            let is_selected = idx == state.selected_chain;
+
+            if row_hovered {
+                ctx.set_fill_color_alpha(SURFACE_2, 0.4);
+                ctx.fill_rect(margin, item_y, content_w - 56.0, item_h);
+            }
+
+            // ---- Radio indicator ----
+            let radio_cx = margin + 28.0;
+            let radio_cy = item_y + item_h / 2.0;
+            let radio_r = 9.0;
+
+            if is_selected {
+                ctx.begin_path();
+                ctx.arc(radio_cx, radio_cy, radio_r, 0.0, std::f64::consts::PI * 2.0);
+                ctx.set_stroke_color(ACCENT);
+                ctx.set_stroke_width(2.0);
+                ctx.stroke();
+                ctx.begin_path();
+                ctx.arc(radio_cx, radio_cy, radio_r * 0.5, 0.0, std::f64::consts::PI * 2.0);
+                ctx.set_fill_color(ACCENT);
+                ctx.fill();
+            } else {
+                ctx.begin_path();
+                ctx.arc(radio_cx, radio_cy, radio_r, 0.0, std::f64::consts::PI * 2.0);
+                ctx.set_stroke_color(SEPARATOR);
+                ctx.set_stroke_width(2.0);
+                ctx.stroke();
+            }
+
+            // ---- Text column ----
+            let text_x = margin + 52.0;
+            let name_y = item_y + 16.0;
+
+            // Chain name (bold, top line)
+            let name_color = if is_selected { ACCENT } else { TEXT_PRIMARY };
+            ctx.set_fill_color(name_color);
+            ctx.set_font("bold 16px pt root ui");
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_text_baseline(TextBaseline::Top);
+            ctx.fill_text(chain_name, text_x, name_y);
+
+            // Protocol badge (VLESS + XHTTP for server-managed chains)
+            let badge_x = text_x + chain_name.len() as f64 * 9.0 + 8.0;
+            draw_protocol_badge(ctx, "VLESS+XHTTP", badge_x, name_y - 1.0);
+
+            // Chain ID label (second line)
+            let id_text = format!("chain #{chain_id}");
+            ctx.set_fill_color(TEXT_MUTED);
+            ctx.set_font("11px pt root ui");
+            ctx.set_text_baseline(TextBaseline::Top);
+            ctx.fill_text(&id_text, text_x, name_y + 24.0);
+
+            // Status dot + label (third line)
+            let status_row_y = name_y + 44.0;
+            let dot_cx = text_x + 6.0;
+            let dot_cy = status_row_y + 6.0;
+            draw_status_dot(ctx, dot_cx, dot_cy, status);
+
+            ctx.set_fill_color(status.color());
+            ctx.set_font("11px pt root ui");
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_text_baseline(TextBaseline::Top);
+            ctx.fill_text(status.label(), text_x + 16.0, status_row_y);
+
+            // ---- Settings gear button (right side) ----
+            let gear_size = 40.0;
+            let gear_x = margin + content_w - gear_size - 8.0;
+            let gear_y = item_y + (item_h - gear_size) / 2.0;
+            let gear_rect = Rect::new(gear_x, gear_y, gear_size, gear_size);
+            let gear_id = WidgetId::new(format!("server_gear_{idx}"));
+            state.coordinator.register(gear_id.clone(), gear_rect, Sense::CLICK);
+            let gear_hovered = state.coordinator.is_hovered(&gear_id);
+
+            if gear_hovered {
+                ctx.set_fill_color_alpha(SURFACE_2, 0.6);
+                ctx.fill_rounded_rect(gear_x, gear_y, gear_size, gear_size, 8.0);
+            }
+
+            let icon_sz = 22.0;
+            draw_svg_icon(
+                ctx,
+                ICON_SETTINGS,
+                gear_x + (gear_size - icon_sz) / 2.0,
+                gear_y + (gear_size - icon_sz) / 2.0,
+                icon_sz,
+                icon_sz,
+                TEXT_MUTED,
+            );
+
+            // Divider between rows
+            if idx < chain_data.len().saturating_sub(1) {
+                draw_divider(ctx, margin + 52.0, item_y + item_h, content_w - 52.0 - 8.0);
+            }
+
+            if clicked && row_hovered {
+                clicked_select = Some(idx);
+            }
+            if clicked && gear_hovered {
+                clicked_settings = Some(idx);
+            }
+        }
+
+        if let Some(idx) = clicked_select {
+            state.select_chain(idx);
+        }
+        if let Some(idx) = clicked_settings {
+            state.push_screen(Screen::ServerInfo { server_idx: idx });
+        }
+
+        // Suppress unused import warning from legacy path.
+        let _ = badge_width;
+        let _ = protocol_display_name;
+    } else if let Some(cfg) = &state.config {
+        // -----------------------------------------------------------------
+        // Path 2: render legacy config-based chains
+        // -----------------------------------------------------------------
         if cfg.chains.is_empty() {
             ctx.set_fill_color(TEXT_MUTED);
             ctx.set_font("14px pt root ui");
@@ -169,24 +331,22 @@ pub fn draw_servers_screen(
                 w / 2.0,
                 (list_top + add_btn_y) / 2.0,
             );
+            let _ = badge_width;
         } else {
             let chain_count = cfg.chains.len();
             let list_h = item_h * chain_count as f64;
 
-            // List container background
             ctx.set_fill_color(SURFACE);
             ctx.fill_rounded_rect(margin, list_top, content_w, list_h, 16.0);
             ctx.set_stroke_color(SURFACE_2);
             ctx.set_stroke_width(1.0);
             ctx.stroke_rounded_rect(margin, list_top, content_w, list_h, 16.0);
 
-            // Snapshot chain data to avoid borrowing state twice
             let chain_data: Vec<(String, ProtocolId, String, String, bool)> = cfg
                 .chains
                 .iter()
                 .enumerate()
                 .map(|(idx, ch)| {
-                    // Region/SNI label: prefer l2.sni as region hint, fall back to addr
                     let region = if ch.l2.sni.is_empty() {
                         ch.l2.addr.ip().to_string()
                     } else {
@@ -216,7 +376,6 @@ pub fn draw_servers_screen(
                 let item_y = list_top + idx as f64 * item_h;
                 let status = DisplayStatus::for_index(idx);
 
-                // ---- Row hit area (excluding gear) ----
                 let row_rect = Rect::new(margin, item_y, content_w - 56.0, item_h);
                 let row_id = WidgetId::new(format!("server_row_{idx}"));
                 state.coordinator.register(row_id.clone(), row_rect, Sense::CLICK);
@@ -227,7 +386,6 @@ pub fn draw_servers_screen(
                     ctx.fill_rect(margin, item_y, content_w - 56.0, item_h);
                 }
 
-                // ---- Radio indicator ----
                 let radio_cx = margin + 28.0;
                 let radio_cy = item_y + item_h / 2.0;
                 let radio_r = 9.0;
@@ -250,11 +408,9 @@ pub fn draw_servers_screen(
                     ctx.stroke();
                 }
 
-                // ---- Text column ----
                 let text_x = margin + 52.0;
                 let name_y = item_y + 16.0;
 
-                // Chain name (bold, top line)
                 let name_color = if *is_selected { ACCENT } else { TEXT_PRIMARY };
                 ctx.set_fill_color(name_color);
                 ctx.set_font("bold 16px pt root ui");
@@ -262,19 +418,16 @@ pub fn draw_servers_screen(
                 ctx.set_text_baseline(TextBaseline::Top);
                 ctx.fill_text(chain_id, text_x, name_y);
 
-                // Protocol badge (right of chain name, same line)
                 let proto_label = protocol_display_name(*protocol);
-                let badge_x = text_x + chain_id.len() as f64 * 9.0 + 8.0; // rough name width
+                let badge_x = text_x + chain_id.len() as f64 * 9.0 + 8.0;
                 draw_protocol_badge(ctx, proto_label, badge_x, name_y - 1.0);
 
-                // Region / hop info (second line)
                 let hop_text = format!("{l1_hop}  →  {region}");
                 ctx.set_fill_color(TEXT_MUTED);
                 ctx.set_font("11px pt root ui");
                 ctx.set_text_baseline(TextBaseline::Top);
                 ctx.fill_text(&hop_text, text_x, name_y + 24.0);
 
-                // Status dot + label (third line)
                 let status_row_y = name_y + 44.0;
                 let dot_cx = text_x + 6.0;
                 let dot_cy = status_row_y + 6.0;
@@ -286,7 +439,6 @@ pub fn draw_servers_screen(
                 ctx.set_text_baseline(TextBaseline::Top);
                 ctx.fill_text(status.label(), text_x + 16.0, status_row_y);
 
-                // ---- Settings gear button (right side) ----
                 let gear_size = 40.0;
                 let gear_x = margin + content_w - gear_size - 8.0;
                 let gear_y = item_y + (item_h - gear_size) / 2.0;
@@ -311,7 +463,6 @@ pub fn draw_servers_screen(
                     TEXT_MUTED,
                 );
 
-                // Divider between rows
                 if idx < chain_data.len().saturating_sub(1) {
                     draw_divider(ctx, margin + 52.0, item_y + item_h, content_w - 52.0 - 8.0);
                 }
@@ -324,7 +475,6 @@ pub fn draw_servers_screen(
                 }
             }
 
-            // Handle clicks after the iteration to avoid re-borrow
             if let Some(idx) = clicked_select {
                 state.select_chain(idx);
             }
@@ -332,11 +482,12 @@ pub fn draw_servers_screen(
                 state.push_screen(Screen::ServerInfo { server_idx: idx });
             }
 
-            // Suppress unused import
             let _ = badge_width;
         }
     } else {
-        // No config loaded
+        // -----------------------------------------------------------------
+        // Path 3: no server chains and no config — empty state
+        // -----------------------------------------------------------------
         ctx.set_fill_color(TEXT_MUTED);
         ctx.set_font("14px pt root ui");
         ctx.set_text_align(TextAlign::Center);
@@ -347,8 +498,8 @@ pub fn draw_servers_screen(
             (list_top + add_btn_y) / 2.0,
         );
 
-        // Still suppress badge_width when no config
         let _ = badge_width;
+        let _ = protocol_display_name;
     }
 
     // -------------------------------------------------------------------------
@@ -390,12 +541,5 @@ pub fn draw_servers_screen(
 
     if clicked && add_hovered {
         state.go_to_tab(3); // Connect tab
-    }
-
-    // -------------------------------------------------------------------------
-    // Nav bar
-    // -------------------------------------------------------------------------
-    if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, 1) {
-        state.go_to_tab(tab);
     }
 }

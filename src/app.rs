@@ -3,6 +3,8 @@ use std::time::Instant;
 use mirage_core::config::{ClientConfig, ProtocolId};
 use uzor::input::InputCoordinator;
 
+use crate::api::{ApiClient, ApiRequest, ApiResponse};
+
 /// Connection status.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
@@ -141,6 +143,16 @@ pub struct AppState {
     // ---- DNS settings -------------------------------------------------------
     pub dns_primary: String,
     pub dns_secondary: String,
+
+    // ---- API client (mirage2server) -----------------------------------------
+    pub api: ApiClient,
+    pub api_token: Option<String>,
+    pub providers_l1: Vec<crate::api::Provider>,
+    pub providers_l2: Vec<crate::api::Provider>,
+    pub nodes: Vec<crate::api::Node>,
+    pub chains: Vec<crate::api::Chain>,
+    pub server_online: bool,
+    pub api_error: Option<String>,
 }
 
 impl AppState {
@@ -149,6 +161,11 @@ impl AppState {
         let mut text_fields = HashMap::new();
         text_fields.insert("dns_primary".into(), "1.1.1.1".into());
         text_fields.insert("dns_secondary".into(), "1.0.0.1".into());
+
+        let api = ApiClient::new("http://localhost:19400");
+        // Fire initial health check and providers fetch immediately on startup.
+        api.send(ApiRequest::Health);
+        api.send(ApiRequest::FetchProviders);
 
         Self {
             connection: ConnectionState::Disconnected,
@@ -185,6 +202,14 @@ impl AppState {
             killswitch_strict: false,
             dns_primary: "1.1.1.1".into(),
             dns_secondary: "1.0.0.1".into(),
+            api,
+            api_token: None,
+            providers_l1: Vec::new(),
+            providers_l2: Vec::new(),
+            nodes: Vec::new(),
+            chains: Vec::new(),
+            server_online: false,
+            api_error: None,
         }
     }
 
@@ -219,10 +244,53 @@ impl AppState {
         self.nav_stack.push(root);
     }
 
+    /// Drain all pending API responses and apply them to state.
+    pub fn process_api_responses(&mut self) {
+        while let Some(resp) = self.api.try_recv() {
+            match resp {
+                ApiResponse::Health(ok) => {
+                    self.server_online = ok;
+                }
+                ApiResponse::Providers { l1, l2 } => {
+                    self.providers_l1 = l1;
+                    self.providers_l2 = l2;
+                }
+                ApiResponse::TokenSet => {
+                    // Token is now stored in the worker; fetch authenticated data.
+                    self.api.send(ApiRequest::FetchNodes);
+                    self.api.send(ApiRequest::FetchChains);
+                }
+                ApiResponse::Nodes(nodes) => {
+                    self.nodes = nodes;
+                }
+                ApiResponse::Chains(chains) => {
+                    self.chains = chains;
+                }
+                ApiResponse::ChainActivated { chain_id } => {
+                    if let Some(c) = self.chains.iter_mut().find(|c| c.id == chain_id) {
+                        c.status = "active".into();
+                    }
+                }
+                ApiResponse::ChainDeactivated { chain_id } => {
+                    if let Some(c) = self.chains.iter_mut().find(|c| c.id == chain_id) {
+                        c.status = "inactive".into();
+                    }
+                }
+                ApiResponse::Error(msg) => {
+                    tracing::warn!(error = %msg, "API error");
+                    self.api_error = Some(msg);
+                }
+            }
+        }
+    }
+
     /// Advance animation state and connection timer.
     ///
     /// Call once per frame, passing `input.dt` (seconds since last frame).
     pub fn tick(&mut self, dt: f64) {
+        // Drain any pending API responses first.
+        self.process_api_responses();
+
         // Advance animation phase for pulse/spin effects.
         self.animation_phase = (self.animation_phase + dt * 1.5) % 1.0;
 
@@ -238,7 +306,28 @@ impl AppState {
             if let Some(start) = self.connect_start {
                 if start.elapsed().as_secs_f64() >= 1.5 {
                     self.connect_start = None;
-                    self.on_connected();
+                    // Prefer server chain if available (find first active or first chain).
+                    let server_chain = self
+                        .chains
+                        .iter()
+                        .find(|c| c.status == "active")
+                        .or_else(|| self.chains.first())
+                        .map(|c| (c.id.to_string(), "VLESS + XHTTP".to_string()));
+
+                    if let Some((chain_id, protocol_name)) = server_chain {
+                        self.push_log(
+                            format!("Подключено через {chain_id}").as_str(),
+                        );
+                        self.connection = ConnectionState::Connected {
+                            chain_id,
+                            protocol: ProtocolId::Mirage,
+                            duration_secs: 0,
+                        };
+                        // Store protocol name for display elsewhere if needed.
+                        let _ = protocol_name;
+                    } else {
+                        self.on_connected();
+                    }
                 }
             }
         }
@@ -275,8 +364,10 @@ impl AppState {
 
     /// Start connection.
     ///
-    /// If no config is loaded, immediately transitions to Error state.
-    /// Otherwise transitions to Connecting; `tick()` drives the transition after 1.5 s.
+    /// If chains are available from the server, activates the first chain via API.
+    /// Falls back to legacy config-based flow if no server chains are available.
+    /// Transitions to Connecting; `tick()` drives the Connecting→Connected transition
+    /// after 1.5 s.
     pub fn connect(&mut self) {
         if !matches!(
             self.connection,
@@ -285,7 +376,7 @@ impl AppState {
             return;
         }
 
-        if self.config.is_none() {
+        if self.chains.is_empty() && self.config.is_none() {
             self.on_error("Конфигурация не загружена — откройте Настройки".to_string());
             return;
         }
@@ -293,6 +384,11 @@ impl AppState {
         self.connect_start = Some(Instant::now());
         self.connection = ConnectionState::Connecting;
         self.push_log("Подключение...");
+
+        // Request chain activation if we have server-managed chains.
+        if let Some(chain) = self.chains.first() {
+            self.api.send(ApiRequest::ActivateChain { chain_id: chain.id });
+        }
     }
 
     /// Simulate successful connect (called from tick() after delay, or directly in demo).
@@ -321,6 +417,14 @@ impl AppState {
 
     /// Disconnect.
     pub fn disconnect(&mut self) {
+        // Notify server if we have an active server-managed chain.
+        if let ConnectionState::Connected { ref chain_id, .. } = self.connection {
+            // chain_id may be a numeric server chain ID or a legacy string ID.
+            if let Ok(id) = chain_id.parse::<i64>() {
+                self.api.send(ApiRequest::DeactivateChain { chain_id: id });
+            }
+        }
+
         self.connect_start = None;
         self.connection = ConnectionState::Disconnected;
         self.bytes_up = 0;
