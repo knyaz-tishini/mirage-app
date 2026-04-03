@@ -5,19 +5,16 @@ use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
 use uzor::types::{Rect, WidgetId};
 use uzor::input::{InputState, Sense, LayerId};
 
-use crate::app::{AppState, ConnectionState, Screen};
+use crate::app::{AppState, ConnectionState};
 use super::components::{
-    BG, ACCENT, SURFACE, SURFACE_2, SUCCESS, WARNING, ERROR_COLOR,
+    BG, ACCENT, SURFACE, SURFACE_2, ERROR_COLOR,
     TEXT_PRIMARY, TEXT_MUTED, SEPARATOR, NAV_HEIGHT,
-    ICON_CHEVRON_RIGHT,
+    ICON_CHEVRON_RIGHT, ICON_CHEVRON_DOWN,
     draw_nav_bar,
 };
 
 /// Power-off SVG icon (arc + vertical line), 24x24 viewBox.
 const ICON_POWER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>"##;
-
-/// Chevron-down icon for server panel.
-const ICON_CHEVRON_DOWN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>"##;
 
 /// Server panel height — sits directly above nav bar.
 const SERVER_PANEL_H: f64 = 72.0;
@@ -46,10 +43,10 @@ pub fn draw_main_screen(
     ctx.fill_rect(0.0, 0.0, w, h);
 
     // -------------------------------------------------------------------------
-    // Title bar
+    // Title bar — "MIRAGE" branding
     // -------------------------------------------------------------------------
     ctx.set_fill_color(TEXT_MUTED);
-    ctx.set_font("bold 13px sans-serif");
+    ctx.set_font("bold 13px pt root ui");
     ctx.set_text_align(TextAlign::Center);
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text("MIRAGE", w / 2.0, 20.0);
@@ -71,7 +68,7 @@ pub fn draw_main_screen(
             ctx.set_global_alpha(alpha);
             ctx.begin_path();
             ctx.arc(cx, cy, r + 8.0, 0.0, PI * 2.0);
-            ctx.set_stroke_color(WARNING);
+            ctx.set_stroke_color(ACCENT);
             ctx.set_stroke_width(3.0);
             ctx.stroke();
             ctx.set_global_alpha(1.0);
@@ -86,7 +83,7 @@ pub fn draw_main_screen(
         ConnectionState::Disconnected => {
             ctx.begin_path();
             ctx.arc(cx, cy, r + 8.0, 0.0, PI * 2.0);
-            ctx.set_stroke_color(SURFACE_2);
+            ctx.set_stroke_color(TEXT_PRIMARY);
             ctx.set_stroke_width(2.0);
             ctx.stroke();
         }
@@ -100,11 +97,7 @@ pub fn draw_main_screen(
     }
 
     // Inner fill
-    let fill_color = if is_connected {
-        "#15151A"
-    } else {
-        "#121215"
-    };
+    let fill_color = if is_connected { "#15151A" } else { "#121215" };
     ctx.begin_path();
     ctx.arc(cx, cy, r, 0.0, PI * 2.0);
     ctx.set_fill_color(fill_color);
@@ -113,8 +106,8 @@ pub fn draw_main_screen(
     // Power icon centered in circle
     let icon_size = r * 0.7;
     let icon_color = match &state.connection {
-        ConnectionState::Disconnected => TEXT_MUTED,
-        ConnectionState::Connecting => WARNING,
+        ConnectionState::Disconnected => TEXT_PRIMARY,
+        ConnectionState::Connecting => ACCENT,
         ConnectionState::Connected { .. } => ACCENT,
         ConnectionState::Error(_) => ERROR_COLOR,
     };
@@ -151,29 +144,27 @@ pub fn draw_main_screen(
     // Status label below circle
     // -------------------------------------------------------------------------
     let (status_text, status_color) = match &state.connection {
-        ConnectionState::Disconnected => ("Not protected", TEXT_MUTED),
-        ConnectionState::Connecting => ("Establishing connection...", WARNING),
-        ConnectionState::Connected { .. } => ("Your connection is secure", SUCCESS),
+        ConnectionState::Disconnected => ("Не защищено", TEXT_MUTED),
+        ConnectionState::Connecting => ("Установка соединения...", ACCENT),
+        ConnectionState::Connected { .. } => ("Ваше соединение защищено", ACCENT),
         ConnectionState::Error(e) => (e.as_str(), ERROR_COLOR),
     };
     ctx.set_fill_color(status_color);
-    ctx.set_font("13px sans-serif");
+    ctx.set_font("bold 20px pt root ui");
     ctx.set_text_align(TextAlign::Center);
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text(status_text, cx, cy + r + 18.0);
 
     if is_connecting {
         ctx.set_fill_color(TEXT_MUTED);
-        ctx.set_font("11px sans-serif");
+        ctx.set_font("13px pt root ui");
         ctx.set_text_align(TextAlign::Center);
         ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text("Tap to cancel", cx, cy + r + 36.0);
+        ctx.fill_text("Нажмите для отмены", cx, cy + r + 46.0);
     }
 
     // -------------------------------------------------------------------------
     // Server panel — grows directly out of the nav bar.
-    // Both share SURFACE/NAV_BG background, only a thin divider between them.
-    // The panel is part of the bottom chrome; it does NOT go behind the sheet.
     // -------------------------------------------------------------------------
     let panel_y = nav_y - SERVER_PANEL_H;
     let panel_pad = 16.0;
@@ -183,7 +174,7 @@ pub fn draw_main_screen(
         .as_ref()
         .and_then(|c| c.chains.get(state.selected_chain))
         .map(|ch| ch.chain_id.as_str())
-        .unwrap_or("No server");
+        .unwrap_or("Нет сервера");
 
     let protocol_str = state
         .config
@@ -197,12 +188,12 @@ pub fn draw_main_screen(
     state.coordinator.register(panel_id.clone(), panel_rect, Sense::CLICK);
     let panel_hovered = state.coordinator.is_hovered(&panel_id);
 
-    // Panel background — same as nav bar so they merge visually
+    // Panel background
     let panel_fill = if panel_hovered { SURFACE_2 } else { SURFACE };
     ctx.set_fill_color(panel_fill);
     ctx.fill_rect(0.0, panel_y, w, SERVER_PANEL_H);
 
-    // Thin divider at top of server panel (separates it from content area)
+    // Thin divider at top of server panel
     ctx.set_stroke_color(SEPARATOR);
     ctx.set_stroke_width(0.5);
     ctx.begin_path();
@@ -212,14 +203,14 @@ pub fn draw_main_screen(
 
     // Chain name (bold, left-aligned)
     ctx.set_fill_color(TEXT_PRIMARY);
-    ctx.set_font("bold 15px sans-serif");
+    ctx.set_font("bold 15px pt root ui");
     ctx.set_text_align(TextAlign::Left);
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text(chain_name, panel_pad, panel_y + panel_pad);
 
     // Protocol (muted, below chain name)
     ctx.set_fill_color(TEXT_MUTED);
-    ctx.set_font("12px sans-serif");
+    ctx.set_font("12px pt root ui");
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text(&protocol_str, panel_pad, panel_y + panel_pad + 22.0);
 
@@ -241,16 +232,14 @@ pub fn draw_main_screen(
     }
 
     // -------------------------------------------------------------------------
-    // Nav bar — drawn over the server panel continuation
+    // Nav bar
     // -------------------------------------------------------------------------
-    let active_tab = 0;
-    if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, active_tab) {
-        navigate_tab(state, tab);
+    if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, 0) {
+        state.go_to_tab(tab);
     }
 
     // -------------------------------------------------------------------------
     // Bottom sheet overlay — drawn last, above everything except nav bar.
-    // Sheet STOPS at nav_y: it never covers the nav bar.
     // -------------------------------------------------------------------------
     if state.sheet_progress > 0.0 {
         draw_bottom_sheet(ctx, input, w, h, nav_y, state, clicked);
@@ -258,10 +247,6 @@ pub fn draw_main_screen(
 }
 
 /// Draw the bottom sheet overlay with server/protocol details.
-///
-/// The sheet rises from `nav_y` (top of nav bar) upward.
-/// At progress = 1.0 the sheet top is at `h * 0.15`.
-/// The sheet NEVER extends below `nav_y` — the nav bar always stays visible.
 fn draw_bottom_sheet(
     ctx: &mut dyn RenderContext,
     _input: &InputState,
@@ -273,16 +258,14 @@ fn draw_bottom_sheet(
 ) {
     let progress = state.sheet_progress;
 
-    // Push a sheet layer so sheet widgets win over background widgets in z-order.
     state.coordinator.push_layer(LayerId::new("sheet"), 100, false);
 
-    // Sheet top position: lerps from nav_y (fully closed) to h*0.15 (fully open).
     let sheet_top_open = h * 0.15;
     let sheet_top = nav_y - (nav_y - sheet_top_open) * progress;
-    let sheet_bottom = nav_y; // Always stops at nav bar top edge
+    let sheet_bottom = nav_y;
     let sheet_h = sheet_bottom - sheet_top;
 
-    // Semi-transparent overlay covers the area ABOVE the sheet (between title bar and sheet)
+    // Semi-transparent overlay
     let overlay_alpha = 0.5 * progress;
     ctx.set_fill_color_alpha("#000000", overlay_alpha);
     ctx.fill_rect(0.0, 0.0, w, sheet_top);
@@ -290,12 +273,11 @@ fn draw_bottom_sheet(
     // Sheet background with rounded top corners only
     ctx.set_fill_color(SURFACE);
     ctx.fill_rounded_rect(0.0, sheet_top, w, sheet_h + 16.0, 16.0);
-    // Fill the lower portion square so only the top corners are rounded
     if sheet_h > 16.0 {
         ctx.fill_rect(0.0, sheet_top + 16.0, w, sheet_h - 16.0);
     }
 
-    // Drag handle — small pill at the top of the sheet
+    // Drag handle
     let handle_w = 40.0;
     let handle_h = 4.0;
     let handle_x = (w - handle_w) / 2.0;
@@ -303,12 +285,12 @@ fn draw_bottom_sheet(
     ctx.set_fill_color(SURFACE_2);
     ctx.fill_rounded_rect(handle_x, handle_y, handle_w, handle_h, 2.0);
 
-    // Register sheet overlay hit area so clicks above sheet are captured
+    // Register overlay hit area
     let overlay_rect = Rect::new(0.0, 0.0, w, sheet_top);
     let overlay_id = WidgetId::new("sheet_overlay");
     state.coordinator.register_on_layer(overlay_id.clone(), overlay_rect, Sense::CLICK, &LayerId::new("sheet"));
 
-    // Only render sheet content when mostly open
+    // Only render content when mostly open
     if progress > 0.5 {
         let content_alpha = ((progress - 0.5) * 2.0).min(1.0);
         ctx.set_global_alpha(content_alpha);
@@ -322,43 +304,42 @@ fn draw_bottom_sheet(
             .as_ref()
             .and_then(|c| c.chains.get(state.selected_chain))
             .map(|ch| ch.chain_id.as_str())
-            .unwrap_or("My Server");
+            .unwrap_or("Мой сервер");
 
         ctx.set_fill_color(TEXT_PRIMARY);
-        ctx.set_font("bold 18px sans-serif");
-        ctx.set_text_align(TextAlign::Left);
+        ctx.set_font("bold 25px pt root ui");
+        ctx.set_text_align(TextAlign::Center);
         ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text(chain_name, pad, content_y);
+        ctx.fill_text(chain_name, w / 2.0, content_y);
 
         // Server address (muted below name)
         ctx.set_fill_color(TEXT_MUTED);
-        ctx.set_font("13px sans-serif");
+        ctx.set_font("13px pt root ui");
         ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text("vpn.example.com", pad, content_y + 26.0);
+        ctx.fill_text("vpn.example.com", w / 2.0, content_y + 34.0);
 
         // Protocols section header
-        let protocols_y = content_y + 66.0;
+        let protocols_y = content_y + 72.0;
         ctx.set_fill_color(TEXT_MUTED);
-        ctx.set_font("11px sans-serif");
+        ctx.set_font("bold 25px pt root ui");
         ctx.set_text_align(TextAlign::Left);
         ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text("PROTOCOLS", pad, protocols_y);
+        ctx.fill_text("Серверы", pad, protocols_y);
 
-        // Protocol items — hardcoded Amnezia-style list
+        // Protocol items
         struct Protocol {
             name: &'static str,
             desc: &'static str,
         }
         let protocols = [
-            Protocol { name: "AmneziaWG",  desc: "Obfuscated WireGuard — recommended" },
-            Protocol { name: "WireGuard",  desc: "Fast, modern VPN protocol"           },
-            Protocol { name: "XRay",       desc: "Traffic obfuscation via XTLS/Reality" },
+            Protocol { name: "AmneziaWG",  desc: "Обфусцированный WireGuard — рекомендуется" },
+            Protocol { name: "WireGuard",  desc: "Быстрый современный VPN-протокол"           },
+            Protocol { name: "XRay",       desc: "Обфускация через XTLS/Reality"              },
         ];
 
         let item_h = 60.0;
-        let list_top = protocols_y + 20.0;
+        let list_top = protocols_y + 36.0;
 
-        // List card background
         ctx.set_fill_color(BG);
         ctx.fill_rounded_rect(0.0, list_top, w, item_h * protocols.len() as f64, 12.0);
 
@@ -380,20 +361,17 @@ fn draw_bottom_sheet(
                 ctx.fill_rect(0.0, item_y, w, item_h);
             }
 
-            // Protocol name
             ctx.set_fill_color(TEXT_PRIMARY);
-            ctx.set_font("bold 14px sans-serif");
+            ctx.set_font("bold 14px pt root ui");
             ctx.set_text_align(TextAlign::Left);
             ctx.set_text_baseline(TextBaseline::Top);
             ctx.fill_text(proto.name, pad, item_y + 12.0);
 
-            // Protocol description
             ctx.set_fill_color(TEXT_MUTED);
-            ctx.set_font("12px sans-serif");
+            ctx.set_font("12px pt root ui");
             ctx.set_text_baseline(TextBaseline::Top);
             ctx.fill_text(proto.desc, pad, item_y + 32.0);
 
-            // Chevron right
             let chevron_size = 18.0;
             draw_svg_icon(
                 ctx,
@@ -405,7 +383,6 @@ fn draw_bottom_sheet(
                 TEXT_MUTED,
             );
 
-            // Divider between items (not after last)
             if i < protocols.len().saturating_sub(1) {
                 ctx.set_stroke_color(SEPARATOR);
                 ctx.set_stroke_width(0.5);
@@ -419,19 +396,8 @@ fn draw_bottom_sheet(
         ctx.set_global_alpha(1.0);
     }
 
-    // Clicking the overlay (above the sheet) closes the sheet
     if clicked && state.coordinator.is_hovered(&WidgetId::new("sheet_overlay")) {
         state.sheet_open = false;
     }
 }
 
-pub fn navigate_tab(state: &mut AppState, tab: usize) {
-    let screen = match tab {
-        0 => Screen::Main,
-        1 => Screen::Chains,
-        2 => Screen::Settings,
-        3 => Screen::Connect,
-        _ => return,
-    };
-    state.go_to(screen);
-}

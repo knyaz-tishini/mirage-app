@@ -1,6 +1,5 @@
 use std::time::Instant;
 use mirage_core::config::{ClientConfig, ProtocolId};
-use uzor::types::ScrollState;
 use uzor::input::InputCoordinator;
 
 /// Connection status.
@@ -16,13 +15,28 @@ pub enum ConnectionState {
     Error(String),
 }
 
-/// Current active screen/tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// All possible screens — matches Amnezia's PageEnum.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Screen {
-    Main,
-    Chains,
+    // Tab roots
+    Home,
+    Servers,
     Settings,
     Connect,
+
+    // Server sub-screens
+    ServerInfo { server_idx: usize },
+
+    // Settings sub-screens
+    SettingsServersList,
+    SettingsConnection,
+    SettingsApplication,
+    SettingsLogs,
+    SettingsAbout,
+
+    // Connection sub-screens
+    SettingsDns,
+    SettingsSplitTunneling,
 }
 
 /// Main mutable application state.
@@ -38,10 +52,13 @@ pub struct AppState {
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub status_message: String,
-    pub screen: Screen,
+
+    /// Navigation stack (like Amnezia's StackView).
+    pub nav_stack: Vec<Screen>,
+    /// Active bottom tab (0=Home, 1=Servers, 2=Settings, 3=Connect).
+    pub active_tab: usize,
+
     pub log_lines: Vec<String>,
-    /// Scroll state for the chains screen.
-    pub chains_scroll: ScrollState,
     /// Animation phase 0.0–1.0 (wraps), updated each tick for pulse effects.
     pub animation_phase: f64,
     /// Timestamp when connection attempt started; drives the Connecting→Connected delay.
@@ -52,6 +69,8 @@ pub struct AppState {
     pub sheet_open: bool,
     /// Z-order-aware input coordinator — single winner per widget ID per frame.
     pub coordinator: InputCoordinator,
+    /// Server info active tab (0=Protocols, 1=Services, 2=Management).
+    pub server_info_tab: usize,
 }
 
 impl AppState {
@@ -66,15 +85,47 @@ impl AppState {
             bytes_up: 0,
             bytes_down: 0,
             status_message: "Ready".to_string(),
-            screen: Screen::Main,
+            nav_stack: vec![Screen::Home],
+            active_tab: 0,
             log_lines: vec!["Mirage started".to_string()],
-            chains_scroll: ScrollState::new(),
             animation_phase: 0.0,
             connect_start: None,
             sheet_progress: 0.0,
             sheet_open: false,
             coordinator: InputCoordinator::new(),
+            server_info_tab: 0,
         }
+    }
+
+    /// Current screen (top of nav stack).
+    pub fn current_screen(&self) -> &Screen {
+        self.nav_stack.last().unwrap_or(&Screen::Home)
+    }
+
+    /// Push a screen onto the nav stack.
+    pub fn push_screen(&mut self, screen: Screen) {
+        self.nav_stack.push(screen);
+    }
+
+    /// Pop the current screen, staying at root if already at root.
+    pub fn pop_screen(&mut self) {
+        if self.nav_stack.len() > 1 {
+            self.nav_stack.pop();
+        }
+    }
+
+    /// Switch to a root tab — clears the nav stack and pushes the tab root.
+    pub fn go_to_tab(&mut self, tab: usize) {
+        self.active_tab = tab;
+        let root = match tab {
+            0 => Screen::Home,
+            1 => Screen::Servers,
+            2 => Screen::Settings,
+            3 => Screen::Connect,
+            _ => Screen::Home,
+        };
+        self.nav_stack.clear();
+        self.nav_stack.push(root);
     }
 
     /// Advance animation state and connection timer.
@@ -115,13 +166,13 @@ impl AppState {
         }
 
         if self.config.is_none() {
-            self.on_error("No config loaded — open Settings to load a config file".to_string());
+            self.on_error("Конфигурация не загружена — откройте Настройки".to_string());
             return;
         }
 
         self.connect_start = Some(Instant::now());
         self.connection = ConnectionState::Connecting;
-        self.push_log("Connecting...");
+        self.push_log("Подключение...");
     }
 
     /// Simulate successful connect (called from tick() after delay, or directly in demo).
@@ -140,7 +191,7 @@ impl AppState {
             .map(|ch| ch.protocol)
             .unwrap_or(ProtocolId::Mirage);
 
-        self.push_log(format!("Connected via {chain_id}").as_str());
+        self.push_log(format!("Подключено через {chain_id}").as_str());
         self.connection = ConnectionState::Connected {
             chain_id,
             protocol,
@@ -154,19 +205,14 @@ impl AppState {
         self.connection = ConnectionState::Disconnected;
         self.bytes_up = 0;
         self.bytes_down = 0;
-        self.push_log("Disconnected");
+        self.push_log("Отключено");
     }
 
     /// Set connection error state.
     pub fn on_error(&mut self, reason: String) {
-        self.push_log(format!("Error: {reason}").as_str());
+        self.push_log(format!("Ошибка: {reason}").as_str());
         self.connection = ConnectionState::Error(reason.clone());
         self.status_message = reason;
-    }
-
-    /// Navigate to a screen.
-    pub fn go_to(&mut self, screen: Screen) {
-        self.screen = screen;
     }
 
     /// Select a chain by index.
@@ -181,7 +227,6 @@ impl AppState {
         }
         self.status_message = line.to_string();
     }
-
 }
 
 // ---------------------------------------------------------------------------
