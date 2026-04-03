@@ -1,8 +1,8 @@
 //! Chains screen — server list with Amnezia-style selection and scroll.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
-use uzor::types::Rect;
-use uzor::input::InputState;
+use uzor::types::{Rect, WidgetId};
+use uzor::input::{InputState, Sense};
 
 use crate::app::{AppState, Screen};
 use super::components::{
@@ -53,7 +53,8 @@ pub fn draw_chains_screen(
             let chain_count = config.chains.len();
             let total_content_h = chain_count as f64 * (item_h + item_gap);
 
-            // Handle scroll wheel
+            // Handle scroll wheel — raw is_hovered for the scroll area is fine (no z-order
+            // conflict here, the scroll area is the only widget in this region)
             let scroll_delta = input.scroll_delta.1;
             if scroll_delta != 0.0 {
                 let scroll_area = Rect::new(0.0, content_top, w, content_h);
@@ -98,7 +99,10 @@ pub fn draw_chains_screen(
                 }
 
                 let item_rect = Rect::new(item_margin, item_y, item_w, item_h);
-                let is_hovered = input.is_hovered(&item_rect);
+                let item_id = WidgetId::new(format!("chain_{idx}"));
+
+                state.coordinator.register(item_id.clone(), item_rect, Sense::CLICK);
+                let is_hovered = state.coordinator.is_hovered(&item_id);
 
                 // Card background — slightly lighter on hover
                 let card_fill = if is_hovered && !is_selected {
@@ -218,17 +222,18 @@ pub fn draw_chains_screen(
         ctx.set_text_baseline(TextBaseline::Middle);
         ctx.fill_text("Open Settings", w / 2.0, btn_y + btn_h / 2.0);
 
-        if clicked {
-            let btn_rect = Rect::new(btn_x, btn_y, btn_w, btn_h);
-            if input.is_hovered(&btn_rect) {
-                state.go_to(Screen::Settings);
-            }
+        let settings_btn_id = WidgetId::new("chains_settings_btn");
+        let btn_rect = Rect::new(btn_x, btn_y, btn_w, btn_h);
+        state.coordinator.register(settings_btn_id.clone(), btn_rect, Sense::CLICK);
+
+        if clicked && state.coordinator.is_hovered(&settings_btn_id) {
+            state.go_to(Screen::Settings);
         }
     }
 
     // Nav bar
     let active_tab = 1;
-    if let Some(tab) = draw_nav_bar(ctx, input, w, h, active_tab) {
+    if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, active_tab) {
         navigate_tab(state, tab);
     }
 }

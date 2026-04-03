@@ -142,10 +142,16 @@ impl ApplicationHandler for MirageHandler {
 
                 let viewport = Rect::new(0.0, 0.0, width as f64, height as f64);
 
+                // Begin coordinator frame — clears widget registrations, stores input.
+                app.app_state.coordinator.begin_frame(input.clone());
+
                 // CPU render frame into TinySkia pixmap
                 let dpr = app.window.scale_factor();
                 let mut ctx = TinySkiaCpuRenderContext::new(width, height, dpr);
                 ui::draw_frame(&mut ctx, input, viewport, &mut app.app_state);
+
+                // End coordinator frame — computes hover/click responses.
+                app.app_state.coordinator.end_frame();
 
                 // Convert RGBA8 -> softbuffer u32 (0x00RRGGBB format)
                 let pixels = ctx.pixels();

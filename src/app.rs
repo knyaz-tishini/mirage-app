@@ -1,6 +1,7 @@
 use std::time::Instant;
 use mirage_core::config::{ClientConfig, ProtocolId};
 use uzor::types::ScrollState;
+use uzor::input::InputCoordinator;
 
 /// Connection status.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +22,7 @@ pub enum Screen {
     Main,
     Chains,
     Settings,
-    Logs,
+    Connect,
 }
 
 /// Main mutable application state.
@@ -39,16 +40,18 @@ pub struct AppState {
     pub status_message: String,
     pub screen: Screen,
     pub log_lines: Vec<String>,
-    /// Scroll state for the logs screen — managed by uzor ScrollState.
-    pub logs_scroll: ScrollState,
     /// Scroll state for the chains screen.
     pub chains_scroll: ScrollState,
     /// Animation phase 0.0–1.0 (wraps), updated each tick for pulse effects.
     pub animation_phase: f64,
     /// Timestamp when connection attempt started; drives the Connecting→Connected delay.
     pub connect_start: Option<Instant>,
-    /// Previous log count — used to auto-scroll logs to bottom on new entries.
-    pub prev_log_count: usize,
+    /// Bottom sheet animation progress (0.0 = hidden, 1.0 = fully open).
+    pub sheet_progress: f64,
+    /// Whether the server detail bottom sheet is open.
+    pub sheet_open: bool,
+    /// Z-order-aware input coordinator — single winner per widget ID per frame.
+    pub coordinator: InputCoordinator,
 }
 
 impl AppState {
@@ -65,11 +68,12 @@ impl AppState {
             status_message: "Ready".to_string(),
             screen: Screen::Main,
             log_lines: vec!["Mirage started".to_string()],
-            logs_scroll: ScrollState::new(),
             chains_scroll: ScrollState::new(),
             animation_phase: 0.0,
             connect_start: None,
-            prev_log_count: 1,
+            sheet_progress: 0.0,
+            sheet_open: false,
+            coordinator: InputCoordinator::new(),
         }
     }
 
@@ -79,6 +83,13 @@ impl AppState {
     pub fn tick(&mut self, dt: f64) {
         // Advance animation phase for pulse/spin effects.
         self.animation_phase = (self.animation_phase + dt * 1.5) % 1.0;
+
+        // Animate bottom sheet open/close.
+        if self.sheet_open && self.sheet_progress < 1.0 {
+            self.sheet_progress = (self.sheet_progress + dt * 4.0).min(1.0);
+        } else if !self.sheet_open && self.sheet_progress > 0.0 {
+            self.sheet_progress = (self.sheet_progress - dt * 4.0).max(0.0);
+        }
 
         // Connecting → Connected after 1.5 s delay.
         if matches!(self.connection, ConnectionState::Connecting) {

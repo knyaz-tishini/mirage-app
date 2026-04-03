@@ -2,8 +2,10 @@
 //! Follows AmneziaVPN's exact dark palette.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
-use uzor::input::InputState;
-use uzor::types::Rect;
+use uzor::input::{InputState, Sense};
+use uzor::types::{Rect, WidgetId};
+
+use crate::app::AppState;
 
 // =============================================================================
 // Color palette — AmneziaVPN dark theme
@@ -44,6 +46,7 @@ pub const NAV_HEIGHT: f64 = 52.0;
 pub fn draw_nav_bar(
     ctx: &mut dyn RenderContext,
     input: &InputState,
+    state: &mut AppState,
     width: f64,
     height: f64,
     active_tab: usize,
@@ -75,21 +78,23 @@ pub fn draw_nav_bar(
 
     for i in 0..tab_count {
         let bx = group_x + i as f64 * btn_w;
+        let nav_rect = Rect::new(bx, nav_y, btn_w, NAV_HEIGHT);
+        let nav_id = WidgetId::new(format!("nav_{i}"));
+
+        state.coordinator.register(nav_id.clone(), nav_rect, Sense::CLICK);
+        let is_hovered = state.coordinator.is_hovered(&nav_id);
         let is_active = active_tab == i;
-        let icon_color = if is_active { ACCENT } else { TEXT_MUTED };
+        let icon_color = if is_active { ACCENT } else if is_hovered { TEXT_PRIMARY } else { TEXT_MUTED };
 
         let icon_x = bx + (btn_w - icon_size) / 2.0;
         let icon_y = nav_y + (NAV_HEIGHT - icon_size) / 2.0;
 
-        // SVG icon — active is colored, inactive is muted
+        // SVG icon — active is colored, hovered is slightly highlighted, inactive is muted
         draw_svg_icon(ctx, icons[i], icon_x, icon_y, icon_size, icon_size, icon_color);
 
-        // Hit detection — full column width for easier tapping
-        if clicked {
-            let nav_rect = Rect::new(bx, nav_y, btn_w, NAV_HEIGHT);
-            if input.is_hovered(&nav_rect) {
-                result = Some(i);
-            }
+        // Click detection — uses coordinator z-order-aware hover
+        if clicked && is_hovered {
+            result = Some(i);
         }
     }
 
@@ -112,6 +117,8 @@ pub fn draw_divider(ctx: &mut dyn RenderContext, x: f64, y: f64, w: f64) {
 pub fn draw_settings_row(
     ctx: &mut dyn RenderContext,
     input: &InputState,
+    state: &mut AppState,
+    row_id: &str,
     icon_svg: &str,
     title: &str,
     x: f64,
@@ -119,8 +126,11 @@ pub fn draw_settings_row(
     w: f64,
     h: f64,
 ) -> bool {
-    let row_rect = Rect::new(x, y, w, h);
-    let is_hovered = input.is_hovered(&row_rect);
+    let rect = Rect::new(x, y, w, h);
+    let id = WidgetId::new(row_id);
+
+    state.coordinator.register(id.clone(), rect, Sense::CLICK);
+    let is_hovered = state.coordinator.is_hovered(&id);
     let clicked = input.is_clicked();
 
     // Hover highlight

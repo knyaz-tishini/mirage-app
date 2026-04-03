@@ -1,6 +1,6 @@
 pub mod chains_screen;
 pub mod components;
-pub mod logs_screen;
+pub mod connect_screen;
 pub mod main_screen;
 pub mod settings_screen;
 
@@ -21,6 +21,6 @@ pub fn draw_frame(
         Screen::Main => main_screen::draw_main_screen(ctx, &input, viewport, state),
         Screen::Chains => chains_screen::draw_chains_screen(ctx, &input, viewport, state),
         Screen::Settings => settings_screen::draw_settings_screen(ctx, &input, viewport, state),
-        Screen::Logs => logs_screen::draw_logs_screen(ctx, &input, viewport, state),
+        Screen::Connect => connect_screen::draw_connect_screen(ctx, &input, viewport, state),
     }
 }

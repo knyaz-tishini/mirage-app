@@ -49,14 +49,15 @@ pub fn draw_settings_screen(
     struct Item {
         icon: &'static str,
         title: &'static str,
+        id: &'static str,
     }
 
     let items: &[Item] = &[
-        Item { icon: ICON_SERVER,   title: "Servers"     },
-        Item { icon: ICON_SETTINGS, title: "Connection"  },
-        Item { icon: ICON_SETTINGS, title: "Application" },
-        Item { icon: ICON_LOGS,     title: "Logs"        },
-        Item { icon: ICON_SETTINGS, title: "About"       },
+        Item { icon: ICON_SERVER,   title: "Servers",     id: "settings_row_0" },
+        Item { icon: ICON_SETTINGS, title: "Connection",  id: "settings_row_1" },
+        Item { icon: ICON_SETTINGS, title: "Application", id: "settings_row_2" },
+        Item { icon: ICON_LOGS,     title: "Logs",        id: "settings_row_3" },
+        Item { icon: ICON_SETTINGS, title: "About",       id: "settings_row_4" },
     ];
 
     for (i, item) in items.iter().enumerate() {
@@ -65,6 +66,8 @@ pub fn draw_settings_screen(
         let _row_clicked = draw_settings_row(
             ctx,
             input,
+            state,
+            item.id,
             item.icon,
             item.title,
             content_x,
@@ -153,7 +156,7 @@ pub fn draw_settings_screen(
 
     // Nav bar
     let active_tab = 2;
-    if let Some(tab) = draw_nav_bar(ctx, input, w, h, active_tab) {
+    if let Some(tab) = draw_nav_bar(ctx, input, state, w, h, active_tab) {
         navigate_tab(state, tab);
     }
 }
