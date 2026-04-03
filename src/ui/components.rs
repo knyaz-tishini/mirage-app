@@ -22,25 +22,23 @@ pub const SEPARATOR: &str = "#2C2D30";     // slateGray
 pub const NAV_BG: &str = "#1C1D21";       // onyxBlack
 
 // =============================================================================
-// SVG icon constants — re-exported from uzor built-in icon library
+// SVG icon constants — from uzor UI icon library (Feather/Lucide style)
 // =============================================================================
 
-pub use uzor::macos::icons::paths::HOME as ICON_HOME;
-pub use uzor::macos::icons::paths::SERVER as ICON_SERVER;
-pub use uzor::macos::icons::paths::GEAR as ICON_SETTINGS;
-pub use uzor::macos::icons::paths::DOCUMENT as ICON_LOGS;
+pub use uzor::render::icons::ui::ICON_HOME;
+pub use uzor::render::icons::ui::ICON_SERVER;
+pub use uzor::render::icons::ui::ICON_SETTINGS;
+pub use uzor::render::icons::ui::ICON_FILE_TEXT as ICON_LOGS;
+pub use uzor::render::icons::ui::ICON_CHEVRON_RIGHT;
 pub use uzor::macos::icons::paths::CHECKMARK as ICON_CHECK;
-pub use uzor::macos::icons::paths::CHEVRON_RIGHT as ICON_CHEVRON_RIGHT;
 
 // =============================================================================
 // Nav bar constants
 // =============================================================================
 
-pub const NAV_HEIGHT: f64 = 72.0;
+pub const NAV_HEIGHT: f64 = 52.0;
 
-const NAV_LABELS: [&str; 4] = ["Home", "Servers", "Settings", "Logs"];
-
-/// Draw the bottom navigation bar with SVG icons and text labels.
+/// Draw the bottom navigation bar — centered icon group, no labels.
 ///
 /// Returns `Some(index)` if a tab was clicked this frame, `None` otherwise.
 pub fn draw_nav_bar(
@@ -52,7 +50,11 @@ pub fn draw_nav_bar(
 ) -> Option<usize> {
     let nav_y = height - NAV_HEIGHT;
     let tab_count = 4usize;
-    let btn_w = width / tab_count as f64;
+    let icon_size = 32.0;
+    let icon_gap = 24.0; // gap between icon centers
+    let btn_w = icon_size + icon_gap;
+    let group_w = btn_w * tab_count as f64;
+    let group_x = (width - group_w) / 2.0;
     let clicked = input.is_clicked();
 
     // Background
@@ -72,31 +74,17 @@ pub fn draw_nav_bar(
     let mut result = None;
 
     for i in 0..tab_count {
-        let bx = i as f64 * btn_w;
+        let bx = group_x + i as f64 * btn_w;
         let is_active = active_tab == i;
         let icon_color = if is_active { ACCENT } else { TEXT_MUTED };
-        let label_color = if is_active { ACCENT } else { TEXT_MUTED };
-        let icon_size = 22.0;
+
         let icon_x = bx + (btn_w - icon_size) / 2.0;
-        let icon_y = nav_y + 10.0;
+        let icon_y = nav_y + (NAV_HEIGHT - icon_size) / 2.0;
 
-        // Active indicator bar at top
-        if is_active {
-            ctx.set_fill_color(ACCENT);
-            ctx.fill_rect(bx + btn_w / 2.0 - 14.0, nav_y, 28.0, 2.5);
-        }
-
-        // SVG icon
+        // SVG icon — active is colored, inactive is muted
         draw_svg_icon(ctx, icons[i], icon_x, icon_y, icon_size, icon_size, icon_color);
 
-        // Label text below icon
-        ctx.set_fill_color(label_color);
-        ctx.set_font("10px sans-serif");
-        ctx.set_text_align(TextAlign::Center);
-        ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text(NAV_LABELS[i], bx + btn_w / 2.0, icon_y + icon_size + 4.0);
-
-        // Hit detection via InputState
+        // Hit detection — full column width for easier tapping
         if clicked {
             let nav_rect = Rect::new(bx, nav_y, btn_w, NAV_HEIGHT);
             if input.is_hovered(&nav_rect) {
@@ -141,7 +129,7 @@ pub fn draw_settings_row(
         ctx.fill_rect(x, y, w, h);
     }
 
-    let icon_size = 22.0;
+    let icon_size = 26.0;
     let icon_margin = 16.0;
     let icon_y = y + (h - icon_size) / 2.0;
 
@@ -156,7 +144,7 @@ pub fn draw_settings_row(
     ctx.fill_text(title, x + icon_margin + icon_size + 12.0, y + h / 2.0);
 
     // Chevron right — uzor built-in icon
-    let chevron_size = 16.0;
+    let chevron_size = 20.0;
     draw_svg_icon(
         ctx,
         ICON_CHEVRON_RIGHT,
