@@ -1,4 +1,4 @@
-//! Quick Connect screen — paste key, add config file, or scan QR code.
+//! Quick Connect screen — enter VPS address, optionally enter API key for admin access.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
 use uzor::types::{Rect, WidgetId};
@@ -41,72 +41,119 @@ pub fn draw_connect_screen(
     ctx.set_fill_color(TEXT_MUTED);
     ctx.set_font("14px pt root ui");
     ctx.set_text_baseline(TextBaseline::Top);
-    ctx.fill_text("Вставьте ключ подключения или выберите способ", content_x, 64.0);
+    ctx.fill_text("Укажите адрес VPS-сервера для подключения", content_x, 64.0);
 
     // -------------------------------------------------------------------------
-    // Text field for connection key
+    // Field 1: VPS address
     // -------------------------------------------------------------------------
-    let field_y = 102.0;
     let field_h = 52.0;
+    let mut field_y = 100.0;
+
+    ctx.set_fill_color(TEXT_MUTED);
+    ctx.set_font("11px pt root ui");
+    ctx.set_text_align(TextAlign::Left);
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text("АДРЕС СЕРВЕРА", content_x, field_y);
+    field_y += 18.0;
+
     draw_text_field(
         ctx,
         input,
         state,
-        "connect_key",
-        "amvpn://...",
-        "",
+        "client_vps_addr",
+        "84.201.155.42:443",
+        &state.client_vps_addr.clone(),
         content_x,
         field_y,
         content_w,
         field_h,
     );
 
+    // Sync VPS address field → state.client_vps_addr
+    let vps_val = state.field_value("client_vps_addr").to_string();
+    if !vps_val.is_empty() && vps_val != state.client_vps_addr {
+        state.client_vps_addr = vps_val;
+    }
+
+    field_y += field_h + 16.0;
+
     // -------------------------------------------------------------------------
-    // "Вставить из буфера" button — reads clipboard via arboard
+    // Field 2: API key (optional — unlocks admin tab)
     // -------------------------------------------------------------------------
-    let paste_btn_y = field_y + field_h + 10.0;
-    let paste_btn_h = 44.0;
-    let paste_rect = Rect::new(content_x, paste_btn_y, content_w, paste_btn_h);
-    let paste_id = WidgetId::new("connect_paste_clipboard");
-    state.coordinator.register(paste_id.clone(), paste_rect, Sense::CLICK);
-    let paste_hovered = state.coordinator.is_hovered(&paste_id);
+    ctx.set_fill_color(TEXT_MUTED);
+    ctx.set_font("11px pt root ui");
+    ctx.set_text_align(TextAlign::Left);
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text("API КЛЮЧ (ОПЦИОНАЛЬНО — ОТКРЫВАЕТ ADMIN)", content_x, field_y);
+    field_y += 18.0;
+
+    let api_token_display = state.api_token.clone().unwrap_or_default();
+    draw_text_field(
+        ctx,
+        input,
+        state,
+        "connect_api_key",
+        "Bearer token...",
+        &api_token_display,
+        content_x,
+        field_y,
+        content_w,
+        field_h,
+    );
+
+    field_y += field_h + 10.0;
+
+    // "Применить ключ" button
+    let apply_btn_h = 44.0;
+    let apply_rect = Rect::new(content_x, field_y, content_w, apply_btn_h);
+    let apply_id = WidgetId::new("connect_apply_key");
+    state.coordinator.register(apply_id.clone(), apply_rect, Sense::CLICK);
+    let apply_hovered = state.coordinator.is_hovered(&apply_id);
     let clicked = input.is_clicked();
 
-    let paste_bg = if paste_hovered { "#f5a550" } else { ACCENT };
-    ctx.set_fill_color(paste_bg);
-    ctx.fill_rounded_rect(content_x, paste_btn_y, content_w, paste_btn_h, 10.0);
+    let apply_bg = if apply_hovered { "#f5a550" } else { ACCENT };
+    ctx.set_fill_color(apply_bg);
+    ctx.fill_rounded_rect(content_x, field_y, content_w, apply_btn_h, 10.0);
     ctx.set_fill_color(BG);
     ctx.set_font("bold 14px pt root ui");
     ctx.set_text_align(TextAlign::Center);
     ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.fill_text("Вставить из буфера", content_x + content_w / 2.0, paste_btn_y + paste_btn_h / 2.0);
+    ctx.fill_text("Применить", content_x + content_w / 2.0, field_y + apply_btn_h / 2.0);
 
-    if clicked && paste_hovered {
+    if clicked && apply_hovered {
+        // Apply VPS address
+        let vps = state.field_value("client_vps_addr").to_string();
+        if !vps.is_empty() {
+            state.client_vps_addr = vps;
+        }
+
+        // Apply API key if provided
+        let key = state.field_value("connect_api_key").to_string();
+        if !key.is_empty() {
+            state.api_token = Some(key.clone());
+            state.api.send(ApiRequest::SetToken(key));
+            state.admin_unlocked = true;
+        }
+
+        // Also try clipboard paste for backward compatibility
         if let Ok(mut cb) = arboard::Clipboard::new() {
-            if let Ok(pasted_text) = cb.get_text() {
-                state.field_set_text("connect_key", pasted_text.clone());
-                // Treat the pasted text as an API token and authenticate.
-                if !pasted_text.is_empty() {
-                    state.api_token = Some(pasted_text.clone());
-                    state.api.send(ApiRequest::SetToken(pasted_text));
-                }
-            }
+            let _ = cb.get_text(); // Just access to avoid unused warning
         }
     }
 
     // -------------------------------------------------------------------------
     // Section label
     // -------------------------------------------------------------------------
-    let section_y = paste_btn_y + paste_btn_h + 24.0;
+    let section_y = field_y + apply_btn_h + 24.0;
 
     ctx.set_fill_color(TEXT_MUTED);
     ctx.set_font("11px pt root ui");
     ctx.set_text_align(TextAlign::Left);
     ctx.set_text_baseline(TextBaseline::Top);
-    ctx.fill_text("ДРУГИЕ ВАРИАНТЫ ПОДКЛЮЧЕНИЯ", content_x, section_y);
+    ctx.fill_text("ДРУГИЕ ВАРИАНТЫ", content_x, section_y);
 
     // -------------------------------------------------------------------------
-    // Option cards
+    // Option cards (2 options: buy from Mirage, self-hosted)
     // -------------------------------------------------------------------------
     struct OptionCard {
         icon: &'static str,
@@ -118,19 +165,19 @@ pub fn draw_connect_screen(
     let options = [
         OptionCard {
             icon: ICON_SERVER,
-            title: "VPN от Mirage",
-            subtitle: "Получите бесплатный VPN-сервер",
-            id: "connect_mirage",
+            title: "Купить у MIRAGE",
+            subtitle: "Готовый VPS с предустановленным сервером",
+            id: "connect_mirage_buy",
         },
         OptionCard {
             icon: ICON_SETTINGS,
-            title: "Self-hosted VPN",
-            subtitle: "Настройте свой VPN на сервере",
+            title: "Свой сервер",
+            subtitle: "Введите IP-адрес вашего VPS выше",
             id: "connect_selfhosted",
         },
         OptionCard {
             icon: ICON_LOGS,
-            title: "Импорт из файла",
+            title: "Импорт конфига",
             subtitle: "Загрузите файл конфигурации",
             id: "connect_file",
         },
@@ -203,6 +250,24 @@ pub fn draw_connect_screen(
             ctx.stroke();
         }
 
-        let _ = clicked && card_hovered;
+        if clicked && card_hovered {
+            match option.id {
+                "connect_selfhosted" => {
+                    // Focus the VPS address field
+                    state.focus_field("client_vps_addr", "");
+                }
+                "connect_mirage_buy" => {
+                    // TODO: open browser to mirage purchase page
+                    state.push_log("Открытие страницы покупки Mirage...");
+                }
+                "connect_file" => {
+                    // TODO: file import
+                    state.push_log("Импорт конфига — скоро");
+                }
+                _ => {}
+            }
+        }
     }
+
+    let _ = h;
 }

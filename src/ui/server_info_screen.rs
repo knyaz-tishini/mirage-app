@@ -1,15 +1,15 @@
-//! Server info screen — 3-tab view: Протоколы / Сервисы / Управление.
+//! Server info screen — 3-tab view: Статус / Сервисы / Управление.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
 use uzor::types::{Rect, WidgetId};
 use uzor::input::{InputState, Sense};
 
-use crate::app::{AppState, ConfirmDrawer, Screen};
+use crate::app::{AppState, ConfirmDrawer, ConnectionState};
 use super::components::{
-    BG, SURFACE, SURFACE_2, ACCENT, ERROR_COLOR,
+    BG, SURFACE, SURFACE_2, ACCENT, ERROR_COLOR, SUCCESS,
     TEXT_PRIMARY, TEXT_MUTED, NAV_HEIGHT,
     ICON_CHEVRON_RIGHT, ICON_SETTINGS,
-    draw_back_header, draw_tab_bar, draw_divider, draw_toggle,
+    draw_back_header, draw_tab_bar, draw_divider,
 };
 
 pub fn draw_server_info_screen(
@@ -73,8 +73,8 @@ pub fn draw_server_info_screen(
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text(&format!("root · {server_addr}"), margin, name_y + 42.0);
 
-    // Tab bar
-    let tabs = ["Протоколы", "Сервисы", "Управление"];
+    // Tab bar — Статус / Сервисы / Управление
+    let tabs = ["Статус", "Сервисы", "Управление"];
     let tab_y = name_y + 70.0;
     let tab_w = w - margin * 2.0;
 
@@ -88,7 +88,7 @@ pub fn draw_server_info_screen(
     let content_w = w - margin * 2.0;
 
     match state.server_info_tab {
-        0 => draw_protocols_tab(ctx, input, state, margin, content_top, content_w, content_h, clicked, server_idx),
+        0 => draw_status_tab(ctx, state, margin, content_top, content_w, content_h),
         1 => draw_services_tab(ctx, input, state, margin, content_top, content_w, content_h, clicked),
         2 => draw_management_tab(ctx, input, state, margin, content_top, content_w, content_h, clicked, server_idx),
         _ => {}
@@ -96,125 +96,108 @@ pub fn draw_server_info_screen(
 }
 
 // ---------------------------------------------------------------------------
-// Tab 0: Протоколы
+// Tab 0: Статус
 // ---------------------------------------------------------------------------
 
-fn draw_protocols_tab(
+fn draw_status_tab(
     ctx: &mut dyn RenderContext,
-    input: &InputState,
     state: &mut AppState,
     margin: f64,
     y: f64,
     w: f64,
     _h: f64,
-    clicked: bool,
-    chain_idx: usize,
 ) {
-    struct ProtocolItem {
-        name: &'static str,
-        desc: &'static str,
-        toggle_id: &'static str,
-        /// Index used for `Screen::ProtocolDetail { protocol_idx }`.
-        protocol_idx: usize,
-    }
+    let row_h = 64.0;
+    let gap = 10.0;
 
-    let protocols = [
-        ProtocolItem {
-            name: "Mirage",
-            desc: "Нативный протокол с маскировкой трафика",
-            toggle_id: "proto_mirage",
-            protocol_idx: 0,
-        },
-        ProtocolItem {
-            name: "VLESS+Reality",
-            desc: "XRay VLESS с Reality TLS-маскировкой",
-            toggle_id: "proto_vless",
-            protocol_idx: 1,
-        },
-        ProtocolItem {
-            name: "XHTTP",
-            desc: "XRay транспорт XHTTP",
-            toggle_id: "proto_xhttp",
-            protocol_idx: 2,
-        },
-        ProtocolItem {
-            name: "ShadowTLS",
-            desc: "ShadowTLS — скрытие трафика под TLS",
-            toggle_id: "proto_shadowtls",
-            protocol_idx: 3,
-        },
-        ProtocolItem {
-            name: "Hysteria2",
-            desc: "Протокол Hysteria2 на основе QUIC",
-            toggle_id: "proto_hysteria2",
-            protocol_idx: 4,
-        },
-    ];
+    // Connection state row
+    let (conn_label, conn_value, conn_color) = match &state.connection {
+        ConnectionState::Connected { chain_id: _, protocol, .. } => (
+            "Состояние",
+            format!("Подключено · {:?}", protocol),
+            SUCCESS,
+        ),
+        ConnectionState::Connecting => (
+            "Состояние",
+            "Подключение...".to_string(),
+            ACCENT,
+        ),
+        ConnectionState::Disconnected => (
+            "Состояние",
+            "Не подключено".to_string(),
+            TEXT_MUTED,
+        ),
+        ConnectionState::Error(e) => (
+            "Состояние",
+            format!("Ошибка: {e}"),
+            ERROR_COLOR,
+        ),
+    };
 
-    let item_h = 72.0;
-    let list_h = item_h * protocols.len() as f64;
+    draw_status_row(ctx, conn_label, &conn_value, conn_color, margin, y, w, row_h);
 
+    // Auto-selected protocol
+    let protocol_row_y = y + row_h + gap;
+    draw_status_row(ctx, "Протокол", "Mirage (автовыбор)", TEXT_MUTED, margin, protocol_row_y, w, row_h);
+
+    // VPS address
+    let vps_row_y = protocol_row_y + row_h + gap;
+    let vps_addr = state.client_vps_addr.clone();
+    let vps_display = if vps_addr.is_empty() { "Не задан".to_string() } else { vps_addr };
+    draw_status_row(ctx, "Адрес сервера", &vps_display, TEXT_MUTED, margin, vps_row_y, w, row_h);
+
+    // Uptime
+    let uptime_row_y = vps_row_y + row_h + gap;
+    let uptime = if state.connection_duration_secs > 0 {
+        let secs = state.connection_duration_secs;
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        "—".to_string()
+    };
+    draw_status_row(ctx, "Время соединения", &uptime, TEXT_MUTED, margin, uptime_row_y, w, row_h);
+
+    // Note about automatic protocol selection
+    let note_y = uptime_row_y + row_h + 16.0;
+    ctx.set_fill_color(TEXT_MUTED);
+    ctx.set_font("12px pt root ui");
+    ctx.set_text_align(TextAlign::Left);
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text(
+        "Протокол выбирается автоматически. Ручной выбор не требуется.",
+        margin,
+        note_y,
+    );
+}
+
+fn draw_status_row(
+    ctx: &mut dyn RenderContext,
+    label: &str,
+    value: &str,
+    value_color: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) {
     ctx.set_fill_color(SURFACE);
-    ctx.fill_rounded_rect(margin, y, w, list_h, 16.0);
+    ctx.fill_rounded_rect(x, y, w, h, 10.0);
     ctx.set_stroke_color(SURFACE_2);
     ctx.set_stroke_width(1.0);
-    ctx.stroke_rounded_rect(margin, y, w, list_h, 16.0);
+    ctx.stroke_rounded_rect(x, y, w, h, 10.0);
 
-    for (i, proto) in protocols.iter().enumerate() {
-        let item_y = y + i as f64 * item_h;
+    ctx.set_fill_color(TEXT_MUTED);
+    ctx.set_font("11px pt root ui");
+    ctx.set_text_align(TextAlign::Left);
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text(label, x + 14.0, y + 8.0);
 
-        // Row hover detection (excluding toggle area)
-        let row_rect = Rect::new(margin, item_y, w - 70.0, item_h);
-        let row_id = WidgetId::new(format!("proto_row_{i}"));
-        state.coordinator.register(row_id.clone(), row_rect, Sense::CLICK);
-        let is_hovered = state.coordinator.is_hovered(&row_id);
-
-        if is_hovered {
-            ctx.set_fill_color_alpha(SURFACE_2, 0.5);
-            ctx.fill_rect(margin, item_y, w, item_h);
-        }
-
-        // Protocol name
-        ctx.set_fill_color(TEXT_PRIMARY);
-        ctx.set_font("bold 15px pt root ui");
-        ctx.set_text_align(TextAlign::Left);
-        ctx.set_text_baseline(TextBaseline::Bottom);
-        ctx.fill_text(proto.name, margin + 16.0, item_y + item_h / 2.0 - 2.0);
-
-        // Description
-        ctx.set_fill_color(TEXT_MUTED);
-        ctx.set_font("12px pt root ui");
-        ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text(proto.desc, margin + 16.0, item_y + item_h / 2.0 + 4.0);
-
-        // Toggle on the right
-        let toggle_x = margin + w - 16.0 - 44.0;
-        let toggle_y = item_y + (item_h - 26.0) / 2.0;
-        draw_toggle(ctx, input, state, proto.toggle_id, toggle_x, toggle_y);
-
-        // Chevron (slightly to the right of center for the row area)
-        let chevron_size = 18.0;
-        draw_svg_icon(
-            ctx,
-            ICON_CHEVRON_RIGHT,
-            margin + w - 44.0 - chevron_size - 10.0,
-            item_y + (item_h - chevron_size) / 2.0,
-            chevron_size,
-            chevron_size,
-            TEXT_MUTED,
-        );
-
-        if i < protocols.len().saturating_sub(1) {
-            draw_divider(ctx, margin + 16.0, item_y + item_h, w - 16.0);
-        }
-
-        // Navigate to ProtocolDetail on row click
-        if clicked && is_hovered {
-            let pidx = proto.protocol_idx;
-            state.push_screen(Screen::ProtocolDetail { chain_idx, protocol_idx: pidx });
-            return;
-        }
-    }
+    ctx.set_fill_color(value_color);
+    ctx.set_font("14px pt root ui");
+    ctx.set_text_baseline(TextBaseline::Bottom);
+    ctx.fill_text(value, x + 14.0, y + h - 8.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +304,7 @@ fn draw_services_tab(
     );
 
     let _ = clicked && st_hovered;
+    let _ = draw_divider; // used in other tabs
 }
 
 // ---------------------------------------------------------------------------

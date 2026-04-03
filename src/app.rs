@@ -61,9 +61,10 @@ pub enum Screen {
     SettingsDns,
     SettingsSplitTunneling,
 
-    // New screens (Phase 1)
+    // New screens
     SettingsKillSwitch,
-    ProtocolDetail { chain_idx: usize, protocol_idx: usize },
+    /// Hidden admin panel — only reachable when `admin_unlocked` is true.
+    Admin,
 }
 
 /// Main mutable application state.
@@ -153,6 +154,12 @@ pub struct AppState {
     pub chains: Vec<crate::api::Chain>,
     pub server_online: bool,
     pub api_error: Option<String>,
+
+    // ---- Client VPS connection fields ---------------------------------------
+    /// Address of the client VPS to connect to (e.g. "84.201.155.42:443").
+    pub client_vps_addr: String,
+    /// Whether admin mode is unlocked (API key validated).
+    pub admin_unlocked: bool,
 }
 
 impl AppState {
@@ -210,6 +217,8 @@ impl AppState {
             chains: Vec::new(),
             server_online: false,
             api_error: None,
+            client_vps_addr: String::new(),
+            admin_unlocked: false,
         }
     }
 
@@ -238,6 +247,7 @@ impl AppState {
             1 => Screen::Servers,
             2 => Screen::Settings,
             3 => Screen::Connect,
+            4 => Screen::Admin,
             _ => Screen::Home,
         };
         self.nav_stack.clear();
@@ -266,15 +276,8 @@ impl AppState {
                 ApiResponse::Chains(chains) => {
                     self.chains = chains;
                 }
-                ApiResponse::ChainActivated { chain_id } => {
-                    if let Some(c) = self.chains.iter_mut().find(|c| c.id == chain_id) {
-                        c.status = "active".into();
-                    }
-                }
-                ApiResponse::ChainDeactivated { chain_id } => {
-                    if let Some(c) = self.chains.iter_mut().find(|c| c.id == chain_id) {
-                        c.status = "inactive".into();
-                    }
+                ApiResponse::NodeRebooted { node_id } => {
+                    tracing::info!(node_id, "Node reboot acknowledged");
                 }
                 ApiResponse::Error(msg) => {
                     tracing::warn!(error = %msg, "API error");
@@ -306,28 +309,13 @@ impl AppState {
             if let Some(start) = self.connect_start {
                 if start.elapsed().as_secs_f64() >= 1.5 {
                     self.connect_start = None;
-                    // Prefer server chain if available (find first active or first chain).
-                    let server_chain = self
-                        .chains
-                        .iter()
-                        .find(|c| c.status == "active")
-                        .or_else(|| self.chains.first())
-                        .map(|c| (c.id.to_string(), "VLESS + XHTTP".to_string()));
-
-                    if let Some((chain_id, protocol_name)) = server_chain {
-                        self.push_log(
-                            format!("Подключено через {chain_id}").as_str(),
-                        );
-                        self.connection = ConnectionState::Connected {
-                            chain_id,
-                            protocol: ProtocolId::Mirage,
-                            duration_secs: 0,
-                        };
-                        // Store protocol name for display elsewhere if needed.
-                        let _ = protocol_name;
-                    } else {
-                        self.on_connected();
-                    }
+                    let addr = self.client_vps_addr.clone();
+                    self.push_log(&format!("Подключено к {addr}"));
+                    self.connection = ConnectionState::Connected {
+                        chain_id: addr,
+                        protocol: ProtocolId::Mirage,
+                        duration_secs: 0,
+                    };
                 }
             }
         }
@@ -362,10 +350,8 @@ impl AppState {
         }
     }
 
-    /// Start connection.
+    /// Start connection to the client VPS.
     ///
-    /// If chains are available from the server, activates the first chain via API.
-    /// Falls back to legacy config-based flow if no server chains are available.
     /// Transitions to Connecting; `tick()` drives the Connecting→Connected transition
     /// after 1.5 s.
     pub fn connect(&mut self) {
@@ -376,60 +362,25 @@ impl AppState {
             return;
         }
 
-        if self.chains.is_empty() && self.config.is_none() {
-            self.on_error("Конфигурация не загружена — откройте Настройки".to_string());
+        if self.client_vps_addr.is_empty() {
+            self.on_error("Адрес сервера не указан".to_string());
             return;
         }
 
         self.connect_start = Some(Instant::now());
         self.connection = ConnectionState::Connecting;
-        self.push_log("Подключение...");
-
-        // Request chain activation if we have server-managed chains.
-        if let Some(chain) = self.chains.first() {
-            self.api.send(ApiRequest::ActivateChain { chain_id: chain.id });
-        }
+        self.push_log(&format!("Подключение к {}...", self.client_vps_addr));
+        // TODO: actual mirage2web client connection will go here
     }
 
-    /// Simulate successful connect (called from tick() after delay, or directly in demo).
-    pub fn on_connected(&mut self) {
-        let chain_id = self
-            .config
-            .as_ref()
-            .and_then(|c| c.chains.get(self.selected_chain))
-            .map(|ch| ch.chain_id.clone())
-            .unwrap_or_else(|| "default".to_string());
-
-        let protocol = self
-            .config
-            .as_ref()
-            .and_then(|c| c.chains.get(self.selected_chain))
-            .map(|ch| ch.protocol)
-            .unwrap_or(ProtocolId::Mirage);
-
-        self.push_log(format!("Подключено через {chain_id}").as_str());
-        self.connection = ConnectionState::Connected {
-            chain_id,
-            protocol,
-            duration_secs: 0,
-        };
-    }
-
-    /// Disconnect.
+    /// Disconnect from the client VPS.
     pub fn disconnect(&mut self) {
-        // Notify server if we have an active server-managed chain.
-        if let ConnectionState::Connected { ref chain_id, .. } = self.connection {
-            // chain_id may be a numeric server chain ID or a legacy string ID.
-            if let Ok(id) = chain_id.parse::<i64>() {
-                self.api.send(ApiRequest::DeactivateChain { chain_id: id });
-            }
-        }
-
         self.connect_start = None;
         self.connection = ConnectionState::Disconnected;
         self.bytes_up = 0;
         self.bytes_down = 0;
         self.push_log("Отключено");
+        // TODO: actual disconnect from mirage2web
     }
 
     /// Set connection error state.

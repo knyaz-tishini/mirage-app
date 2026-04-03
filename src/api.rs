@@ -20,14 +20,12 @@ pub enum ApiRequest {
     FetchProviders,
     /// Store a bearer token; subsequent authenticated requests will use it.
     SetToken(String),
-    /// Fetch the current user's nodes.
+    /// Fetch the current user's nodes (admin only).
     FetchNodes,
-    /// Fetch the current user's chains.
+    /// Fetch the current user's chains (admin only).
     FetchChains,
-    /// Activate a chain.
-    ActivateChain { chain_id: i64 },
-    /// Deactivate a chain.
-    DeactivateChain { chain_id: i64 },
+    /// Reboot a node (admin only).
+    RebootNode { node_id: i64 },
 }
 
 /// Messages the API worker sends back to the UI.
@@ -37,8 +35,7 @@ pub enum ApiResponse {
     TokenSet,
     Nodes(Vec<Node>),
     Chains(Vec<Chain>),
-    ChainActivated { chain_id: i64 },
-    ChainDeactivated { chain_id: i64 },
+    NodeRebooted { node_id: i64 },
     Error(String),
 }
 
@@ -224,41 +221,21 @@ async fn handle_request(
             }
         }
 
-        ApiRequest::ActivateChain { chain_id } => {
+        ApiRequest::RebootNode { node_id } => {
             let Some(t) = token else {
                 return ApiResponse::Error("no token set".into());
             };
             match client
-                .post(format!("{base}/api/owner/chains/{chain_id}/activate"))
+                .post(format!("{base}/api/owner/nodes/{node_id}/reboot"))
                 .bearer_auth(t)
                 .send()
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    ApiResponse::ChainActivated { chain_id: *chain_id }
+                    ApiResponse::NodeRebooted { node_id: *node_id }
                 }
-                Ok(r) => ApiResponse::Error(format!("activate chain {chain_id}: {}", r.status())),
-                Err(e) => ApiResponse::Error(format!("activate chain {chain_id}: {e}")),
-            }
-        }
-
-        ApiRequest::DeactivateChain { chain_id } => {
-            let Some(t) = token else {
-                return ApiResponse::Error("no token set".into());
-            };
-            match client
-                .post(format!("{base}/api/owner/chains/{chain_id}/deactivate"))
-                .bearer_auth(t)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => {
-                    ApiResponse::ChainDeactivated { chain_id: *chain_id }
-                }
-                Ok(r) => {
-                    ApiResponse::Error(format!("deactivate chain {chain_id}: {}", r.status()))
-                }
-                Err(e) => ApiResponse::Error(format!("deactivate chain {chain_id}: {e}")),
+                Ok(r) => ApiResponse::Error(format!("reboot node {node_id}: {}", r.status())),
+                Err(e) => ApiResponse::Error(format!("reboot node {node_id}: {e}")),
             }
         }
     }

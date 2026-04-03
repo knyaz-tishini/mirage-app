@@ -1,7 +1,7 @@
+pub mod admin_screen;
 pub mod components;
 pub mod connect_screen;
 pub mod main_screen;
-pub mod protocol_detail_screen;
 pub mod server_info_screen;
 pub mod servers_screen;
 pub mod settings_about;
@@ -36,8 +36,8 @@ fn nav_tab_for_screen(screen: &Screen) -> usize {
         Screen::SettingsDns => 2,
         Screen::SettingsSplitTunneling => 2,
         Screen::SettingsKillSwitch => 2,
-        Screen::ProtocolDetail { .. } => 1,
         Screen::Connect => 3,
+        Screen::Admin => 4,
     }
 }
 
@@ -60,6 +60,7 @@ pub fn draw_frame(
         Screen::Servers => servers_screen::draw_servers_screen(ctx, &input, viewport, state),
         Screen::Settings => settings_screen::draw_settings_screen(ctx, &input, viewport, state),
         Screen::Connect => connect_screen::draw_connect_screen(ctx, &input, viewport, state),
+        Screen::Admin => admin_screen::draw_admin_screen(ctx, &input, viewport, state),
 
         Screen::ServerInfo { server_idx } => {
             server_info_screen::draw_server_info_screen(ctx, &input, viewport, state, server_idx)
@@ -88,9 +89,6 @@ pub fn draw_frame(
         }
         Screen::SettingsKillSwitch => {
             settings_killswitch::draw(ctx, &input, viewport, state)
-        }
-        Screen::ProtocolDetail { chain_idx, protocol_idx } => {
-            protocol_detail_screen::draw(ctx, &input, viewport, state, chain_idx, protocol_idx)
         }
     }
 

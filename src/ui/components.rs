@@ -36,6 +36,7 @@ pub use uzor::render::icons::ui::ICON_CHEVRON_RIGHT;
 pub use uzor::render::icons::ui::ICON_CHEVRON_DOWN;
 pub use uzor::render::icons::ui::ICON_CHEVRON_LEFT as ICON_ARROW_LEFT;
 pub use uzor::render::icons::ui::ICON_PLUS;
+pub use uzor::render::icons::ui::ICON_SHIELD;
 
 // =============================================================================
 // Nav bar constants
@@ -44,6 +45,9 @@ pub use uzor::render::icons::ui::ICON_PLUS;
 pub const NAV_HEIGHT: f64 = 52.0;
 
 /// Draw the bottom navigation bar — centered icon group, no labels.
+///
+/// Shows 4 tabs normally; 5th "Админ" tab (shield icon) is shown only when
+/// `state.admin_unlocked` is true.
 ///
 /// Returns `Some(index)` if a tab was clicked this frame, `None` otherwise.
 pub fn draw_nav_bar(
@@ -55,7 +59,7 @@ pub fn draw_nav_bar(
     active_tab: usize,
 ) -> Option<usize> {
     let nav_y = height - NAV_HEIGHT;
-    let tab_count = 4usize;
+    let tab_count = if state.admin_unlocked { 5usize } else { 4usize };
     let icon_size = 32.0;
     let icon_gap = 24.0;
     let btn_w = icon_size + icon_gap;
@@ -75,7 +79,10 @@ pub fn draw_nav_bar(
     ctx.line_to(width, nav_y);
     ctx.stroke();
 
-    let icons = [ICON_HOME, ICON_SERVER, ICON_SETTINGS, ICON_PLUS];
+    // 4 standard tabs + optional Admin tab
+    let icons_4 = [ICON_HOME, ICON_SERVER, ICON_SETTINGS, ICON_PLUS];
+    let icons_5 = [ICON_HOME, ICON_SERVER, ICON_SETTINGS, ICON_PLUS, ICON_SHIELD];
+    let icons: &[&str] = if state.admin_unlocked { &icons_5 } else { &icons_4 };
 
     let mut result = None;
 
