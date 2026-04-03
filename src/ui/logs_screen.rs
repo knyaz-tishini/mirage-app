@@ -42,6 +42,13 @@ pub fn draw_logs_screen(
     let lines_count = state.log_lines.len();
     let total_content_h = lines_count as f64 * line_h + 16.0;
 
+    // Auto-scroll to bottom when new log lines are added.
+    if lines_count != state.prev_log_count {
+        state.prev_log_count = lines_count;
+        let max_scroll = (total_content_h - content_h).max(0.0);
+        state.logs_scroll.offset = max_scroll;
+    }
+
     // Scroll via uzor ScrollState — handle_wheel applies physics clamping
     let scroll_delta = input.scroll_delta.1;
     if scroll_delta != 0.0 {

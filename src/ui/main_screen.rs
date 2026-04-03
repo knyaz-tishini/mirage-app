@@ -7,11 +7,14 @@ use uzor::input::InputState;
 
 use crate::app::{AppState, ConnectionState, Screen};
 use super::components::{
-    BG, ACCENT, SUCCESS, WARNING, ERROR_COLOR,
+    BG, ACCENT, SURFACE, SURFACE_2, SUCCESS, WARNING, ERROR_COLOR,
     TEXT_PRIMARY, TEXT_MUTED, SEPARATOR, NAV_HEIGHT,
     ICON_CHEVRON_RIGHT,
     draw_nav_bar,
 };
+
+/// Power-off SVG icon (arc + vertical line), 24x24 viewBox.
+const ICON_POWER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>"##;
 
 /// Draw the main screen.
 pub fn draw_main_screen(
@@ -20,6 +23,9 @@ pub fn draw_main_screen(
     viewport: Rect,
     state: &mut AppState,
 ) {
+    // Advance animation + connection timer first.
+    state.tick(input.dt);
+
     let w = viewport.width;
     let h = viewport.height;
     let clicked = input.is_clicked();
@@ -40,32 +46,55 @@ pub fn draw_main_screen(
     ctx.fill_text("MIRAGE", w / 2.0, 20.0);
 
     // -------------------------------------------------------------------------
-    // Big circle button — centered at ~280px from top
+    // Big circle button — proportional position
     // -------------------------------------------------------------------------
     let cx = w / 2.0;
-    let cy = 280.0;
-    let r = 90.0;
+    let cy = h * 0.36;
+    let r = (w.min(h) * 0.17).min(90.0);
 
-    let is_connected = state.is_connected();
     let is_connecting = matches!(state.connection, ConnectionState::Connecting);
+    let is_connected = matches!(state.connection, ConnectionState::Connected { .. });
 
-    // Ring stroke color
-    let ring_color = match &state.connection {
-        ConnectionState::Disconnected => SEPARATOR,
-        ConnectionState::Connecting => WARNING,
-        ConnectionState::Connected { .. } => ACCENT,
-        ConnectionState::Error(_) => ERROR_COLOR,
-    };
+    // Outer ring — state-dependent
+    match &state.connection {
+        ConnectionState::Connecting => {
+            // Pulsing ring at r+8
+            let alpha = 0.3 + 0.7 * ((state.animation_phase * std::f64::consts::TAU).sin().abs());
+            ctx.set_global_alpha(alpha);
+            ctx.begin_path();
+            ctx.arc(cx, cy, r + 8.0, 0.0, PI * 2.0);
+            ctx.set_stroke_color(WARNING);
+            ctx.set_stroke_width(3.0);
+            ctx.stroke();
+            ctx.set_global_alpha(1.0);
+        }
+        ConnectionState::Connected { .. } => {
+            // Solid accent outer ring
+            ctx.begin_path();
+            ctx.arc(cx, cy, r + 8.0, 0.0, PI * 2.0);
+            ctx.set_stroke_color(ACCENT);
+            ctx.set_stroke_width(3.0);
+            ctx.stroke();
+        }
+        ConnectionState::Disconnected => {
+            // Subtle SURFACE_2 ring
+            ctx.begin_path();
+            ctx.arc(cx, cy, r + 8.0, 0.0, PI * 2.0);
+            ctx.set_stroke_color(SURFACE_2);
+            ctx.set_stroke_width(2.0);
+            ctx.stroke();
+        }
+        ConnectionState::Error(_) => {
+            ctx.begin_path();
+            ctx.arc(cx, cy, r + 8.0, 0.0, PI * 2.0);
+            ctx.set_stroke_color(ERROR_COLOR);
+            ctx.set_stroke_width(2.0);
+            ctx.stroke();
+        }
+    }
 
-    // Outer ring (2px stroke)
-    ctx.begin_path();
-    ctx.arc(cx, cy, r + 4.0, 0.0, PI * 2.0);
-    ctx.set_stroke_color(ring_color);
-    ctx.set_stroke_width(2.0);
-    ctx.stroke();
-
-    // Inner fill (slightly lighter than BG)
-    let fill_color = if is_connected && !is_connecting {
+    // Inner fill
+    let fill_color = if is_connected {
         "#15151A"
     } else {
         "#121215"
@@ -75,44 +104,34 @@ pub fn draw_main_screen(
     ctx.set_fill_color(fill_color);
     ctx.fill();
 
-    // Circle inner text
-    let (circle_text, text_color) = match &state.connection {
-        ConnectionState::Disconnected => ("TAP TO\nCONNECT", TEXT_MUTED),
-        ConnectionState::Connecting => ("CONNECTING", WARNING),
-        ConnectionState::Connected { .. } => ("CONNECTED", ACCENT),
-        ConnectionState::Error(_) => ("ERROR\nTAP TO RETRY", ERROR_COLOR),
+    // Power icon centered in circle
+    let icon_size = r * 0.7;
+    let icon_color = match &state.connection {
+        ConnectionState::Disconnected => TEXT_MUTED,
+        ConnectionState::Connecting => WARNING,
+        ConnectionState::Connected { .. } => ACCENT,
+        ConnectionState::Error(_) => ERROR_COLOR,
     };
+    draw_svg_icon(
+        ctx,
+        ICON_POWER,
+        cx - icon_size / 2.0,
+        cy - icon_size / 2.0,
+        icon_size,
+        icon_size,
+        icon_color,
+    );
 
-    ctx.set_text_align(TextAlign::Center);
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.set_fill_color(text_color);
-
-    let lines: Vec<&str> = circle_text.split('\n').collect();
-    let line_h = 18.0;
-    let total_h = lines.len() as f64 * line_h;
-    let start_y = cy - total_h / 2.0 + line_h / 2.0;
-
-    for (i, line) in lines.iter().enumerate() {
-        let font = if i == 0 {
-            "bold 14px sans-serif"
-        } else {
-            "12px sans-serif"
-        };
-        ctx.set_font(font);
-        ctx.fill_text(line, cx, start_y + i as f64 * line_h);
-    }
-
-    // Click detection on the circle — use bounding rect for the hit test area
-    // (circle hit-test uses distance to keep circular feel)
+    // Click detection on the circle
     if clicked {
         if let Some((mx, my)) = input.pointer.pos {
             let dx = mx - cx;
             let dy = my - cy;
-            if dx * dx + dy * dy <= (r + 4.0) * (r + 4.0) {
+            if dx * dx + dy * dy <= (r + 8.0) * (r + 8.0) {
                 match &state.connection {
                     ConnectionState::Disconnected | ConnectionState::Error(_) => {
                         state.connect();
-                        state.on_connected();
+                        // tick() drives the Connecting → Connected transition after 1.5 s
                     }
                     ConnectionState::Connected { .. } => {
                         state.disconnect();
@@ -138,15 +157,25 @@ pub fn draw_main_screen(
     ctx.set_text_baseline(TextBaseline::Top);
     ctx.fill_text(status_text, cx, cy + r + 18.0);
 
+    // Connecting sub-label (small hint)
+    if is_connecting {
+        ctx.set_fill_color(TEXT_MUTED);
+        ctx.set_font("11px sans-serif");
+        ctx.set_text_align(TextAlign::Center);
+        ctx.set_text_baseline(TextBaseline::Top);
+        ctx.fill_text("Tap to cancel", cx, cy + r + 36.0);
+    }
+
     // -------------------------------------------------------------------------
-    // Server selector panel (bottom, above nav bar)
-    // Amnezia-style: transparent bg with top border, left-aligned server name
+    // Server selector card (bottom, above nav bar)
+    // Proper card with SURFACE fill, rounded corners, padding
     // -------------------------------------------------------------------------
-    let panel_margin = 16.0;
-    let panel_y = h - NAV_HEIGHT - 90.0;
-    let panel_h = 68.0;
-    let panel_x = panel_margin;
-    let panel_w = w - panel_margin * 2.0;
+    let card_margin = 16.0;
+    let card_y = h - NAV_HEIGHT - 96.0;
+    let card_h = 72.0;
+    let card_x = card_margin;
+    let card_w = w - card_margin * 2.0;
+    let card_pad = 16.0;
 
     let chain_name = state
         .config
@@ -162,59 +191,46 @@ pub fn draw_main_screen(
         .map(|ch| ch.protocol.to_string())
         .unwrap_or_else(|| "—".to_string());
 
-    let server_addr = state
-        .config
-        .as_ref()
-        .and_then(|c| c.chains.get(state.selected_chain))
-        .map(|ch| ch.l1.addr.to_string())
-        .unwrap_or_else(|| "—".to_string());
+    let card_rect = Rect::new(card_x, card_y, card_w, card_h);
+    let card_hovered = input.is_hovered(&card_rect);
 
-    let panel_rect = Rect::new(panel_x, panel_y, panel_w, panel_h);
-    let panel_hovered = input.is_hovered(&panel_rect);
+    // Card background
+    let card_fill = if card_hovered { SURFACE_2 } else { SURFACE };
+    ctx.set_fill_color(card_fill);
+    ctx.fill_rounded_rect(card_x, card_y, card_w, card_h, 12.0);
 
-    // Panel background (slightly lighter on hover)
-    if panel_hovered {
-        ctx.set_fill_color_alpha(SEPARATOR, 0.4);
-        ctx.fill_rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0);
-    }
-
-    // Top border line
+    // Card border
     ctx.set_stroke_color(SEPARATOR);
-    ctx.set_stroke_width(0.5);
-    ctx.begin_path();
-    ctx.move_to(panel_x, panel_y);
-    ctx.line_to(panel_x + panel_w, panel_y);
-    ctx.stroke();
+    ctx.set_stroke_width(1.0);
+    ctx.stroke_rounded_rect(card_x, card_y, card_w, card_h, 12.0);
 
-    // Chain name (left)
+    // Chain name (bold, left-aligned with padding)
     ctx.set_fill_color(TEXT_PRIMARY);
     ctx.set_font("bold 15px sans-serif");
     ctx.set_text_align(TextAlign::Left);
     ctx.set_text_baseline(TextBaseline::Top);
-    ctx.fill_text(chain_name, panel_x + 4.0, panel_y + 10.0);
+    ctx.fill_text(chain_name, card_x + card_pad, card_y + card_pad);
 
-    // Chevron right SVG (right side) — uzor built-in icon
+    // Protocol (muted, below chain name)
+    ctx.set_fill_color(TEXT_MUTED);
+    ctx.set_font("12px sans-serif");
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text(&protocol_str, card_x + card_pad, card_y + card_pad + 22.0);
+
+    // Chevron right SVG (right side)
     let chevron_size = 16.0;
     draw_svg_icon(
         ctx,
         ICON_CHEVRON_RIGHT,
-        panel_x + panel_w - chevron_size - 4.0,
-        panel_y + (panel_h - chevron_size) / 2.0,
+        card_x + card_w - chevron_size - card_pad,
+        card_y + (card_h - chevron_size) / 2.0,
         chevron_size,
         chevron_size,
         ACCENT,
     );
 
-    // Protocol + addr
-    ctx.set_fill_color(TEXT_MUTED);
-    ctx.set_font("12px sans-serif");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Top);
-    let detail = format!("{protocol_str}  ·  {server_addr}");
-    ctx.fill_text(&detail, panel_x + 4.0, panel_y + 32.0);
-
     // Click navigates to chains screen
-    if clicked && panel_hovered {
+    if clicked && card_hovered {
         state.go_to(Screen::Chains);
     }
 

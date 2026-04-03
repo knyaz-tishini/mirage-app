@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "uzor"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "ahash 0.8.12",
  "bitflags 2.11.0",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-backend-tiny-skia"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-desktop"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "arboard",
  "dark-light",

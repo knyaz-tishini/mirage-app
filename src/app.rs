@@ -1,3 +1,4 @@
+use std::time::Instant;
 use mirage_core::config::{ClientConfig, ProtocolId};
 use uzor::types::ScrollState;
 
@@ -40,6 +41,14 @@ pub struct AppState {
     pub log_lines: Vec<String>,
     /// Scroll state for the logs screen — managed by uzor ScrollState.
     pub logs_scroll: ScrollState,
+    /// Scroll state for the chains screen.
+    pub chains_scroll: ScrollState,
+    /// Animation phase 0.0–1.0 (wraps), updated each tick for pulse effects.
+    pub animation_phase: f64,
+    /// Timestamp when connection attempt started; drives the Connecting→Connected delay.
+    pub connect_start: Option<Instant>,
+    /// Previous log count — used to auto-scroll logs to bottom on new entries.
+    pub prev_log_count: usize,
 }
 
 impl AppState {
@@ -57,13 +66,35 @@ impl AppState {
             screen: Screen::Main,
             log_lines: vec!["Mirage started".to_string()],
             logs_scroll: ScrollState::new(),
+            chains_scroll: ScrollState::new(),
+            animation_phase: 0.0,
+            connect_start: None,
+            prev_log_count: 1,
+        }
+    }
+
+    /// Advance animation state and connection timer.
+    ///
+    /// Call once per frame, passing `input.dt` (seconds since last frame).
+    pub fn tick(&mut self, dt: f64) {
+        // Advance animation phase for pulse/spin effects.
+        self.animation_phase = (self.animation_phase + dt * 1.5) % 1.0;
+
+        // Connecting → Connected after 1.5 s delay.
+        if matches!(self.connection, ConnectionState::Connecting) {
+            if let Some(start) = self.connect_start {
+                if start.elapsed().as_secs_f64() >= 1.5 {
+                    self.connect_start = None;
+                    self.on_connected();
+                }
+            }
         }
     }
 
     /// Start connection.
     ///
     /// If no config is loaded, immediately transitions to Error state.
-    /// Otherwise transitions to Connecting then calls `on_connected()`.
+    /// Otherwise transitions to Connecting; `tick()` drives the transition after 1.5 s.
     pub fn connect(&mut self) {
         if !matches!(
             self.connection,
@@ -77,11 +108,12 @@ impl AppState {
             return;
         }
 
+        self.connect_start = Some(Instant::now());
         self.connection = ConnectionState::Connecting;
         self.push_log("Connecting...");
     }
 
-    /// Simulate successful connect (called from async task result, or directly in demo).
+    /// Simulate successful connect (called from tick() after delay, or directly in demo).
     pub fn on_connected(&mut self) {
         let chain_id = self
             .config
@@ -107,6 +139,7 @@ impl AppState {
 
     /// Disconnect.
     pub fn disconnect(&mut self) {
+        self.connect_start = None;
         self.connection = ConnectionState::Disconnected;
         self.bytes_up = 0;
         self.bytes_down = 0;
@@ -138,13 +171,6 @@ impl AppState {
         self.status_message = line.to_string();
     }
 
-    /// Returns true if currently connected or connecting.
-    pub fn is_connected(&self) -> bool {
-        matches!(
-            self.connection,
-            ConnectionState::Connected { .. } | ConnectionState::Connecting
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------

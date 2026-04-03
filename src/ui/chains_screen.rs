@@ -1,4 +1,4 @@
-//! Chains screen — server list with Amnezia-style selection.
+//! Chains screen — server list with Amnezia-style selection and scroll.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline, draw_svg_icon};
 use uzor::types::Rect;
@@ -35,8 +35,10 @@ pub fn draw_chains_screen(
 
     let content_top = 64.0;
     let content_bottom = h - NAV_HEIGHT - 8.0;
+    let content_h = content_bottom - content_top;
 
     let item_h = 70.0;
+    let item_gap = 8.0;
     let item_margin = 16.0;
     let item_w = w - item_margin * 2.0;
 
@@ -48,8 +50,25 @@ pub fn draw_chains_screen(
             ctx.set_text_baseline(TextBaseline::Middle);
             ctx.fill_text("No chains in config", w / 2.0, (content_top + content_bottom) / 2.0);
         } else {
+            let chain_count = config.chains.len();
+            let total_content_h = chain_count as f64 * (item_h + item_gap);
+
+            // Handle scroll wheel
+            let scroll_delta = input.scroll_delta.1;
+            if scroll_delta != 0.0 {
+                let scroll_area = Rect::new(0.0, content_top, w, content_h);
+                if input.is_hovered(&scroll_area) {
+                    state
+                        .chains_scroll
+                        .handle_wheel(scroll_delta, total_content_h, content_h);
+                }
+            }
+
+            let scroll_offset = state.chains_scroll.offset;
+
             let selected = state.selected_chain;
 
+            // Collect chain data before mutable borrow on state
             let chain_data: Vec<(String, String, String, bool)> = config
                 .chains
                 .iter()
@@ -64,18 +83,30 @@ pub fn draw_chains_screen(
                 })
                 .collect();
 
+            // Clip to content area
+            ctx.save();
+            ctx.clip_rect(0.0, content_top, w, content_h);
+
             let mut clicked_idx = None;
 
             for (idx, (chain_id, protocol, addr, is_selected)) in chain_data.iter().enumerate() {
-                let item_y = content_top + idx as f64 * (item_h + 8.0);
+                let item_y = content_top + idx as f64 * (item_h + item_gap) - scroll_offset;
 
                 // Skip if outside visible area
                 if item_y + item_h < content_top || item_y > content_bottom {
                     continue;
                 }
 
-                // Card background
-                ctx.set_fill_color(SURFACE);
+                let item_rect = Rect::new(item_margin, item_y, item_w, item_h);
+                let is_hovered = input.is_hovered(&item_rect);
+
+                // Card background — slightly lighter on hover
+                let card_fill = if is_hovered && !is_selected {
+                    SURFACE_2
+                } else {
+                    SURFACE
+                };
+                ctx.set_fill_color(card_fill);
                 ctx.fill_rounded_rect(item_margin, item_y, item_w, item_h, 12.0);
 
                 // Border: 1px goldenApricot if selected, 1px slateGray if not
@@ -84,7 +115,7 @@ pub fn draw_chains_screen(
                 ctx.set_stroke_width(1.0);
                 ctx.stroke_rounded_rect(item_margin, item_y, item_w, item_h, 12.0);
 
-                // Checkmark or empty circle indicator — use uzor's built-in CHECKMARK icon
+                // Checkmark or empty circle indicator
                 if *is_selected {
                     let check_size = 18.0;
                     draw_svg_icon(
@@ -126,13 +157,35 @@ pub fn draw_chains_screen(
                 let detail = format!("{protocol}  ·  {addr}");
                 ctx.fill_text(&detail, item_margin + 44.0, item_y + 36.0);
 
-                // Click detection via InputState
-                if clicked {
-                    let item_rect = Rect::new(item_margin, item_y, item_w, item_h);
-                    if input.is_hovered(&item_rect) {
-                        clicked_idx = Some(idx);
-                    }
+                // Click detection
+                if clicked && is_hovered {
+                    clicked_idx = Some(idx);
                 }
+            }
+
+            ctx.restore();
+
+            // Scrollbar (if content overflows)
+            let max_scroll = (total_content_h - content_h).max(0.0);
+            if total_content_h > content_h {
+                let sb_w = 4.0;
+                let sb_x = w - sb_w - 4.0;
+                let sb_track_h = content_h - 8.0;
+                let sb_y = content_top + 4.0;
+
+                let thumb_ratio = content_h / total_content_h;
+                let thumb_h = (sb_track_h * thumb_ratio).max(20.0);
+                let thumb_offset = if max_scroll > 0.0 {
+                    (scroll_offset / max_scroll) * (sb_track_h - thumb_h)
+                } else {
+                    0.0
+                };
+
+                ctx.set_fill_color_alpha(SEPARATOR, 0.4);
+                ctx.fill_rounded_rect(sb_x, sb_y, sb_w, sb_track_h, 2.0);
+
+                ctx.set_fill_color(TEXT_MUTED);
+                ctx.fill_rounded_rect(sb_x, sb_y + thumb_offset, sb_w, thumb_h, 2.0);
             }
 
             if let Some(idx) = clicked_idx {
@@ -144,7 +197,11 @@ pub fn draw_chains_screen(
         ctx.set_font("14px sans-serif");
         ctx.set_text_align(TextAlign::Center);
         ctx.set_text_baseline(TextBaseline::Middle);
-        ctx.fill_text("Config not loaded", w / 2.0, (content_top + content_bottom) / 2.0 - 20.0);
+        ctx.fill_text(
+            "Config not loaded",
+            w / 2.0,
+            (content_top + content_bottom) / 2.0 - 20.0,
+        );
 
         // Button to go to settings
         let btn_w = 180.0;
