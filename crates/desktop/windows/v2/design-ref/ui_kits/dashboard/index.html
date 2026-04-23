@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mirage — Mesh Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+  <link rel="stylesheet" href="../../colors_and_type.css">
+  <link rel="stylesheet" href="kit.css">
+</head>
+<body>
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="left">
+      <a class="logo" href="#">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M3 17 L12 4 L21 17 M7 17 L12 10 L17 17" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/></svg>
+        mirage
+      </a>
+      <span class="crumb">mesh / <b>eu-prod-01</b></span>
+    </div>
+    <div class="right">
+      <span class="status-on">all systems operational</span>
+      <span class="kbd">⌘</span><span class="kbd">K</span>
+      <span>andrey@mirage.sh</span>
+    </div>
+  </header>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sb__group">Mesh</div>
+    <div class="sb__item is-active">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.5"/><circle cx="5" cy="5" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="19" cy="5" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="5" cy="19" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="19" cy="19" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M7 7l3 3m7-3l-3 3m-4 4l-3 3m4-3l3 3" stroke="currentColor" stroke-width="1.5"/></svg>
+      Topology<span class="count">12</span>
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="3" y="14" width="18" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="7" r="0.8" fill="currentColor"/><circle cx="7" cy="17" r="0.8" fill="currentColor"/></svg>
+      Nodes<span class="count">12</span>
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M3 12h4l2-6 4 12 2-6h6" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+      Traffic
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="1" stroke="currentColor" stroke-width="1.5"/><path d="M3 9h18M7 13h6M7 16h4" stroke="currentColor" stroke-width="1.5"/></svg>
+      Logs
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.5"/></svg>
+      Obfuscation
+    </div>
+
+    <div class="sb__group">Config</div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.5"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" stroke="currentColor" stroke-width="1.5"/></svg>
+      Settings
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.5"/></svg>
+      Policies<span class="count">3</span>
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="1" stroke="currentColor" stroke-width="1.5"/><path d="M9 9h6v6H9z" stroke="currentColor" stroke-width="1.5"/></svg>
+      Keys
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M4 17V7l8-4 8 4v10M4 17l8 4 8-4M4 17l8-4 8 4M12 3v14" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+      Billing
+    </div>
+
+    <div class="sb__group">Ops</div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><polyline points="4 17 10 11 14 15 20 7" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>
+      Metrics
+    </div>
+    <div class="sb__item">
+      <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="1.5"/></svg>
+      Connect node
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <!-- Page header -->
+    <section class="page-hd">
+      <div>
+        <div class="ds-eyebrow ds-eyebrow--muted" style="margin-bottom:6px;">MESH / eu-prod-01</div>
+        <h1>Topology overview</h1>
+      </div>
+      <div class="meta">last sync · 18/apr/2026 14:03:22 MSK</div>
+      <div class="actions">
+        <button class="btn">Export manifest</button>
+        <button class="btn primary">+ Add node</button>
+      </div>
+    </section>
+
+    <!-- KPI strip -->
+    <section class="kpi-strip">
+      <div class="k">
+        <span class="label">Nodes online</span>
+        <span class="v">12<span class="unit"> / 12</span></span>
+        <span class="delta up">↑ 100% reachable</span>
+      </div>
+      <div class="k">
+        <span class="label">L1 relays (RU)</span>
+        <span class="v" style="color:var(--l1)">4</span>
+        <span class="delta">Moscow · SPb · Ленобл.</span>
+      </div>
+      <div class="k">
+        <span class="label">L2 exits</span>
+        <span class="v a">8</span>
+        <span class="delta">AMS · FRA · ALA · WAW</span>
+      </div>
+      <div class="k">
+        <span class="label">Latency p50</span>
+        <span class="v">18<span class="unit"> ms</span></span>
+        <span class="delta dn">↓ −3ms vs 24h</span>
+      </div>
+      <div class="k">
+        <span class="label">Throughput</span>
+        <span class="v">842<span class="unit"> Mbit/s</span></span>
+        <span class="delta up">↑ 6% vs 24h</span>
+      </div>
+      <div class="k">
+        <span class="label">Obfuscation</span>
+        <span class="v ok">OK</span>
+        <span class="delta">XTLS-Vision · REALITY</span>
+      </div>
+    </section>
+
+    <!-- Body -->
+    <section class="body">
+
+      <!-- Left: node table + logs -->
+      <div class="panel" style="display:flex;flex-direction:column;">
+        <div class="panel__hd">
+          <span>NODES <span class="pill">12</span></span>
+          <div class="right">
+            <span class="pill">filter: all</span>
+            <span class="pill">sort: layer ↓</span>
+          </div>
+        </div>
+        <div class="nodes">
+          <div class="node-row is-head">
+            <span></span>
+            <span>Node</span>
+            <span style="text-align:right">Latency</span>
+            <span style="text-align:right">Loss</span>
+            <span style="text-align:right">Up%</span>
+            <span style="text-align:right">Uptime</span>
+            <span>24h throughput</span>
+          </div>
+
+          <!-- L1 -->
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l1">L1</span>yandex-moscow-a<span class="node-addr">84.201.146.12</span></span>
+            <span class="cell-num">12 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">100</span>
+            <span class="cell-num muted">41d 02:11</span>
+            <span class="spark l1" data-spark="l1"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l1">L1</span>yandex-moscow-b<span class="node-addr">84.201.146.44</span></span>
+            <span class="cell-num">14 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">100</span>
+            <span class="cell-num muted">41d 02:11</span>
+            <span class="spark l1" data-spark="l1"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l1">L1</span>selectel-spb-01<span class="node-addr">188.93.154.9</span></span>
+            <span class="cell-num">16 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">99.9</span>
+            <span class="cell-num muted">18d 04:32</span>
+            <span class="spark l1" data-spark="l1"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot w"></span>
+            <span class="node-name"><span class="layer l1">L1</span>vk-cloud-msk<span class="node-addr">95.163.201.77</span></span>
+            <span class="cell-num">23 ms</span>
+            <span class="cell-num" style="color:var(--warn)">0.4%</span>
+            <span class="cell-num">98.7</span>
+            <span class="cell-num muted">07d 11:05</span>
+            <span class="spark l1" data-spark="l1w"></span>
+          </div>
+
+          <!-- L2 -->
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l2">L2</span>timeweb-ams-01<span class="node-addr">149.154.71.12</span></span>
+            <span class="cell-num">42 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">100</span>
+            <span class="cell-num muted">90d 17:02</span>
+            <span class="spark"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l2">L2</span>timeweb-fra-02<span class="node-addr">149.154.71.98</span></span>
+            <span class="cell-num">38 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">100</span>
+            <span class="cell-num muted">90d 17:02</span>
+            <span class="spark"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l2">L2</span>ruvds-ala-kz<span class="node-addr">85.202.194.3</span></span>
+            <span class="cell-num">21 ms</span>
+            <span class="cell-num muted">0.1%</span>
+            <span class="cell-num">99.8</span>
+            <span class="cell-num muted">32d 09:44</span>
+            <span class="spark"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l2">L2</span>serverspace-ala<span class="node-addr">93.95.217.55</span></span>
+            <span class="cell-num">19 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">100</span>
+            <span class="cell-num muted">14d 06:12</span>
+            <span class="spark"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l2">L2</span>hostkey-nl-03<span class="node-addr">213.183.63.201</span></span>
+            <span class="cell-num">45 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">99.9</span>
+            <span class="cell-num muted">61d 22:38</span>
+            <span class="spark"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l2">L2</span>fornex-waw-01<span class="node-addr">37.220.86.19</span></span>
+            <span class="cell-num">34 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">100</span>
+            <span class="cell-num muted">12d 01:18</span>
+            <span class="spark"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot err"></span>
+            <span class="node-name"><span class="layer l2">L2</span>vdsina-ams-02<span class="node-addr">45.80.158.4</span></span>
+            <span class="cell-num" style="color:var(--error)">— —</span>
+            <span class="cell-num" style="color:var(--error)">100%</span>
+            <span class="cell-num">0</span>
+            <span class="cell-num muted">02:14</span>
+            <span class="spark" data-spark="err"></span>
+          </div>
+          <div class="node-row">
+            <span class="node-dot ok"></span>
+            <span class="node-name"><span class="layer l2">L2</span>ishosting-hel-04<span class="node-addr">91.239.115.27</span></span>
+            <span class="cell-num">29 ms</span>
+            <span class="cell-num muted">0.0%</span>
+            <span class="cell-num">99.9</span>
+            <span class="cell-num muted">05d 18:44</span>
+            <span class="spark"></span>
+          </div>
+        </div>
+
+        <!-- Logs -->
+        <div class="panel__hd" style="border-top:1px solid var(--border);">
+          <span>LIVE LOGS <span class="pill">streaming</span></span>
+          <div class="right">
+            <span class="pill">debug OFF</span>
+            <span class="pill">tail -f</span>
+          </div>
+        </div>
+        <div class="logs" id="logs">
+          <!-- populated by JS -->
+        </div>
+      </div>
+
+      <!-- Right column -->
+      <div class="right-stack">
+
+        <!-- Traffic chart -->
+        <div class="panel">
+          <div class="panel__hd">
+            <span>THROUGHPUT · 24h</span>
+            <div class="right">
+              <span class="pill">in</span>
+              <span class="pill">out</span>
+            </div>
+          </div>
+          <div class="chart">
+            <svg viewBox="0 0 600 180" preserveAspectRatio="none">
+              <!-- grid -->
+              <g stroke="rgba(255,255,255,0.04)">
+                <line x1="0" y1="36" x2="600" y2="36"/>
+                <line x1="0" y1="72" x2="600" y2="72"/>
+                <line x1="0" y1="108" x2="600" y2="108"/>
+                <line x1="0" y1="144" x2="600" y2="144"/>
+              </g>
+              <!-- L1 band (blue) -->
+              <path d="M0 120 L25 118 L50 112 L75 108 L100 114 L125 105 L150 98 L175 102 L200 92 L225 86 L250 90 L275 82 L300 70 L325 76 L350 68 L375 72 L400 60 L425 58 L450 52 L475 48 L500 58 L525 52 L550 48 L575 44 L600 42 L600 180 L0 180 Z" fill="rgba(109,184,245,0.18)"/>
+              <path d="M0 120 L25 118 L50 112 L75 108 L100 114 L125 105 L150 98 L175 102 L200 92 L225 86 L250 90 L275 82 L300 70 L325 76 L350 68 L375 72 L400 60 L425 58 L450 52 L475 48 L500 58 L525 52 L550 48 L575 44 L600 42" stroke="#6DB8F5" stroke-width="1.5" fill="none"/>
+              <!-- L2 band (amber) above -->
+              <path d="M0 90 L25 82 L50 78 L75 72 L100 80 L125 68 L150 60 L175 64 L200 52 L225 46 L250 48 L275 38 L300 30 L325 36 L350 28 L375 32 L400 20 L425 18 L450 14 L475 10 L500 18 L525 14 L550 10 L575 8 L600 6 L600 42 L575 44 L550 48 L525 52 L500 58 L475 48 L450 52 L425 58 L400 60 L375 72 L350 68 L325 76 L300 70 L275 82 L250 90 L225 86 L200 92 L175 102 L150 98 L125 105 L100 114 L75 108 L50 112 L25 118 L0 120 Z" fill="rgba(251,178,106,0.18)"/>
+              <path d="M0 90 L25 82 L50 78 L75 72 L100 80 L125 68 L150 60 L175 64 L200 52 L225 46 L250 48 L275 38 L300 30 L325 36 L350 28 L375 32 L400 20 L425 18 L450 14 L475 10 L500 18 L525 14 L550 10 L575 8 L600 6" stroke="#FBB26A" stroke-width="1.5" fill="none"/>
+            </svg>
+          </div>
+        </div>
+
+        <!-- World map (schematic) -->
+        <div class="panel">
+          <div class="panel__hd">
+            <span>GEO DISTRIBUTION</span>
+            <div class="right">
+              <div class="legend" style="gap:12px;">
+                <span class="item"><span class="d l1"></span>L1 · RU</span>
+                <span class="item"><span class="d l2"></span>L2 · intl</span>
+              </div>
+            </div>
+          </div>
+          <div class="map">
+            <svg viewBox="0 0 600 260" xmlns="http://www.w3.org/2000/svg">
+              <!-- faint world plate: concentric rectangles + grid of dots -->
+              <defs>
+                <pattern id="dots" width="10" height="10" patternUnits="userSpaceOnUse">
+                  <circle cx="1" cy="1" r="0.6" fill="rgba(255,255,255,0.08)"/>
+                </pattern>
+              </defs>
+              <rect x="10" y="10" width="580" height="240" fill="url(#dots)"/>
+              <rect x="10" y="10" width="580" height="240" fill="none" stroke="rgba(255,255,255,0.06)"/>
+
+              <!-- equator / meridian hairlines -->
+              <line x1="10" y1="130" x2="590" y2="130" stroke="rgba(255,255,255,0.05)"/>
+              <line x1="300" y1="10" x2="300" y2="250" stroke="rgba(255,255,255,0.05)"/>
+
+              <!-- rough continents as blobs -->
+              <g fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.09)" stroke-width="0.8">
+                <!-- Europe -->
+                <path d="M250 80 Q290 60 330 70 Q360 78 365 95 Q370 115 345 125 Q315 135 290 130 Q265 122 258 105 Z"/>
+                <!-- Russia / N. Asia -->
+                <path d="M330 60 Q430 50 540 72 Q560 85 550 105 Q530 120 490 118 Q440 118 390 110 Q355 100 345 85 Q340 70 330 60 Z"/>
+                <!-- N. America -->
+                <path d="M40 70 Q100 55 150 70 Q185 85 180 120 Q160 145 120 140 Q70 132 45 110 Q32 90 40 70 Z"/>
+                <!-- S. America -->
+                <path d="M140 160 Q170 155 175 190 Q170 225 150 235 Q130 225 128 200 Q130 175 140 160 Z"/>
+                <!-- Africa -->
+                <path d="M290 135 Q320 132 335 155 Q345 190 325 215 Q305 230 290 215 Q275 190 280 165 Z"/>
+                <!-- Asia south -->
+                <path d="M400 130 Q440 130 460 150 Q470 175 450 185 Q420 185 405 165 Q395 145 400 130 Z"/>
+                <!-- Australia -->
+                <path d="M485 195 Q520 192 535 210 Q530 225 505 228 Q485 222 485 210 Z"/>
+              </g>
+
+              <!-- L1 nodes (Russia) -->
+              <g>
+                <circle cx="360" cy="88" r="3" fill="#6DB8F5"/>
+                <circle cx="360" cy="88" r="7" fill="#6DB8F5" opacity="0.15"/>
+                <text x="366" y="86" fill="#6DB8F5" font-family="JetBrains Mono" font-size="8" font-weight="700">MSK</text>
+
+                <circle cx="352" cy="80" r="3" fill="#6DB8F5"/>
+                <circle cx="352" cy="80" r="7" fill="#6DB8F5" opacity="0.15"/>
+                <text x="330" y="78" fill="#6DB8F5" font-family="JetBrains Mono" font-size="8" font-weight="700">SPB</text>
+              </g>
+
+              <!-- L2 nodes -->
+              <g>
+                <!-- AMS -->
+                <circle cx="300" cy="92" r="3" fill="#FBB26A"/>
+                <circle cx="300" cy="92" r="7" fill="#FBB26A" opacity="0.15"/>
+                <text x="272" y="90" fill="#FBB26A" font-family="JetBrains Mono" font-size="8" font-weight="700">AMS</text>
+                <!-- FRA -->
+                <circle cx="312" cy="100" r="3" fill="#FBB26A"/>
+                <text x="316" y="108" fill="#FBB26A" font-family="JetBrains Mono" font-size="8" font-weight="700">FRA</text>
+                <!-- WAW -->
+                <circle cx="325" cy="92" r="3" fill="#FBB26A"/>
+                <text x="328" y="88" fill="#FBB26A" font-family="JetBrains Mono" font-size="8" font-weight="700">WAW</text>
+                <!-- HEL -->
+                <circle cx="320" cy="75" r="3" fill="#FBB26A"/>
+                <text x="324" y="72" fill="#FBB26A" font-family="JetBrains Mono" font-size="8" font-weight="700">HEL</text>
+                <!-- ALA -->
+                <circle cx="450" cy="115" r="3" fill="#FBB26A"/>
+                <circle cx="450" cy="115" r="7" fill="#FBB26A" opacity="0.15"/>
+                <text x="454" y="113" fill="#FBB26A" font-family="JetBrains Mono" font-size="8" font-weight="700">ALA</text>
+              </g>
+
+              <!-- Links: user → L1 → L2 -->
+              <g stroke-dasharray="2 3" stroke-width="1">
+                <line x1="362" y1="120" x2="360" y2="91" stroke="#6DB8F5" opacity="0.6"/>
+                <line x1="360" y1="88" x2="300" y2="92" stroke="#FBB26A" opacity="0.6"/>
+                <line x1="352" y1="80" x2="320" y2="75" stroke="#FBB26A" opacity="0.6"/>
+                <line x1="360" y1="88" x2="450" y2="115" stroke="#FBB26A" opacity="0.6"/>
+                <line x1="360" y1="88" x2="325" y2="92" stroke="#FBB26A" opacity="0.6"/>
+                <line x1="360" y1="88" x2="312" y2="100" stroke="#FBB26A" opacity="0.6"/>
+              </g>
+
+              <!-- User origin -->
+              <g>
+                <circle cx="362" cy="120" r="3" fill="#D7D8DB"/>
+                <text x="366" y="128" fill="#D7D8DB" font-family="JetBrains Mono" font-size="8" font-weight="700">YOU</text>
+              </g>
+            </svg>
+            <div class="legend" style="justify-content:space-between;">
+              <span class="item">active routes · 7</span>
+              <span class="item">avg hop latency · 24ms</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Detail side -->
+        <div class="panel" style="flex:1;">
+          <div class="panel__hd">
+            <span>SELECTED · yandex-moscow-a</span>
+            <div class="right">
+              <span class="pill">L1</span>
+              <span class="pill" style="color:var(--ok);border-color:var(--ok-border)">● healthy</span>
+            </div>
+          </div>
+          <div class="detail">
+            <div class="kv-grid">
+              <span class="l">Provider</span><span class="v">Yandex Cloud</span>
+              <span class="l">Region</span><span class="v">ru-central1-a</span>
+              <span class="l">IP</span><span class="v a">84.201.146.12</span>
+              <span class="l">ASN</span><span class="v">AS200350 · YANDEXCLOUD</span>
+              <span class="l">Whitelist</span><span class="v" style="color:var(--ok)">Минцифры · confirmed</span>
+              <span class="l">Role</span><span class="v">Relay (L1)</span>
+              <span class="l">Transport</span><span class="v">XTLS-Vision · REALITY</span>
+              <span class="l">Peers</span><span class="v">→ timeweb-ams-01 · ruvds-ala-kz · serverspace-ala</span>
+              <span class="l">Key rot.</span><span class="v">6h · next 19:42</span>
+              <span class="l">Cost</span><span class="v">₽ 520 / mo</span>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="btn">SSH console</button>
+              <button class="btn">Rotate keys</button>
+              <button class="btn">Restart</button>
+              <button class="btn" style="color:var(--error); border-color:rgba(235,87,87,0.3)">Drain node</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // ----- sparklines -----
+    function spark(el, kind) {
+      const n = 32;
+      const bars = [];
+      for (let i = 0; i < n; i++) {
+        let h;
+        if (kind === 'err')       h = i > n - 4 ? 2 : 4 + Math.random() * 8;
+        else if (kind === 'l1w')  h = 6 + Math.random() * 10 + (i > n-6 ? 6 : 0);
+        else                       h = 6 + Math.random() * 14;
+        bars.push(h);
+      }
+      el.innerHTML = bars.map(h => `<span style="height:${h}px"></span>`).join('');
+    }
+    document.querySelectorAll('.spark').forEach(el => spark(el, el.dataset.spark));
+
+    // ----- live logs -----
+    const LOG = document.getElementById('logs');
+    const samples = [
+      {tag:'OK',  msg:'handshake <span class="l1">yandex-moscow-a</span> → <span class="k">timeweb-ams-01</span> · rtt 42ms'},
+      {tag:'OK',  msg:'key rotation complete · node <span class="k">selectel-spb-01</span> · next in 6h'},
+      {tag:'WARN',msg:'packet loss 0.4% on <span class="l1">vk-cloud-msk</span> · throttling L2 assignments'},
+      {tag:'OK',  msg:'obfuscation probe passed · XTLS-Vision OK on 6/6 L2'},
+      {tag:'OK',  msg:'mesh sync · 12 nodes · ok <span class="m">(delta=0)</span>'},
+      {tag:'ERR', msg:'node <span class="k">vdsina-ams-02</span> unreachable · failover to <span class="k">timeweb-ams-01</span>'},
+      {tag:'OK',  msg:'traffic shaping applied · policy <span class="m">default</span> · 842Mbit/s cap'},
+      {tag:'OK',  msg:'client <span class="m">mobile-ios-2a..</span> connected via <span class="l1">yandex-moscow-b</span>'},
+      {tag:'WARN',msg:'whitelist drift detected on <span class="l1">vk-cloud-msk</span> · recheck queued'},
+      {tag:'OK',  msg:'deep-packet probe from ru-msk-edge · <span class="m">marked as corp TLS</span>'},
+    ];
+    function pad(n){ return n < 10 ? '0'+n : ''+n; }
+    function ts() {
+      const d = new Date();
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+    function pushLog(s) {
+      const div = document.createElement('div');
+      div.className = 'log-row';
+      div.innerHTML = `<span class="t">${ts()}</span><span class="tag ${s.tag.toLowerCase()}">${s.tag}</span><span class="msg">${s.msg}</span>`;
+      LOG.prepend(div);
+      while (LOG.childElementCount > 40) LOG.lastChild.remove();
+    }
+    // seed with a batch
+    for (let i = 0; i < 14; i++) pushLog(samples[Math.floor(Math.random()*samples.length)]);
+    setInterval(() => pushLog(samples[Math.floor(Math.random()*samples.length)]), 2200);
+  </script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Palette · Surfaces</title>
+<style>
+.grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.sw {
+  aspect-ratio: 2 / 1;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-2);
+}
+.sw .n { color: var(--fg-0); font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+.sw .h { letter-spacing: 0; }
+</style></head>
+<body>
+<div class="card stack">
+  <div class="eyebrow">Surface ladder · 5 steps · dark-only</div>
+  <div class="grid">
+    <div class="sw" style="background:#08090B"><span class="n">bg-0</span><span class="h">#08090B</span></div>
+    <div class="sw" style="background:#0E0E11"><span class="n">bg</span><span class="h">#0E0E11</span></div>
+    <div class="sw" style="background:#14151A"><span class="n">surface</span><span class="h">#14151A</span></div>
+    <div class="sw" style="background:#1C1D23"><span class="n">raised</span><span class="h">#1C1D23</span></div>
+    <div class="sw" style="background:#23252C"><span class="n">hover</span><span class="h">#23252C</span></div>
+  </div>
+</div>
+</body></html>

@@ -1,0 +1,31 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Components · Badges</title>
+<style>
+.row7 { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.b { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; padding: 4px 10px; border-radius: 4px; display: inline-flex; align-items: center; gap: 6px; }
+.b.l1 { color: #6DB8F5; background: rgba(109,184,245,0.15); border: 1px solid rgba(109,184,245,0.3); }
+.b.l2 { color: #FBB26A; background: rgba(251,178,106,0.12); border: 1px solid rgba(251,178,106,0.3); }
+.b.ok { color: #5CB87A; background: rgba(92,184,122,0.1); border: 1px solid rgba(92,184,122,0.28); }
+.b.warn { color: #E8A838; background: rgba(232,168,56,0.1); border: 1px solid rgba(232,168,56,0.28); }
+.b.err { color: #EB5757; background: rgba(235,87,87,0.1); border: 1px solid rgba(235,87,87,0.28); }
+.b.mute { color: #878B91; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); }
+.dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+.pill { border-radius: 999px; padding: 4px 12px; }
+</style></head>
+<body>
+<div class="card stack">
+  <div class="eyebrow">Badges · Layer · Status · Payment</div>
+  <div class="row7">
+    <span class="b l1">L1 RELAY</span>
+    <span class="b l2">L2 EXIT</span>
+    <span class="b ok"><span class="dot"></span>ONLINE</span>
+    <span class="b warn">UNSTABLE</span>
+    <span class="b err">OFFLINE</span>
+    <span class="b mute">Рубли · Мир · USDT</span>
+    <span class="b l2 pill">Двухузловая маршрутизация</span>
+  </div>
+</div>
+</body></html>

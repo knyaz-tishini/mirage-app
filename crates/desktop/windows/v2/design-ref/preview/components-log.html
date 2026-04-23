@@ -1,0 +1,25 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Components · Log stream</title>
+<style>
+.log { background: #0A0B0D; border: 1px solid rgba(255,255,255,0.06); border-radius: 6px; padding: 12px 14px; font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.6; color: #878B91; }
+.t { color: #555860; }
+.ok { color: #5CB87A; }
+.a { color: #FBB26A; }
+.l1 { color: #6DB8F5; }
+.w { color: #E8A838; }
+</style></head>
+<body>
+<div class="card stack">
+  <div class="eyebrow">Log row · timestamps · colour-coded tags</div>
+  <div class="log">
+<div><span class="t">[14:02:17.182]</span> <span class="ok">OK</span>   handshake <span class="l1">l1-msk-01</span> → <span class="a">l2-ams-03</span>  rtt=18ms</div>
+<div><span class="t">[14:02:17.201]</span> <span class="ok">OK</span>   wireguard peer established  184.82.x.x:51820</div>
+<div><span class="t">[14:02:17.409]</span> <span class="w">WARN</span> obfs4 bridge latency p95=142ms  (target &lt;120)</div>
+<div><span class="t">[14:02:18.003]</span> <span class="ok">OK</span>   tunnel up  <span class="a">mirage0</span>  mtu=1420  keepalive=25s</div>
+<div><span class="t">[14:02:19.551]</span> <span class="ok">OK</span>   dns via l2  1.1.1.1  dot  verified</div>
+  </div>
+</div>
+</body></html>

@@ -1,26 +1,24 @@
 [workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/desktop/windows/v1",
+    "crates/desktop/windows/v2",
+    # "crates/mobile",  # cdylib — skip on Windows build
+]
 
-[package]
-name = "mirage2app"
-version = "0.1.7"
+[workspace.package]
+version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "mirage2app"
-path = "src/main.rs"
-
-[dependencies]
-mirage-core = { path = "../mirage2web/crates/mirage-core" }
-mirage-mesh = { path = "../mirage2web/crates/mirage-mesh" }
-uzor = { path = "../uzor/uzor" }
-uzor-desktop = { path = "../uzor/uzor-desktop" }
-uzor-backend-tiny-skia = { path = "../uzor/uzor-backend-tiny-skia" }
-softbuffer = "0.4"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
+[workspace.dependencies]
+tokio          = { version = "1", features = ["full"] }
+tokio-util     = { version = "0.7", features = ["codec"] }
+tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-open = "5"
-arboard = "3"
-reqwest = { version = "0.12", features = ["json"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+clap           = { version = "4", features = ["derive"] }
+thiserror      = "2"
+mirage-core    = { path = "../mirage2web/crates/mirage-core" }
+mirage-protocol = { path = "../mirage2web/crates/mirage-protocol" }

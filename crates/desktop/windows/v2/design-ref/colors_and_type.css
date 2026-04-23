@@ -1,0 +1,304 @@
+/* ============================================================
+   Mirage — Design Tokens
+   ops / infrastructure-brutalism direction
+   Dark-first. Amber accent. Mono-first for data, grotesk for display.
+   ============================================================ */
+
+/* ---------- Self-hosted fonts ---------- */
+@font-face {
+  font-family: 'PT Root UI';
+  src: url('fonts/PTRootUI-VF.ttf') format('truetype-variations'),
+       url('fonts/PTRootUI-VF.ttf') format('truetype');
+  font-weight: 300 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('fonts/JetBrainsMono-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('fonts/JetBrainsMono-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Roboto';
+  src: url('fonts/Roboto-Regular.ttf') format('truetype');
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Roboto';
+  src: url('fonts/Roboto-Bold.ttf') format('truetype');
+  font-weight: 700; font-style: normal; font-display: swap;
+}
+
+/* Space Grotesk for display — closest Google-Fonts match we need.
+   We link it from Google Fonts in each HTML surface; flagged as a substitution. */
+
+:root {
+  /* ---------- Surface ladder ---------- */
+  --bg-0:            #08090B;   /* deepest — page ground */
+  --bg:              #0E0E11;   /* default page */
+  --surface:         #14151A;   /* panels, cards */
+  --surface-raised:  #1C1D23;   /* raised / hovered card */
+  --surface-hover:   #23252C;   /* active / pressed surface */
+  --surface-inset:   #0A0B0D;   /* inset wells (code, logs) */
+
+  /* ---------- Text ---------- */
+  --fg-0:            #F4F4F5;   /* maximum contrast — large display */
+  --fg-1:            #D7D8DB;   /* primary body */
+  --fg-2:            #878B91;   /* muted / labels */
+  --fg-3:            #555860;   /* decor, timestamps, rulers */
+  --fg-on-accent:    #1A1400;   /* text on amber */
+
+  /* ---------- Accent — amber (unchanged brand) ---------- */
+  --accent:          #FBB26A;
+  --accent-hover:    #F9A04E;
+  --accent-dim:      rgba(251, 178, 106, 0.12);
+  --accent-wash:     rgba(251, 178, 106, 0.06);
+  --accent-glow:     rgba(251, 178, 106, 0.25);
+  --accent-border:   rgba(251, 178, 106, 0.30);
+
+  /* ---------- Layer-coded blue (L1 relay only) ---------- */
+  --l1:              #6DB8F5;
+  --l1-dim:          rgba(109, 184, 245, 0.15);
+  --l1-border:       rgba(109, 184, 245, 0.30);
+
+  /* ---------- Status ---------- */
+  --ok:              #5CB87A;
+  --ok-dim:          rgba(92, 184, 122, 0.10);
+  --ok-border:       rgba(92, 184, 122, 0.28);
+
+  --warn:            #E8A838;
+  --warn-dim:        rgba(232, 168, 56, 0.10);
+
+  --error:           #EB5757;
+  --error-dim:       rgba(235, 87, 87, 0.10);
+
+  /* ---------- Borders / rulers ---------- */
+  --border:          rgba(255, 255, 255, 0.06);   /* hairline */
+  --border-strong:   rgba(255, 255, 255, 0.12);
+  --border-accent:   rgba(251, 178, 106, 0.30);
+
+  /* ---------- Decorative fills ---------- */
+  --chip:            rgba(255, 255, 255, 0.04);
+  --overlay-soft:    rgba(14, 14, 17, 0.85);
+
+  /* ---------- Background textures ---------- */
+  /* dot grid — very low contrast, 24px cell */
+  --grid-dot: radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px);
+  --grid-size: 24px 24px;
+  /* line grid — hair rulers, for section backs */
+  --grid-line:
+    linear-gradient(to right,  rgba(255,255,255,0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,0.035) 1px, transparent 1px);
+
+  /* ---------- Shadows (rare, glowy, not material) ---------- */
+  --shadow-card:     0 2px 12px rgba(0, 0, 0, 0.30);
+  --shadow-overlay:  0 8px 40px rgba(0, 0, 0, 0.55);
+  --shadow-glow:     0 0 24px rgba(251, 178, 106, 0.25);
+  --shadow-glow-sm:  0 0 12px rgba(251, 178, 106, 0.18);
+  --shadow-featured: 0 0 40px rgba(251, 178, 106, 0.08);
+  --shadow-inset:    inset 0 0 0 1px rgba(255,255,255,0.03);
+
+  /* ---------- Radii ---------- */
+  --radius-xs:       4px;    /* chips, ticks */
+  --radius-sm:       6px;    /* buttons, fields, badges */
+  --radius:          8px;    /* cards (tighter than before — more brutalist) */
+  --radius-lg:       12px;   /* hero frame, panels */
+  --radius-pill:     999px;
+
+  /* ---------- Typography ---------- */
+  /* Display — geometric grotesk with character.
+     Space Grotesk is our CDN pick; PT Root UI is the self-hosted fallback. */
+  --font-display:    'Space Grotesk', 'PT Root UI', 'Inter', system-ui, sans-serif;
+  /* UI sans — PT Root UI (self-hosted) */
+  --font-sans:       'PT Root UI', 'Inter', system-ui, -apple-system, sans-serif;
+  /* Mono — first-class for numbers, logs, code, badges, labels */
+  --font-mono:       'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  /* Body fallback */
+  --font-body:       'Roboto', system-ui, sans-serif;
+
+  /* Fluid scale */
+  --text-hero:       clamp(56px, 9vw, 120px);   /* massive hero */
+  --text-display:    clamp(40px, 6vw, 72px);
+  --text-h1:         clamp(28px, 4vw, 42px);
+  --text-h2:         24px;
+  --text-h3:         19px;
+  --text-h4:         16px;
+  --text-body-lg:    17px;
+  --text-body:       15px;    /* tighter default — dev-tool density */
+  --text-sm:         13px;
+  --text-xs:         12px;
+  --text-micro:      11px;    /* ALL-CAPS labels */
+
+  --weight-regular:  400;
+  --weight-medium:   500;
+  --weight-semibold: 600;
+  --weight-bold:     700;
+
+  --tracking-tight:  -0.02em;
+  --tracking-normal: 0;
+  --tracking-wide:   0.04em;
+  --tracking-wider:  0.08em;
+  --tracking-mono:   -0.01em;   /* tighten mono slightly for display */
+
+  --lh-tight:        1.05;
+  --lh-snug:         1.25;
+  --lh-normal:       1.5;
+  --lh-loose:        1.65;
+
+  /* ---------- Spacing (4-pt → 8-pt grid) ---------- */
+  --space-0:   2px;
+  --space-1:   4px;
+  --space-2:   8px;
+  --space-3:   12px;
+  --space-4:   16px;
+  --space-5:   20px;
+  --space-6:   24px;
+  --space-8:   32px;
+  --space-10:  40px;
+  --space-12:  48px;
+  --space-14:  56px;
+  --space-16:  64px;
+  --space-20:  80px;
+  --space-24:  96px;
+  --space-32:  128px;
+
+  /* ---------- Layout ---------- */
+  --container:       1280px;   /* wider — dev-tool density */
+  --container-tight: 1160px;
+  --header-h:        56px;     /* tighter than before */
+  --transition:      120ms ease;
+  --transition-slow: 240ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ============================================================
+   Base element defaults
+   ============================================================ */
+
+html, body {
+  background: var(--bg);
+  color: var(--fg-1);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: var(--lh-normal);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Display — grotesk, tight tracking */
+.ds-hero,
+h1.hero-title {
+  font-family: var(--font-display);
+  font-size: var(--text-hero);
+  font-weight: 500;              /* Space Grotesk reads heavy at 500 */
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--lh-tight);
+  color: var(--fg-0);
+}
+
+.ds-display, h1 {
+  font-family: var(--font-display);
+  font-size: var(--text-display);
+  font-weight: 500;
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--lh-tight);
+  color: var(--fg-0);
+}
+
+h1.ds-h1, .ds-h1 {
+  font-family: var(--font-display);
+  font-size: var(--text-h1);
+  font-weight: 500;
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--lh-snug);
+  color: var(--fg-0);
+}
+
+h2, .ds-h2 {
+  font-family: var(--font-sans);
+  font-size: var(--text-h2);
+  font-weight: 700;
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-0);
+}
+
+h3, .ds-h3 {
+  font-family: var(--font-sans);
+  font-size: var(--text-h3);
+  font-weight: 700;
+  color: var(--fg-1);
+}
+
+p, .ds-p {
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  font-weight: 400;
+  line-height: var(--lh-loose);
+  color: var(--fg-1);
+}
+
+.ds-lead {
+  font-size: var(--text-body-lg);
+  color: var(--fg-2);
+  line-height: var(--lh-loose);
+}
+
+.ds-muted { color: var(--fg-2); }
+.ds-decor { color: var(--fg-3); }
+.ds-accent { color: var(--accent); }
+
+/* Mono — first-class, not just "code" */
+code, kbd, pre, .ds-mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  letter-spacing: var(--tracking-mono);
+}
+
+/* Big monospace numerals — latency, throughput, uptime */
+.ds-stat {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum', 'zero';
+  letter-spacing: var(--tracking-mono);
+  color: var(--fg-0);
+  line-height: 1;
+}
+
+.ds-stat--xl { font-size: clamp(40px, 6vw, 72px); }
+.ds-stat--lg { font-size: 32px; }
+.ds-stat--md { font-size: 22px; }
+
+/* Eyebrow — ALL CAPS, mono, small */
+.ds-eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  color: var(--accent);
+}
+
+.ds-eyebrow--muted { color: var(--fg-2); }
+
+/* Key/value label used throughout the UI kit */
+.ds-kv-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--fg-2);
+}
+.ds-kv-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--fg-1);
+}

@@ -1,0 +1,34 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Components · Provider card</title>
+<style>
+.card2 { background: #14151A; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.h { display: flex; justify-content: space-between; align-items: flex-start; }
+.name { font-family: 'PT Root UI', sans-serif; font-size: 17px; font-weight: 700; color: #F4F4F5; }
+.price { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700; color: #FBB26A; background: rgba(251,178,106,0.12); border: 1px solid rgba(251,178,106,0.3); border-radius: 4px; padding: 3px 8px; }
+.desc { font-family: 'PT Root UI', sans-serif; font-size: 13px; color: #878B91; line-height: 1.55; }
+.tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.tag { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #878B91; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; padding: 2px 8px; }
+.footer { display: flex; justify-content: space-between; align-items: center; margin-top: 4px; }
+.badge { font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; padding: 3px 8px; border-radius: 4px; color: #6DB8F5; background: rgba(109,184,245,0.15); border: 1px solid rgba(109,184,245,0.3); }
+.link { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #FBB26A; text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid rgba(251,178,106,0.3); padding: 4px 10px; border-radius: 4px; }
+</style></head>
+<body>
+<div class="card stack">
+  <div class="eyebrow">Provider card · L1 relay · tags + price chip + layer badge</div>
+  <div class="card2">
+    <div class="h">
+      <span class="name">Selectel</span>
+      <span class="price">от 300 ₽/мес</span>
+    </div>
+    <p class="desc">Крупнейший независимый российский облачный провайдер. Партнёр ViPNet Coordinator — IP в белых списках ТСПУ.</p>
+    <div class="tags"><span class="tag">Москва</span><span class="tag">СПб</span><span class="tag">Ленобласть</span></div>
+    <div class="footer">
+      <span class="badge">L1 Relay · РФ</span>
+      <span class="link">→ Перейти</span>
+    </div>
+  </div>
+</div>
+</body></html>

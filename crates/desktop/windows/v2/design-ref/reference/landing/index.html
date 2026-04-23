@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mirage — Конфигурация частных сетей с обфускацией трафика</title>
+  <meta name="description" content="Выберите VPS-серверы, мы настроим безопасную частную сеть с двухузловой маршрутизацией и маскировкой трафика" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=PT+Sans:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/style.css?v=0.2.0" />
+</head>
+<body>
+
+  <!-- ===== HEADER / NAV ===== -->
+  <header class="header" id="header">
+    <div class="container header__inner">
+      <a href="#" class="logo">
+        <svg class="logo__icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M12 2L3 7v10l9 5 9-5V7L12 2Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          <path d="M12 2v20M3 7l9 5 9-5" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+        </svg>
+        <span class="logo__text">Mirage</span>
+      </a>
+      <nav class="nav" id="nav">
+        <a href="#providers" class="nav__link">Провайдеры</a>
+        <a href="#how-it-works" class="nav__link">Как это работает</a>
+      </nav>
+      <button class="burger" id="burger" aria-label="Открыть меню" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===== HERO ===== -->
+  <section class="hero" id="home">
+    <div class="container hero__inner">
+      <div class="hero__content">
+        <div class="hero__badge">Двухузловая маршрутизация</div>
+        <h1 class="hero__title">Mirage</h1>
+        <p class="hero__subtitle">Конфигурация частной mesh-сети с обфускацией трафика</p>
+        <p class="hero__description">
+          Выберите VPS-серверы, мы настроим вашу частную сеть с двухузловой маршрутизацией
+          и маскировкой трафика. Никакого централизованного провайдера — только ваши серверы.
+        </p>
+        <div class="hero__actions">
+          <a href="#" class="btn btn--accent">Скачать клиент</a>
+          <a href="#providers" class="btn btn--outline">Выбрать провайдеров</a>
+        </div>
+      </div>
+      <div class="hero__visual" aria-hidden="true">
+        <div class="network-diagram">
+          <div class="node node--user">
+            <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="3.5" stroke="currentColor" stroke-width="1.8"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            <span>Вы</span>
+          </div>
+          <div class="node-line"></div>
+          <div class="node node--l1">
+            <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.8"/><circle cx="7.5" cy="12" r="1.5" fill="currentColor"/><path d="M11 12h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            <span>L1 Relay</span>
+          </div>
+          <div class="node-line"></div>
+          <div class="node node--l2">
+            <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20" stroke="currentColor" stroke-width="1.8"/></svg>
+            <span>L2 Exit</span>
+          </div>
+          <div class="node-line"></div>
+          <div class="node node--dest">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" stroke="currentColor" stroke-width="1.8"/></svg>
+            <span>Интернет</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== HOW IT WORKS ===== -->
+  <section class="section how-it-works" id="how-it-works">
+    <div class="container">
+      <h2 class="section__title">Как это работает</h2>
+      <p class="section__subtitle">Три шага до собственной приватной инфраструктуры</p>
+      <div class="steps">
+        <div class="step-card">
+          <div class="step-card__number">01</div>
+          <div class="step-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="3" y="3" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.8"/>
+              <rect x="13" y="3" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.8"/>
+              <rect x="3" y="13" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.8"/>
+              <rect x="13" y="13" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.8"/>
+            </svg>
+          </div>
+          <h3 class="step-card__title">Выберите VPS</h3>
+          <p class="step-card__text">
+            Выберите провайдера L1 (relay) и L2 (exit) из нашего агрегатора.
+            L1 — промежуточный узел для обфускации, L2 — выходной узел в нужной юрисдикции.
+          </p>
+        </div>
+        <div class="step-connector" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="step-card">
+          <div class="step-card__number">02</div>
+          <div class="step-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2L2 7l10 5 10-5-10-5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+              <path d="M2 17l10 5 10-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M2 12l10 5 10-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h3 class="step-card__title">Мы настроим</h3>
+          <p class="step-card__text">
+            Предоставьте доступ к серверам, мы развернём защищённую конфигурацию
+            с WireGuard, двухузловой маршрутизацией и обфускацией трафика.
+          </p>
+        </div>
+        <div class="step-connector" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="step-card">
+          <div class="step-card__number">03</div>
+          <div class="step-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+              <path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h3 class="step-card__title">Подключайтесь</h3>
+          <p class="step-card__text">
+            Используйте клиент Mirage для безопасного подключения через двухузловую сеть.
+            Ваш трафик защищён на каждом участке маршрута.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== VPS AGGREGATOR ===== -->
+  <section class="section providers" id="providers">
+    <div class="container">
+      <h2 class="section__title">Провайдеры VPS</h2>
+      <p class="section__subtitle">Выберите подходящие серверы для вашей инфраструктуры</p>
+
+      <div class="tabs">
+        <button class="tab-btn tab-btn--active" data-tab="l1" id="tab-l1">
+          <span class="tab-badge tab-badge--l1">L1</span>
+          Relay — промежуточные узлы
+        </button>
+        <button class="tab-btn" data-tab="l2" id="tab-l2">
+          <span class="tab-badge tab-badge--l2">L2</span>
+          Exit — выходные узлы
+        </button>
+      </div>
+
+      <div class="tab-panel" id="panel-l1">
+        <p class="tab-panel__hint">
+          <strong>L1 Relay</strong> — промежуточные серверы. Выбирайте по географии и цене.
+          Главное: низкая задержка, широкое покрытие, разрешённый шифрованный трафик.
+        </p>
+        <div class="providers-grid" id="providers-l1">
+          <!-- Заполняется из JS -->
+          <div class="providers-loading">Загрузка провайдеров...</div>
+        </div>
+      </div>
+
+      <div class="tab-panel tab-panel--hidden" id="panel-l2">
+        <p class="tab-panel__hint">
+          <strong>L2 Exit</strong> — выходные серверы. Выбирайте по юрисдикции и политике конфиденциальности.
+          Главное: офшорная юрисдикция, разрешённый Tor и приватный трафик, отсутствие логирования.
+        </p>
+        <div class="providers-grid" id="providers-l2">
+          <!-- Заполняется из JS -->
+          <div class="providers-loading">Загрузка провайдеров...</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="footer">
+    <div class="container footer__inner">
+      <div class="footer__brand">
+        <a href="#" class="logo">
+          <svg class="logo__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 2L3 7v10l9 5 9-5V7L12 2Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M12 2v20M3 7l9 5 9-5" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          </svg>
+          <span class="logo__text">Mirage</span>
+        </a>
+        <p class="footer__tagline">Мы не продаём VPS. Мы настраиваем вашу инфраструктуру.</p>
+      </div>
+      <nav class="footer__nav">
+        <a href="https://github.com" target="_blank" rel="noopener noreferrer" class="footer__link">GitHub</a>
+        <a href="https://t.me" target="_blank" rel="noopener noreferrer" class="footer__link">Telegram</a>
+        <a href="#" class="footer__link">Политика конфиденциальности</a>
+      </nav>
+      <p class="footer__copy">Mirage &copy; 2025</p>
+    </div>
+  </footer>
+
+  <script src="js/app.js?v=0.2.0"></script>
+</body>
+</html>

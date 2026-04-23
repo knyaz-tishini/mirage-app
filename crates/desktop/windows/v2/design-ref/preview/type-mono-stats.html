@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Type · Mono + stats</title>
+<style>
+.grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+.stat { display: flex; flex-direction: column; gap: 4px; padding: 12px; background: #14151A; border: 1px solid rgba(255,255,255,0.06); border-radius: 6px; }
+.stat .label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #878B91; text-transform: uppercase; letter-spacing: 0.08em; }
+.stat .v { font-family: 'JetBrains Mono', monospace; font-size: 24px; font-weight: 700; color: #F4F4F5; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+.stat .v.amber { color: #FBB26A; }
+.stat .d { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #555860; }
+</style></head>
+<body>
+<div class="card stack">
+  <div class="eyebrow">Mono · JetBrains · tabular-nums · data-first</div>
+  <div class="grid">
+    <div class="stat"><span class="label">latency</span><span class="v">18ms</span><span class="d">p50 · 24h</span></div>
+    <div class="stat"><span class="label">uptime</span><span class="v amber">99.98%</span><span class="d">30d</span></div>
+    <div class="stat"><span class="label">throughput</span><span class="v">842<span style="color:#555860">Mbps</span></span><span class="d">peak 1.2G</span></div>
+    <div class="stat"><span class="label">nodes</span><span class="v">2/2</span><span class="d">L1 · L2</span></div>
+  </div>
+</div>
+</body></html>

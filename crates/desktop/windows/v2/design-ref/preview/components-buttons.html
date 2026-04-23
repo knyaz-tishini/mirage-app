@@ -1,0 +1,40 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Components · Buttons</title>
+<style>
+.row6 { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 18px;
+  border-radius: 6px;
+  font-family: 'PT Root UI', sans-serif;
+  font-size: 13px; font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  border: 1.5px solid transparent;
+  transition: all 120ms ease;
+}
+.btn.primary { background: #FBB26A; color: #1A1400; }
+.btn.primary:hover { background: #F9A04E; box-shadow: 0 0 24px rgba(251,178,106,0.25); }
+.btn.outline { background: transparent; color: #D7D8DB; border-color: rgba(255,255,255,0.12); }
+.btn.outline:hover { color: #FBB26A; border-color: #FBB26A; }
+.btn.ghost { background: transparent; color: #878B91; border: 0; padding: 9px 12px; }
+.btn.ghost:hover { color: #D7D8DB; background: rgba(255,255,255,0.04); }
+.btn.mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 8px 14px; letter-spacing: 0.04em; text-transform: uppercase; }
+.btn.mono.primary { background: #FBB26A; color: #1A1400; }
+.btn.mono.outline { background: #14151A; color: #D7D8DB; border-color: rgba(255,255,255,0.08); }
+</style></head>
+<body>
+<div class="card stack">
+  <div class="eyebrow">Buttons · primary amber · outline · ghost · mono variant</div>
+  <div class="row6">
+    <button class="btn primary">Скачать клиент</button>
+    <button class="btn outline">Выбрать провайдеров</button>
+    <button class="btn ghost">Пропустить</button>
+    <button class="btn mono primary">DEPLOY →</button>
+    <button class="btn mono outline">mirage --connect</button>
+  </div>
+</div>
+</body></html>

@@ -1,0 +1,28 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Brand · Icons</title>
+<style>
+.icons { display: grid; grid-template-columns: repeat(10, 1fr); gap: 8px; }
+.i { aspect-ratio: 1; border: 1px solid rgba(255,255,255,0.06); border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #D7D8DB; background: #14151A; }
+.i svg { width: 20px; height: 20px; }
+</style></head>
+<body>
+<div class="card stack">
+  <div class="eyebrow">Icons · currentColor · 1.8 stroke · rounded caps · 24 viewBox</div>
+  <div class="icons" id="grid"></div>
+</div>
+<script>
+const names = ['node-user','node-l1','node-l2','node-internet','grid','stack','shield-check','arrow-right','activity','server','terminal','settings','globe','zap','lock','download','menu','search','filter','copy'];
+const grid = document.getElementById('grid');
+(async () => {
+  for (const n of names) {
+    const r = await fetch(`../assets/icons/${n}.svg`);
+    const t = await r.text();
+    const d = document.createElement('div'); d.className='i'; d.innerHTML = t;
+    grid.appendChild(d);
+  }
+})();
+</script>
+</body></html>
