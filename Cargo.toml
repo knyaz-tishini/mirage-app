@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/client-core",
     "crates/cli",
-    "crates/desktop/windows/v1",
     "crates/desktop/windows/v2",
     # "crates/mobile",  # cdylib — skip on Windows build
 ]
@@ -12,13 +12,21 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
-tokio          = { version = "1", features = ["full"] }
-tokio-util     = { version = "0.7", features = ["codec"] }
-tracing        = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde          = { version = "1", features = ["derive"] }
-serde_json     = "1"
-clap           = { version = "4", features = ["derive"] }
-thiserror      = "2"
-mirage-core    = { path = "../mirage2web/crates/mirage-core" }
-mirage-protocol = { path = "../mirage2web/crates/mirage-protocol" }
+tokio               = { version = "1", features = ["full"] }
+tokio-util          = { version = "0.7", features = ["codec", "rt"] }
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+serde               = { version = "1", features = ["derive"] }
+serde_json          = "1"
+clap                = { version = "4", features = ["derive"] }
+thiserror           = "2"
+futures             = "0.3"
+rand                = "0.8"
+bytes               = "1"
+arc-swap            = "1"
+axum                = "0.8"
+reqwest             = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
+mirage-core         = { path = "../mirage2web/crates/mirage-core" }
+mirage-protocol     = { path = "../mirage2web/crates/mirage-protocol" }
+mirage-mux          = { path = "../mirage2web/crates/mirage-mux" }
+mirage-client-core  = { path = "crates/client-core" }

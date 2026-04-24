@@ -1851,25 +1851,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "is-docker"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
-dependencies = [
- "once_cell",
-]
-
-[[package]]
-name = "is-wsl"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
-dependencies = [
- "is-docker",
- "once_cell",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2144,6 +2125,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirage-client-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "libloading",
+ "mirage-client-core",
+ "mirage-core",
+ "mirage-protocol",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.59.0",
+ "winres",
+]
+
+[[package]]
 name = "mirage-client-core"
 version = "0.1.0"
 dependencies = [
@@ -2164,26 +2165,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "mirage-client-desktop"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "clap",
- "libloading",
- "mirage-client-core",
- "mirage-core",
- "mirage-protocol",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.59.0",
- "winres",
 ]
 
 [[package]]
@@ -2244,25 +2225,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "x25519-dalek",
-]
-
-[[package]]
-name = "mirage2app"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "mirage-core",
- "open",
- "reqwest",
- "serde",
- "serde_json",
- "softbuffer",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uzor",
- "uzor-backend-tiny-skia",
- "uzor-desktop",
 ]
 
 [[package]]
@@ -2716,17 +2678,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "open"
-version = "5.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f3bab717c29a857abf75fcef718d441ec7cb2725f937343c734740a985d37fd"
-dependencies = [
- "is-wsl",
- "libc",
- "pathdiff",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2837,12 +2788,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pem"
@@ -4373,7 +4318,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uzor"
-version = "1.0.43"
+version = "1.1.0"
 dependencies = [
  "ahash 0.8.12",
  "bitflags 2.11.1",
@@ -4391,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-backend-tiny-skia"
-version = "1.0.43"
+version = "1.1.0"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -4400,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-desktop"
-version = "1.0.43"
+version = "1.1.0"
 dependencies = [
  "arboard",
  "dark-light",

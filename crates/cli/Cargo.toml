@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 mirage-core        = { workspace = true }
 mirage-protocol    = { workspace = true }
-mirage-client-core = { path = "../../../mirage2web/crates/mirage-client-core" }
+mirage-client-core = { workspace = true }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }
 tracing            = { workspace = true }
