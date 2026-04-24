@@ -254,6 +254,15 @@ async fn main() -> Result<(), BoxError> {
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");
 
+        // Health watcher: auto-switch active chain when monitor marks it unhealthy.
+        let health_rx = link.subscribe();
+        let rt_for_health = Arc::clone(&runtime);
+        tokio::spawn(mirage_client_core::health_watcher::run_health_watcher(
+            rt_for_health,
+            health_rx,
+        ));
+        info!("health watcher spawned");
+
         // TUN bridge: when tun_api_url is configured, forward every config
         // update to the TUN chain registry automatically.
         if let Some(ref tun_api_url) = config.tun_api_url {

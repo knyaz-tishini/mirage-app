@@ -150,24 +150,22 @@ async fn lease_with_failover(
 ) -> Result<crate::pool::TunnelLease, MirageError> {
     match primary.lease().await {
         Ok(lease) => return Ok(lease),
-        Err(MirageError::PoolExhausted) => {
-            // Primary exhausted — try failover chains in priority order.
+        Err(e) => {
+            warn!(error = %e, "primary pool lease failed, trying failover");
         }
-        Err(e) => return Err(e),
     }
 
     for (chain_id, pool) in failover {
-        warn!(chain = %chain_id, "primary pool exhausted, failing over");
+        warn!(chain = %chain_id, "failing over to chain");
         match pool.lease().await {
             Ok(lease) => {
                 info!(chain = %chain_id, "failover: using chain");
                 return Ok(lease);
             }
-            Err(MirageError::PoolExhausted) => {
-                warn!(chain = %chain_id, "failover chain also exhausted");
+            Err(e) => {
+                warn!(chain = %chain_id, error = %e, "failover chain also failed");
                 continue;
             }
-            Err(e) => return Err(e),
         }
     }
 

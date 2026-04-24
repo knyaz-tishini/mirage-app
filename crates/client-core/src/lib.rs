@@ -1,3 +1,4 @@
+pub mod health_watcher;
 pub mod log_capture;
 pub mod monitor_link;
 pub mod tun_bridge;
