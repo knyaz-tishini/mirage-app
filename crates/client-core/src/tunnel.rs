@@ -51,7 +51,19 @@ pub async fn establish_raw_tunnel(
             "establishing onion tunnel"
         );
 
-        let tunnel = OnionTunnel::connect(chain, destination, &[]).await?;
+        const ONION_TIMEOUT: Duration = Duration::from_secs(15);
+        let tunnel = tokio::time::timeout(
+            ONION_TIMEOUT,
+            OnionTunnel::connect(chain, destination, &[]),
+        )
+        .await
+        .map_err(|_| {
+            MirageError::NodeUnreachable(format!(
+                "chain {}: onion connect timed out after {}s",
+                chain.chain_id,
+                ONION_TIMEOUT.as_secs()
+            ))
+        })??;
         return Ok(Box::new(tunnel));
     }
 

@@ -22,6 +22,7 @@
 //! `recv_buf` and are used on the next call.  No framing desync can occur.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mirage_core::{
@@ -90,9 +91,13 @@ impl OnionTunnel {
         let (onion_bytes, session) =
             build_onion_ephemeral(&chain.hops, &destination, initial_user_data)?;
 
-        let mut stream = TcpStream::connect(hop0_addr)
-            .await
-            .map_err(MirageError::Io)?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(hop0_addr),
+        )
+        .await
+        .map_err(|_| MirageError::NodeUnreachable(format!("connect to {} timed out", hop0_addr)))?
+        .map_err(MirageError::Io)?;
         let len = (onion_bytes.len() as u32).to_be_bytes();
         stream.write_all(&len).await.map_err(MirageError::Io)?;
         stream
@@ -145,9 +150,13 @@ impl OnionTunnel {
             "onion telescopic: connecting to entry hop"
         );
 
-        let mut stream = TcpStream::connect(hop0_addr)
-            .await
-            .map_err(MirageError::Io)?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(hop0_addr),
+        )
+        .await
+        .map_err(|_| MirageError::NodeUnreachable(format!("connect to {} timed out", hop0_addr)))?
+        .map_err(MirageError::Io)?;
 
         let mut builder = TelescopicBuilder::new(&chain.hops);
 
