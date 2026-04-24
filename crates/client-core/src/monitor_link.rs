@@ -5,6 +5,7 @@
 //! pushes updates through a [`tokio::sync::watch`] channel so the runtime can
 //! react without polling.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,29 @@ pub struct MonitorConfig {
     pub version: u64,
     /// Chains advertised by the monitor.
     pub chains: Vec<MonitorChain>,
+    /// Optional traffic policy pushed by the monitor.
+    pub policy: Option<MonitorPolicy>,
+    /// Optional camouflage parameters pushed by the monitor.
+    pub camouflage: Option<HashMap<String, String>>,
+    /// Optional traffic shaping parameters pushed by the monitor.
+    pub shaping: Option<HashMap<String, String>>,
+}
+
+/// Traffic policy received from the monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorPolicy {
+    pub rules: Vec<MonitorPolicyRule>,
+    pub default_action: String,
+}
+
+/// A single rule within a [`MonitorPolicy`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorPolicyRule {
+    #[serde(rename = "type")]
+    pub rule_type: String,
+    #[serde(flatten)]
+    pub params: serde_json::Value,
+    pub action: String,
 }
 
 /// A single chain entry from the monitor config response.
@@ -41,6 +65,12 @@ struct ConfigResponse {
     chains: Vec<ChainEntry>,
     #[serde(default = "default_poll_interval")]
     monitor_poll_interval_secs: u64,
+    #[serde(default)]
+    policy: Option<MonitorPolicy>,
+    #[serde(default)]
+    camouflage: Option<HashMap<String, String>>,
+    #[serde(default)]
+    shaping: Option<HashMap<String, String>>,
 }
 
 fn default_poll_interval() -> u64 {
@@ -214,6 +244,9 @@ impl MonitorLink {
                                     healthy: c.healthy,
                                 })
                                 .collect(),
+                            policy: cfg.policy,
+                            camouflage: cfg.camouflage,
+                            shaping: cfg.shaping,
                         };
                         // Ignore send error — if all receivers dropped, we're shutting down.
                         let _ = self.config_tx.send(Some(monitor_cfg));

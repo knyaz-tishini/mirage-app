@@ -14,7 +14,8 @@ use crate::monitor_link::MonitorConfig;
 use crate::runtime::ClientRuntime;
 
 /// Watch the monitor config channel and auto-switch the active chain whenever
-/// the current chain is reported unhealthy.
+/// the current chain is reported unhealthy.  When `tun_api_url` is provided,
+/// also pushes any policy update from the monitor to the TUN daemon.
 ///
 /// # Behaviour
 ///
@@ -24,12 +25,22 @@ use crate::runtime::ClientRuntime;
 ///    the first healthy one found.
 /// 4. If no healthy chain exists, logs an error but keeps the current chain
 ///    (degraded mode is better than no chain at all).
-/// 5. Returns when the sender half of the watch channel is dropped (i.e. the
+/// 5. When `tun_api_url` is set and the config version changed and a policy is
+///    present, POSTs the policy to `{tun_api_url}/policy/set`.
+/// 6. Returns when the sender half of the watch channel is dropped (i.e. the
 ///    monitor link is shutting down).
 pub async fn run_health_watcher(
     runtime: Arc<ClientRuntime>,
     mut config_rx: watch::Receiver<Option<MonitorConfig>>,
+    tun_api_url: Option<String>,
 ) {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let mut last_policy_version: u64 = 0;
+
     loop {
         // Block until there is a new config version to inspect.
         if config_rx.changed().await.is_err() {
@@ -55,35 +66,61 @@ pub async fn run_health_watcher(
             .map(|c| c.healthy)
             .unwrap_or(false); // unknown chain → treat as unhealthy
 
-        if active_healthy {
-            // Nothing to do.
-            continue;
+        if !active_healthy {
+            warn!(chain = %active_id, "health_watcher: active chain is unhealthy, searching for replacement");
+
+            // Find the first healthy chain whose pool is actually present in the runtime.
+            let pools_snapshot = runtime.pool_snapshot();
+            let candidate = cfg
+                .chains
+                .iter()
+                .find(|c| c.healthy && pools_snapshot.contains_key(&c.name));
+
+            match candidate {
+                Some(chain) => {
+                    info!(
+                        from = %active_id,
+                        to   = %chain.name,
+                        "health_watcher: switching active chain"
+                    );
+                    runtime.active_chain_id.store(Arc::new(chain.name.clone()));
+                }
+                None => {
+                    error!(
+                        chain = %active_id,
+                        "health_watcher: no healthy chain available, keeping current (degraded mode)"
+                    );
+                }
+            }
         }
 
-        warn!(chain = %active_id, "health_watcher: active chain is unhealthy, searching for replacement");
-
-        // Find the first healthy chain whose pool is actually present in the runtime.
-        let pools_snapshot = runtime.pool_snapshot();
-        let candidate = cfg
-            .chains
-            .iter()
-            .find(|c| c.healthy && pools_snapshot.contains_key(&c.name));
-
-        match candidate {
-            Some(chain) => {
-                info!(
-                    from = %active_id,
-                    to   = %chain.name,
-                    "health_watcher: switching active chain"
-                );
-                runtime.active_chain_id.store(Arc::new(chain.name.clone()));
+        // Apply policy to TUN if provided by monitor and version changed.
+        if cfg.version != last_policy_version {
+            if let (Some(ref policy), Some(ref tun_url)) = (&cfg.policy, &tun_api_url) {
+                let url = format!("{}/policy/set", tun_url);
+                let body = serde_json::json!({
+                    "rules": policy.rules,
+                    "default_action": policy.default_action,
+                });
+                match http
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        info!("health_watcher: pushed policy to TUN");
+                    }
+                    Ok(resp) => {
+                        warn!(status = %resp.status(), "health_watcher: TUN policy push failed");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "health_watcher: TUN policy push error");
+                    }
+                }
             }
-            None => {
-                error!(
-                    chain = %active_id,
-                    "health_watcher: no healthy chain available, keeping current (degraded mode)"
-                );
-            }
+            last_policy_version = cfg.version;
         }
     }
 }
