@@ -106,14 +106,21 @@ async fn main() -> Result<(), BoxError> {
         return Err("no chains configured".into());
     }
 
-    let default_chain = all_chains[0].clone();
-    let default_chain_id = default_chain.chain_id.clone();
+    let explicit_default: Option<String> = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("routing")?.get("default_chain")?.as_str().map(String::from));
+    let default_chain_id = explicit_default
+        .unwrap_or_else(|| all_chains[0].chain_id.clone());
+    let default_chain = (*all_chains.iter()
+        .find(|c| c.chain_id == default_chain_id)
+        .unwrap_or(&all_chains[0]))
+        .clone();
 
     let pool_cfg_base = config.pool.clone();
     let use_mux = config.use_mux;
 
-    // Build one TunnelPool per chain.
-    let mut pools: HashMap<String, Arc<TunnelPool>> = HashMap::new();
+    // Build one TunnelPool per chain — all in parallel so a dead node doesn't block others.
+    let mut pool_tasks = tokio::task::JoinSet::new();
     for chain in &all_chains {
         let pool_cfg = if use_mux {
             let mut cfg = pool_cfg_base.clone();
@@ -131,15 +138,29 @@ async fn main() -> Result<(), BoxError> {
             "creating tunnel pool for chain"
         );
 
-        let pool = TunnelPool::new(
-            (*chain).clone(),
-            Arc::clone(&chain_protocols),
-            pool_cfg,
-        )
-        .await
-        .map_err(|e| format!("tunnel pool init failed for chain '{}': {e}", chain.chain_id))?;
+        let chain_owned = (*chain).clone();
+        let protocols = Arc::clone(&chain_protocols);
+        pool_tasks.spawn(async move {
+            let id = chain_owned.chain_id.clone();
+            match TunnelPool::new(chain_owned, protocols, pool_cfg).await {
+                Ok(pool) => Some((id, pool)),
+                Err(e) => {
+                    tracing::warn!(chain = %id, "pool init failed, skipping: {e}");
+                    None
+                }
+            }
+        });
+    }
 
-        pools.insert(chain.chain_id.clone(), pool);
+    let mut pools: HashMap<String, Arc<TunnelPool>> = HashMap::new();
+    while let Some(result) = pool_tasks.join_next().await {
+        if let Ok(Some((id, pool))) = result {
+            pools.insert(id, pool);
+        }
+    }
+
+    if pools.is_empty() {
+        return Err("all tunnel pools failed to initialize".into());
     }
 
     // Default pool (highest-priority chain).

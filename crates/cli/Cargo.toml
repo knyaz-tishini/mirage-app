@@ -1,10 +1,10 @@
 [package]
-name = "mirage-client-desktop"
+name = "mirage-client-cli"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "mirage-client"
+name = "mirage-client-cli"
 path = "src/main.rs"
 
 [dependencies]
