@@ -25,4 +25,22 @@ curl -x socks5h://127.0.0.1:19486 http://ifconfig.me   # three-hop-telescopic
 curl -x http://127.0.0.1:19481 http://ifconfig.me       # HTTP CONNECT proxy
 ```
 
-All should return `45.59.119.139` (L2-CH-TEST exit IP).
+Classic chains (19480, 19482, 19483) return `45.59.119.139` (L2-CH-TEST IPv4).
+Onion chains (19484, 19486) return `2602:fa59:11:616::1` (L2-CH-TEST IPv6, different exit path).
+
+## Port map
+
+| Port | Chain | Protocol |
+|------|-------|----------|
+| 19480 | byte-cipher-classic (default) | MirageTls |
+| 19481 | HTTP CONNECT proxy | — |
+| 19482 | classic-direct | Mirage (transparent L1) |
+| 19483 | crypto-relay-classic | Mirage (crypto L1) |
+| 19484 | three-hop-onion | Mirage (3-hop ephemeral) |
+| 19486 | three-hop-telescopic | Mirage (3-hop Tor-style) |
+
+## Config
+
+Client config: `../mirage2tun/client-config.json`
+
+Per-chain SOCKS5 port set via `chains[].socks5_bind`. Default chain gets `--bind` (19480).
