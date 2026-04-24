@@ -1,5 +1,11 @@
 # CHANGELOG — mirage2app
 
+## Стабильный: e3c4b18 (24 апр 2026)
+
+`docs: README — port map, expected IPs, config reference`
+
+5 чейнов работают через CLI + TUN. socks5_fail=0. Протестировано E2E.
+
 ## Коммиты
 
 1. **b4072f0** — chore: bump to v0.1.1
@@ -12,12 +18,15 @@
 8. **b7eda52** — feat: client VPS connect + hidden admin panel (v0.1.7)
 9. **309051d** — refactor: restructure mirage2app as unified client workspace
 10. **5267e62** — fix(cli): parallel pool init + correct default_chain + rename to mirage-client-cli
-11. **(uncommitted)** (24 апр) — mirage-client-core перенесён из mirage2web в mirage2app/crates/client-core
+11. **49c9971** (24 апр) — mirage-client-core перенесён из mirage2web, v1 GUI → _deprecated
+12. **860de1a** (24 апр) — fix(onion): connect timeouts 10s TCP + 15s full handshake (ephemeral + telescopic)
+13. **e3c4b18** (24 апр) — docs: README — port map, expected IPs, config reference
 
 ---
 
 ## Что сделано
 
 - **GUI клиент** — v1 (Windows desktop), v2 (mirage2light), Amnezia-style навигация, connect screen, admin panel
-- **CLI клиент** — mirage-client-cli, parallel pool init, default_chain
+- **CLI клиент** — mirage-client-cli, parallel pool init, default_chain, per-chain SOCKS5 listeners
+- **Onion timeouts** — TcpStream::connect 10s timeout + OnionTunnel::connect 15s outer timeout. Предотвращает зависание CLI при недоступных hop нодах
 - **Workspace restructure** — mirage-client-core перенесён из mirage2web. mirage2app теперь владеет всеми клиентскими крейтами (cli + client-core + GUI)
