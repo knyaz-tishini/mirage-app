@@ -59,12 +59,14 @@ pub async fn run_health_watcher(
         let active_id: &str = active_id.as_ref();
 
         // Find the health status of the active chain in the received config.
+        // Treat "monitor doesn't know this chain" as healthy — chain inventory
+        // is owned by client-config.json, monitor only annotates known chains.
         let active_healthy = cfg
             .chains
             .iter()
             .find(|c| c.name == active_id)
             .map(|c| c.healthy)
-            .unwrap_or(false); // unknown chain → treat as unhealthy
+            .unwrap_or(true);
 
         if !active_healthy {
             warn!(chain = %active_id, "health_watcher: active chain is unhealthy, searching for replacement");

@@ -297,17 +297,20 @@ async fn main() -> Result<(), BoxError> {
                 // Load current pools snapshot for diffing.
                 let current = rt_for_watcher.pool_snapshot();
 
-                let mut new_map: HashMap<String, Arc<TunnelPool>> = HashMap::new();
+                // Start from current pools — monitor can ADD new chains but
+                // never removes locally-configured ones (monitor advertises
+                // node-level health via `healthy` flag; chain inventory is
+                // owned by client-config.json).
+                let mut new_map: HashMap<String, Arc<TunnelPool>> = (*current).clone();
                 let mut added: Vec<String> = Vec::new();
-                let mut kept: Vec<String> = Vec::new();
+                let kept: Vec<String> = current.keys().cloned().collect();
 
                 for monitor_chain in &cfg.chains {
                     let chain_id = &monitor_chain.name;
 
-                    if let Some(existing_pool) = current.get(chain_id) {
-                        // Chain unchanged — reuse existing pool.
-                        new_map.insert(chain_id.clone(), Arc::clone(existing_pool));
-                        kept.push(chain_id.clone());
+                    if current.contains_key(chain_id) {
+                        // Already exists — keep the live pool, healthy flag
+                        // is consumed by health_watcher separately.
                     } else {
                         // New chain — build a ChainConfig from monitor data.
                         let pool_cfg = if use_mux_for_watcher {
@@ -373,20 +376,13 @@ async fn main() -> Result<(), BoxError> {
                     }
                 }
 
-                let removed: Vec<String> = current
-                    .keys()
-                    .filter(|id| !new_map.contains_key(*id))
-                    .cloned()
-                    .collect();
-
-                if added.is_empty() && removed.is_empty() {
+                if added.is_empty() {
                     tracing::debug!(version = cfg.version, "pool hot-swap: no changes");
                     continue;
                 }
 
                 tracing::info!(
                     added = ?added,
-                    removed = ?removed,
                     kept = ?kept,
                     "pool hot-swap"
                 );
