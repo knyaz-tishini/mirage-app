@@ -1,26 +1,25 @@
 //! mirage-chain-worker — single-chain SOCKS5 worker process.
 //!
 //! Receives IPC commands from supervisor over stdin/stdout (JSON-line framing).
-//! Binds a SOCKS5 listener with SO_REUSEPORT (or SO_REUSEADDR on Windows).
-//! Spawns a stub connection handler per accepted connection.
+//! Loads a ChainConfig from the config file, builds a TunnelPool, and runs
+//! a Socks5Server for the assigned chain.
 
-mod chain_stub;
+use std::{net::SocketAddr, sync::Arc};
 
-use chain_stub::ChainStub;
+use anyhow::Context;
 use mirage_chain_ipc::{SupervisorMsg, WorkerMsg, WorkerState, read_msg, write_msg};
-use socket2::{Domain, Protocol, Socket, Type};
-use std::{
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
-    },
+use mirage_client_core::{
+    endpoint_protocol::EndpointProtocol,
+    pool::TunnelPool,
+    socks5::Socks5Server,
 };
-use tokio::{
-    io::{BufReader, BufWriter},
-    net::TcpListener,
-    sync::mpsc,
+use mirage_core::config::{ClientConfig, TcpProtocolId};
+use mirage_protocol::{
+    aliases::{mirage_base, mirage_tls},
+    negotiation::ProtocolChain,
+    traits::TcpProtocol,
 };
+use tokio::io::{BufReader, BufWriter};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -74,15 +73,46 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    info!(config_path = %config_path, "using config path (stub — not loaded)");
-
-    let addr: SocketAddr = socks5_bind.parse().map_err(|e| {
-        anyhow::anyhow!("invalid socks5_bind address '{}': {}", socks5_bind, e)
+    let addr: SocketAddr = socks5_bind.parse().with_context(|| {
+        format!("invalid socks5_bind address '{socks5_bind}'")
     })?;
 
-    let listener = bind_reuseport(addr)?;
-    let listener = TcpListener::from_std(listener)?;
+    // Load and parse config.
+    let raw = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("read config {config_path}"))?;
+    let client_config: ClientConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("parse config {config_path}"))?;
 
+    // Find the chain this worker is responsible for.
+    let chain = client_config
+        .chains
+        .iter()
+        .find(|c| c.chain_id == chain_id)
+        .ok_or_else(|| anyhow::anyhow!("chain '{}' not found in config", chain_id))?
+        .clone();
+
+    // Build protocol chain (mirrors cli/src/main.rs).
+    let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
+    protocols.push(Box::new(EndpointProtocol::new(
+        mirage_base(),
+        TcpProtocolId::Mirage,
+    )));
+    if client_config.psk.is_some() {
+        protocols.push(Box::new(EndpointProtocol::new(
+            mirage_tls("cloudflare.com", vec!["h2".into(), "http/1.1".into()]),
+            TcpProtocolId::MirageShadowTls,
+        )));
+    }
+    let chain_protocols = Arc::new(ProtocolChain::new(protocols));
+
+    // Build tunnel pool.
+    let pool_cfg = client_config.pool.clone();
+    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
+    // TunnelPool::new already returns Arc<TunnelPool>.
+
+    // Announce readiness.
     let pid = std::process::id();
     write_msg(
         &mut writer,
@@ -94,41 +124,13 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     info!(chain_id = %chain_id, pid, "sent Ready");
 
-    let active = Arc::new(AtomicU32::new(0));
-    let total = Arc::new(AtomicU64::new(0));
-    let chain = Arc::new(ChainStub::new(chain_id.clone()));
-
-    // Shutdown signal for accept loop.
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    let accept_active = active.clone();
-    let accept_total = total.clone();
-    let accept_chain = chain.clone();
-    let accept_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _)) => {
-                            accept_active.fetch_add(1, Ordering::Relaxed);
-                            accept_total.fetch_add(1, Ordering::Relaxed);
-                            let c = accept_chain.clone();
-                            let active_ref = accept_active.clone();
-                            tokio::spawn(async move {
-                                c.handle_connection(stream).await;
-                                active_ref.fetch_sub(1, Ordering::Relaxed);
-                            });
-                        }
-                        Err(e) => {
-                            info!("accept error (likely closed): {e}");
-                            break;
-                        }
-                    }
-                }
+    // Spawn SOCKS5 server.
+    let server = Socks5Server::new(addr);
+    let server_handle = tokio::spawn({
+        let pool = Arc::clone(&pool);
+        async move {
+            if let Err(e) = server.run_simple(pool).await {
+                tracing::error!(error = %e, "SOCKS5 server exited with error");
             }
         }
     });
@@ -140,30 +142,29 @@ async fn main() -> anyhow::Result<()> {
         match read_msg::<_, SupervisorMsg>(&mut reader).await? {
             None => {
                 warn!("stdin closed — shutting down");
-                let _ = shutdown_tx.send(()).await;
+                server_handle.abort();
                 break;
             }
             Some(SupervisorMsg::Drain { timeout_secs }) => {
                 info!(timeout_secs, "received Drain");
                 drain_timeout_secs = timeout_secs;
-                let _ = shutdown_tx.send(()).await;
+                server_handle.abort();
                 break;
             }
             Some(SupervisorMsg::Shutdown) => {
                 info!("received Shutdown — exiting immediately");
-                let _ = shutdown_tx.send(()).await;
-                accept_handle.await.ok();
+                server_handle.abort();
                 return Ok(());
             }
             Some(SupervisorMsg::Ping) => {
-                let snap_active = active.load(Ordering::Relaxed);
-                let snap_total = total.load(Ordering::Relaxed);
+                let stats = pool.pool_stats().await;
+                let active_connections = stats.leased as u32;
                 write_msg(
                     &mut writer,
                     &WorkerMsg::Status {
                         chain_id: chain_id.clone(),
-                        active_connections: snap_active,
-                        total_connections: snap_total,
+                        active_connections,
+                        total_connections: 0,
                         state: WorkerState::Ready,
                     },
                 )
@@ -175,28 +176,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    accept_handle.await.ok();
-
-    // Drain phase: wait for active connections to reach zero or timeout.
+    // Drain phase: wait for leased tunnels to reach zero or timeout.
     let drain_deadline = tokio::time::Instant::now()
         + tokio::time::Duration::from_secs(drain_timeout_secs);
 
     loop {
-        let snap = active.load(Ordering::Relaxed);
+        let stats = pool.pool_stats().await;
+        let active = stats.leased as u32;
         write_msg(
             &mut writer,
             &WorkerMsg::Draining {
                 chain_id: chain_id.clone(),
-                active_connections: snap,
+                active_connections: active,
             },
         )
         .await?;
 
-        if snap == 0 {
+        if active == 0 {
             break;
         }
         if tokio::time::Instant::now() >= drain_deadline {
-            warn!(active = snap, "drain timeout reached — forcing exit");
+            warn!(active, "drain timeout reached — forcing exit");
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -211,20 +211,4 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     info!(chain_id = %chain_id, "drained — exiting");
     Ok(())
-}
-
-/// Bind a TCP listener with SO_REUSEPORT (Linux) or SO_REUSEADDR (Windows).
-fn bind_reuseport(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    #[cfg(unix)]
-    sock.set_reuse_port(true)?;
-    sock.set_reuse_address(true)?;
-    sock.bind(&addr.into())?;
-    sock.listen(1024)?;
-    Ok(sock.into())
 }
