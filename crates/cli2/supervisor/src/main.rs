@@ -6,6 +6,7 @@
 mod config;
 mod ota_poller;
 mod rollout;
+mod tun_registry;
 mod worker_handle;
 
 use std::collections::HashMap;
@@ -18,7 +19,8 @@ use config::Config;
 use mirage_chain_ipc::WorkerMsg;
 use ota_poller::{UpdateAvailable, spawn_ota_poller};
 use rollout::{download_new_binary, rolling_update, shutdown_all};
-use worker_handle::WorkerHandle;
+use tun_registry::push_tun_registry;
+use worker_handle::{HandleState, WorkerHandle};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("all workers ready");
 
+    // Push chain → SOCKS5 mapping to the local TUN process.
+    push_tun_registry(&config).await;
+
     // OTA poller channel.
     let (ota_tx, mut ota_rx) = mpsc::channel::<UpdateAvailable>(4);
     let current_version = mirage_chain_ota::current_version().to_string();
@@ -73,9 +78,6 @@ async fn main() -> anyhow::Result<()> {
         ota_tx,
     );
 
-    // Build merged IPC event channel.
-    // Each WorkerHandle has its own rx; we poll them in the main loop.
-
     // Shutdown signal.
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -86,6 +88,73 @@ async fn main() -> anyhow::Result<()> {
             while let Ok(event) = handle.rx.try_recv() {
                 handle.apply_msg(&event.msg);
                 log_worker_event(chain_id, &event.msg);
+            }
+        }
+
+        // Detect dead workers and respawn unless the death was intentional or
+        // the chain has hit the restart rate limit.
+        let chain_configs: Vec<_> = config.chains.clone();
+        let mut to_respawn: Vec<String> = Vec::new();
+
+        for (chain_id, handle) in handles.iter_mut() {
+            if handle.state == HandleState::Exited {
+                continue;
+            }
+            if let Some(code) = handle.try_wait() {
+                if handle.intentional_restart {
+                    // Rolling update / graceful drain — do not respawn here.
+                    info!(chain_id = %chain_id, "worker exited intentionally — skip respawn");
+                    handle.intentional_restart = false;
+                    continue;
+                }
+                warn!(
+                    chain_id = %chain_id,
+                    code = ?code,
+                    "worker died unexpectedly"
+                );
+                to_respawn.push(chain_id.clone());
+            }
+        }
+
+        for chain_id in to_respawn {
+            let Some(chain_cfg) = chain_configs.iter().find(|c| c.id == chain_id) else {
+                continue;
+            };
+
+            // Move tracker out of old handle so we preserve restart history.
+            let old_tracker = handles
+                .remove(&chain_id)
+                .map(|h| h.restart_tracker)
+                .unwrap_or_default();
+
+            let mut tracker = old_tracker;
+            if !tracker.record() {
+                error!(
+                    chain_id = %chain_id,
+                    total = tracker.total,
+                    "worker hit restart limit — will not respawn"
+                );
+                // Re-insert a dead placeholder so the map still has the entry.
+                // We cannot insert a live handle, so we skip; the chain is gone.
+                continue;
+            }
+
+            info!(
+                chain_id = %chain_id,
+                restart_count = tracker.total,
+                "respawning worker"
+            );
+
+            match WorkerHandle::spawn_with_tracker(&binary_path, chain_cfg, tracker) {
+                Err(e) => {
+                    error!(chain_id = %chain_id, "respawn failed: {e:#}");
+                }
+                Ok(mut new_handle) => {
+                    if let Err(e) = new_handle.send_start(chain_cfg).await {
+                        error!(chain_id = %chain_id, "send_start after respawn failed: {e:#}");
+                    }
+                    handles.insert(chain_id, new_handle);
+                }
             }
         }
 
@@ -108,6 +177,10 @@ async fn main() -> anyhow::Result<()> {
                                 error!("OTA download failed: {e:#}");
                             }
                             Ok(new_binary) => {
+                                // Mark all handles as intentional so respawn watchdog is quiet.
+                                for handle in handles.values_mut() {
+                                    handle.intentional_restart = true;
+                                }
                                 if let Err(e) = rolling_update(
                                     &mut handles,
                                     &config.chains,
@@ -116,6 +189,39 @@ async fn main() -> anyhow::Result<()> {
                                 .await
                                 {
                                     error!("rolling update failed: {e:#}");
+                                } else {
+                                    // Re-push TUN registry after successful rollout.
+                                    push_tun_registry(&config).await;
+
+                                    // Self-update: if the new binary is the supervisor itself,
+                                    // spawn it and exit. Workers survive because they are in
+                                    // their own process group and will see stdin EOF → graceful
+                                    // shutdown.
+                                    //
+                                    // TODO(v2): switch worker IPC to named pipes / Unix sockets
+                                    // so workers can truly survive supervisor replacement.
+                                    let self_path = std::env::current_exe()
+                                        .unwrap_or_else(|_| new_binary.clone());
+                                    if new_binary == self_path
+                                        || new_binary.file_name() == self_path.file_name()
+                                    {
+                                        info!(
+                                            new_binary = ?new_binary,
+                                            "supervisor binary updated — handing off to new process"
+                                        );
+                                        match std::process::Command::new(&new_binary)
+                                            .args(std::env::args().skip(1))
+                                            .spawn()
+                                        {
+                                            Ok(_) => {
+                                                info!("new supervisor spawned — exiting");
+                                                std::process::exit(0);
+                                            }
+                                            Err(e) => {
+                                                error!("failed to spawn new supervisor: {e}");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -123,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Yield briefly so the try_recv loop can drain events.
+            // Yield briefly so the try_recv / try_wait loop can drain events.
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
         }
     }
@@ -134,8 +240,6 @@ async fn main() -> anyhow::Result<()> {
 
 /// Wait until every worker handle has transitioned to Ready.
 async fn wait_all_ready(handles: &mut HashMap<String, WorkerHandle>) {
-    use worker_handle::HandleState;
-
     let timeout = tokio::time::Duration::from_secs(60);
     let deadline = tokio::time::Instant::now() + timeout;
 

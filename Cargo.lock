@@ -2206,6 +2206,7 @@ dependencies = [
  "anyhow",
  "mirage-chain-ipc",
  "mirage-chain-ota",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

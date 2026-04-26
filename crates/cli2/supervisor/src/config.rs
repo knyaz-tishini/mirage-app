@@ -15,6 +15,10 @@ pub struct Config {
     pub ota_poll_interval_secs: u64,
     /// Path to the worker binary (relative or absolute).
     pub worker_binary: String,
+    /// Base URL of the local TUN process for chain registry pushes.
+    /// If unset or unreachable, supervisor logs a warning and continues.
+    #[serde(default)]
+    pub tun_api_url: Option<String>,
     /// Chain definitions.
     pub chains: Vec<ChainConfig>,
 }

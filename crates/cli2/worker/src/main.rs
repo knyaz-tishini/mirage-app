@@ -124,6 +124,17 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     info!(chain_id = %chain_id, pid, "sent Ready");
 
+    // Write PID file so a restarted supervisor can detect live workers.
+    let pid_file = pid_file_path(&chain_id);
+    if let Some(dir) = pid_file.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("could not create PID dir {:?}: {e}", dir);
+        }
+    }
+    if let Err(e) = std::fs::write(&pid_file, pid.to_string()) {
+        warn!("could not write PID file {:?}: {e}", pid_file);
+    }
+
     // Spawn SOCKS5 server.
     let server = Socks5Server::new(addr);
     let server_handle = tokio::spawn({
@@ -210,5 +221,20 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     info!(chain_id = %chain_id, "drained — exiting");
+
+    // Remove PID file on clean exit.
+    let pid_file = pid_file_path(&chain_id);
+    if let Err(e) = std::fs::remove_file(&pid_file) {
+        // Not fatal — file may not exist if write failed earlier.
+        warn!("could not remove PID file {:?}: {e}", pid_file);
+    }
+
     Ok(())
+}
+
+/// Returns `${TEMP}/mirage-cli2/{chain_id}.pid`.
+fn pid_file_path(chain_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("mirage-cli2")
+        .join(format!("{chain_id}.pid"))
 }
