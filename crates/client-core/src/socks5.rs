@@ -140,6 +140,107 @@ impl Socks5Server {
             });
         }
     }
+
+    /// Run the SOCKS5 server with the simplest possible setup:
+    /// every CONNECT goes through `pool` via the chain, no routing rules,
+    /// no mux pool, no failover.
+    ///
+    /// Used by single-chain workers (mirage2split) where each worker process
+    /// owns exactly one chain and one bind address.
+    pub async fn run_simple(&self, pool: Arc<TunnelPool>) -> Result<(), MirageError> {
+        let listener = TcpListener::bind(self.bind_addr).await?;
+        info!(addr = %self.bind_addr, "SOCKS5 server (simple) listening");
+
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            debug!(%peer, "new SOCKS5 connection (simple)");
+            let pool = Arc::clone(&pool);
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_socks5_simple(stream, pool).await {
+                    error!(%peer, "connection error: {e}");
+                }
+            });
+        }
+    }
+}
+
+/// Handle a single SOCKS5 connection — always route via the chain pool.
+/// No routing decision, no failover, no mux.
+async fn handle_socks5_simple(
+    mut stream: TcpStream,
+    pool: Arc<TunnelPool>,
+) -> Result<(), MirageError> {
+    // ── 1. SOCKS5 greeting ───────────────────────────────────────────────────
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await?;
+    if header[0] != SOCKS5_VERSION {
+        return Err(MirageError::Protocol(format!(
+            "expected SOCKS5 version 5, got {}",
+            header[0]
+        )));
+    }
+    let n_methods = header[1] as usize;
+    if n_methods == 0 {
+        return Err(MirageError::Protocol("SOCKS5 greeting: zero methods".into()));
+    }
+    let mut methods = vec![0u8; n_methods];
+    stream.read_exact(&mut methods).await?;
+    stream.write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE]).await?;
+
+    // ── 2. SOCKS5 request ────────────────────────────────────────────────────
+    let mut req_header = [0u8; 4];
+    stream.read_exact(&mut req_header).await?;
+    if req_header[0] != SOCKS5_VERSION {
+        return Err(MirageError::Protocol("SOCKS5 request: bad version".into()));
+    }
+    let cmd = req_header[1];
+    let atyp = req_header[3];
+
+    match cmd {
+        SOCKS5_CMD_CONNECT => {
+            let dest = parse_destination(&mut stream, atyp).await?;
+            let target_addr = dest.to_addr_string();
+            debug!(target = %target_addr, "routing decision: chain (simple)");
+
+            let mut lease = pool.lease().await?;
+            let send_result = if lease.is_onion {
+                let target_bytes = target_addr.as_bytes();
+                let len_prefix = (target_bytes.len() as u16).to_be_bytes();
+                let mut framed = Vec::with_capacity(2 + target_bytes.len());
+                framed.extend_from_slice(&len_prefix);
+                framed.extend_from_slice(target_bytes);
+                lease.send(&framed).await
+            } else {
+                lease.send(target_addr.as_bytes()).await
+            };
+            if let Err(e) = send_result {
+                lease.poison();
+                return Err(e);
+            }
+
+            send_socks5_success(&mut stream).await?;
+
+            lease.set_relay_active(true);
+            let tunnel = lease.take_tunnel().ok_or(MirageError::TunnelClosed)?;
+            let mut compat = TunnelCompat::wrap(tunnel);
+            let result = relay_loop(&mut stream, &mut compat).await;
+            lease.poison();
+            result
+        }
+        SOCKS5_CMD_UDP_ASSOCIATE => {
+            send_socks5_error(&mut stream, SOCKS5_REP_CMD_NOT_SUPPORTED).await;
+            Err(MirageError::Protocol(
+                "SOCKS5 UDP ASSOCIATE not supported in simple mode".into(),
+            ))
+        }
+        _ => {
+            send_socks5_error(&mut stream, SOCKS5_REP_CMD_NOT_SUPPORTED).await;
+            Err(MirageError::Protocol(format!(
+                "SOCKS5 unsupported command: 0x{cmd:02x}"
+            )))
+        }
+    }
 }
 
 /// Lease a tunnel from the primary pool, falling over to other chains when
@@ -246,44 +347,11 @@ async fn handle_socks5_connection(
     match cmd {
         SOCKS5_CMD_CONNECT => {
             // ── 3. Parse destination address ──────────────────────────────────────
-            let dest = match atyp {
-                SOCKS5_ATYP_IPV4 => {
-                    let mut addr_buf = [0u8; 4];
-                    stream.read_exact(&mut addr_buf).await?;
-                    let mut port_buf = [0u8; 2];
-                    stream.read_exact(&mut port_buf).await?;
-                    let port = u16::from_be_bytes(port_buf);
-                    let ip = std::net::Ipv4Addr::from(addr_buf);
-                    Destination::Ip(SocketAddr::from((ip, port)))
-                }
-                SOCKS5_ATYP_DOMAIN => {
-                    let mut len_buf = [0u8; 1];
-                    stream.read_exact(&mut len_buf).await?;
-                    let domain_len = len_buf[0] as usize;
-                    let mut domain_buf = vec![0u8; domain_len];
-                    stream.read_exact(&mut domain_buf).await?;
-                    let domain = String::from_utf8(domain_buf).map_err(|_| {
-                        MirageError::Protocol("SOCKS5 domain is not valid UTF-8".into())
-                    })?;
-                    let mut port_buf = [0u8; 2];
-                    stream.read_exact(&mut port_buf).await?;
-                    let port = u16::from_be_bytes(port_buf);
-                    Destination::Domain(domain, port)
-                }
-                SOCKS5_ATYP_IPV6 => {
-                    let mut addr_buf = [0u8; 16];
-                    stream.read_exact(&mut addr_buf).await?;
-                    let mut port_buf = [0u8; 2];
-                    stream.read_exact(&mut port_buf).await?;
-                    let port = u16::from_be_bytes(port_buf);
-                    let ip = std::net::Ipv6Addr::from(addr_buf);
-                    Destination::Ip(SocketAddr::from((ip, port)))
-                }
-                _ => {
+            let dest = match parse_destination(&mut stream, atyp).await {
+                Ok(d) => d,
+                Err(e) => {
                     send_socks5_error(&mut stream, SOCKS5_REP_ATYP_NOT_SUPPORTED).await;
-                    return Err(MirageError::Protocol(format!(
-                        "SOCKS5 unsupported atyp: 0x{atyp:02x}"
-                    )));
+                    return Err(e);
                 }
             };
 
@@ -495,6 +563,49 @@ async fn handle_transparent_connection(
     }
 
     Ok(())
+}
+
+/// Parse the SOCKS5 destination address from `stream` given `atyp`.
+///
+/// Reads the address and port fields according to RFC 1928 §5.
+/// Returns a [`Destination`] on success.
+async fn parse_destination(stream: &mut TcpStream, atyp: u8) -> Result<Destination, MirageError> {
+    match atyp {
+        SOCKS5_ATYP_IPV4 => {
+            let mut addr_buf = [0u8; 4];
+            stream.read_exact(&mut addr_buf).await?;
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            let port = u16::from_be_bytes(port_buf);
+            let ip = std::net::Ipv4Addr::from(addr_buf);
+            Ok(Destination::Ip(SocketAddr::from((ip, port))))
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            let mut len_buf = [0u8; 1];
+            stream.read_exact(&mut len_buf).await?;
+            let domain_len = len_buf[0] as usize;
+            let mut domain_buf = vec![0u8; domain_len];
+            stream.read_exact(&mut domain_buf).await?;
+            let domain = String::from_utf8(domain_buf).map_err(|_| {
+                MirageError::Protocol("SOCKS5 domain is not valid UTF-8".into())
+            })?;
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            Ok(Destination::Domain(domain, u16::from_be_bytes(port_buf)))
+        }
+        SOCKS5_ATYP_IPV6 => {
+            let mut addr_buf = [0u8; 16];
+            stream.read_exact(&mut addr_buf).await?;
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            let port = u16::from_be_bytes(port_buf);
+            let ip = std::net::Ipv6Addr::from(addr_buf);
+            Ok(Destination::Ip(SocketAddr::from((ip, port))))
+        }
+        _ => Err(MirageError::Protocol(format!(
+            "SOCKS5 unsupported atyp: 0x{atyp:02x}"
+        ))),
+    }
 }
 
 /// Send a SOCKS5 error reply (best-effort — errors are ignored).
