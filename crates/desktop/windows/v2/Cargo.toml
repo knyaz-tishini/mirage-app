@@ -10,8 +10,8 @@ path = "src/main.rs"
 [dependencies]
 mirage-core            = { path = "../../../../../mirage2web/crates/mirage-core" }
 uzor                   = { path = "../../../../../uzor/uzor" }
-uzor-desktop           = { path = "../../../../../uzor/uzor-desktop" }
-uzor-backend-tiny-skia = { path = "../../../../../uzor/uzor-backend-tiny-skia" }
+uzor-window-desktop    = { path = "../../../../../uzor/uzor-window-desktop" }
+uzor-render-tiny-skia = { path = "../../../../../uzor/uzor-render-tiny-skia" }
 softbuffer             = "0.4"
 tokio                  = { workspace = true }
 serde                  = { workspace = true }

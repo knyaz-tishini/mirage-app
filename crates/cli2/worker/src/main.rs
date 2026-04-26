@@ -106,7 +106,15 @@ async fn main() -> anyhow::Result<()> {
     let chain_protocols = Arc::new(ProtocolChain::new(protocols));
 
     // Build tunnel pool.
-    let pool_cfg = client_config.pool.clone();
+    // Mirror cli/src/main.rs: when use_mux is enabled, force pool_size = 3 so we
+    // hold 3 TCP connections per chain and multiplex everything else through them.
+    // Without this override each worker hammered the L1 node with config.pool.pool_size
+    // direct TCP+ECDH handshakes, exhausting the node's half-open queue when 5 workers
+    // started simultaneously.
+    let mut pool_cfg = client_config.pool.clone();
+    if client_config.use_mux {
+        pool_cfg.pool_size = 3;
+    }
     let pool = TunnelPool::new(chain, chain_protocols, pool_cfg)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
