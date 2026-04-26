@@ -3,6 +3,10 @@ resolver = "2"
 members = [
     "crates/client-core",
     "crates/cli",
+    "crates/cli2/ipc",
+    "crates/cli2/ota",
+    "crates/cli2/worker",
+    "crates/cli2/supervisor",
     "crates/desktop/windows/v2",
     # "crates/mobile",  # cdylib — skip on Windows build
 ]
