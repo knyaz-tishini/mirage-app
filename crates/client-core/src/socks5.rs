@@ -371,8 +371,24 @@ async fn handle_socks5_connection(
             match decision {
                 RouteDecision::Direct => route_direct(&mut stream, &target_addr).await,
                 RouteDecision::Chain => {
+                    // Try mux first; on mux open_stream error (session EOF, circuit
+                    // open, write error before SOCKS5 success was sent) fall back
+                    // to TunnelPool with failover so individual mux glitches don't
+                    // kill new connections. Existing in-flight streams over the
+                    // dead mux session still break (TCP semantics), but new ones
+                    // immediately use TCP while mux reconnects in the background.
                     if let Some(mp) = mux_pool {
-                        route_via_mux_pool(&mut stream, mp, &target_addr).await
+                        match route_via_mux_pool(&mut stream, mp, &target_addr).await {
+                            Ok(()) => Ok(()),
+                            Err(e) if matches!(&e, MirageError::CircuitOpen) => {
+                                tracing::warn!(target = %target_addr, "mux circuit open — falling back to TunnelPool");
+                                route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                            }
+                            Err(e) => {
+                                tracing::warn!(target = %target_addr, error = %e, "mux open_stream failed — falling back to TunnelPool");
+                                route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                            }
+                        }
                     } else {
                         route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
                     }
@@ -448,33 +464,33 @@ async fn route_via_pool_with_failover(
 }
 
 /// Open a mux stream, send the target address, then relay.
+/// Try to route a SOCKS5 CONNECT through the mux pool.
+///
+/// Returns Err **without sending anything to the client** if mux setup fails
+/// (open_stream / target write). This lets the caller fall back to the raw
+/// TunnelPool. Only after the target write succeeds do we send SOCKS5 success
+/// and enter the relay loop — at that point any further error is unrecoverable
+/// (the client already saw success, can't re-route).
 async fn route_via_mux_pool(
     client: &mut TcpStream,
     mux_pool: Arc<MuxPool>,
     target_addr: &str,
 ) -> Result<(), MirageError> {
     let is_onion = mux_pool.is_onion.load(std::sync::atomic::Ordering::Acquire);
-    let mut stream = match mux_pool.open_stream().await {
-        Ok(s) => s,
-        Err(MirageError::CircuitOpen) => {
-            debug!(target = %target_addr, "mux circuit open: fast-rejecting");
-            send_socks5_error(client, 0x04).await; // host unreachable
-            return Err(MirageError::CircuitOpen);
-        }
-        Err(e) => return Err(e),
-    };
+    let mut stream = mux_pool.open_stream().await?;
 
-    if is_onion {
+    let write_result = if is_onion {
         let target_bytes = target_addr.as_bytes();
         let len_prefix = (target_bytes.len() as u16).to_be_bytes();
         let mut framed = Vec::with_capacity(2 + target_bytes.len());
         framed.extend_from_slice(&len_prefix);
         framed.extend_from_slice(target_bytes);
         tokio::io::AsyncWriteExt::write_all(&mut stream, &framed).await
-            .map_err(MirageError::Io)?;
     } else {
         tokio::io::AsyncWriteExt::write_all(&mut stream, target_addr.as_bytes()).await
-            .map_err(MirageError::Io)?;
+    };
+    if let Err(e) = write_result {
+        return Err(MirageError::Io(e));
     }
 
     send_socks5_success(client).await?;

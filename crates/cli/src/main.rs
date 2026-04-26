@@ -169,20 +169,50 @@ async fn main() -> Result<(), BoxError> {
         .cloned()
         .expect("default pool inserted above");
 
-    // ── Mux pool (default chain only) ─────────────────────────────────────────
-    let mux_pool: Option<Arc<MuxPool>> = if use_mux {
-        info!("creating mux pool (multiplexed mode, default chain)");
-        let mux = MuxPool::new(
-            default_chain.clone(),
-            Arc::clone(&chain_protocols),
-            pool_cfg_base.clone(),
-        )
-        .await
-        .map_err(|e| format!("mux pool init failed: {e}"))?;
-        Some(mux)
-    } else {
-        None
-    };
+    // ── Mux pools (one per direct chain when use_mux=true) ────────────────────
+    // Build mux for direct chains (1-hop). Onion / telescopic chains can't use
+    // mux today: the L1 onion-peel just byte-forwards to the next hop, no
+    // mux server runs at L2 exit, so mux frames on those chains see EOF.
+    // Onion chains keep TunnelPool only — mux server in onion exit is a
+    // separate piece of work (see mirage2node/src/exit/onion.rs).
+    let mut mux_pools: HashMap<String, Arc<MuxPool>> = HashMap::new();
+    if use_mux {
+        let direct_chains: Vec<_> = all_chains
+            .iter()
+            .filter(|c| c.hops.is_empty())
+            .copied()
+            .collect();
+        let onion_count = all_chains.len() - direct_chains.len();
+        info!(
+            direct = direct_chains.len(),
+            onion_skipped = onion_count,
+            "creating mux pools (direct chains only; onion chains use TunnelPool)"
+        );
+        let mut mux_tasks = tokio::task::JoinSet::new();
+        for chain in direct_chains {
+            let chain_owned = (*chain).clone();
+            let id = chain.chain_id.clone();
+            let protocols = Arc::clone(&chain_protocols);
+            let cfg = pool_cfg_base.clone();
+            mux_tasks.spawn(async move {
+                match MuxPool::new(chain_owned, protocols, cfg).await {
+                    Ok(mux) => Some((id, mux)),
+                    Err(e) => {
+                        tracing::warn!(chain = %id, "mux pool init failed, will fall back to TCP: {e}");
+                        None
+                    }
+                }
+            });
+        }
+        while let Some(result) = mux_tasks.join_next().await {
+            if let Ok(Some((id, mux))) = result {
+                mux_pools.insert(id, mux);
+            }
+        }
+    }
+
+    // Default chain mux (used by default SOCKS5 listener).
+    let mux_pool: Option<Arc<MuxPool>> = mux_pools.get(&default_chain_id).cloned();
 
     // ── Kill switch ────────────────────────────────────────────────────────────
     // Must be activated before the server starts accepting connections.
@@ -479,13 +509,17 @@ async fn main() -> Result<(), BoxError> {
         let router2 = Arc::clone(&router);
         let cfg2 = Arc::clone(&config);
         let chain_id = chain.chain_id.clone();
+        // Per-chain mux pool (Some when use_mux=true and mux init succeeded for this chain).
+        // run() will use mux for TCP CONNECT and fall back to TunnelPool on failure.
+        let chain_mux = mux_pools.get(&chain_id).cloned();
         tokio::spawn(async move {
             info!(
                 chain = %chain_id,
                 addr = %bind_addr,
+                mux = chain_mux.is_some(),
                 "per-chain SOCKS5 listener starting"
             );
-            if let Err(e) = server.run(primary_pool, None, cfg2, router2).await {
+            if let Err(e) = server.run(primary_pool, chain_mux, cfg2, router2).await {
                 tracing::error!(chain = %chain_id, "per-chain SOCKS5 error: {e}");
             }
         });
