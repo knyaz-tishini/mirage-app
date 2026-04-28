@@ -49,12 +49,26 @@ pub struct MonitorPolicyRule {
 }
 
 /// A single chain entry from the monitor config response.
+///
+/// Carries the full `ChainConfig` materialized by the monitor (so the
+/// client can spin up a TunnelPool / MuxPool from it directly) plus
+/// monitor-only metadata (`healthy`, `latency_ms`) used by the runtime
+/// for selection / display.
 #[derive(Debug, Clone)]
 pub struct MonitorChain {
-    pub name: String,
-    pub node_addr: String,
-    pub transport: String,
+    /// Full chain configuration materialized from monitor's stend registry.
+    pub chain: mirage_core::config::ChainConfig,
+    /// Live health flag from monitor.
     pub healthy: bool,
+    /// Last measured latency to L1 (ms), if known.
+    pub latency_ms: Option<u64>,
+}
+
+impl MonitorChain {
+    /// Convenience accessor — chain id (mirrors `chain.chain_id`).
+    pub fn name(&self) -> &str {
+        &self.chain.chain_id
+    }
 }
 
 // ── Wire format (private) ─────────────────────────────────────────────────────
@@ -77,14 +91,21 @@ fn default_poll_interval() -> u64 {
     30
 }
 
+/// Wire-format mirror of monitor's `ClientConfigChain`: full inlined
+/// `ChainConfig` plus monitor-only metadata. We just deserialize directly
+/// into `mirage_core::config::ChainConfig` (with `#[serde(flatten)]`) and
+/// pull the metadata fields off the side.
 #[derive(Debug, Deserialize)]
 struct ChainEntry {
-    name: String,
-    node_addr: String,
-    transport: String,
-    #[serde(default)]
+    #[serde(flatten)]
+    chain: mirage_core::config::ChainConfig,
+    #[serde(default = "chain_entry_default_healthy")]
     healthy: bool,
+    #[serde(default)]
+    latency_ms: Option<u64>,
 }
+
+fn chain_entry_default_healthy() -> bool { true }
 
 #[derive(Debug, Serialize)]
 struct RegisterBody {
@@ -238,10 +259,9 @@ impl MonitorLink {
                                 .chains
                                 .into_iter()
                                 .map(|c| MonitorChain {
-                                    name: c.name,
-                                    node_addr: c.node_addr,
-                                    transport: c.transport,
+                                    chain: c.chain,
                                     healthy: c.healthy,
+                                    latency_ms: c.latency_ms,
                                 })
                                 .collect(),
                             policy: cfg.policy,

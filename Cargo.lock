@@ -2349,8 +2349,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uzor",
- "uzor-backend-tiny-skia",
- "uzor-desktop",
+ "uzor-render-tiny-skia",
+ "uzor-window-desktop",
 ]
 
 [[package]]
@@ -4484,7 +4484,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uzor"
-version = "1.0.43"
+version = "1.1.6"
 dependencies = [
  "ahash 0.8.12",
  "bitflags 2.11.1",
@@ -4501,8 +4501,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "uzor-backend-tiny-skia"
-version = "1.0.43"
+name = "uzor-fonts"
+version = "1.1.6"
+
+[[package]]
+name = "uzor-render-tiny-skia"
+version = "1.1.6"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -4510,18 +4514,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "uzor-desktop"
-version = "1.0.43"
+name = "uzor-window-desktop"
+version = "1.1.6"
 dependencies = [
  "arboard",
  "dark-light",
  "uzor",
  "winit",
 ]
-
-[[package]]
-name = "uzor-fonts"
-version = "1.0.1"
 
 [[package]]
 name = "valuable"

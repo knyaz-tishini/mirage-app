@@ -64,7 +64,7 @@ pub async fn run_health_watcher(
         let active_healthy = cfg
             .chains
             .iter()
-            .find(|c| c.name == active_id)
+            .find(|c| c.name() == active_id)
             .map(|c| c.healthy)
             .unwrap_or(true);
 
@@ -76,16 +76,16 @@ pub async fn run_health_watcher(
             let candidate = cfg
                 .chains
                 .iter()
-                .find(|c| c.healthy && pools_snapshot.contains_key(&c.name));
+                .find(|c| c.healthy && pools_snapshot.contains_key(c.name()));
 
             match candidate {
                 Some(chain) => {
                     info!(
                         from = %active_id,
-                        to   = %chain.name,
+                        to   = %chain.name(),
                         "health_watcher: switching active chain"
                     );
-                    runtime.active_chain_id.store(Arc::new(chain.name.clone()));
+                    runtime.active_chain_id.store(Arc::new(chain.name().to_string()));
                 }
                 None => {
                     error!(

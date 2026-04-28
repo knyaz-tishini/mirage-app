@@ -336,13 +336,16 @@ async fn main() -> Result<(), BoxError> {
                 let kept: Vec<String> = current.keys().cloned().collect();
 
                 for monitor_chain in &cfg.chains {
-                    let chain_id = &monitor_chain.name;
+                    let chain_id = monitor_chain.name();
 
                     if current.contains_key(chain_id) {
                         // Already exists — keep the live pool, healthy flag
                         // is consumed by health_watcher separately.
                     } else {
-                        // New chain — build a ChainConfig from monitor data.
+                        // New chain — monitor delivered a fully materialized
+                        // ChainConfig (with pubkey, hops, protocol, etc.).
+                        // Just clone it and stand up a pool. No more local
+                        // synthesis with empty public_key.
                         let pool_cfg = if use_mux_for_watcher {
                             let mut c = pool_cfg_for_watcher.clone();
                             c.pool_size = 3;
@@ -351,39 +354,7 @@ async fn main() -> Result<(), BoxError> {
                             pool_cfg_for_watcher.clone()
                         };
 
-                        let node_addr: std::net::SocketAddr =
-                            match monitor_chain.node_addr.parse() {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        chain = %chain_id,
-                                        addr = %monitor_chain.node_addr,
-                                        "monitor: invalid node_addr, skipping: {e}"
-                                    );
-                                    continue;
-                                }
-                            };
-
-                        let chain_cfg = mirage_core::config::ChainConfig {
-                            chain_id: chain_id.clone(),
-                            l1: Some(mirage_core::config::ChainNode {
-                                addr: node_addr,
-                                public_key: String::new(),
-                                sni: None,
-                            }),
-                            l2: None,
-                            l1_transparent: false,
-                            hops: Vec::new(),
-                            handshake: Default::default(),
-                            reply: Default::default(),
-                            protocol: mirage_core::config::ProtocolId::Tcp(TcpProtocolId::Mirage),
-                            priority: 0,
-                            shaping: Default::default(),
-                            camouflage: Default::default(),
-                            cover_traffic: Default::default(),
-                            byte_cipher: None,
-                            socks5_bind: None,
-                        };
+                        let chain_cfg = monitor_chain.chain.clone();
 
                         match TunnelPool::new(
                             chain_cfg,
@@ -393,8 +364,8 @@ async fn main() -> Result<(), BoxError> {
                         .await
                         {
                             Ok(pool) => {
-                                new_map.insert(chain_id.clone(), pool);
-                                added.push(chain_id.clone());
+                                new_map.insert(chain_id.to_string(), pool);
+                                added.push(chain_id.to_string());
                             }
                             Err(e) => {
                                 tracing::warn!(

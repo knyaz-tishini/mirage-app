@@ -81,9 +81,20 @@ impl TunBridge {
 }
 
 fn chain_to_json(c: &MonitorChain) -> serde_json::Value {
+    // TUN's /chains/update consumes a chain registry that maps a chain name
+    // to a SOCKS5 listener address (the local port the client listens on
+    // for that chain). When the chain has its own dedicated socks5_bind we
+    // forward that. Without it we fall back to the L1 addr — historical
+    // behavior preserved for compat. `protocol` is informational here.
+    let socks5_addr: String = c
+        .chain
+        .socks5_bind
+        .clone()
+        .or_else(|| c.chain.l1.as_ref().map(|n| n.addr.to_string()))
+        .unwrap_or_default();
     serde_json::json!({
-        "name":       c.name,
-        "socks5_addr": c.node_addr,
-        "protocol":   c.transport,
+        "name":        c.chain.chain_id,
+        "socks5_addr": socks5_addr,
+        "protocol":    format!("{:?}", c.chain.protocol),
     })
 }
