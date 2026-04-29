@@ -23,6 +23,7 @@ use mirage_client_core::{
     socks5::Socks5Server,
     tun_bridge::TunBridge,
 };
+use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -59,6 +60,22 @@ async fn main() -> Result<(), BoxError> {
         .with(fmt_layer)
         .with(capture_layer)
         .init();
+
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        tracing::error!(location = %location, message = %msg, "panic — process exiting for respawn");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::process::exit(1);
+    }));
 
     let args = Args::parse();
 
@@ -410,6 +427,16 @@ async fn main() -> Result<(), BoxError> {
         *runtime.http_cancel.lock().await = Some(token);
         info!(%bind_addr, "HTTP CONNECT proxy spawned");
     }
+
+    // ── Memory guard ───────────────────────────────────────────────────────────
+    // Sentinel will respawn on exit(0).
+    let _memory_guard = MemoryGuard::spawn(
+        MemoryGuardConfig::default(),
+        Box::new(|| {
+            tracing::warn!("memory guard: fatal threshold — exiting for respawn");
+            std::process::exit(0);
+        }),
+    );
 
     info!(bind = %args.bind, "mirage-client starting");
 

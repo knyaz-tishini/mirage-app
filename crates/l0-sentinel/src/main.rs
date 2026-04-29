@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use mirage_client_core::monitor_link::MonitorLink;
+use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
@@ -145,6 +146,22 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        tracing::error!(location = %location, message = %msg, "panic — process exiting for respawn");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::process::exit(1);
+    }));
+
     let args = Args::parse();
 
     info!("[sentinel] loading config {:?}", args.config);
@@ -233,6 +250,17 @@ async fn main() -> Result<()> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("failed to spawn {:?}", cfg.client_binary))?;
+
+    // ── Memory guard ─────────────────────────────────────────────────────────
+    // On fatal pressure: exit sentinel (child becomes orphan briefly; d-watchdog
+    // or OS respawns sentinel which will re-spawn the child).
+    let _memory_guard = MemoryGuard::spawn(
+        MemoryGuardConfig::default(),
+        Box::new(|| {
+            warn!("[sentinel] memory guard: fatal threshold — exiting for respawn");
+            std::process::exit(0);
+        }),
+    );
 
     // ── Config-watch loop + process supervisor ────────────────────────────────
     loop {

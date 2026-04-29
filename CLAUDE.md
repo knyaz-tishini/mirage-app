@@ -76,6 +76,56 @@ Forward direction уже raw post-RELAY frame для telescopic, поэтому 
 
 `MonitorChain.chain` — полный `mirage_core::config::ChainConfig` (с pubkey/hops/protocol/...). Раньше был урезанный stub — теперь монитор отдаёт всё нужное чтобы клиент мог поднять chain без локального config (см. etap A в mirage2monitor).
 
+## Reliability hardening
+
+Каждый L0 процесс (cli, sentinel, supervisor, worker) умеет защищаться от утечек памяти и зомби-state. Четыре механизма:
+
+### 1. Pool reaper (`client-core`)
+
+`pool.rs::TunnelPool` и `mux_pool.rs::MuxPool` спавнят periodic reaper task в `new()`:
+
+- Раз в минуту обходят слоты
+- Слот в состоянии `Idle` без активности > `TUNNEL_POOL_IDLE_KILL_TIMEOUT` (300s) или > `MUX_POOL_IDLE_KILL_TIMEOUT` (600s) → close + переход в новое состояние `Dormant`
+- `lease()` / `open_stream()` будит `Dormant` → `Reconnecting` on demand
+- Reaper держит `Weak<Pool>` — когда сам pool drop'ается, task завершается на следующем tick
+
+`switch_chain()` в обоих pools тоже будит `Dormant` слоты, чтобы они переподключились к новому чейну.
+
+### 2. Memory guard (`mirage-runtime-guard`)
+
+Новый shared crate `crates/runtime-guard/`. Каждый L0 binary вызывает `MemoryGuard::spawn(config, on_fatal)` при старте.
+
+Background tokio task:
+- Раз в `sample_interval` (default 10s) читает RSS процесса через `sysinfo`
+- Считает % от системного RAM
+- Threshold transitions: 70% → Warn, 85% → Critical, 95% → Fatal
+- На Fatal вызывает `on_fatal` ровно один раз (caller сам решает: log + `exit(0)`/`exit(1)` для respawn, или graceful shutdown)
+
+Дефолтная политика в L0 binaries: **`exit(0)` для clean respawn от sentinel/OS**. У supervisor дополнительно — kill всех children перед exit.
+
+mirage2tun не может зависеть на `mirage-runtime-guard` через path (другой workspace) — там лежит локальная копия в `crates/mirage-tun-windows/src/runtime_guard.rs`.
+
+### 3. Panic catcher (5 binaries)
+
+Каждый main.rs устанавливает `std::panic::set_hook` сразу после `tracing_subscriber::init()`. На любой panic:
+- Извлечь location + payload string
+- `tracing::error!` с подробностями
+- Sleep 100ms (чтобы tracing flush'нулся)
+- `std::process::exit(1)` — clean exit, не abort
+
+Это предотвращает **default Rust abort** (`SIGABRT` на Unix, `__fastfail` на Windows) и даёт sentinel/OS возможность респаунить процесс из чистого состояния.
+
+### 4. Socket reaper в TUN (`mirage-tcpip-stack`)
+
+См. документацию в `mirage2tun/` — reaper для smoltcp socket'ов внутри userspace TCP/IP stack. Аналогичный концепт.
+
+### Cascade на pressure
+
+Каскад при росте RSS:
+1. **Warn (70%)** — лог, никаких действий
+2. **Critical (85%)** — лог
+3. **Fatal (95%)** — `on_fatal()` запускает graceful shutdown + `exit(0)` → sentinel/OS respawn
+
 ## Builds
 
 ```bash

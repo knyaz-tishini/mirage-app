@@ -117,11 +117,33 @@ impl CircuitBreaker {
     }
 }
 
+// ── Reaper constants ──────────────────────────────────────────────────────────
+
+/// How often the mux idle reaper wakes.
+const MUX_POOL_IDLE_REAPER_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Mux sessions with no stream opened in this window are closed by the reaper.
+/// Longer than the tunnel reaper (600 s vs 300 s) because re-establishing a mux
+/// session is more expensive than a plain TCP tunnel.
+const MUX_POOL_IDLE_KILL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
 // ── Pool internals ────────────────────────────────────────────────────────────
 
 enum SessionSlot {
-    Active(Arc<SessionHandle>),
+    /// Live session with timestamp of last successfully opened stream.
+    Active {
+        session: Arc<SessionHandle>,
+        /// When a stream was last opened on this session.
+        last_open_stream_at: Instant,
+    },
+    /// Background task is re-establishing this slot.
     Reconnecting,
+    /// Reaped by the idle reaper: session was closed, no reconnect in flight.
+    /// Woken to `Reconnecting` on next `open_stream()` call when no `Active`
+    /// slots remain.
+    Dormant,
 }
 
 struct PoolInner {
@@ -179,7 +201,10 @@ impl MuxPool {
             match result {
                 Ok((idx, Ok(session))) => {
                     info!(slot = idx, ready = ready_count + 1, threshold, "mux session established");
-                    slots.push((idx, SessionSlot::Active(Arc::new(session))));
+                    slots.push((idx, SessionSlot::Active {
+                        session: Arc::new(session),
+                        last_open_stream_at: Instant::now(),
+                    }));
                     ready_count += 1;
                 }
                 Ok((idx, Err(e))) => {
@@ -232,6 +257,12 @@ impl MuxPool {
             mux_maintenance_loop(pool_weak, reconnect_notify_clone).await;
         });
 
+        // Spawn the idle reaper (closes sessions idle > MUX_POOL_IDLE_KILL_TIMEOUT).
+        let pool_weak_reaper = Arc::downgrade(&pool);
+        tokio::spawn(async move {
+            mux_reaper_loop(pool_weak_reaper).await;
+        });
+
         if !join_set.is_empty() {
             let inner_clone = Arc::clone(&pool.inner);
             let notify_clone = Arc::clone(&pool.stream_notify);
@@ -241,7 +272,10 @@ impl MuxPool {
                         Ok((idx, Ok(session))) => {
                             let mut guard = inner_clone.lock().await;
                             if matches!(guard.slots.get(idx), Some(SessionSlot::Reconnecting)) {
-                                guard.slots[idx] = SessionSlot::Active(Arc::new(session));
+                                guard.slots[idx] = SessionSlot::Active {
+                                    session: Arc::new(session),
+                                    last_open_stream_at: Instant::now(),
+                                };
                                 info!(slot = idx, "mux background warmup: session established");
                                 drop(guard);
                                 notify_clone.notify_waiters();
@@ -289,11 +323,27 @@ impl MuxPool {
                 (0..pool_size)
                     .map(|i| (start + i) % pool_size)
                     .filter_map(|idx| match &guard.slots[idx] {
-                        SessionSlot::Active(s) => Some((idx, Arc::clone(s))),
-                        SessionSlot::Reconnecting => None,
+                        SessionSlot::Active { session, .. } => Some((idx, Arc::clone(session))),
+                        SessionSlot::Reconnecting | SessionSlot::Dormant => None,
                     })
                     .collect()
             };
+
+            // If there are no active sessions, wake any dormant ones.
+            if sessions.is_empty() {
+                let mut guard = self.inner.lock().await;
+                let mut woke = false;
+                for slot in guard.slots.iter_mut() {
+                    if matches!(slot, SessionSlot::Dormant) {
+                        *slot = SessionSlot::Reconnecting;
+                        woke = true;
+                    }
+                }
+                if woke {
+                    debug!("open_stream: woke dormant mux sessions for reconnect");
+                    self.reconnect_notify.notify_one();
+                }
+            }
 
             let mut marked_reconnecting = false;
             for (idx, session) in sessions {
@@ -308,6 +358,15 @@ impl MuxPool {
                 match session.open_stream().await {
                     Ok(stream) => {
                         debug!(slot = idx, "opened mux stream");
+                        // Bump last_open_stream_at so the reaper knows this slot is active.
+                        {
+                            let mut guard = self.inner.lock().await;
+                            if let Some(SessionSlot::Active { last_open_stream_at, .. }) =
+                                guard.slots.get_mut(idx)
+                            {
+                                *last_open_stream_at = Instant::now();
+                            }
+                        }
                         self.circuit_breaker.record_success();
                         return Ok(TokioMuxStream(stream));
                     }
@@ -343,13 +402,13 @@ impl MuxPool {
         let mut guard = self.inner.lock().await;
         guard.chain = new_chain;
         for slot in guard.slots.iter_mut() {
-            if matches!(slot, SessionSlot::Active(_)) {
+            if matches!(slot, SessionSlot::Active { .. } | SessionSlot::Dormant) {
                 *slot = SessionSlot::Reconnecting;
             }
         }
         self.is_onion
             .store(!guard.chain.hops.is_empty(), Ordering::Release);
-        info!("mux pool chain switched: active sessions marked reconnecting");
+        info!("mux pool chain switched: active and dormant sessions marked reconnecting");
     }
 }
 
@@ -363,6 +422,62 @@ async fn build_session(
     let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain).await?;
     let compat = TunnelCompat::wrap(tunnel);
     Ok(SessionHandle::client(compat))
+}
+
+/// Background task: periodically closes long-idle mux sessions.
+///
+/// Sessions where no stream has been opened in [`MUX_POOL_IDLE_KILL_TIMEOUT`]
+/// are transitioned to `Dormant`: the underlying TCP connection is closed and no
+/// reconnect is immediately spawned.  The next `open_stream()` call that finds no
+/// `Active` session will wake `Dormant` slots to `Reconnecting`.
+///
+/// Stops automatically when the pool is dropped (weak reference upgrade fails).
+async fn mux_reaper_loop(pool_weak: std::sync::Weak<MuxPool>) {
+    loop {
+        tokio::time::sleep(MUX_POOL_IDLE_REAPER_INTERVAL).await;
+
+        let Some(pool) = pool_weak.upgrade() else {
+            return;
+        };
+
+        // Collect stale active slots and take ownership of their session handles.
+        let stale_sessions: Vec<(usize, Arc<SessionHandle>)> = {
+            let mut guard = pool.inner.lock().await;
+            let mut collected = Vec::new();
+            for (idx, slot) in guard.slots.iter_mut().enumerate() {
+                if let SessionSlot::Active { session, last_open_stream_at } = slot {
+                    if last_open_stream_at.elapsed() >= MUX_POOL_IDLE_KILL_TIMEOUT {
+                        let session_clone = Arc::clone(session);
+                        *slot = SessionSlot::Dormant;
+                        collected.push((idx, session_clone));
+                    }
+                }
+            }
+            collected
+        };
+
+        for (idx, session) in stale_sessions {
+            info!(
+                slot = idx,
+                idle_secs = MUX_POOL_IDLE_KILL_TIMEOUT.as_secs(),
+                "mux reaper: closing long-idle session (→ Dormant)"
+            );
+            // Try to take exclusive ownership so we can call the async close.
+            // If the Arc has other owners (a stream is still active), fall back
+            // to a plain drop — the session will close when the last Arc drops.
+            match Arc::try_unwrap(session) {
+                Ok(handle) => {
+                    if let Err(e) = handle.close().await {
+                        debug!(slot = idx, error = %e, "mux reaper: session close error (ignored)");
+                    }
+                }
+                Err(_arc) => {
+                    // Other owners exist — drop our reference, not forcibly closed.
+                    debug!(slot = idx, "mux reaper: session still referenced, releasing Arc");
+                }
+            }
+        }
+    }
 }
 
 async fn mux_maintenance_loop(
@@ -390,8 +505,8 @@ async fn mux_maintenance_loop(
             let mut guard = pool.inner.lock().await;
             let mut indices = Vec::new();
             for (idx, slot) in guard.slots.iter_mut().enumerate() {
-                if let SessionSlot::Active(s) = slot {
-                    if s.is_closed() {
+                if let SessionSlot::Active { session, .. } = slot {
+                    if session.is_closed() {
                         debug!(slot = idx, "maintenance: session closed, reconnecting");
                         *slot = SessionSlot::Reconnecting;
                         indices.push(idx);
@@ -484,7 +599,10 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                 info!(slot = slot_idx, attempt, "mux reconnect succeeded");
                 {
                     let mut guard = pool.inner.lock().await;
-                    guard.slots[slot_idx] = SessionSlot::Active(Arc::new(session));
+                    guard.slots[slot_idx] = SessionSlot::Active {
+                        session: Arc::new(session),
+                        last_open_stream_at: Instant::now(),
+                    };
                 }
                 pool.circuit_breaker.record_success();
                 pool.stream_notify.notify_waiters();

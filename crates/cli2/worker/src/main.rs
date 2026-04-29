@@ -17,6 +17,7 @@ use mirage_chain_ipc::{
     pid_file_path, pipe_path,
     pipe::{PipePair, PipeListener},
 };
+use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use mirage_client_core::{
     endpoint_protocol::EndpointProtocol,
     mux_pool::MuxPool,
@@ -49,6 +50,22 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        tracing::error!(location = %location, message = %msg, "panic — process exiting for respawn");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::process::exit(1);
+    }));
+
     let chain_id =
         std::env::var("MIRAGE_CHAIN_ID").unwrap_or_else(|_| "unknown".to_string());
 
@@ -58,6 +75,16 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(DEFAULT_ORPHAN_TIMEOUT_SECS);
 
     info!(chain_id = %chain_id, "worker starting");
+
+    // ── Memory guard ──────────────────────────────────────────────────────────
+    // Exit cleanly: supervisor will detect the exit and respawn.
+    let _memory_guard = MemoryGuard::spawn(
+        MemoryGuardConfig::default(),
+        Box::new(|| {
+            tracing::warn!("worker memory guard: fatal threshold — exiting for respawn");
+            std::process::exit(0);
+        }),
+    );
 
     // Write PID file immediately so the supervisor can discover us during
     // its startup scan.

@@ -39,6 +39,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::tunnel::establish_raw_tunnel;
 
+// ── Reaper constants ──────────────────────────────────────────────────────────
+
+/// How often the idle reaper wakes to scan for stale idle slots.
+const TUNNEL_POOL_IDLE_REAPER_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Idle slots unused longer than this are closed by the reaper (not immediately
+/// reconnected — they go `Dormant` and reconnect on the next `lease()` call).
+const TUNNEL_POOL_IDLE_KILL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
 // ── Slot state ────────────────────────────────────────────────────────────────
 
 enum Slot {
@@ -51,6 +62,10 @@ enum Slot {
     Leased,
     /// Background task is re-establishing this slot.
     Reconnecting,
+    /// Reaped by the idle reaper: underlying TCP was closed, no active reconnect
+    /// is in flight.  The slot will be woken (→ `Reconnecting`) on the next
+    /// `lease()` call that finds no `Idle` slot available.
+    Dormant,
 }
 
 // ── Pool inner state ──────────────────────────────────────────────────────────
@@ -75,6 +90,8 @@ pub struct PoolStats {
     pub leased: usize,
     /// Slots undergoing reconnection.
     pub reconnecting: usize,
+    /// Slots reaped (TCP closed, will reconnect on next `lease()` demand).
+    pub dormant: usize,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -170,10 +187,16 @@ impl TunnelPool {
             is_onion: AtomicBool::new(is_onion),
         });
 
-        // Spawn the background maintenance task.
+        // Spawn the background maintenance task (reconnects Reconnecting slots).
         let pool_weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
             maintenance_loop(pool_weak).await;
+        });
+
+        // Spawn the idle reaper task (closes long-idle tunnels → Dormant).
+        let pool_weak_reaper = Arc::downgrade(&pool);
+        tokio::spawn(async move {
+            reaper_loop(pool_weak_reaper).await;
         });
 
         // Drain remaining JoinSet results in background — fills Reconnecting placeholders.
@@ -254,7 +277,22 @@ impl TunnelPool {
                     }
                 }
             }
-            // No idle slot — wait for one to become available (timeout 500 ms).
+            // No idle slot — wake any dormant slots so maintenance reconnects them.
+            {
+                let mut guard = self.inner.lock().await;
+                let mut woke = false;
+                for slot in guard.slots.iter_mut() {
+                    if matches!(slot, Slot::Dormant) {
+                        *slot = Slot::Reconnecting;
+                        woke = true;
+                    }
+                }
+                if woke {
+                    debug!("lease: woke dormant slots for reconnect");
+                    self.available.notify_one();
+                }
+            }
+            // Wait for a slot to become available (timeout 500 ms).
             tokio::select! {
                 _ = self.available.notified() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -285,12 +323,14 @@ impl TunnelPool {
             idle: 0,
             leased: 0,
             reconnecting: 0,
+            dormant: 0,
         };
         for slot in &guard.slots {
             match slot {
                 Slot::Idle { .. } => stats.idle += 1,
                 Slot::Leased => stats.leased += 1,
                 Slot::Reconnecting => stats.reconnecting += 1,
+                Slot::Dormant => stats.dormant += 1,
             }
         }
         stats
@@ -314,12 +354,12 @@ impl TunnelPool {
         let mut guard = self.inner.lock().await;
         guard.chain = new_chain;
         for slot in guard.slots.iter_mut() {
-            if matches!(slot, Slot::Idle { .. }) {
+            if matches!(slot, Slot::Idle { .. } | Slot::Dormant) {
                 *slot = Slot::Reconnecting;
             }
         }
         self.is_onion.store(!guard.chain.hops.is_empty(), Ordering::Release);
-        info!("chain switched (drain): idle slots marked for reconnect");
+        info!("chain switched (drain): idle and dormant slots marked for reconnect");
         self.available.notify_waiters();
     }
 
@@ -438,6 +478,57 @@ impl Tunnel for TunnelLease {
     }
 }
 
+// ── Background reaper loop ────────────────────────────────────────────────────
+
+/// Background task: periodically closes long-idle tunnel slots.
+///
+/// Slots that have been `Idle` longer than [`TUNNEL_POOL_IDLE_KILL_TIMEOUT`] are
+/// transitioned to `Dormant`: the TCP connection is closed immediately and no
+/// reconnect is spawned.  The slot will be woken to `Reconnecting` on the next
+/// `lease()` call that finds no live `Idle` slot, keeping the pool bursty-idle
+/// friendly (resources freed when quiet, reconnected when needed).
+///
+/// Stops automatically when the pool is dropped (weak reference upgrade fails).
+async fn reaper_loop(pool_weak: std::sync::Weak<TunnelPool>) {
+    loop {
+        tokio::time::sleep(TUNNEL_POOL_IDLE_REAPER_INTERVAL).await;
+
+        let Some(pool) = pool_weak.upgrade() else {
+            // Pool was dropped — exit cleanly.
+            return;
+        };
+
+        // Collect slots that are long-idle and take ownership of their tunnels.
+        let mut stale_tunnels: Vec<(usize, Box<dyn Tunnel>)> = Vec::new();
+        {
+            let mut guard = pool.inner.lock().await;
+            for (idx, slot) in guard.slots.iter_mut().enumerate() {
+                if let Slot::Idle { last_used, .. } = slot {
+                    if last_used.elapsed() >= TUNNEL_POOL_IDLE_KILL_TIMEOUT {
+                        // Swap out the tunnel so we can close it outside the lock.
+                        let old = std::mem::replace(slot, Slot::Dormant);
+                        if let Slot::Idle { tunnel, .. } = old {
+                            stale_tunnels.push((idx, tunnel));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Close each stale tunnel outside the lock (close is async).
+        for (idx, mut tunnel) in stale_tunnels {
+            info!(
+                slot = idx,
+                idle_secs = TUNNEL_POOL_IDLE_KILL_TIMEOUT.as_secs(),
+                "reaper: closing long-idle tunnel (→ Dormant)"
+            );
+            if let Err(e) = tunnel.close().await {
+                debug!(slot = idx, error = %e, "reaper: tunnel close returned error (ignored)");
+            }
+        }
+    }
+}
+
 // ── Background maintenance loop ───────────────────────────────────────────────
 
 /// Background task: checks idle-timeout expiry and triggers reconnects.
@@ -482,6 +573,7 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
         };
 
         // Also pick up any slots already in Reconnecting state.
+        // Dormant slots are intentionally skipped — they reconnect on demand.
         {
             let guard = pool.inner.lock().await;
             for (i, s) in guard.slots.iter().enumerate() {

@@ -1,0 +1,9 @@
+[package]
+name = "mirage-runtime-guard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio  = { workspace = true, features = ["rt", "sync", "time"] }
+sysinfo = "0.32"
+tracing = { workspace = true }

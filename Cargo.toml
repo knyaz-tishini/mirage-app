@@ -9,6 +9,7 @@ members = [
     "crates/cli2/supervisor",
     "crates/desktop/windows/v2",
     "crates/l0-sentinel",
+    "crates/runtime-guard",
     # "crates/mobile",  # cdylib — skip on Windows build
 ]
 
@@ -35,4 +36,5 @@ mirage-core         = { path = "../mirage2web/crates/mirage-core" }
 mirage-protocol     = { path = "../mirage2web/crates/mirage-protocol" }
 mirage-mux          = { path = "../mirage2web/crates/mirage-mux" }
 mirage-client-core  = { path = "crates/client-core" }
-tokio-tungstenite   = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roots"] }
+mirage-runtime-guard    = { path = "crates/runtime-guard" }

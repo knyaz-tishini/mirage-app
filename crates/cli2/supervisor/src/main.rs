@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 
 use config::Config;
 use mirage_chain_ipc::WorkerMsg;
+use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use ota_poller::{UpdateAvailable, spawn_ota_poller};
 use reattach::discover_orphans;
 use rollout::{download_new_binary, rolling_update, shutdown_all};
@@ -34,6 +35,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        tracing::error!(location = %location, message = %msg, "panic — process exiting for respawn");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::process::exit(1);
+    }));
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "supervisor.toml".to_string());
@@ -45,6 +62,16 @@ async fn main() -> anyhow::Result<()> {
         chains = config.chains.len(),
         monitor_url = %config.monitor_url,
         "supervisor starting"
+    );
+
+    // ── Memory guard ──────────────────────────────────────────────────────────
+    // On fatal: send Shutdown to all workers then exit so the parent respawns.
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let _memory_guard = MemoryGuard::spawn(
+        MemoryGuardConfig::default(),
+        Box::new(move || {
+            let _ = fatal_tx.try_send(());
+        }),
     );
 
     let binary_path = std::path::PathBuf::from(&config.worker_binary);
@@ -200,6 +227,12 @@ async fn main() -> anyhow::Result<()> {
                 info!("ctrl-c — shutting down all workers");
                 shutdown_all(&mut handles).await;
                 break;
+            }
+
+            _ = fatal_rx.recv() => {
+                warn!("memory guard: fatal threshold — shutting down workers and exiting");
+                shutdown_all(&mut handles).await;
+                std::process::exit(0);
             }
 
             update = ota_rx.recv() => {

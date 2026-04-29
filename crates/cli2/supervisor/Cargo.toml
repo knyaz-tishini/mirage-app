@@ -16,8 +16,9 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 reqwest = { version = "0.12", features = ["json"] }
-mirage-chain-ipc = { path = "../ipc" }
-mirage-chain-ota = { path = "../ota" }
+mirage-chain-ipc     = { path = "../ipc" }
+mirage-chain-ota     = { path = "../ota" }
+mirage-runtime-guard = { path = "../../../runtime-guard" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
