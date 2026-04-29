@@ -52,6 +52,10 @@ pub struct OnionTunnel {
     /// Overflow buffer: plaintext bytes that did not fit in the caller's `buf`
     /// on the previous `recv()` call and must be returned first on the next call.
     plaintext_buf: Vec<u8>,
+    /// When true, `recv()` passes bytes through without AEAD framing or
+    /// unwrapping.  Must be set for mux sessions: after the server upgrades
+    /// to raw mux frames the reply stream is no longer `[4B len][ciphertext]`.
+    pub raw_mode: bool,
 }
 
 impl OnionTunnel {
@@ -117,6 +121,7 @@ impl OnionTunnel {
             info,
             recv_buf: Vec::new(),
             plaintext_buf: Vec::new(),
+            raw_mode: false,
         })
     }
 
@@ -242,6 +247,7 @@ impl OnionTunnel {
             info,
             recv_buf: Vec::new(),
             plaintext_buf: Vec::new(),
+            raw_mode: false,
         })
     }
 }
@@ -282,6 +288,11 @@ impl Tunnel for OnionTunnel {
     /// not lost — bytes already pulled from the socket stay in the buffer and
     /// are consumed on the next call.
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, MirageError> {
+        // Raw mode: server has upgraded to mux framing; bypass AEAD unwrap entirely.
+        if self.raw_mode {
+            return self.reader.read(buf).await.map_err(MirageError::Io);
+        }
+
         // Return any bytes that overflowed the caller's buffer on the previous call.
         if !self.plaintext_buf.is_empty() {
             let copy_len = self.plaintext_buf.len().min(buf.len());

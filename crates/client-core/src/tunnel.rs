@@ -196,7 +196,7 @@ pub async fn establish_mux_tunnel(
         );
 
         const ONION_TIMEOUT: Duration = Duration::from_secs(15);
-        let tunnel = tokio::time::timeout(
+        let mut tunnel = tokio::time::timeout(
             ONION_TIMEOUT,
             OnionTunnel::connect(chain, destination, ONION_MUX_MAGIC),
         )
@@ -208,6 +208,9 @@ pub async fn establish_mux_tunnel(
                 ONION_TIMEOUT.as_secs()
             ))
         })??;
+        // Server upgrades to raw mux frames after receiving MUX_MAGIC.
+        // Reply stream is no longer AEAD-framed; bypass unwrap on recv().
+        tunnel.raw_mode = true;
         return Ok(Box::new(tunnel));
     }
 
