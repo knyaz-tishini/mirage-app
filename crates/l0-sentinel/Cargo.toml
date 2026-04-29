@@ -18,4 +18,4 @@ tracing-subscriber = { workspace = true }
 clap               = { workspace = true }
 toml                 = "0.8"
 anyhow               = "1"
-mirage-runtime-guard = { path = "../runtime-guard" }
+mirage-runtime-guard = { workspace = true }

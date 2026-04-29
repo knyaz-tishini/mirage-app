@@ -18,7 +18,7 @@ anyhow = "1"
 reqwest = { version = "0.12", features = ["json"] }
 mirage-chain-ipc     = { path = "../ipc" }
 mirage-chain-ota     = { path = "../ota" }
-mirage-runtime-guard = { path = "../../../runtime-guard" }
+mirage-runtime-guard = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
