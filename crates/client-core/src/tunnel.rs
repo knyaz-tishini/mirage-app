@@ -208,9 +208,15 @@ pub async fn establish_mux_tunnel(
                 ONION_TIMEOUT.as_secs()
             ))
         })??;
-        // Server upgrades to raw mux frames after receiving MUX_MAGIC.
-        // Reply stream is no longer AEAD-framed; bypass unwrap on recv().
-        tunnel.raw_mode = true;
+        // ReplyMode::Raw (variant 1): exit writes raw mux frames → bypass AEAD
+        // unwrap on recv().
+        // ReplyMode::Onion (variant 2): exit wraps each mux reply chunk in
+        // wrap_reply_layer; intermediate hops add their layers; existing
+        // OnionTunnel::recv unwraps N layers. Keep raw_mode = false (default).
+        use mirage_core::config::ReplyMode;
+        if chain.reply == ReplyMode::Raw {
+            tunnel.raw_mode = true;
+        }
         return Ok(Box::new(tunnel));
     }
 
