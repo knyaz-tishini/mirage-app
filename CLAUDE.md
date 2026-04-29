@@ -45,7 +45,7 @@ respect_user_config = true
 
 Для **direct chains** (`hops` пустой) при `use_mux=true` — строит `MuxPool` и использует его в `Socks5Server::run(pool, Some(mux_pool), ...)`. При сбое mux — fallback на TunnelPool runtime (не только при init).
 
-Для **onion chains** mux работает только если все hops в chain имеют `onion_reply_mode=raw` на server side (см. `mirage2node/CLAUDE.md`).
+Для **onion chains** mux работает с `onion_reply_mode=onion` (variant 2 — live с Apr 2026, see `mirage2node/CLAUDE.md`). Forward path raw post-RELAY, reply path layered AEAD.
 
 `pool_size = 3` принудительно когда `use_mux=true` (3 TCP-несущих под mux достаточно для неограниченного числа streams).
 
