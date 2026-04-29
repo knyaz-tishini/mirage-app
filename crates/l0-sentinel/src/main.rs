@@ -184,20 +184,11 @@ async fn main() -> Result<()> {
     }
 
     // ── Spawn MonitorLink ─────────────────────────────────────────────────────
-    let monitor_url = if let Some(ref key) = cfg.monitor_api_key {
-        // Embed key in URL is not standard; MonitorLink doesn't support headers yet.
-        // We log and continue — key support is a v2 item.
-        warn!(
-            "[sentinel] monitor_api_key is set but MonitorLink v1 does not support Bearer auth; key will NOT be sent"
-        );
-        let _ = key;
-        cfg.monitor_url.clone()
-    } else {
-        cfg.monitor_url.clone()
-    };
+    let monitor_url = cfg.monitor_url.clone();
+    let monitor_api_key = cfg.monitor_api_key.clone();
 
     info!("[sentinel] spawning MonitorLink → {}", monitor_url);
-    let (link, mut config_rx) = MonitorLink::new(monitor_url);
+    let (link, mut config_rx) = MonitorLink::new(monitor_url, monitor_api_key);
     link.spawn();
 
     // Wait for first config update (with timeout).

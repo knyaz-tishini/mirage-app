@@ -10,10 +10,14 @@ use anyhow::Context;
 use mirage_chain_ipc::{SupervisorMsg, WorkerMsg, WorkerState, read_msg, write_msg};
 use mirage_client_core::{
     endpoint_protocol::EndpointProtocol,
+    mux_pool::MuxPool,
     pool::TunnelPool,
     socks5::Socks5Server,
 };
-use mirage_core::config::{ClientConfig, TcpProtocolId};
+use mirage_core::{
+    config::{ClientConfig, TcpProtocolId},
+    routing::RoutingTable,
+};
 use mirage_protocol::{
     aliases::{mirage_base, mirage_tls},
     negotiation::ProtocolChain,
@@ -115,10 +119,38 @@ async fn main() -> anyhow::Result<()> {
     if client_config.use_mux {
         pool_cfg.pool_size = 3;
     }
+
+    // Build MuxPool for direct chains when use_mux is enabled.
+    // Onion chains (chain.hops non-empty) skip mux: no mux acceptor runs at
+    // onion exit yet (etap G). On init failure, log a warning and continue
+    // with TCP-only so the worker still serves connections.
+    let is_direct = chain.hops.is_empty();
+    let mux_pool_opt: Option<Arc<MuxPool>> = if client_config.use_mux && is_direct {
+        match MuxPool::new(chain.clone(), Arc::clone(&chain_protocols), pool_cfg.clone()).await {
+            Ok(mp) => {
+                info!(chain_id = %chain_id, "mux pool ready");
+                Some(mp)
+            }
+            Err(e) => {
+                warn!(chain_id = %chain_id, "mux pool init failed, falling back to TCP-only: {e}");
+                None
+            }
+        }
+    } else {
+        if !is_direct {
+            info!(chain_id = %chain_id, "onion chain — mux skipped (etap G)");
+        }
+        None
+    };
+
     let pool = TunnelPool::new(chain, chain_protocols, pool_cfg)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
     // TunnelPool::new already returns Arc<TunnelPool>.
+
+    // Build routing table from config (required by Socks5Server::run).
+    let router = Arc::new(RoutingTable::new(&client_config.routing));
+    let config_arc = Arc::new(client_config.clone());
 
     // Announce readiness.
     let pid = std::process::id();
@@ -144,11 +176,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Spawn SOCKS5 server.
+    // Use full run() when mux is available; run_simple() for TCP-only paths
+    // (onion chains or when mux init failed).
     let server = Socks5Server::new(addr);
     let server_handle = tokio::spawn({
         let pool = Arc::clone(&pool);
         async move {
-            if let Err(e) = server.run_simple(pool).await {
+            let result = if mux_pool_opt.is_some() {
+                server.run(pool, mux_pool_opt, config_arc, router).await
+            } else {
+                server.run_simple(pool).await
+            };
+            if let Err(e) = result {
                 tracing::error!(error = %e, "SOCKS5 server exited with error");
             }
         }

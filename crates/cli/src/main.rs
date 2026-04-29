@@ -111,7 +111,7 @@ async fn main() -> Result<(), BoxError> {
         .and_then(|v| v.get("routing")?.get("default_chain")?.as_str().map(String::from));
     let default_chain_id = explicit_default
         .unwrap_or_else(|| all_chains[0].chain_id.clone());
-    let default_chain = (*all_chains.iter()
+    let _default_chain = (*all_chains.iter()
         .find(|c| c.chain_id == default_chain_id)
         .unwrap_or(&all_chains[0]))
         .clone();
@@ -280,7 +280,7 @@ async fn main() -> Result<(), BoxError> {
     // When `monitor_url` is set in config, spawn a background task that polls
     // mirage2monitor for chain config updates and reacts to them.
     if let Some(ref monitor_url) = config.monitor_url {
-        let (link, mut config_rx) = MonitorLink::new(monitor_url.clone());
+        let (link, mut config_rx) = MonitorLink::new(monitor_url.clone(), None);
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");
 
