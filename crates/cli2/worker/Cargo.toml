@@ -18,3 +18,6 @@ anyhow = "1"
 mirage-core = { workspace = true }
 mirage-protocol = { workspace = true }
 mirage-client-core = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

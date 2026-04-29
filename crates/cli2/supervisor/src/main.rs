@@ -1,10 +1,11 @@
 //! mirage-chain-supervisor — orchestrator process.
 //!
-//! Reads config, spawns one worker per chain, handles IPC, polls for OTA updates,
-//! and performs rolling binary rollouts.
+//! Reads config, discovers live workers (pipe reattach), spawns missing ones,
+//! handles IPC, polls for OTA updates, and performs rolling binary rollouts.
 
 mod config;
 mod ota_poller;
+mod reattach;
 mod rollout;
 mod tun_registry;
 mod worker_handle;
@@ -18,6 +19,7 @@ use tracing::{error, info, warn};
 use config::Config;
 use mirage_chain_ipc::WorkerMsg;
 use ota_poller::{UpdateAvailable, spawn_ota_poller};
+use reattach::discover_orphans;
 use rollout::{download_new_binary, rolling_update, shutdown_all};
 use tun_registry::push_tun_registry;
 use worker_handle::{HandleState, WorkerHandle};
@@ -47,16 +49,55 @@ async fn main() -> anyhow::Result<()> {
 
     let binary_path = std::path::PathBuf::from(&config.worker_binary);
 
-    // Spawn all workers.
-    let mut handles: HashMap<String, WorkerHandle> = HashMap::new();
-    for chain in &config.chains {
-        let mut handle = WorkerHandle::spawn(&binary_path, chain)
-            .with_context(|| format!("spawning worker for chain {}", chain.id))?;
-        handle.send_start(chain).await?;
-        handles.insert(chain.id.clone(), handle);
+    // ── Phase 1: discover orphan workers from previous supervisor run ─────────
+    let temp_dir = std::env::temp_dir();
+    let orphans = discover_orphans(&temp_dir).await;
+    let mut orphan_map: HashMap<String, _> = orphans
+        .into_iter()
+        .map(|o| (o.chain_id.clone(), o))
+        .collect();
+
+    if !orphan_map.is_empty() {
+        info!(
+            count = orphan_map.len(),
+            "discovered orphan workers — reattaching"
+        );
     }
 
-    info!("all workers spawned — waiting for Ready");
+    // ── Phase 2: for each chain, reattach or spawn ───────────────────────────
+    let mut handles: HashMap<String, WorkerHandle> = HashMap::new();
+
+    for chain in &config.chains {
+        if let Some(orphan) = orphan_map.remove(&chain.id) {
+            info!(chain_id = %chain.id, pid = orphan.pid, "reattaching to orphan worker");
+            let mut handle = WorkerHandle::reattach(orphan.chain_id, orphan.pid, orphan.ipc);
+            if let Err(e) = handle.send_continue().await {
+                warn!(chain_id = %chain.id, "send_continue failed: {e:#} — will respawn");
+                // Fall through to spawning a fresh worker below.
+                match WorkerHandle::spawn(&binary_path, chain) {
+                    Err(se) => {
+                        error!(chain_id = %chain.id, "respawn failed: {se:#}");
+                        continue;
+                    }
+                    Ok(mut new_handle) => {
+                        if let Err(se) = new_handle.send_start(chain).await {
+                            error!(chain_id = %chain.id, "send_start failed: {se:#}");
+                        }
+                        handles.insert(chain.id.clone(), new_handle);
+                    }
+                }
+            } else {
+                handles.insert(chain.id.clone(), handle);
+            }
+        } else {
+            let mut handle = WorkerHandle::spawn(&binary_path, chain)
+                .with_context(|| format!("spawning worker for chain {}", chain.id))?;
+            handle.send_start(chain).await?;
+            handles.insert(chain.id.clone(), handle);
+        }
+    }
+
+    info!("all workers spawned/reattached — waiting for Ready");
 
     // Wait for all workers to signal Ready.
     wait_all_ready(&mut handles).await;
@@ -102,7 +143,6 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(code) = handle.try_wait() {
                 if handle.intentional_restart {
-                    // Rolling update / graceful drain — do not respawn here.
                     info!(chain_id = %chain_id, "worker exited intentionally — skip respawn");
                     handle.intentional_restart = false;
                     continue;
@@ -121,7 +161,6 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             };
 
-            // Move tracker out of old handle so we preserve restart history.
             let old_tracker = handles
                 .remove(&chain_id)
                 .map(|h| h.restart_tracker)
@@ -134,8 +173,6 @@ async fn main() -> anyhow::Result<()> {
                     total = tracker.total,
                     "worker hit restart limit — will not respawn"
                 );
-                // Re-insert a dead placeholder so the map still has the entry.
-                // We cannot insert a live handle, so we skip; the chain is gone.
                 continue;
             }
 
@@ -177,7 +214,6 @@ async fn main() -> anyhow::Result<()> {
                                 error!("OTA download failed: {e:#}");
                             }
                             Ok(new_binary) => {
-                                // Mark all handles as intentional so respawn watchdog is quiet.
                                 for handle in handles.values_mut() {
                                     handle.intentional_restart = true;
                                 }
@@ -190,16 +226,12 @@ async fn main() -> anyhow::Result<()> {
                                 {
                                     error!("rolling update failed: {e:#}");
                                 } else {
-                                    // Re-push TUN registry after successful rollout.
                                     push_tun_registry(&config).await;
 
-                                    // Self-update: if the new binary is the supervisor itself,
-                                    // spawn it and exit. Workers survive because they are in
-                                    // their own process group and will see stdin EOF → graceful
-                                    // shutdown.
-                                    //
-                                    // TODO(v2): switch worker IPC to named pipes / Unix sockets
-                                    // so workers can truly survive supervisor replacement.
+                                    // Supervisor self-update: spawn new binary and exit.
+                                    // Workers survive because they are fully detached and
+                                    // keep their pipes listening. The new supervisor will
+                                    // discover them via discover_orphans() on startup.
                                     let self_path = std::env::current_exe()
                                         .unwrap_or_else(|_| new_binary.clone());
                                     if new_binary == self_path
@@ -262,7 +294,6 @@ async fn wait_all_ready(handles: &mut HashMap<String, WorkerHandle>) {
             break;
         }
 
-        // Drain events.
         for handle in handles.values_mut() {
             if let Ok(event) = handle.rx.try_recv() {
                 handle.apply_msg(&event.msg);
@@ -301,6 +332,9 @@ fn log_worker_event(chain_id: &str, msg: &WorkerMsg) {
         }
         WorkerMsg::Error { message, .. } => {
             error!(chain_id, "worker Error: {message}");
+        }
+        WorkerMsg::Hello { pid, .. } => {
+            info!(chain_id, pid, "worker Hello");
         }
     }
 }

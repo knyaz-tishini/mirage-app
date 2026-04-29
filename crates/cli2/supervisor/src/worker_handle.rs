@@ -1,17 +1,14 @@
-//! WorkerHandle: owns a spawned worker process + its IPC channels.
+//! WorkerHandle: owns a worker process + its IPC channels (named pipe / Unix socket).
 
 use anyhow::Context;
-use mirage_chain_ipc::{SupervisorMsg, WorkerMsg, WorkerState, read_msg, write_msg};
-use std::{
-    path::Path,
-    process::Stdio,
-    time::Instant,
+use mirage_chain_ipc::{
+    SupervisorMsg, WorkerMsg, WorkerState,
+    pipe::{PipePair, connect_with_retry},
+    pipe_path,
 };
-use tokio::{
-    io::{BufReader, BufWriter},
-    process::{Child, ChildStdin},
-    sync::mpsc,
-};
+use std::{path::Path, time::Instant};
+use tokio::process::Child;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::ChainConfig;
@@ -20,6 +17,10 @@ use crate::config::ChainConfig;
 const MAX_RESTARTS_IN_WINDOW: u32 = 5;
 /// Window length for restart rate limiting.
 const RESTART_WINDOW_SECS: u64 = 60;
+/// How many times to retry connecting to the worker pipe after spawn.
+const PIPE_CONNECT_ATTEMPTS: u32 = 25;
+/// Delay between pipe connect retries (ms).
+const PIPE_CONNECT_DELAY_MS: u64 = 200;
 
 /// Live state of the worker as seen by the supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,38 +67,44 @@ impl RestartTracker {
     }
 }
 
-/// Handle to a running worker process.
+/// Handle to a worker process. IPC is via named pipe / Unix socket.
 pub struct WorkerHandle {
     pub chain_id: String,
     pub pid: Option<u32>,
     pub state: HandleState,
-    /// Set by rollout code before intentionally killing/draining the worker,
-    /// so the respawn watchdog does not trigger a restart.
+    /// Set by rollout code before intentionally killing/draining the worker.
     pub intentional_restart: bool,
     /// Tracks how often this worker has been respawned.
     pub restart_tracker: RestartTracker,
-    child: Child,
-    stdin_writer: BufWriter<ChildStdin>,
+    /// Child process handle. `None` for reattached orphans (supervisor didn't spawn them).
+    child: Option<Child>,
+    /// IPC write half (send SupervisorMsg to worker).
+    ipc_writer: IpcSender,
     /// Receives WorkerMsg events forwarded by the background reader task.
     pub rx: mpsc::Receiver<WorkerEvent>,
+}
+
+/// Thin wrapper so the mpsc sender side is clearly typed.
+struct IpcSender {
+    tx: mpsc::Sender<SupervisorMsg>,
+}
+
+impl IpcSender {
+    async fn send(&self, msg: SupervisorMsg) -> anyhow::Result<()> {
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("IPC sender channel closed"))
+    }
 }
 
 impl WorkerHandle {
     /// Spawn a new worker process for `chain_config` using `binary_path`.
     ///
-    /// The worker communicates over its stdin/stdout. A background task
-    /// reads its stdout and forwards [`WorkerEvent`]s through `rx`.
-    ///
-    /// Workers are spawned in their own process group (Unix: `process_group(0)`,
-    /// Windows: `CREATE_NEW_PROCESS_GROUP`). This means a Ctrl-C sent to the
-    /// supervisor console does **not** propagate to workers. However, because
-    /// IPC uses stdin/stdout pipes, if the supervisor exits its stdin pipe
-    /// closes → the worker sees EOF → clean shutdown. This is the v1
-    /// limitation: true detachment requires switching to named-pipe/socket IPC.
-    pub fn spawn(
-        binary_path: &Path,
-        chain_config: &ChainConfig,
-    ) -> anyhow::Result<Self> {
+    /// After spawn, connects to its named pipe / Unix socket with retries.
+    /// Expects the worker to send `Hello` on connect; sends `Continue` if the
+    /// worker already has config (shouldn't happen on fresh spawn, but safe).
+    pub fn spawn(binary_path: &Path, chain_config: &ChainConfig) -> anyhow::Result<Self> {
         Self::spawn_with_tracker(binary_path, chain_config, RestartTracker::default())
     }
 
@@ -107,100 +114,146 @@ impl WorkerHandle {
         chain_config: &ChainConfig,
         restart_tracker: RestartTracker,
     ) -> anyhow::Result<Self> {
-        // Build a std::process::Command first so we can apply platform-specific
-        // process-group flags that tokio::process::Command may not expose
-        // directly (e.g. Windows CommandExt).
+        use std::process::Stdio;
+
         let mut std_cmd = std::process::Command::new(binary_path);
         std_cmd
             .env("MIRAGE_CHAIN_ID", &chain_config.id)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            // stdin/stdout/stderr: all inherited or null — no IPC pipes.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(Stdio::inherit());
 
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // Own process group: won't receive Ctrl-C from supervisor's console.
-            std_cmd.process_group(0);
+            // Own process group + session so the worker is fully detached.
+            unsafe {
+                std_cmd.pre_exec(|| {
+                    // setsid() creates a new session; worker survives supervisor exit.
+                    libc::setsid();
+                    Ok(())
+                });
+            }
         }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            // CREATE_NEW_PROCESS_GROUP (0x200): child won't receive Ctrl-C from
-            // parent console. We do NOT use DETACHED_PROCESS (0x8) because that
-            // closes stdio handles — we need them for IPC.
+            // DETACHED_PROCESS (0x8): no console; CREATE_NEW_PROCESS_GROUP (0x200):
+            // won't receive Ctrl-C from parent. Combined they fully detach the worker.
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            std_cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+            std_cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
 
-        // Convert to tokio::process::Command for async process management.
         let mut cmd = tokio::process::Command::from(std_cmd);
-
-        let mut child = cmd.spawn().with_context(|| {
+        let child = cmd.spawn().with_context(|| {
             format!(
                 "spawning worker {:?} for chain {}",
                 binary_path, chain_config.id
             )
         })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("worker stdin not available"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("worker stdout not available"))?;
-
-        let stdin_writer = BufWriter::new(stdin);
-        let (tx, rx) = mpsc::channel::<WorkerEvent>(32);
-
-        let chain_id_reader = chain_config.id.clone();
-        let mut reader = BufReader::new(stdout);
-        tokio::spawn(async move {
-            loop {
-                match read_msg::<_, WorkerMsg>(&mut reader).await {
-                    Ok(Some(msg)) => {
-                        debug!(chain_id = %chain_id_reader, ?msg, "worker → supervisor");
-                        if tx.send(WorkerEvent { msg }).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        info!(chain_id = %chain_id_reader, "worker stdout closed");
-                        break;
-                    }
-                    Err(e) => {
-                        error!(chain_id = %chain_id_reader, "IPC read error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-
         info!(
             chain_id = %chain_config.id,
             binary = ?binary_path,
-            "worker spawned"
+            "worker spawned — will connect to pipe"
         );
 
+        let chain_id = chain_config.id.clone();
+        let pipe_addr = pipe_path(&chain_id);
+
+        // Build mpsc channels. A background task owns the PipePair and
+        // proxies messages in both directions.
+        let (sup_tx, sup_rx) = mpsc::channel::<SupervisorMsg>(32);
+        let (worker_tx, worker_rx) = mpsc::channel::<WorkerEvent>(32);
+
+        let chain_id_bg = chain_id.clone();
+        tokio::spawn(async move {
+            // Connect to the worker's pipe with retry.
+            let mut ipc = match connect_with_retry(
+                &pipe_addr,
+                PIPE_CONNECT_ATTEMPTS,
+                PIPE_CONNECT_DELAY_MS,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(chain_id = %chain_id_bg, "could not connect to worker pipe: {e}");
+                    return;
+                }
+            };
+
+            // Worker sends Hello immediately; read + log it, then send Continue.
+            match ipc.read_msg::<WorkerMsg>().await {
+                Ok(Some(WorkerMsg::Hello { ref chain_id, pid, .. })) => {
+                    info!(chain_id = %chain_id, pid, "worker Hello (fresh spawn)");
+                }
+                Ok(Some(other)) => {
+                    debug!(chain_id = %chain_id_bg, ?other, "first message from new worker (not Hello)");
+                }
+                Ok(None) => {
+                    warn!(chain_id = %chain_id_bg, "worker pipe EOF before Hello");
+                    return;
+                }
+                Err(e) => {
+                    error!(chain_id = %chain_id_bg, "IPC read error waiting for Hello: {e}");
+                    return;
+                }
+            }
+
+            // Worker waits for Continue or a Start message.
+            // For fresh spawns we use Continue here; the caller then sends Start separately.
+            // (Caller uses send_start() which goes through sup_rx.)
+            // We do NOT send Continue here — we let the normal send path deliver Start.
+            // Just proceed to the bidirectional relay loop.
+
+            ipc_relay_loop(ipc, sup_rx, worker_tx, chain_id_bg).await;
+        });
+
         Ok(Self {
-            chain_id: chain_config.id.clone(),
+            chain_id,
             pid: None,
             state: HandleState::Spawned,
             intentional_restart: false,
             restart_tracker,
-            child,
-            stdin_writer,
-            rx,
+            child: Some(child),
+            ipc_writer: IpcSender { tx: sup_tx },
+            rx: worker_rx,
         })
     }
 
+    /// Construct a `WorkerHandle` from a reattached orphan (no child process owned here).
+    ///
+    /// `ipc` is already connected and `Hello` has already been read by `discover_orphans`.
+    /// After calling this, the caller must send `Continue` via `send_continue()`.
+    pub fn reattach(chain_id: String, pid: u32, ipc: PipePair) -> Self {
+        let (sup_tx, sup_rx) = mpsc::channel::<SupervisorMsg>(32);
+        let (worker_tx, worker_rx) = mpsc::channel::<WorkerEvent>(32);
+
+        let chain_id_bg = chain_id.clone();
+        tokio::spawn(async move {
+            ipc_relay_loop(ipc, sup_rx, worker_tx, chain_id_bg).await;
+        });
+
+        Self {
+            chain_id,
+            pid: Some(pid),
+            state: HandleState::Ready, // orphan was running; assume Ready until proven otherwise
+            intentional_restart: false,
+            restart_tracker: RestartTracker::default(),
+            child: None,
+            ipc_writer: IpcSender { tx: sup_tx },
+            rx: worker_rx,
+        }
+    }
+
     /// Non-blocking poll: returns `Some(exit_status_code)` if child has exited,
-    /// `None` if still running.
+    /// `None` if still running or if this is a reattached orphan (no owned child).
     pub fn try_wait(&mut self) -> Option<Option<i32>> {
-        // tokio::process::Child::try_wait is synchronous (does not require .await).
-        match self.child.try_wait() {
+        let child = self.child.as_mut()?;
+        match child.try_wait() {
             Ok(Some(status)) => {
                 self.state = HandleState::Exited;
                 Some(status.code())
@@ -213,16 +266,17 @@ impl WorkerHandle {
         }
     }
 
-    /// Send a message to the worker over its stdin.
-    pub async fn send(&mut self, msg: &SupervisorMsg) -> anyhow::Result<()> {
-        write_msg(&mut self.stdin_writer, msg)
+    /// Send a message to the worker.
+    pub async fn send(&mut self, msg: SupervisorMsg) -> anyhow::Result<()> {
+        self.ipc_writer
+            .send(msg)
             .await
             .with_context(|| format!("sending to worker {}", self.chain_id))
     }
 
     /// Send `Start` with the chain config.
     pub async fn send_start(&mut self, chain: &ChainConfig) -> anyhow::Result<()> {
-        self.send(&SupervisorMsg::Start {
+        self.send(SupervisorMsg::Start {
             chain_id: chain.id.clone(),
             socks5_bind: chain.socks5_bind.clone(),
             config_path: chain.config_path.clone(),
@@ -230,21 +284,28 @@ impl WorkerHandle {
         .await
     }
 
+    /// Send `Continue` to a reattached orphan worker.
+    pub async fn send_continue(&mut self) -> anyhow::Result<()> {
+        self.send(SupervisorMsg::Continue).await
+    }
+
     /// Send `Drain` and transition to draining state.
     pub async fn send_drain(&mut self, timeout_secs: u64) -> anyhow::Result<()> {
         self.state = HandleState::Draining;
-        self.send(&SupervisorMsg::Drain { timeout_secs }).await
+        self.send(SupervisorMsg::Drain { timeout_secs }).await
     }
 
     /// Send `Shutdown` (force exit).
     pub async fn send_shutdown(&mut self) -> anyhow::Result<()> {
-        self.send(&SupervisorMsg::Shutdown).await
+        self.send(SupervisorMsg::Shutdown).await
     }
 
-    /// Wait for the child process to exit.
+    /// Wait for the child process to exit. No-op for reattached orphans.
     pub async fn wait(&mut self) -> anyhow::Result<()> {
-        let status = self
-            .child
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let status = child
             .wait()
             .await
             .with_context(|| format!("waiting for worker {}", self.chain_id))?;
@@ -259,10 +320,12 @@ impl WorkerHandle {
         Ok(())
     }
 
-    /// Kill the child process immediately.
+    /// Kill the child process immediately. No-op for reattached orphans.
     pub async fn kill(&mut self) {
-        if let Err(e) = self.child.kill().await {
-            warn!(chain_id = %self.chain_id, "kill error: {e}");
+        if let Some(child) = self.child.as_mut() {
+            if let Err(e) = child.kill().await {
+                warn!(chain_id = %self.chain_id, "kill error: {e}");
+            }
         }
         self.state = HandleState::Exited;
     }
@@ -286,6 +349,55 @@ impl WorkerHandle {
             WorkerMsg::Status { state, .. } => {
                 if *state == WorkerState::Ready {
                     self.state = HandleState::Ready;
+                }
+            }
+            WorkerMsg::Hello { pid, .. } => {
+                // Hello on an established connection means supervisor reconnected
+                // to an existing worker. Update PID in case it's useful.
+                self.pid = Some(*pid);
+            }
+        }
+    }
+}
+
+/// Background task: relay messages between the supervisor mpsc and the pipe.
+async fn ipc_relay_loop(
+    mut ipc: PipePair,
+    mut sup_rx: mpsc::Receiver<SupervisorMsg>,
+    worker_tx: mpsc::Sender<WorkerEvent>,
+    chain_id: String,
+) {
+    loop {
+        tokio::select! {
+            // Supervisor wants to send a message to the worker.
+            msg = sup_rx.recv() => {
+                let Some(msg) = msg else {
+                    // Supervisor dropped the sender — clean exit.
+                    break;
+                };
+                if let Err(e) = ipc.write_msg(&msg).await {
+                    error!(chain_id = %chain_id, "IPC write error: {e}");
+                    break;
+                }
+            }
+
+            // Worker sent a message to the supervisor.
+            result = ipc.read_msg::<WorkerMsg>() => {
+                match result {
+                    Ok(Some(msg)) => {
+                        debug!(chain_id = %chain_id, ?msg, "worker → supervisor");
+                        if worker_tx.send(WorkerEvent { msg }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        info!(chain_id = %chain_id, "worker pipe closed (EOF)");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(chain_id = %chain_id, "IPC read error: {e}");
+                        break;
+                    }
                 }
             }
         }

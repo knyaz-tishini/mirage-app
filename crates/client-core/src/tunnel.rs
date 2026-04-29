@@ -170,6 +170,50 @@ pub async fn establish_raw_tunnel(
 }
 
 
+/// Magic prefix sent as `initial_user_data` to signal the onion exit that this
+/// is a multiplexed session.  Must match `MUX_MAGIC` in `mirage-node`'s
+/// `exit/onion.rs` exactly.
+pub const ONION_MUX_MAGIC: &[u8] = b"MUX\0";
+
+/// Establish a tunnel for use as a mux session transport.
+///
+/// For onion chains (`chain.hops` non-empty) the onion envelope is built with
+/// `ONION_MUX_MAGIC` as `initial_user_data` so the exit node upgrades to a
+/// `SessionHandle::server` instead of the single-envelope TCP proxy.
+///
+/// For direct chains (no hops) this is identical to [`establish_raw_tunnel`].
+pub async fn establish_mux_tunnel(
+    chain_protocols: &ProtocolChain,
+    chain: &ChainConfig,
+) -> Result<Box<dyn Tunnel>, MirageError> {
+    if !chain.hops.is_empty() {
+        let destination = NextHop::Terminal;
+
+        debug!(
+            chain_id = %chain.chain_id,
+            hops = chain.hops.len(),
+            "establishing onion mux tunnel (MUX magic)"
+        );
+
+        const ONION_TIMEOUT: Duration = Duration::from_secs(15);
+        let tunnel = tokio::time::timeout(
+            ONION_TIMEOUT,
+            OnionTunnel::connect(chain, destination, ONION_MUX_MAGIC),
+        )
+        .await
+        .map_err(|_| {
+            MirageError::NodeUnreachable(format!(
+                "chain {}: onion mux connect timed out after {}s",
+                chain.chain_id,
+                ONION_TIMEOUT.as_secs()
+            ))
+        })??;
+        return Ok(Box::new(tunnel));
+    }
+
+    establish_raw_tunnel(chain_protocols, chain).await
+}
+
 /// Decode a 64-character hex string into a 32-byte X25519 public key.
 fn decode_hex_pubkey(hex: &str) -> Result<[u8; 32], String> {
     if hex.len() != 64 {

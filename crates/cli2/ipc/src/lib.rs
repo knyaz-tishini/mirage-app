@@ -1,9 +1,14 @@
 //! IPC protocol for supervisor ↔ worker communication.
 //!
 //! JSON-line framing over duplex byte stream.
-//! Same message types work over Unix socket (Linux) and named pipe (Windows).
+//! Transport-agnostic: works over named pipe (Windows) and Unix socket (Linux/macOS).
 
 use serde::{Deserialize, Serialize};
+
+pub mod pipe;
+pub mod transport;
+
+pub use transport::{IpcReader, IpcWriter};
 
 /// Messages sent from supervisor to worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +26,10 @@ pub enum SupervisorMsg {
     Shutdown,
     /// Status ping.
     Ping,
+    /// Supervisor acknowledges reattach — continue current state.
+    Continue,
+    /// Supervisor requests worker to drain and exit (will be respawned fresh).
+    Restart { reason: String },
 }
 
 /// Messages sent from worker to supervisor.
@@ -45,6 +54,14 @@ pub enum WorkerMsg {
     },
     /// Worker encountered fatal error.
     Error { chain_id: String, message: String },
+    /// First message after every supervisor connection (initial + reattach).
+    Hello {
+        chain_id: String,
+        pid: u32,
+        started_at_unix: u64,
+        version: String,
+        state: WorkerState,
+    },
 }
 
 /// Worker lifecycle state.
@@ -97,4 +114,28 @@ where
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Returns `\\.\pipe\mirage-cli2-{chain_id}` on Windows,
+/// `${TEMP}/mirage-cli2/{chain_id}.sock` on Unix.
+pub fn pipe_path(chain_id: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(r"\\.\pipe\mirage-cli2-{chain_id}")
+    }
+    #[cfg(not(windows))]
+    {
+        let tmp = std::env::temp_dir();
+        tmp.join("mirage-cli2")
+            .join(format!("{chain_id}.sock"))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Returns `${TEMP}/mirage-cli2/{chain_id}.pid`.
+pub fn pid_file_path(chain_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("mirage-cli2")
+        .join(format!("{chain_id}.pid"))
 }

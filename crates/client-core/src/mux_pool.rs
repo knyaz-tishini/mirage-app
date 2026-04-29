@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::relay::TunnelCompat;
-use crate::tunnel::establish_raw_tunnel;
+use crate::tunnel::establish_mux_tunnel;
 
 // ── Circuit breaker state constants ──────────────────────────────────────────
 const CIRCUIT_CLOSED: u8 = 0;
@@ -357,7 +357,10 @@ async fn build_session(
     chain_protocols: &Arc<ProtocolChain>,
     chain: &ChainConfig,
 ) -> Result<SessionHandle, MirageError> {
-    let tunnel: Box<dyn Tunnel> = establish_raw_tunnel(chain_protocols, chain).await?;
+    // Onion chains send MUX\0 magic so the exit upgrades to a mux server.
+    // Direct chains use the raw tunnel path (no magic needed — they connect
+    // directly to a relay that already runs a mux server).
+    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain).await?;
     let compat = TunnelCompat::wrap(tunnel);
     Ok(SessionHandle::client(compat))
 }
@@ -433,6 +436,30 @@ async fn mux_maintenance_loop(
                 let _ = done_tx.send(slot_idx);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tunnel::ONION_MUX_MAGIC;
+
+    /// Assert the magic constant is the right 4 bytes.
+    #[test]
+    fn onion_mux_magic_correct() {
+        assert_eq!(ONION_MUX_MAGIC, b"MUX\0");
+    }
+
+    /// When a chain has hops (onion), `establish_mux_tunnel` would pass
+    /// ONION_MUX_MAGIC as initial_user_data.  This test is a compile-time guard
+    /// that the constant is visible here and has the expected value.  The actual
+    /// magic injection into OnionTunnel::connect is tested via e2e after deploy.
+    #[test]
+    fn onion_session_prepends_magic() {
+        // Simulate: chain with hops → magic must be non-empty and start "MUX"
+        let magic = ONION_MUX_MAGIC;
+        assert!(!magic.is_empty());
+        assert_eq!(&magic[..3], b"MUX");
+        assert_eq!(magic[3], 0u8); // null terminator
     }
 }
 

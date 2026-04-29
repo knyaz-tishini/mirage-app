@@ -169,27 +169,18 @@ async fn main() -> Result<(), BoxError> {
         .cloned()
         .expect("default pool inserted above");
 
-    // ── Mux pools (one per direct chain when use_mux=true) ────────────────────
-    // Build mux for direct chains (1-hop). Onion / telescopic chains can't use
-    // mux today: the L1 onion-peel just byte-forwards to the next hop, no
-    // mux server runs at L2 exit, so mux frames on those chains see EOF.
-    // Onion chains keep TunnelPool only — mux server in onion exit is a
-    // separate piece of work (see mirage2node/src/exit/onion.rs).
+    // ── Mux pools (one per chain when use_mux=true) ───────────────────────────
+    // Both direct and onion chains support mux: direct chains connect to a relay
+    // mux server; onion chains send MUX\0 magic so the L2 exit upgrades to a
+    // mux server session (see mirage2node/src/exit/onion.rs).
     let mut mux_pools: HashMap<String, Arc<MuxPool>> = HashMap::new();
     if use_mux {
-        let direct_chains: Vec<_> = all_chains
-            .iter()
-            .filter(|c| c.hops.is_empty())
-            .copied()
-            .collect();
-        let onion_count = all_chains.len() - direct_chains.len();
         info!(
-            direct = direct_chains.len(),
-            onion_skipped = onion_count,
-            "creating mux pools (direct chains only; onion chains use TunnelPool)"
+            chains = all_chains.len(),
+            "creating mux pools (all chains)"
         );
         let mut mux_tasks = tokio::task::JoinSet::new();
-        for chain in direct_chains {
+        for chain in &all_chains {
             let chain_owned = (*chain).clone();
             let id = chain.chain_id.clone();
             let protocols = Arc::clone(&chain_protocols);
