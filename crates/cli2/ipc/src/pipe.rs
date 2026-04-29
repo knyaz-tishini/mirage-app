@@ -52,32 +52,56 @@ mod imp {
         }
     }
 
-    /// Server-side listener (worker). Holds the first instance to own the pipe name.
+    /// Server-side listener (worker).
+    ///
+    /// On Windows, a named-pipe "instance" must call `connect().await` to be
+    /// reachable by clients. The pipe name persists as long as at least one
+    /// instance is alive, so we simply create a fresh instance per `accept()`
+    /// and keep the previous instance alive (held by the `PipePair` returned
+    /// from the previous `accept`).
+    ///
+    /// The first instance is created on `bind()` so the pipe name is owned
+    /// from that moment; it's stored in `pending` so the next `accept()`
+    /// awaits its `connect()` rather than creating a new instance.
     pub struct PipeListener {
         path: String,
-        /// First-instance handle kept alive so the OS doesn't release the pipe name.
-        _owner: NamedPipeServer,
+        /// The next server instance, already created and ready for `connect().await`.
+        /// Always Some between calls except briefly inside `accept()`.
+        pending: Option<NamedPipeServer>,
     }
 
     impl PipeListener {
         /// Claim the pipe name and start accepting connections.
         pub fn bind(path: &str) -> io::Result<Self> {
-            let owner = ServerOptions::new()
+            let initial = ServerOptions::new()
                 .first_pipe_instance(true)
                 .create(path)
                 .map_err(|e| io::Error::new(e.kind(), format!("bind {path}: {e}")))?;
             Ok(Self {
                 path: path.to_string(),
-                _owner: owner,
+                pending: Some(initial),
             })
         }
 
         /// Block until a supervisor connects; return the connected pair.
+        ///
+        /// Awaits `connect()` on the currently pending instance, then prepares
+        /// a fresh instance so the pipe name stays claimed (held by the
+        /// returned `PipePair` until it's dropped, plus the new pending).
         pub async fn accept(&mut self) -> io::Result<PipePair> {
-            let server = ServerOptions::new()
-                .first_pipe_instance(false)
-                .create(&self.path)?;
+            // Take the existing pending instance and await a client connect on it.
+            let server = self.pending.take().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "PipeListener: no pending instance")
+            })?;
             server.connect().await?;
+
+            // Prepare the next instance so the pipe name stays claimed.
+            let next = ServerOptions::new()
+                .first_pipe_instance(false)
+                .create(&self.path)
+                .map_err(|e| io::Error::new(e.kind(), format!("rebind {}: {e}", self.path)))?;
+            self.pending = Some(next);
+
             Ok(PipePair::from_server(server))
         }
     }
