@@ -1,0 +1,20 @@
+[package]
+name    = "mirage-l0-sentinel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mirage-l0-sentinel"
+path = "src/main.rs"
+
+[dependencies]
+mirage-client-core = { path = "../client-core" }
+mirage-core        = { path = "../../../mirage2web/crates/mirage-core" }
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap               = { workspace = true }
+toml               = "0.8"
+anyhow             = "1"

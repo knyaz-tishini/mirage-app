@@ -2292,6 +2292,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirage-l0-sentinel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mirage-client-core",
+ "mirage-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mirage-mux"
 version = "0.1.0"
 dependencies = [
