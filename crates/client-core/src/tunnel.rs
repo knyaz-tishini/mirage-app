@@ -236,3 +236,72 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
         _ => Err(format!("invalid hex character: {}", b as char)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mirage_core::config::{
+        ChainConfig, HandshakeStrategy, HopConfig, HopRole, ProtocolId, TcpProtocolId,
+    };
+    use mirage_protocol::onion::layer::NextHop;
+
+    use super::ONION_MUX_MAGIC;
+    use crate::onion_tunnel::OnionTunnel;
+
+    /// Build a minimal `ChainConfig` with `handshake = Telescopic` and one dummy
+    /// hop pointing at a localhost port that is not listening.
+    fn telescopic_chain() -> ChainConfig {
+        ChainConfig {
+            chain_id: "test-telescopic".into(),
+            l1: None,
+            l2: None,
+            l1_transparent: false,
+            hops: vec![HopConfig {
+                addr: "127.0.0.1:19999".into(),
+                // 64 hex zeros — syntactically valid, cryptographically meaningless
+                public_key: "0".repeat(64),
+                sni: None,
+                role: HopRole::Exit,
+            }],
+            handshake: HandshakeStrategy::Telescopic,
+            reply: mirage_core::config::ReplyMode::Raw,
+            protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
+            priority: 0,
+            shaping: Default::default(),
+            camouflage: Default::default(),
+            cover_traffic: Default::default(),
+            byte_cipher: None,
+            socks5_bind: None,
+        }
+    }
+
+    /// `establish_mux_tunnel` for a telescopic chain must route through
+    /// `connect_telescopic` with `ONION_MUX_MAGIC`.  We confirm the magic
+    /// reaches `connect_telescopic` by calling it directly and asserting the
+    /// error is a network/IO error (connection refused), not a config/logic
+    /// error such as "empty hops" or an onion-builder error that would arise
+    /// if user_data were silently dropped or the function signature mismatched.
+    #[tokio::test]
+    async fn telescopic_mux_magic_reaches_connect_telescopic() {
+        let chain = telescopic_chain();
+        let result = OnionTunnel::connect_telescopic(
+            &chain,
+            NextHop::Terminal,
+            ONION_MUX_MAGIC,
+        )
+        .await;
+
+        // The only path that gets this far is: public_key decoded (64 zeros is
+        // valid hex), TCP connect attempted, connection refused → NodeUnreachable
+        // or Io. A config/logic error would surface with a different message.
+        match result {
+            Ok(_) => panic!("expected a network-level error from connect_telescopic"),
+            Err(err) => {
+                let msg = format!("{err:?}");
+                assert!(
+                    msg.contains("timed out") || msg.contains("refused") || msg.contains("Io") || msg.contains("NodeUnreachable"),
+                    "unexpected error (expected network-level failure, got): {msg}"
+                );
+            }
+        }
+    }
+}

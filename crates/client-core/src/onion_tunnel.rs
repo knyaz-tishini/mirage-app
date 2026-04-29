@@ -81,7 +81,7 @@ impl OnionTunnel {
                 // fall through to ephemeral build below
             }
             HandshakeStrategy::Telescopic => {
-                return OnionTunnel::connect_telescopic(chain, destination).await;
+                return OnionTunnel::connect_telescopic(chain, destination, initial_user_data).await;
             }
         }
 
@@ -128,9 +128,16 @@ impl OnionTunnel {
     /// and ready for `RELAY` data frames.
     ///
     /// `destination` is the exit target encoded in the innermost data frame.
+    ///
+    /// `initial_user_data` is embedded in the RELAY payload's innermost onion
+    /// layer so the exit node receives it alongside the destination.  Pass `&[]`
+    /// when no application payload is needed at circuit establishment time.
+    /// Callers that need mux signaling (e.g. [`crate::tunnel::establish_mux_tunnel`])
+    /// pass [`crate::tunnel::ONION_MUX_MAGIC`] here.
     pub async fn connect_telescopic(
         chain: &ChainConfig,
         destination: NextHop,
+        initial_user_data: &[u8],
     ) -> Result<Self, MirageError> {
         use mirage_protocol::onion::{
             builder::TelescopicBuilder,
@@ -216,7 +223,7 @@ impl OnionTunnel {
         // produces Terminal rather than Forward.
         let exit_idx = chain.hops.len().saturating_sub(1);
         let exit_slice = &chain.hops[exit_idx..];
-        let (onion_bytes, _) = build_onion_ephemeral_at_position(exit_slice, exit_idx as u8, &destination, &[])?;
+        let (onion_bytes, _) = build_onion_ephemeral_at_position(exit_slice, exit_idx as u8, &destination, initial_user_data)?;
         CF {
             msg_type: MsgType::Relay,
             flags: 0,
