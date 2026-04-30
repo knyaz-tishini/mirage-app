@@ -170,8 +170,13 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         }));
     }
 
-    // WaitingOnboard: block if credentials missing
-    if cfg.monitor_api_key.is_none() || cfg.client_id.is_none() {
+    // WaitingOnboard: block if any required credential is missing or empty.
+    // Treat empty string the same as None (TOML default for missing string fields).
+    let creds_ready = !cfg.monitor_url.trim().is_empty()
+        && cfg.monitor_api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+        && cfg.client_id.as_deref().is_some_and(|id| !id.trim().is_empty());
+
+    if !creds_ready {
         publisher.set(SentinelPhase::WaitingOnboard);
         info!("[sentinel] credentials missing — waiting for /onboard");
         loop {
