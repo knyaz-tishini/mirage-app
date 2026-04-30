@@ -3,6 +3,10 @@ name = "mirage-client-cli"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "mirage_client_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mirage-client-cli"
 path = "src/main.rs"

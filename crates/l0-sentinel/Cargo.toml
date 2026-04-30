@@ -3,6 +3,10 @@ name    = "mirage-l0-sentinel"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "mirage_l0_sentinel"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mirage-l0-sentinel"
 path = "src/main.rs"

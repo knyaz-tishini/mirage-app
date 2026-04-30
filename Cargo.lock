@@ -2302,6 +2302,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirage-l0-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "mirage-client-cli",
+ "mirage-l0-sentinel",
+ "mirage-runtime-guard",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mirage-l0-sentinel"
 version = "0.1.0"
 dependencies = [

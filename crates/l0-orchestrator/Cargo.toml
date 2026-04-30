@@ -1,0 +1,31 @@
+[package]
+name    = "mirage-l0-orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mirage_l0_orchestrator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mirage-l0-orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+tokio-util         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+clap               = { workspace = true }
+toml               = "0.8"
+anyhow             = "1"
+async-trait        = "0.1"
+mirage-runtime-guard = { workspace = true }
+
+# In-process embedding (mobile / single-binary mode):
+# orchestrator can call sentinel::run / cli::run directly as tokio tasks
+# instead of spawning subprocesses.
+mirage-l0-sentinel  = { path = "../l0-sentinel" }
+mirage-client-cli   = { path = "../cli" }

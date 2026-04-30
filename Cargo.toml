@@ -9,6 +9,7 @@ members = [
     "crates/cli2/supervisor",
     "crates/desktop/windows/v2",
     "crates/l0-sentinel",
+    "crates/l0-orchestrator",
     "crates/runtime-guard",
     # "crates/mobile",  # cdylib — skip on Windows build
 ]

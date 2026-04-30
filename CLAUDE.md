@@ -6,8 +6,9 @@ mirage2app содержит **headless backend клиента**. Три проц
 
 | Crate | Роль |
 |-------|------|
-| `crates/l0-sentinel/` (`mirage-l0-sentinel`) | Bootstrap: связь с монитором, материализация client-config, спавн cli |
-| `crates/cli/` (`mirage-client-cli`) | SOCKS5/HTTP proxy server, TunnelPool/MuxPool, push в TUN через `/chains/update` |
+| `crates/l0-orchestrator/` (`mirage-l0-orchestrator`) | Топ-уровневый supervisor для desktop+mobile. Process mode (desktop) спавнит компоненты бинарями; task mode (mobile) — встраивает их через `lib::run()` в один процесс. См. `orchestrator.example.toml` |
+| `crates/l0-sentinel/` (`mirage-l0-sentinel`) | Bootstrap: связь с монитором, материализация client-config, спавн cli. **Двойной крейт (lib + bin)** — `pub async fn run(SentinelConfig)` для embedded use из orchestrator |
+| `crates/cli/` (`mirage-client-cli`) | SOCKS5/HTTP proxy server, TunnelPool/MuxPool, push в TUN через `/chains/update`. **Двойной крейт (lib + bin)** — `pub async fn run(CliRunOptions)` для embedded use |
 | `crates/cli2/` (`supervisor` + `worker`) | Split-arch: один supervisor + N worker-процессов (по чейну) с reattach через named pipes — для soft-restart на OTA |
 
 mirage2tun (отдельный submodule) — низкоуровневый TUN-перехватчик. Получает chains через `cli` POST. **Нельзя ходить в монитор напрямую из cli или tun** — только через sentinel. MonitorLink в самих cli/tun допустим только как fallback на случай мёртвого sentinel.
@@ -126,6 +127,19 @@ mirage2tun не может зависеть на `mirage-runtime-guard` чере
 2. **Critical (85%)** — лог
 3. **Fatal (95%)** — `on_fatal()` запускает graceful shutdown + `exit(0)` → sentinel/OS respawn
 
+## Orchestrator (desktop + mobile portability)
+
+`mirage-l0-orchestrator` — топ-уровневый supervisor над L0 компонентами. Два режима:
+
+- **Process mode** (desktop): каждый компонент = отдельный child OS process. Crash isolation, soft-restart на OTA. Конфиг указывает `binary = "..."` для каждого компонента.
+- **Task mode** (mobile/Android/iOS): каждый компонент = `tokio::task` внутри orchestrator-процесса. Sentinel/cli вызываются через их `pub async fn run(...)` библиотечные точки входа без процесса.
+
+`Component` trait + `ComponentHandle` — абстракция над "как запустить и убить". `ProcessSpawner` (process.rs) и `TaskSpawner` (task.rs) — две impl. Supervisor итерирует `[[component]]` из `orchestrator.toml`, спавнит каждый, применяет `RestartPolicy` (always/on-failure/never), exponential backoff capped at 30s, Ctrl-C cascading kill.
+
+На desktop sentinel **сам** спавнит cli — orchestrator управляет только sentinel. На mobile orchestrator спавнит обоих как tokio tasks (sentinel внутри своей логики тоже call'ит cli как process — но на mobile это будет другая ветка, см. TODO).
+
+Embedded режим требует флагов `install_panic_hook=false`, `install_memory_guard=false` (sentinel) и `exit_on_memory_fatal=false` (оба) — orchestrator сам ставит общий panic hook + memory guard, embedded компонент не должен звать `process::exit()`.
+
 ## Builds
 
 ```bash
@@ -133,6 +147,7 @@ mirage2tun не может зависеть на `mirage-runtime-guard` чере
 cd mirage2app
 cargo build --release -p mirage-client-cli
 cargo build --release -p mirage-l0-sentinel
+cargo build --release -p mirage-l0-orchestrator
 cargo build --release -p mirage-chain-supervisor -p mirage-chain-worker
 ```
 
