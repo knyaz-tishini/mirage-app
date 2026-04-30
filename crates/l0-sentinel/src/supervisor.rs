@@ -22,6 +22,13 @@ const RING_CAPACITY: usize = 64 * 1024; // 64 KB
 const CLI_MAX_RESPAWNS: u32 = 5;
 const CLI_RESPAWN_WINDOW: Duration = Duration::from_secs(60);
 
+/// `CREATE_NO_WINDOW` — suppress console window for child processes.
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `CREATE_BREAKAWAY_FROM_JOB` — child escapes the launcher's Job Object so it
+/// survives sentinel's own exit during OTA self-update.
+pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
 // ── RingBuffer ────────────────────────────────────────────────────────────────
 
 /// Fixed-capacity byte ring buffer. Drops oldest bytes when full.
@@ -75,10 +82,16 @@ pub struct ChildHandle {
     pub stderr_buf: Arc<Mutex<RingBuffer>>,
     pub started_at: Instant,
     pub started_at_ms: u64,
+    /// True when this handle was adopted from a PID file rather than freshly
+    /// spawned.  Adopted children have no attached stdio — ring buffers are
+    /// empty and no drain tasks are running.
+    pub adopted: bool,
+    /// The PID file path that was used to adopt this child (if any).
+    pub pid_file: Option<PathBuf>,
 }
 
 impl ChildHandle {
-    fn pid(&self) -> Option<u32> {
+    pub fn pid(&self) -> Option<u32> {
         self.process.id()
     }
 }
@@ -90,6 +103,11 @@ pub struct ChildStatus {
     pub alive: bool,
     pub pid: Option<u32>,
     pub respawn_count: u32,
+    /// Whether this child was adopted from a PID file (no live log capture).
+    pub adopted: bool,
+    /// Path to the PID file used for adoption, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid_file: Option<String>,
 }
 
 // ── ChildState ────────────────────────────────────────────────────────────────
@@ -120,6 +138,12 @@ impl ChildState {
             alive: self.cli.is_some(),
             pid: self.cli.as_ref().and_then(|h| h.pid()),
             respawn_count: self.cli_respawn_count,
+            adopted: self.cli.as_ref().map(|h| h.adopted).unwrap_or(false),
+            pid_file: self
+                .cli
+                .as_ref()
+                .and_then(|h| h.pid_file.as_ref())
+                .map(|p| p.to_string_lossy().into_owned()),
         }
     }
 
@@ -128,6 +152,12 @@ impl ChildState {
             alive: self.tun.is_some(),
             pid: self.tun.as_ref().and_then(|h| h.pid()),
             respawn_count: self.tun_respawn_count,
+            adopted: self.tun.as_ref().map(|h| h.adopted).unwrap_or(false),
+            pid_file: self
+                .tun
+                .as_ref()
+                .and_then(|h| h.pid_file.as_ref())
+                .map(|p| p.to_string_lossy().into_owned()),
         }
     }
 }
@@ -135,9 +165,18 @@ impl ChildState {
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
 
 /// Spawn a child process with piped stdout/stderr; start drain tasks.
-pub fn spawn_child(
+///
+/// `extra_creation_flags` is OR'd into the platform creation flags on Windows.
+/// Pass `CREATE_BREAKAWAY_FROM_JOB` to detach from the launcher's Job Object.
+pub fn spawn_child(binary: &PathBuf, args: &[String]) -> Result<ChildHandle> {
+    spawn_child_with_flags(binary, args, CREATE_NO_WINDOW)
+}
+
+/// Like [`spawn_child`] but accepts explicit Windows creation flags.
+pub fn spawn_child_with_flags(
     binary: &PathBuf,
     args: &[String],
+    #[cfg_attr(not(windows), allow(unused_variables))] creation_flags: u32,
 ) -> Result<ChildHandle> {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(args)
@@ -151,6 +190,9 @@ pub fn spawn_child(
     if std::env::var_os("RUST_LOG").is_none() {
         cmd.env("RUST_LOG", "info");
     }
+
+    #[cfg(windows)]
+    cmd.creation_flags(creation_flags);
 
     let mut child = cmd
         .spawn()
@@ -182,8 +224,99 @@ pub fn spawn_child(
         stderr_buf,
         started_at: Instant::now(),
         started_at_ms: now_ms,
+        adopted: false,
+        pid_file: None,
     })
 }
+
+/// Adopt an already-running process by PID.
+///
+/// Opens the OS process handle and wraps it in a `ChildHandle` marked
+/// `adopted = true`.  No stdio is attached — ring buffers stay empty.
+pub fn adopt_child(pid: u32, pid_file: PathBuf) -> Result<ChildHandle> {
+    // Build a tokio::process::Child from the raw PID using from_raw_pidfd
+    // equivalent.  On Windows tokio uses HANDLE internally; we use
+    // `Child::from_raw` via the `std::process::Child` path.
+    //
+    // Safe approach that works cross-platform: use `tokio::process::Command`
+    // with a dummy that will fail, then replace via unsafe — but that is very
+    // fragile.  Instead we rely on the platform-specific path below.
+
+    let child = adopt_raw_pid(pid)?;
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    Ok(ChildHandle {
+        process: child,
+        stdout_buf: Arc::new(Mutex::new(RingBuffer::new(RING_CAPACITY))),
+        stderr_buf: Arc::new(Mutex::new(RingBuffer::new(RING_CAPACITY))),
+        started_at: Instant::now(),
+        started_at_ms: now_ms,
+        adopted: true,
+        pid_file: Some(pid_file),
+    })
+}
+
+// ── Platform-specific adopt_raw_pid ──────────────────────────────────────────
+//
+// We cannot reconstruct a `tokio::process::Child` from a raw PID in stable
+// Rust.  Instead we spawn a tiny "watcher" process whose lifetime mirrors the
+// target PID.  The supervisor loop's `try_wait()` / `wait()` calls operate on
+// the watcher; when the real child exits the watcher also exits, propagating
+// the liveness signal correctly.
+
+#[cfg(windows)]
+fn adopt_raw_pid(pid: u32) -> Result<tokio::process::Child> {
+    // PowerShell `Wait-Process` blocks until the target exits, then watcher
+    // itself exits.  If the PID is already gone the watcher exits immediately
+    // (which is fine — the supervisor loop will then re-spawn the real child).
+    let script = format!(
+        "try {{ Wait-Process -Id {pid} -ErrorAction Stop }} catch {{ }}; exit 0",
+        pid = pid
+    );
+    let mut cmd = tokio::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle", "Hidden",
+        "-Command", &script,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.spawn().context("failed to spawn windows adopt-watcher")
+}
+
+#[cfg(not(windows))]
+fn adopt_raw_pid(pid: u32) -> Result<tokio::process::Child> {
+    use std::os::unix::process::CommandExt;
+
+    // Shell one-liner: loop until the PID disappears from /proc, then exit.
+    let script = format!("while [ -d /proc/{} ]; do sleep 1; done; exit 0", pid);
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach from terminal so the watcher doesn't receive Ctrl-C.
+    unsafe {
+        cmd.pre_exec(|| {
+            // setsid() syscall number = 112 on x86_64 Linux
+            #[cfg(target_arch = "x86_64")]
+            std::arch::asm!("syscall", in("rax") 112u64, options(nostack, nomem));
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("failed to spawn unix adopt-watcher")?;
+    Ok(tokio::process::Child::from(child))
+}
+
+// ── Background drain ──────────────────────────────────────────────────────────
 
 /// Background task: read from pipe into ring buffer until EOF.
 async fn drain_pipe<R: AsyncReadExt + Unpin>(mut reader: R, buf: Arc<Mutex<RingBuffer>>) {

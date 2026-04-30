@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 pub mod crash_report;
 pub mod log_upload;
 pub mod onboarding;
+pub mod pid_file;
 pub mod status_server;
 pub mod supervisor;
 pub mod telemetry;
@@ -21,8 +22,9 @@ pub mod telemetry;
 use crash_report::{report_crash, spawn_queue_drain};
 use status_server::{MonitorInfo, TunSpawnCfg, reboot_channel};
 use supervisor::{
-    build_crash_report, cli_may_respawn, kill_tun, log_crash, record_cli_respawn,
-    resolve_supervisor_binary, spawn_child, ChildState,
+    adopt_child, build_crash_report, cli_may_respawn, kill_tun, log_crash, record_cli_respawn,
+    resolve_supervisor_binary, spawn_child, spawn_child_with_flags, ChildState,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
 };
 
 // ── Phase enum ────────────────────────────────────────────────────────────────
@@ -323,15 +325,67 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     });
 
     let (cli_binary, child_args) = resolve_cli_binary_and_args(&cfg);
-    info!("[sentinel] spawning cli ({}) {:?}", cfg.cli_variant, cli_binary);
 
-    let cli_handle = match spawn_child(&cli_binary, &child_args) {
-        Ok(h) => h,
-        Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
-    };
-    let cli_pid = cli_handle.process.id();
-    { children.lock().await.cli = Some(cli_handle); }
-    publisher.set(SentinelPhase::ChildRunning { pid: cli_pid });
+    // ── Adopt-on-startup: try to reuse already-running children ──────────────
+    // Determine the expected exe name hints from the resolved binaries.
+    let cli_hint = cli_binary
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mirage-client-cli".to_owned());
+    let tun_hint = cfg.tun_binary
+        .as_ref()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "mirage2tun".to_owned());
+
+    if let Some(cli_pid_path) = pid_file::cli_pid_path() {
+        match pid_file::probe(&cli_pid_path, &cli_hint) {
+            pid_file::ProbeResult::Alive { pid } => {
+                info!("[sentinel] adopting existing cli pid={}", pid);
+                match adopt_child(pid, cli_pid_path) {
+                    Ok(h) => {
+                        let adopted_pid = h.process.id();
+                        children.lock().await.cli = Some(h);
+                        publisher.set(SentinelPhase::ChildRunning { pid: adopted_pid });
+                    }
+                    Err(e) => warn!("[sentinel] adopt cli failed: {} — will spawn fresh", e),
+                }
+            }
+            pid_file::ProbeResult::Stale | pid_file::ProbeResult::Missing => {}
+        }
+    }
+
+    if let Some(tun_pid_path) = pid_file::tun_pid_path() {
+        match pid_file::probe(&tun_pid_path, &tun_hint) {
+            pid_file::ProbeResult::Alive { pid } => {
+                info!("[sentinel] adopting existing tun pid={}", pid);
+                match adopt_child(pid, tun_pid_path) {
+                    Ok(h) => { children.lock().await.tun = Some(h); }
+                    Err(e) => warn!("[sentinel] adopt tun failed: {} — tun stays unmanaged", e),
+                }
+            }
+            pid_file::ProbeResult::Stale | pid_file::ProbeResult::Missing => {}
+        }
+    }
+    // ── End adopt-on-startup ──────────────────────────────────────────────────
+
+    // Only spawn cli if we did not adopt an existing one.
+    let need_spawn_cli = children.lock().await.cli.is_none();
+    if need_spawn_cli {
+        info!("[sentinel] spawning cli ({}) {:?}", cfg.cli_variant, cli_binary);
+        let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+        let cli_handle = match spawn_child_with_flags(&cli_binary, &child_args, flags) {
+            Ok(h) => h,
+            Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
+        };
+        let cli_pid = cli_handle.process.id();
+        if let Some(pid) = cli_pid {
+            if let Some(path) = pid_file::cli_pid_path() {
+                pid_file::write(&path, pid);
+            }
+        }
+        children.lock().await.cli = Some(cli_handle);
+        publisher.set(SentinelPhase::ChildRunning { pid: cli_pid });
+    }
 
     // Task 5
     telemetry::spawn(
@@ -414,9 +468,17 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
                 if may_respawn {
                     info!("[sentinel] respawning cli...");
-                    match spawn_child(&cli_binary, &child_args) {
+                    // Remove stale PID file before spawning fresh child.
+                    if let Some(path) = pid_file::cli_pid_path() { pid_file::remove(&path); }
+                    let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+                    match spawn_child_with_flags(&cli_binary, &child_args, flags) {
                         Ok(new_handle) => {
                             let new_pid = new_handle.process.id();
+                            if let Some(pid) = new_pid {
+                                if let Some(path) = pid_file::cli_pid_path() {
+                                    pid_file::write(&path, pid);
+                                }
+                            }
                             {
                                 let mut ch = children.lock().await;
                                 record_cli_respawn(&mut ch);
@@ -499,17 +561,23 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         if ctrl_c_hit {
             info!("[sentinel] Ctrl-C — shutting down");
             let mut ch = children.lock().await;
-            if let Some(ref mut h) = ch.tun { kill_tun(h).await; }
+            if let Some(ref mut h) = ch.tun {
+                if !h.adopted { kill_tun(h).await; }
+            }
             ch.tun = None;
+            if let Some(path) = pid_file::tun_pid_path() { pid_file::remove(&path); }
             if let Some(ref mut h) = ch.cli {
-                let _ = h.process.kill().await;
-                match tokio::time::timeout(Duration::from_secs(5), h.process.wait()).await {
-                    Ok(Ok(s)) => info!("[sentinel] cli exited {:?}", s),
-                    Ok(Err(e)) => warn!("[sentinel] cli wait: {}", e),
-                    Err(_) => warn!("[sentinel] cli did not exit within 5s"),
+                if !h.adopted {
+                    let _ = h.process.kill().await;
+                    match tokio::time::timeout(Duration::from_secs(5), h.process.wait()).await {
+                        Ok(Ok(s)) => info!("[sentinel] cli exited {:?}", s),
+                        Ok(Err(e)) => warn!("[sentinel] cli wait: {}", e),
+                        Err(_) => warn!("[sentinel] cli did not exit within 5s"),
+                    }
                 }
             }
             ch.cli = None;
+            if let Some(path) = pid_file::cli_pid_path() { pid_file::remove(&path); }
             std::process::exit(0);
         }
 

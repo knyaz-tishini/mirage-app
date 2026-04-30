@@ -26,7 +26,11 @@ use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use crate::onboarding::{OnboardRequest, default_toml_path, log_onboard_result, patch_sentinel_toml};
-use crate::supervisor::{ChildState, ChildStatus, kill_tun, resolve_tun_binary, spawn_child};
+use crate::pid_file;
+use crate::supervisor::{
+    ChildState, ChildStatus, kill_tun, resolve_tun_binary, spawn_child_with_flags,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
+};
 use crate::SentinelPhase;
 
 // ── Shared server state ───────────────────────────────────────────────────────
@@ -127,9 +131,16 @@ async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
         return (StatusCode::INTERNAL_SERVER_ERROR, "tun binary not found").into_response();
     };
 
-    match spawn_child(&binary, &state.spawn_cfg.tun_args) {
+    let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+    match spawn_child_with_flags(&binary, &state.spawn_cfg.tun_args, flags) {
         Ok(handle) => {
-            info!("[sentinel] tun spawned pid={:?}", handle.process.id());
+            let tun_pid = handle.process.id();
+            info!("[sentinel] tun spawned pid={:?}", tun_pid);
+            if let Some(pid) = tun_pid {
+                if let Some(path) = pid_file::tun_pid_path() {
+                    pid_file::write(&path, pid);
+                }
+            }
             children.tun = Some(handle);
             (StatusCode::OK, "tun started").into_response()
         }
@@ -143,7 +154,10 @@ async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
 async fn disconnect(State(state): State<ServerState>) -> impl IntoResponse {
     let mut children = state.children.lock().await;
     if let Some(mut handle) = children.tun.take() {
-        kill_tun(&mut handle).await;
+        if !handle.adopted {
+            kill_tun(&mut handle).await;
+        }
+        if let Some(path) = pid_file::tun_pid_path() { pid_file::remove(&path); }
         info!("[sentinel] tun disconnected");
     }
     (StatusCode::OK, "ok").into_response()
@@ -227,6 +241,28 @@ async fn onboard_handler(
         .into_response()
 }
 
+/// POST /restart-self — trigger a soft self-restart of sentinel.
+///
+/// Children (cli, tun) have been spawned with `CREATE_BREAKAWAY_FROM_JOB` and
+/// will survive sentinel's exit.  Their PID files remain on disk so the new
+/// sentinel instance can adopt them via adopt-on-startup.
+///
+/// Flow:
+/// 1. This handler returns 202 Accepted.
+/// 2. Spawns a background task that sleeps 200 ms (gives HTTP response time to
+///    flush) then calls `process::exit(0)`.
+/// 3. The launcher's watchdog (d-watchdog / OS-level supervisor) sees the exit
+///    and respawns a fresh sentinel binary.
+/// 4. The fresh sentinel reads `cli.pid` / `tun.pid` and adopts the children.
+async fn restart_self_handler(State(_state): State<ServerState>) -> impl IntoResponse {
+    info!("[sentinel] /restart-self triggered — exiting for respawn");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
+    (StatusCode::ACCEPTED, "restarting").into_response()
+}
+
 // ── Phase watch ───────────────────────────────────────────────────────────────
 
 /// Create a watch channel seeded with [`SentinelPhase::Starting`].
@@ -278,6 +314,7 @@ pub fn spawn(
         .route("/logs/cli", get(logs_cli))
         .route("/logs/tun", get(logs_tun))
         .route("/onboard", post(onboard_handler))
+        .route("/restart-self", post(restart_self_handler))
         .with_state(state);
 
     tokio::spawn(async move {
