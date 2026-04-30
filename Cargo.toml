@@ -7,10 +7,12 @@ members = [
     "crates/cli2/ota",
     "crates/cli2/worker",
     "crates/cli2/supervisor",
-    "crates/desktop/windows/v2",
+    # "crates/desktop/windows/v2",  # legacy — uses path-deps to uzor; conflicts with crates.io uzor used by launcher
     "crates/l0-sentinel",
     "crates/l0-orchestrator",
+    "crates/desktop-cli",
     "crates/runtime-guard",
+    "crates/launcher",
     # "crates/mobile",  # cdylib — skip on Windows build
 ]
 

@@ -1,0 +1,29 @@
+[package]
+name = "mirage-launcher"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mirage-launcher"
+path = "src/main.rs"
+
+[dependencies]
+uzor                    = "1.1.8"
+uzor-window-desktop     = "1.1.8"
+uzor-render-tiny-skia   = "1.1.8"
+softbuffer              = "0.4"
+tokio                   = { workspace = true }
+tracing                 = { workspace = true }
+tracing-subscriber      = { workspace = true }
+anyhow                  = "1"
+image                   = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys             = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource            = "0.1"
