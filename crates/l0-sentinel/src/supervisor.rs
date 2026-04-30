@@ -312,6 +312,21 @@ pub fn resolve_tun_binary(configured: Option<&PathBuf>) -> Option<PathBuf> {
     Some(dir.join(name))
 }
 
+/// Resolve supervisor (cli2) binary path: explicit config or
+/// `<exe_dir>/mirage-chain-supervisor[.exe]`.
+pub fn resolve_supervisor_binary(configured: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(p) = configured {
+        return Some(p.clone());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    #[cfg(windows)]
+    let name = "mirage-chain-supervisor.exe";
+    #[cfg(not(windows))]
+    let name = "mirage-chain-supervisor";
+    Some(dir.join(name))
+}
+
 /// Log a supervisor error to tracing.
 pub fn log_crash(report: &CrashReport) {
     error!(

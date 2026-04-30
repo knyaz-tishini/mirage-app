@@ -44,6 +44,8 @@ pub struct ServerState {
     pub monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
     /// Signal re-bootstrap on successful /onboard.
     pub reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
+    /// Which cli variant is currently active (`"cli1"` or `"cli2"`).
+    pub cli_variant: String,
 }
 
 #[derive(Clone)]
@@ -78,6 +80,8 @@ struct StatusResponse {
     tun: ChildStatus,
     monitor_url: String,
     monitor_reachable: bool,
+    /// Which cli variant is running: `"cli1"` (legacy) or `"cli2"` (split-arch).
+    cli_variant: String,
 }
 
 // ── Query params ──────────────────────────────────────────────────────────────
@@ -107,6 +111,7 @@ async fn status_handler(State(state): State<ServerState>) -> impl IntoResponse {
         tun: children.tun_status(),
         monitor_url: info.monitor_url,
         monitor_reachable: info.monitor_reachable,
+        cli_variant: state.cli_variant.clone(),
     };
     Json(body)
 }
@@ -248,6 +253,7 @@ pub fn spawn(
     spawn_cfg: TunSpawnCfg,
     monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
     reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
+    cli_variant: String,
 ) -> PhasePublisher {
     let started_at_ms = unix_now_ms();
     let last_update = Arc::new(std::sync::Mutex::new(started_at_ms));
@@ -261,6 +267,7 @@ pub fn spawn(
         spawn_cfg: Arc::new(spawn_cfg),
         monitor_info,
         reboot_tx,
+        cli_variant,
     };
 
     let app = Router::new()
