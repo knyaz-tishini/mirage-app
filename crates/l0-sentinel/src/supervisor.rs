@@ -145,6 +145,13 @@ pub fn spawn_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Ensure children write logs even on production builds where the default
+    // env_filter would be "off".  Only set if the parent did not already
+    // export RUST_LOG so the operator can still override from the outside.
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info");
+    }
+
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {:?}", binary))?;

@@ -12,6 +12,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
 pub mod crash_report;
+pub mod log_upload;
 pub mod onboarding;
 pub mod status_server;
 pub mod supervisor;
@@ -66,6 +67,10 @@ pub struct SentinelConfig {
     pub tun_args: Vec<String>,
     #[serde(default = "default_telemetry_interval")]
     pub telemetry_interval_secs: u64,
+    /// How often (seconds) to upload cli/tun stderr tails to monitor.
+    /// Set to 0 to disable. Default: 60.
+    #[serde(default = "default_logs_upload_interval")]
+    pub logs_upload_interval_secs: u64,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -77,6 +82,7 @@ pub(crate) fn default_install_panic_hook() -> bool { true }
 pub(crate) fn default_exit_on_memory_fatal() -> bool { true }
 pub(crate) fn default_tun_args() -> Vec<String> { vec!["debug-run".to_owned()] }
 pub(crate) fn default_telemetry_interval() -> u64 { 30 }
+pub(crate) fn default_logs_upload_interval() -> u64 { 60 }
 
 // ── Managed marker ────────────────────────────────────────────────────────────
 
@@ -286,6 +292,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         client_id.clone(),
         cfg.telemetry_interval_secs,
         tun_alive_rx.clone(),
+    );
+
+    // Periodic log-tail upload (best-effort, 0 = disabled)
+    log_upload::spawn(
+        monitor_url.clone(),
+        monitor_api_key.clone(),
+        client_id.clone(),
+        cfg.logs_upload_interval_secs,
+        Arc::clone(&children),
     );
 
     let exit_on_fatal = cfg.exit_on_memory_fatal;
