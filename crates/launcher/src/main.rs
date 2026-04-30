@@ -260,6 +260,9 @@ struct LauncherApp {
 struct LauncherHandler {
     app: Option<LauncherApp>,
     rt: Arc<tokio::runtime::Runtime>,
+    /// mirage://... URL passed as a CLI argument — forwarded to sentinel
+    /// after it becomes reachable.
+    cli_onboard_url: Option<String>,
 }
 
 // ── Rectangular mesh layout ──────────────────────────────────────────────────
@@ -1110,6 +1113,39 @@ impl ApplicationHandler for LauncherHandler {
             }
         };
 
+        // If a mirage:// URL was passed on the CLI, POST it to sentinel
+        // once sentinel's HTTP server becomes reachable (poll up to 15s).
+        if let Some(url) = self.cli_onboard_url.take() {
+            self.rt.spawn(async move {
+                let client = match reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("cli onboard: failed to build client: {e}");
+                        return;
+                    }
+                };
+                // Wait for sentinel HTTP to be up (max 15s).
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!("cli onboard: sentinel did not become reachable in 15s");
+                        return;
+                    }
+                    if client.get(format!("{SENTINEL_BASE}/health")).send().await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                post_onboard_url(url).await;
+            });
+        }
+
         let sentinel_arc = Arc::new(Mutex::new(initial_sentinel));
 
         // Watchdog task: checks every 1500ms if sentinel exited; respawns up
@@ -1597,6 +1633,13 @@ fn main() {
     #[cfg(windows)]
     jobobj::init();
 
+    // Detect a mirage://... URL passed as a CLI argument (registered URL
+    // scheme handler — Windows opens us with the full URL as argv[1]).
+    let cli_onboard_url: Option<String> = std::env::args()
+        .skip(1)
+        .find(|a| a.starts_with("mirage://"))
+        .map(|s| s.trim().to_owned());
+
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1608,6 +1651,6 @@ fn main() {
     let event_loop = EventLoop::new().expect("winit event loop init always succeeds");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut handler = LauncherHandler { app: None, rt };
+    let mut handler = LauncherHandler { app: None, rt, cli_onboard_url };
     event_loop.run_app(&mut handler).expect("event loop run always succeeds");
 }
