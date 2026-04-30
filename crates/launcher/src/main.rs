@@ -74,7 +74,7 @@ const BG: &str = "#0B0B0E";
 /// Dot-grid color.
 const DOT: &str = "#ffffff38"; // rgba(255,255,255,0.22)
 /// Dot-grid spacing (logical px).
-const DOT_STEP: f64 = 27.0;
+const DOT_STEP: f64 = 26.0;
 const SURFACE: &str = "#14151A";
 const BORDER: &str = "#ffffff12";  // rgba(255,255,255,0.07)
 const BORDERS: &str = "#ffffff24"; // rgba(255,255,255,0.14)
@@ -561,6 +561,16 @@ fn draw_frame(
     // visually pushed up by the chrome strip.
     let cy = (H + TITLEBAR_H) / 2.0;
 
+    // Whether the centre cube is currently shown — when it is, we hide the
+    // titlebar logo (one cube on screen, not two).
+    let centre_cube_visible = match state {
+        LauncherState::Off | LauncherState::Error(_) => true,
+        LauncherState::Connecting { started_at_ms } => {
+            (t - started_at_ms).max(0.0) < CUBE_DISSOLVE_MS
+        }
+        LauncherState::On { .. } => false,
+    };
+
     match state {
         LauncherState::On { radar_anchor_ms } => {
             let t_local = (t - radar_anchor_ms).max(0.0);
@@ -572,7 +582,7 @@ fn draw_frame(
     }
 
     // Custom titlebar last so it overlays everything.
-    draw_titlebar(ctx, titlebar_hover.minimize, titlebar_hover.close);
+    draw_titlebar(ctx, titlebar_hover.minimize, titlebar_hover.close, !centre_cube_visible, t);
 }
 
 #[derive(Default, Clone, Copy)]
@@ -626,12 +636,21 @@ fn draw_titlebar(
     ctx: &mut TinySkiaCpuRenderContext,
     min_hovered: bool,
     close_hovered: bool,
+    show_logo: bool,
+    t: f64,
 ) {
     // No background fill — the dot-grid shows through.
 
-    // Cube logo, top-left.
-    let logo_size = 26.0;
-    draw_cube(ctx, 14.0 + logo_size / 2.0, TITLEBAR_H / 2.0, logo_size);
+    // Cube logo, top-left.  Only drawn when the centre cube is gone — the
+    // window only ever has one cube on screen at a time.  Same heat-haze
+    // shimmer + double-exposure phantom drift as the centre cube so the
+    // whole window animation feels coherent.
+    if show_logo {
+        let logo_size = 26.0;
+        let cx = 14.0 + logo_size / 2.0;
+        let cy = TITLEBAR_H / 2.0;
+        draw_cube_idle(ctx, cx, cy, logo_size, t, 1.0);
+    }
 
     // Right-side window controls.
     let close_x = W - TITLEBAR_BTN_W;
