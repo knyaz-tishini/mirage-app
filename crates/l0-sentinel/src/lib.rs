@@ -1,24 +1,24 @@
 //! mirage-l0-sentinel library — embeddable sentinel logic.
-//!
-//! Standalone use: `main.rs` parses CLI, calls [`run`].
-//! Embedded use (mobile orchestrator): `tokio::task::spawn(mirage_l0_sentinel::run(cfg))`.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use mirage_client_core::monitor_link::MonitorLink;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
 pub mod crash_report;
+pub mod onboarding;
 pub mod status_server;
 pub mod supervisor;
+pub mod telemetry;
 
-use crash_report::report_crash;
-use status_server::{MonitorInfo, TunSpawnCfg};
+use crash_report::{report_crash, spawn_queue_drain};
+use status_server::{MonitorInfo, TunSpawnCfg, reboot_channel};
 use supervisor::{
     build_crash_report, cli_may_respawn, kill_tun, log_crash, record_cli_respawn, spawn_child,
     ChildState,
@@ -26,63 +26,46 @@ use supervisor::{
 
 // ── Phase enum ────────────────────────────────────────────────────────────────
 
-/// Current bootstrap phase of the sentinel process.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "phase")]
 pub enum SentinelPhase {
-    /// Process started, before any other work.
     Starting,
-    /// MonitorLink spawned, waiting for first config.
     FetchingConfig { monitor_url: String },
-    /// First config received and client-config file materialised.
     ConfigReady { version: u64, chains: usize, materialised_at_ms: u128 },
-    /// Child process is running.
     ChildRunning { pid: Option<u32> },
-    /// Fatal error; run() returned.
     Error { message: String },
-    /// monitor_url + api_key not yet provided.
     WaitingOnboard,
-    /// Monitor unreachable, using cached config.
     ConfigStale { since_ms: u64 },
 }
 
 // ── Public config ─────────────────────────────────────────────────────────────
 
-/// Configuration for the sentinel bootstrap process.
 #[derive(Debug, Deserialize)]
 pub struct SentinelConfig {
-    /// Base URL of mirage2monitor (e.g. `"http://127.0.0.1:19410"`).
     pub monitor_url: String,
-    /// Optional Bearer token for monitor API.
     #[serde(default)]
     pub monitor_api_key: Option<String>,
-    /// Path where the materialised ClientConfig JSON will be written.
+    #[serde(default)]
+    pub client_id: Option<String>,
     pub client_config_path: PathBuf,
-    /// Path to the mirage-client-cli binary.
     pub client_binary: PathBuf,
-    /// Args to pass; `{client_config_path}` is substituted with the real path.
     #[serde(default = "default_client_args")]
     pub client_args: Vec<String>,
-    /// Base config JSON (everything except `chains`).
     pub client_template: PathBuf,
-    /// Seconds between monitor polls when no change detected.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
-    /// When `true`, refuse to overwrite an unmanaged existing config file.
     #[serde(default = "default_respect_user_config")]
     pub respect_user_config: bool,
-    /// Install a panic hook that calls `exit(1)` on panic.
     #[serde(default = "default_install_panic_hook")]
     pub install_panic_hook: bool,
-    /// Call `exit(0)` when the memory guard hits fatal threshold.
     #[serde(default = "default_exit_on_memory_fatal")]
     pub exit_on_memory_fatal: bool,
-    /// Path to tun binary. Defaults to `<exe_dir>/mirage2tun[.exe]` when absent.
     #[serde(default)]
     pub tun_binary: Option<PathBuf>,
-    /// Args for tun. Defaults to `["debug-run"]`.
     #[serde(default = "default_tun_args")]
     pub tun_args: Vec<String>,
+    #[serde(default = "default_telemetry_interval")]
+    pub telemetry_interval_secs: u64,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -93,15 +76,14 @@ pub(crate) fn default_respect_user_config() -> bool { true }
 pub(crate) fn default_install_panic_hook() -> bool { true }
 pub(crate) fn default_exit_on_memory_fatal() -> bool { true }
 pub(crate) fn default_tun_args() -> Vec<String> { vec!["debug-run".to_owned()] }
+pub(crate) fn default_telemetry_interval() -> u64 { 30 }
 
 // ── Managed marker ────────────────────────────────────────────────────────────
 
 pub(crate) const MANAGED_BY_VALUE: &str = "mirage-l0-sentinel";
 
 pub(crate) fn is_managed(path: &PathBuf) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return false;
-    };
+    let Ok(raw) = std::fs::read_to_string(path) else { return false; };
     if raw.trim_start().starts_with("// mirage-l0-sentinel: managed") {
         return true;
     }
@@ -119,74 +101,56 @@ pub(crate) fn materialise(
     template_raw: &str,
     chains: Vec<mirage_core::config::ChainConfig>,
 ) -> Result<String> {
-    let mut obj: serde_json::Value = serde_json::from_str(template_raw)
-        .context("failed to parse client-template.json")?;
-
-    let map = obj
-        .as_object_mut()
-        .context("client-template.json must be a JSON object")?;
-
+    let mut obj: serde_json::Value =
+        serde_json::from_str(template_raw).context("failed to parse client-template.json")?;
+    let map = obj.as_object_mut().context("client-template.json must be a JSON object")?;
     map.remove("chains");
-
     let chains_val = serde_json::to_value(&chains).context("failed to serialise chains")?;
     map.insert("chains".to_owned(), chains_val);
-
-    map.insert(
-        "_managed_by".to_owned(),
-        serde_json::Value::String(MANAGED_BY_VALUE.to_owned()),
-    );
-
+    map.insert("_managed_by".to_owned(), serde_json::Value::String(MANAGED_BY_VALUE.to_owned()));
     serde_json::to_string_pretty(&obj).context("failed to serialise materialised config")
 }
 
 pub(crate) fn write_atomic(path: &PathBuf, content: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("write tmp file {:?}", tmp))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {:?} → {:?}", tmp, path))?;
+    std::fs::write(&tmp, content).with_context(|| format!("write tmp file {:?}", tmp))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {:?} -> {:?}", tmp, path))?;
     Ok(())
 }
 
-// ── Child process helpers ─────────────────────────────────────────────────────
-
 pub(crate) fn build_child_args(template_args: &[String], config_path: &PathBuf) -> Vec<String> {
     let path_str = config_path.to_string_lossy();
-    template_args
-        .iter()
-        .map(|a| a.replace("{client_config_path}", &path_str))
-        .collect()
+    template_args.iter().map(|a| a.replace("{client_config_path}", &path_str)).collect()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Run the sentinel bootstrap loop.
 pub async fn run(cfg: SentinelConfig) -> Result<()> {
-    // ── Shared supervisor state ───────────────────────────────────────────────
-    let children = std::sync::Arc::new(Mutex::new(ChildState::new()));
-    let monitor_info = std::sync::Arc::new(std::sync::Mutex::new(MonitorInfo {
+    let children = Arc::new(Mutex::new(ChildState::new()));
+    let monitor_info = Arc::new(std::sync::Mutex::new(MonitorInfo {
         monitor_url: cfg.monitor_url.clone(),
         monitor_reachable: false,
     }));
 
-    // ── Status server ─────────────────────────────────────────────────────────
+    let (monitor_reachable_tx, monitor_reachable_rx) = watch::channel(false);
+    let monitor_reachable_tx = Arc::new(monitor_reachable_tx);
+    let (tun_alive_tx, tun_alive_rx) = watch::channel(false);
+    let tun_alive_tx = Arc::new(tun_alive_tx);
+
     let (phase_tx, phase_rx) = status_server::phase_channel();
+    let (reboot_tx, mut reboot_rx) = reboot_channel();
     let publisher = status_server::spawn(
         phase_rx,
         phase_tx,
-        std::sync::Arc::clone(&children),
-        TunSpawnCfg {
-            tun_binary: cfg.tun_binary.clone(),
-            tun_args: cfg.tun_args.clone(),
-        },
-        std::sync::Arc::clone(&monitor_info),
+        Arc::clone(&children),
+        TunSpawnCfg { tun_binary: cfg.tun_binary.clone(), tun_args: cfg.tun_args.clone() },
+        Arc::clone(&monitor_info),
+        Arc::clone(&reboot_tx),
     );
     publisher.set(SentinelPhase::Starting);
 
-    // ── Panic hook ────────────────────────────────────────────────────────────
     let want_hook = cfg.install_panic_hook
         || std::env::var("MIRAGE_SENTINEL_PANIC_EXIT").as_deref() == Ok("1");
-
     if want_hook {
         std::panic::set_hook(Box::new(|info| {
             let location = info
@@ -200,52 +164,62 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             } else {
                 "<non-string panic payload>".to_string()
             };
-            tracing::error!(location = %location, message = %msg, "panic — process exiting for respawn");
+            tracing::error!(location=%location, message=%msg, "panic — process exiting");
             std::thread::sleep(std::time::Duration::from_millis(100));
             std::process::exit(1);
         }));
     }
 
-    info!(
-        "[sentinel] monitor_url={} client_binary={:?}",
-        cfg.monitor_url, cfg.client_binary
-    );
-
-    // ── Managed-file guard ────────────────────────────────────────────────────
-    let config_exists = cfg.client_config_path.exists();
-    let managed = config_exists && is_managed(&cfg.client_config_path);
-
-    if config_exists && !managed && cfg.respect_user_config {
-        warn!(
-            "[sentinel] {:?} exists but has no managed marker — respect_user_config=true, skipping overwrite",
-            cfg.client_config_path
-        );
-        warn!("[sentinel] spawning client with existing config; sentinel will not poll monitor");
-        return run_client_passthrough(&cfg, children, &publisher, monitor_info).await;
+    // WaitingOnboard: block if credentials missing
+    if cfg.monitor_api_key.is_none() || cfg.client_id.is_none() {
+        publisher.set(SentinelPhase::WaitingOnboard);
+        info!("[sentinel] credentials missing — waiting for /onboard");
+        loop {
+            if reboot_rx.changed().await.is_err() {
+                bail!("reboot channel closed while waiting for onboard");
+            }
+            if reboot_rx.borrow().is_some() { break; }
+        }
+        info!("[sentinel] onboard received — exiting for respawn");
+        std::process::exit(0);
     }
 
-    // ── Load template ─────────────────────────────────────────────────────────
+    info!("[sentinel] monitor_url={} client_binary={:?}", cfg.monitor_url, cfg.client_binary);
+
+    let config_exists = cfg.client_config_path.exists();
+    let managed = config_exists && is_managed(&cfg.client_config_path);
+    if config_exists && !managed && cfg.respect_user_config {
+        warn!("[sentinel] unmanaged config exists — skipping overwrite");
+        return run_client_passthrough(&cfg, children, &publisher, monitor_info, tun_alive_tx).await;
+    }
+
     let template_raw = std::fs::read_to_string(&cfg.client_template)
         .with_context(|| format!("cannot read client-template {:?}", cfg.client_template))?;
     {
         let v: serde_json::Value =
-            serde_json::from_str(&template_raw).context("client-template.json is not valid JSON")?;
-        if !v.is_object() {
-            bail!("client-template.json must be a JSON object");
-        }
+            serde_json::from_str(&template_raw).context("client-template.json not valid JSON")?;
+        if !v.is_object() { bail!("client-template.json must be a JSON object"); }
     }
 
-    // ── Spawn MonitorLink ─────────────────────────────────────────────────────
     let monitor_url = cfg.monitor_url.clone();
-    let monitor_api_key = cfg.monitor_api_key.clone();
+    let monitor_api_key = cfg.monitor_api_key.clone().unwrap_or_default();
+    let client_id = cfg.client_id.clone().unwrap_or_default();
 
-    info!("[sentinel] spawning MonitorLink → {}", monitor_url);
+    // Task 2
+    spawn_queue_drain(
+        monitor_reachable_rx.clone(),
+        monitor_url.clone(),
+        monitor_api_key.clone(),
+        client_id.clone(),
+    );
+
+    info!("[sentinel] spawning MonitorLink -> {}", monitor_url);
     publisher.set(SentinelPhase::FetchingConfig { monitor_url: monitor_url.clone() });
-    let (link, mut config_rx) = MonitorLink::new(monitor_url.clone(), monitor_api_key);
+    let (link, mut config_rx) = MonitorLink::new(monitor_url.clone(), Some(monitor_api_key.clone()));
     link.spawn();
 
     let timeout = Duration::from_secs(cfg.poll_interval_secs.max(10));
-    info!("[sentinel] waiting for first monitor config (timeout {}s)…", timeout.as_secs());
+    info!("[sentinel] waiting for first monitor config (timeout {}s)...", timeout.as_secs());
 
     let first_cfg = match tokio::time::timeout(timeout, async {
         loop {
@@ -254,12 +228,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                 return config_rx.borrow().clone().unwrap();
             }
         }
-    })
-    .await
-    {
-        Ok(cfg) => cfg,
+    }).await {
+        Ok(c) => c,
         Err(e) => {
-            let msg = format!("timed out waiting for first monitor config — is the monitor reachable? {e}");
+            let msg = format!("timed out waiting for first monitor config: {e}");
             publisher.set(SentinelPhase::Error { message: msg.clone() });
             anyhow::bail!(msg);
         }
@@ -269,112 +241,103 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         let mut info = monitor_info.lock().unwrap_or_else(|e| e.into_inner());
         info.monitor_reachable = true;
     }
+    let _ = monitor_reachable_tx.send(true);
 
-    info!(
-        "[sentinel] first monitor config received: version={} chains={}",
-        first_cfg.version,
-        first_cfg.chains.len()
-    );
+    info!("[sentinel] first config: version={} chains={}", first_cfg.version, first_cfg.chains.len());
 
     let chains: Vec<_> = first_cfg.chains.iter().map(|c| c.chain.clone()).collect();
     let full_json = match materialise(&template_raw, chains) {
         Ok(j) => j,
-        Err(e) => {
-            publisher.set(SentinelPhase::Error { message: e.to_string() });
-            return Err(e);
-        }
+        Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
-    if let Err(e) = write_atomic(&cfg.client_config_path, &full_json)
-        .context("failed to write initial client config")
-    {
+    if let Err(e) = write_atomic(&cfg.client_config_path, &full_json) {
         publisher.set(SentinelPhase::Error { message: e.to_string() });
         return Err(e);
     }
     info!("[sentinel] wrote {:?}", cfg.client_config_path);
 
-    let materialised_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let materialised_at_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
     publisher.set(SentinelPhase::ConfigReady {
         version: first_cfg.version,
         chains: first_cfg.chains.len(),
         materialised_at_ms,
     });
 
-    // ── Spawn cli ─────────────────────────────────────────────────────────────
     let child_args = build_child_args(&cfg.client_args, &cfg.client_config_path);
-    info!(
-        "[sentinel] spawning cli {:?} with args {:?}",
-        cfg.client_binary, child_args
-    );
+    info!("[sentinel] spawning cli {:?}", cfg.client_binary);
 
     let cli_handle = match spawn_child(&cfg.client_binary, &child_args) {
         Ok(h) => h,
-        Err(e) => {
-            publisher.set(SentinelPhase::Error { message: e.to_string() });
-            return Err(e);
-        }
+        Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
-
     let cli_pid = cli_handle.process.id();
-    {
-        let mut ch = children.lock().await;
-        ch.cli = Some(cli_handle);
-    }
+    { children.lock().await.cli = Some(cli_handle); }
     publisher.set(SentinelPhase::ChildRunning { pid: cli_pid });
 
-    // ── Memory guard ─────────────────────────────────────────────────────────
+    // Task 5
+    telemetry::spawn(
+        monitor_url.clone(),
+        monitor_api_key.clone(),
+        client_id.clone(),
+        cfg.telemetry_interval_secs,
+        tun_alive_rx.clone(),
+    );
+
     let exit_on_fatal = cfg.exit_on_memory_fatal;
     let _memory_guard = MemoryGuard::spawn(
         MemoryGuardConfig::default(),
         Box::new(move || {
-            warn!("[sentinel] memory guard: fatal threshold — exiting for respawn");
-            if exit_on_fatal {
-                std::process::exit(0);
-            }
+            warn!("[sentinel] memory guard fatal — exiting");
+            if exit_on_fatal { std::process::exit(0); }
         }),
     );
 
-    // ── Main supervisor loop ─────────────────────────────────────────────────
+    // Task 4 state
+    let mut last_successful_poll_ms: u64 = unix_now_u64();
+    let mut consecutive_failures: u32 = 0;
+    let mut config_stale = false;
+    const STALE_THRESHOLD_MS: u64 = 60_000;
+    const FAILURE_THRESHOLD: u32 = 3;
+
     loop {
         // Poll cli exit
         let cli_exited = {
             let mut ch = children.lock().await;
-            if let Some(ref mut handle) = ch.cli {
-                match handle.process.try_wait() {
-                    Ok(Some(status)) => Some(status),
+            if let Some(ref mut h) = ch.cli {
+                match h.process.try_wait() {
+                    Ok(Some(s)) => Some(s),
                     Ok(None) => None,
-                    Err(e) => {
-                        error!("[sentinel] cli try_wait error: {}", e);
-                        None
-                    }
+                    Err(e) => { error!("[sentinel] cli try_wait: {}", e); None }
                 }
-            } else {
-                None
-            }
+            } else { None }
         };
 
         if let Some(exit_status) = cli_exited {
             let report = {
                 let ch = children.lock().await;
-                if let Some(ref handle) = ch.cli {
-                    Some(build_crash_report("cli", exit_status, handle).await)
-                } else {
-                    None
-                }
+                if let Some(ref h) = ch.cli {
+                    Some(build_crash_report("cli", exit_status, h).await)
+                } else { None }
             };
 
             if let Some(report) = report {
                 log_crash(&report);
-                report_crash(&report, Some(&monitor_url)).await;
-
+                let kind_str = format!("{:?}", report.kind);
                 let exit_code = report.exit_code.unwrap_or(-1);
+
+                // Task 1
+                report_crash(
+                    &report,
+                    Some(&monitor_url),
+                    Some(&monitor_api_key),
+                    Some(&client_id),
+                ).await;
+
+                // Task 3: Error phase immediately
                 publisher.set(SentinelPhase::Error {
-                    message: format!("cli crashed: {:?} (code {})", report.kind, exit_code),
+                    message: format!("cli crashed: {} (code {})", kind_str, exit_code),
                 });
 
-                // Check respawn eligibility
                 let may_respawn = {
                     let mut ch = children.lock().await;
                     ch.cli = None;
@@ -382,13 +345,17 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                 };
 
                 if may_respawn {
-                    info!("[sentinel] respawning cli…");
+                    info!("[sentinel] respawning cli...");
                     match spawn_child(&cfg.client_binary, &child_args) {
                         Ok(new_handle) => {
                             let new_pid = new_handle.process.id();
-                            let mut ch = children.lock().await;
-                            record_cli_respawn(&mut ch);
-                            ch.cli = Some(new_handle);
+                            {
+                                let mut ch = children.lock().await;
+                                record_cli_respawn(&mut ch);
+                                ch.cli = Some(new_handle);
+                            }
+                            // Task 3: cool-down then ChildRunning
+                            tokio::time::sleep(Duration::from_millis(200)).await;
                             publisher.set(SentinelPhase::ChildRunning { pid: new_pid });
                             info!("[sentinel] cli respawned pid={:?}", new_pid);
                         }
@@ -397,7 +364,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                             publisher.set(SentinelPhase::Error {
                                 message: format!("cli respawn failed: {}", e),
                             });
-                            // Fatal — exit so orchestrator/OS can respawn sentinel
                             std::process::exit(1);
                         }
                     }
@@ -408,46 +374,68 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             }
         }
 
-        // Monitor config updates
+        // Monitor config update + Task 4
         if config_rx.has_changed().unwrap_or(false) {
             config_rx.mark_unchanged();
             let snapshot = config_rx.borrow().clone();
             if let Some(new_cfg) = snapshot {
-                info!(
-                    "[sentinel] monitor config updated: version={} chains={} — rewriting {:?}",
-                    new_cfg.version,
-                    new_cfg.chains.len(),
-                    cfg.client_config_path
-                );
+                last_successful_poll_ms = unix_now_u64();
+                consecutive_failures = 0;
+
+                if config_stale {
+                    config_stale = false;
+                    let pid = children.lock().await.cli.as_ref().and_then(|h| h.process.id());
+                    publisher.set(SentinelPhase::ChildRunning { pid });
+                    info!("[sentinel] monitor recovered — ChildRunning");
+                }
+
+                { monitor_info.lock().unwrap_or_else(|e| e.into_inner()).monitor_reachable = true; }
+                let _ = monitor_reachable_tx.send(true);
+
+                info!("[sentinel] config updated: v={} chains={}", new_cfg.version, new_cfg.chains.len());
                 let chains: Vec<_> = new_cfg.chains.iter().map(|c| c.chain.clone()).collect();
                 match materialise(&template_raw, chains) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
-                        Ok(()) => {
-                            info!("[sentinel] config rewritten — restart client manually to apply (v1)");
-                        }
-                        Err(e) => error!("[sentinel] failed to rewrite config: {}", e),
+                        Ok(()) => info!("[sentinel] config rewritten"),
+                        Err(e) => error!("[sentinel] rewrite failed: {}", e),
                     },
                     Err(e) => error!("[sentinel] materialise error: {}", e),
                 }
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures >= FAILURE_THRESHOLD {
+                    { monitor_info.lock().unwrap_or_else(|e| e.into_inner()).monitor_reachable = false; }
+                    let _ = monitor_reachable_tx.send(false);
+                }
+                let since_ms = unix_now_u64().saturating_sub(last_successful_poll_ms);
+                if since_ms > STALE_THRESHOLD_MS && !config_stale {
+                    config_stale = true;
+                    publisher.set(SentinelPhase::ConfigStale { since_ms });
+                    warn!("[sentinel] monitor unreachable {}ms — ConfigStale", since_ms);
+                }
+            }
+        } else {
+            let since_ms = unix_now_u64().saturating_sub(last_successful_poll_ms);
+            if since_ms > STALE_THRESHOLD_MS && !config_stale {
+                config_stale = true;
+                publisher.set(SentinelPhase::ConfigStale { since_ms });
+                warn!("[sentinel] no monitor update {}ms — ConfigStale", since_ms);
             }
         }
 
-        // Ctrl-C
         let ctrl_c_hit = tokio::select! {
             _ = tokio::signal::ctrl_c() => true,
             _ = tokio::time::sleep(Duration::from_millis(500)) => false,
         };
 
         if ctrl_c_hit {
-            info!("[sentinel] Ctrl-C — shutting down children");
+            info!("[sentinel] Ctrl-C — shutting down");
             let mut ch = children.lock().await;
-            if let Some(ref mut handle) = ch.tun {
-                kill_tun(handle).await;
-            }
+            if let Some(ref mut h) = ch.tun { kill_tun(h).await; }
             ch.tun = None;
-            if let Some(ref mut handle) = ch.cli {
-                let _ = handle.process.kill().await;
-                match tokio::time::timeout(Duration::from_secs(5), handle.process.wait()).await {
+            if let Some(ref mut h) = ch.cli {
+                let _ = h.process.kill().await;
+                match tokio::time::timeout(Duration::from_secs(5), h.process.wait()).await {
                     Ok(Ok(s)) => info!("[sentinel] cli exited {:?}", s),
                     Ok(Err(e)) => warn!("[sentinel] cli wait: {}", e),
                     Err(_) => warn!("[sentinel] cli did not exit within 5s"),
@@ -456,55 +444,54 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             ch.cli = None;
             std::process::exit(0);
         }
+
+        // Update tun_alive for telemetry
+        {
+            let ch = children.lock().await;
+            let alive = ch.tun.is_some();
+            if *tun_alive_rx.borrow() != alive {
+                let _ = tun_alive_tx.send(alive);
+            }
+        }
     }
 }
 
-/// Passthrough mode: client file is unmanaged. Spawn client as-is, wait for exit.
 async fn run_client_passthrough(
     cfg: &SentinelConfig,
-    children: std::sync::Arc<Mutex<ChildState>>,
+    children: Arc<Mutex<ChildState>>,
     publisher: &status_server::PhasePublisher,
-    _monitor_info: std::sync::Arc<std::sync::Mutex<MonitorInfo>>,
+    _monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
+    tun_alive_tx: Arc<watch::Sender<bool>>,
 ) -> Result<()> {
     let child_args = build_child_args(&cfg.client_args, &cfg.client_config_path);
-    info!(
-        "[sentinel][passthrough] spawning {:?} with args {:?}",
-        cfg.client_binary, child_args
-    );
+    info!("[sentinel][passthrough] spawning {:?}", cfg.client_binary);
 
     let handle = spawn_child(&cfg.client_binary, &child_args)
         .with_context(|| format!("failed to spawn {:?}", cfg.client_binary))?;
-
     let pid = handle.process.id();
-    {
-        let mut ch = children.lock().await;
-        ch.cli = Some(handle);
-    }
+    { children.lock().await.cli = Some(handle); }
     publisher.set(SentinelPhase::ChildRunning { pid });
 
     loop {
         let exited = {
             let mut ch = children.lock().await;
-            if let Some(ref mut h) = ch.cli {
-                h.process.try_wait().ok().flatten()
-            } else {
-                break;
-            }
+            if let Some(ref mut h) = ch.cli { h.process.try_wait().ok().flatten() } else { break; }
         };
 
         if let Some(status) = exited {
             let code = status.code().unwrap_or(-1);
-            info!("[sentinel][passthrough] client exited with code {}", code);
+            info!("[sentinel][passthrough] client exited {}", code);
             std::process::exit(code);
         }
+
+        { let ch = children.lock().await; let _ = tun_alive_tx.send(ch.tun.is_some()); }
 
         let ctrl_c_hit = tokio::select! {
             _ = tokio::signal::ctrl_c() => true,
             _ = tokio::time::sleep(Duration::from_millis(500)) => false,
         };
-
         if ctrl_c_hit {
-            info!("[sentinel][passthrough] Ctrl-C — terminating client");
+            info!("[sentinel][passthrough] Ctrl-C");
             let mut ch = children.lock().await;
             if let Some(ref mut h) = ch.cli {
                 let _ = h.process.kill().await;
@@ -515,4 +502,11 @@ async fn run_client_passthrough(
     }
 
     Ok(())
+}
+
+fn unix_now_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

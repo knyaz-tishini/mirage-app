@@ -3,12 +3,14 @@
 //! Binds on `127.0.0.1:19420`.
 //!
 //! Routes:
-//!   GET  /health         → 200 "ok"
-//!   GET  /status         → JSON phase + child states
-//!   POST /connect        → spawn tun (409 if already running)
-//!   POST /disconnect     → kill tun (idempotent)
-//!   GET  /logs/cli?tail=N → last N bytes from cli stderr (default 8KB, max 64KB)
-//!   GET  /logs/tun?tail=N → last N bytes from tun stderr
+//!   GET  /health             → 200 "ok"
+//!   GET  /status             → JSON phase + child states
+//!   POST /connect            → spawn tun (409 if already running)
+//!   POST /disconnect         → kill tun (idempotent)
+//!   GET  /logs/cli?tail=N    → last N bytes from cli stderr (default 8KB, max 64KB)
+//!   GET  /logs/tun?tail=N    → last N bytes from tun stderr
+//!   POST /onboard            → parse mirage://onboard?... URL, patch sentinel.toml,
+//!                              signal re-bootstrap
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
-use crate::supervisor::{ChildState, ChildStatus, spawn_child, kill_tun, resolve_tun_binary};
+use crate::onboarding::{OnboardRequest, default_toml_path, log_onboard_result, patch_sentinel_toml};
+use crate::supervisor::{ChildState, ChildStatus, kill_tun, resolve_tun_binary, spawn_child};
 use crate::SentinelPhase;
 
 // ── Shared server state ───────────────────────────────────────────────────────
@@ -39,6 +42,8 @@ pub struct ServerState {
     pub spawn_cfg: Arc<TunSpawnCfg>,
     /// For status: monitor URL + reachability snapshot.
     pub monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
+    /// Signal re-bootstrap on successful /onboard.
+    pub reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
 }
 
 #[derive(Clone)]
@@ -51,6 +56,14 @@ pub struct TunSpawnCfg {
 pub struct MonitorInfo {
     pub monitor_url: String,
     pub monitor_reachable: bool,
+}
+
+/// Payload sent over the reboot channel when /onboard succeeds.
+#[derive(Clone, Debug)]
+pub struct RebootPayload {
+    pub monitor_url: String,
+    pub api_key: String,
+    pub client_id: String,
 }
 
 // ── Response shapes ───────────────────────────────────────────────────────────
@@ -161,11 +174,68 @@ async fn logs_tun(
     }
 }
 
+async fn onboard_handler(
+    State(state): State<ServerState>,
+    Json(body): Json<OnboardRequest>,
+) -> impl IntoResponse {
+    use crate::onboarding::parse_onboard_url;
+
+    let payload = match parse_onboard_url(&body.url) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    // Patch sentinel.toml on disk
+    if let Some(toml_path) = default_toml_path() {
+        let result = patch_sentinel_toml(&toml_path, &payload);
+        log_onboard_result(&result);
+        if let Err(e) = result {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    } else {
+        warn!("[onboard] cannot determine sentinel.toml path");
+    }
+
+    // Signal re-bootstrap
+    let reboot = RebootPayload {
+        monitor_url: payload.monitor_url.clone(),
+        api_key: payload.api_key.clone(),
+        client_id: payload.client_id.clone(),
+    };
+    let _ = state.reboot_tx.send(Some(reboot));
+
+    info!("[onboard] re-bootstrap triggered for client_id={}", payload.client_id);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "client_id": payload.client_id })),
+    )
+        .into_response()
+}
+
 // ── Phase watch ───────────────────────────────────────────────────────────────
 
 /// Create a watch channel seeded with [`SentinelPhase::Starting`].
 pub fn phase_channel() -> (watch::Sender<SentinelPhase>, watch::Receiver<SentinelPhase>) {
     watch::channel(SentinelPhase::Starting)
+}
+
+/// Create a reboot channel (starts as `None`).
+pub fn reboot_channel() -> (
+    Arc<watch::Sender<Option<RebootPayload>>>,
+    watch::Receiver<Option<RebootPayload>>,
+) {
+    let (tx, rx) = watch::channel(None);
+    (Arc::new(tx), rx)
 }
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
@@ -177,6 +247,7 @@ pub fn spawn(
     children: Arc<Mutex<ChildState>>,
     spawn_cfg: TunSpawnCfg,
     monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
+    reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
 ) -> PhasePublisher {
     let started_at_ms = unix_now_ms();
     let last_update = Arc::new(std::sync::Mutex::new(started_at_ms));
@@ -189,6 +260,7 @@ pub fn spawn(
         children,
         spawn_cfg: Arc::new(spawn_cfg),
         monitor_info,
+        reboot_tx,
     };
 
     let app = Router::new()
@@ -198,6 +270,7 @@ pub fn spawn(
         .route("/disconnect", post(disconnect))
         .route("/logs/cli", get(logs_cli))
         .route("/logs/tun", get(logs_tun))
+        .route("/onboard", post(onboard_handler))
         .with_state(state);
 
     tokio::spawn(async move {
