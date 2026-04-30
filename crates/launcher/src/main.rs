@@ -707,6 +707,17 @@ fn draw_big_button(
     sentinel_phase: &SentinelPhaseLocal,
     sentinel_phase_since_ms: f64,
 ) {
+    // WaitingOnboard — handled separately: white outer-only, dim, with prompt text.
+    if matches!(sentinel_phase, SentinelPhaseLocal::WaitingOnboard) {
+        draw_cube_idle(ctx, cx, cy, CUBE_OFF_SIZE, t, CUBE_WHITE, false, 0.7, false);
+        ctx.set_fill_color(FG3);
+        ctx.set_font("9px jetbrains mono");
+        ctx.set_text_align(TextAlign::Center);
+        ctx.set_text_baseline(TextBaseline::Top);
+        ctx.fill_text("PASTE ONBOARDING LINK", cx, cy + CUBE_OFF_SIZE / 2.0 + 14.0);
+        return;
+    }
+
     // Determine cube color and which lines to draw based on sentinel phase.
     let (cube_color, draw_inner, shimmer) = match sentinel_phase {
         SentinelPhaseLocal::Unknown
@@ -717,7 +728,11 @@ fn draw_big_button(
             (CUBE_WHITE, true, false)
         }
         SentinelPhaseLocal::ChildRunning => (CUBE_AMBER, true, true),
+        // ConfigStale: amber + shimmer (same as ChildRunning).
+        SentinelPhaseLocal::ConfigStale => (CUBE_AMBER, true, true),
         SentinelPhaseLocal::Error(_) => (CUBE_RED, false, false),
+        // WaitingOnboard is handled above.
+        SentinelPhaseLocal::WaitingOnboard => (CUBE_WHITE, false, false),
     };
 
     // For ConfigReady — compute inner alpha fade-in.
@@ -726,7 +741,7 @@ fn draw_big_button(
             let elapsed = (t - sentinel_phase_since_ms).max(0.0);
             (elapsed / 500.0).clamp(0.0, 1.0)
         }
-        SentinelPhaseLocal::ChildRunning => {
+        SentinelPhaseLocal::ChildRunning | SentinelPhaseLocal::ConfigStale => {
             // Fade from white to amber over 600ms.
             let elapsed = (t - sentinel_phase_since_ms).max(0.0);
             (elapsed / 600.0).clamp(0.0, 1.0)
@@ -734,8 +749,11 @@ fn draw_big_button(
         _ => 1.0,
     };
 
-    // For ChildRunning, blend cube color from white to amber.
-    let effective_color = if matches!(sentinel_phase, SentinelPhaseLocal::ChildRunning) {
+    // For ChildRunning / ConfigStale, blend cube color from white to amber.
+    let effective_color = if matches!(
+        sentinel_phase,
+        SentinelPhaseLocal::ChildRunning | SentinelPhaseLocal::ConfigStale
+    ) {
         if inner_alpha >= 1.0 { CUBE_AMBER } else { CUBE_WHITE }
     } else {
         cube_color
@@ -759,6 +777,24 @@ fn draw_big_button(
             draw_doppler(ctx, cx, cy, FULL_RADAR_R, elapsed, ACCENT);
         }
         LauncherState::On { .. } => unreachable!(),
+    }
+
+    // ConfigStale: subtle warning dot in top-right corner of cube bounding box.
+    if matches!(sentinel_phase, SentinelPhaseLocal::ConfigStale) {
+        let dot_x = cx + CUBE_OFF_SIZE * 0.42;
+        let dot_y = cy - CUBE_OFF_SIZE * 0.42;
+        ctx.set_global_alpha(0.65);
+        ctx.set_fill_color(CUBE_AMBER);
+        ctx.begin_path();
+        ctx.arc(dot_x, dot_y, 4.0, 0.0, TAU);
+        ctx.fill();
+        // Exclamation mark inside the dot.
+        ctx.set_fill_color(BG);
+        ctx.set_font("6px jetbrains mono");
+        ctx.set_text_align(TextAlign::Center);
+        ctx.set_text_baseline(TextBaseline::Middle);
+        ctx.fill_text("!", dot_x, dot_y);
+        ctx.set_global_alpha(1.0);
     }
 }
 
@@ -890,6 +926,8 @@ fn draw_titlebar(
             | SentinelPhaseLocal::FetchingConfig => (CUBE_WHITE, false, false),
             SentinelPhaseLocal::ConfigReady => (CUBE_WHITE, true, false),
             SentinelPhaseLocal::ChildRunning => (CUBE_AMBER, true, true),
+            SentinelPhaseLocal::ConfigStale => (CUBE_AMBER, true, true),
+            SentinelPhaseLocal::WaitingOnboard => (CUBE_WHITE, false, false),
             SentinelPhaseLocal::Error(_) => (CUBE_RED, false, false),
         };
         let inner_alpha = match sentinel_phase {
@@ -899,7 +937,10 @@ fn draw_titlebar(
             }
             _ => 1.0,
         };
-        let effective_color = if matches!(sentinel_phase, SentinelPhaseLocal::ChildRunning) {
+        let effective_color = if matches!(
+            sentinel_phase,
+            SentinelPhaseLocal::ChildRunning | SentinelPhaseLocal::ConfigStale
+        ) {
             let elapsed = (t - sentinel_phase_since_ms).max(0.0);
             if elapsed >= 600.0 { CUBE_AMBER } else { CUBE_WHITE }
         } else {
@@ -953,9 +994,12 @@ fn click_target_rect(state: &LauncherState, sentinel_phase: &SentinelPhaseLocal)
     match state {
         LauncherState::On { .. } => uzor::Rect::new(0.0, TITLEBAR_H, W, H - TITLEBAR_H),
         _ => {
-            // Disable click-to-connect until sentinel says ChildRunning or Error.
-            let enabled = matches!(sentinel_phase,
-                SentinelPhaseLocal::ChildRunning | SentinelPhaseLocal::Error(_)
+            // Enable click for: connect flow (ChildRunning/Error) and onboarding.
+            let enabled = matches!(
+                sentinel_phase,
+                SentinelPhaseLocal::ChildRunning
+                    | SentinelPhaseLocal::Error(_)
+                    | SentinelPhaseLocal::WaitingOnboard
             );
             if !enabled {
                 // Return a zero-area rect so clicks are never detected.
@@ -1066,6 +1110,12 @@ impl ApplicationHandler for LauncherHandler {
             }
         };
 
+        let sentinel_arc = Arc::new(Mutex::new(initial_sentinel));
+
+        // Watchdog task: checks every 1500ms if sentinel exited; respawns up
+        // to 5 times in 60s before giving up.
+        spawn_sentinel_watchdog(self.rt.handle(), Arc::downgrade(&sentinel_arc));
+
         self.app = Some(LauncherApp {
             window,
             surface,
@@ -1073,7 +1123,7 @@ impl ApplicationHandler for LauncherHandler {
             last_frame: now,
             startup: now,
             state: LauncherState::Off,
-            sentinel: Arc::new(Mutex::new(initial_sentinel)),
+            sentinel: sentinel_arc,
             event_rx,
             event_tx,
             rt: self.rt.clone(),
@@ -1240,6 +1290,15 @@ impl ApplicationHandler for LauncherHandler {
                     if !resp.clicked || id.0 != "btn" {
                         continue;
                     }
+
+                    // WaitingOnboard: paste onboarding link from clipboard.
+                    if matches!(&current_sentinel, SentinelPhaseLocal::WaitingOnboard) {
+                        if let Some(url) = prompt_for_onboard_link() {
+                            app.rt.spawn(post_onboard_url(url));
+                        }
+                        continue;
+                    }
+
                     match &app.state {
                         LauncherState::Off | LauncherState::Error(_) => {
                             app.state = LauncherState::Connecting { started_at_ms: t };
@@ -1370,6 +1429,164 @@ fn load_icon() -> Option<Icon> {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Icon::from_rgba(rgba.into_raw(), w, h).ok()
+}
+
+// ── Sentinel watchdog ────────────────────────────────────────────────────────
+
+/// Burst limit: at most this many respawns within `RESPAWN_BURST_WINDOW`.
+const RESPAWN_BURST_LIMIT: u32 = 5;
+/// Window duration for burst counting.
+const RESPAWN_BURST_WINDOW: Duration = Duration::from_secs(60);
+/// Cooldown between respawn attempts (avoids tight loops on persistent failures).
+const RESPAWN_COOLDOWN: Duration = Duration::from_millis(500);
+/// How often the watchdog checks the sentinel child status.
+const WATCHDOG_TICK: Duration = Duration::from_millis(1500);
+
+/// Spawns the background watchdog task.  Holds a `Weak` reference to the
+/// shared sentinel handle so the task exits naturally when the app drops.
+fn spawn_sentinel_watchdog(
+    rt: &tokio::runtime::Handle,
+    sentinel: std::sync::Weak<Mutex<Option<tokio::process::Child>>>,
+) {
+    rt.spawn(async move {
+        let mut burst_count: u32 = 0;
+        let mut burst_window_start = tokio::time::Instant::now();
+
+        loop {
+            tokio::time::sleep(WATCHDOG_TICK).await;
+
+            let arc = match sentinel.upgrade() {
+                Some(a) => a,
+                None => return, // app dropped — exit cleanly
+            };
+
+            // Check if sentinel has exited.
+            let exited = {
+                let mut guard = arc.lock().expect("not poisoned");
+                match guard.as_mut() {
+                    None => false, // no child (already taken for kill)
+                    Some(child) => {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                tracing::warn!(
+                                    "sentinel exited (code {:?}) — preparing respawn",
+                                    status.code()
+                                );
+                                true
+                            }
+                            Ok(None) => false, // still running
+                            Err(e) => {
+                                tracing::warn!("sentinel try_wait error: {e}");
+                                false
+                            }
+                        }
+                    }
+                }
+            };
+
+            if !exited {
+                continue;
+            }
+
+            // Reset burst window if it has expired.
+            if burst_window_start.elapsed() >= RESPAWN_BURST_WINDOW {
+                burst_count = 0;
+                burst_window_start = tokio::time::Instant::now();
+            }
+
+            if burst_count >= RESPAWN_BURST_LIMIT {
+                tracing::warn!(
+                    "sentinel respawned {} times in {:?} — giving up; close and reopen launcher",
+                    burst_count,
+                    RESPAWN_BURST_WINDOW,
+                );
+                // Drop the dead child handle but do not respawn.
+                arc.lock().expect("not poisoned").take();
+                return;
+            }
+
+            tokio::time::sleep(RESPAWN_COOLDOWN).await;
+
+            // Upgrade reference again after sleeping (app might have closed).
+            let arc2 = match sentinel.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
+
+            match spawn_sentinel() {
+                Ok(child) => {
+                    burst_count += 1;
+                    tracing::warn!(
+                        "sentinel respawned (burst {}/{})",
+                        burst_count,
+                        RESPAWN_BURST_LIMIT
+                    );
+                    *arc2.lock().expect("not poisoned") = Some(child);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to respawn sentinel: {e}");
+                    burst_count += 1;
+                }
+            }
+        }
+    });
+}
+
+// ── Onboarding (WaitingOnboard) ──────────────────────────────────────────────
+
+/// Read the clipboard and return the text if it looks like an onboarding URL.
+/// On non-Windows always returns `None`.
+fn prompt_for_onboard_link() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use clipboard_win::{formats, get_clipboard};
+        let text: String = get_clipboard(formats::Unicode).ok()?;
+        if text.starts_with("mirage://onboard?") {
+            Some(text.trim().to_owned())
+        } else {
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// POST the onboarding URL to sentinel.  Fire-and-forget (caller does not await).
+async fn post_onboard_url(url: String) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("onboard: failed to build client: {e}");
+            return;
+        }
+    };
+
+    #[derive(serde::Serialize)]
+    struct OnboardPayload<'a> {
+        url: &'a str,
+    }
+
+    match client
+        .post(format!("{SENTINEL_BASE}/onboard"))
+        .json(&OnboardPayload { url: &url })
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!("onboard: accepted by sentinel");
+        }
+        Ok(r) => {
+            tracing::warn!("onboard: sentinel returned {}", r.status());
+        }
+        Err(e) => {
+            tracing::warn!("onboard: request failed: {e}");
+        }
+    }
 }
 
 // ── Entry ────────────────────────────────────────────────────────────────────

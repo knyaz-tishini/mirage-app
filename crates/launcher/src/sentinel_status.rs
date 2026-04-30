@@ -22,6 +22,12 @@ pub enum SentinelPhaseLocal {
     FetchingConfig,
     ConfigReady,
     ChildRunning,
+    /// `monitor_api_key` or `client_id` is missing in `sentinel.toml`.
+    /// Launcher should prompt the user to paste an onboarding link.
+    WaitingOnboard,
+    /// Config was fetched successfully before but is now stale (monitor
+    /// unreachable for too long). Children may still be running.
+    ConfigStale,
     Error(String),
 }
 
@@ -38,6 +44,8 @@ fn parse_phase(raw: SentinelStatusRaw) -> SentinelPhaseLocal {
         "fetching_config" => SentinelPhaseLocal::FetchingConfig,
         "config_ready" => SentinelPhaseLocal::ConfigReady,
         "child_running" => SentinelPhaseLocal::ChildRunning,
+        "waiting_onboard" => SentinelPhaseLocal::WaitingOnboard,
+        "config_stale" => SentinelPhaseLocal::ConfigStale,
         "error" => SentinelPhaseLocal::Error(
             raw.error.unwrap_or_else(|| "sentinel error".into()),
         ),

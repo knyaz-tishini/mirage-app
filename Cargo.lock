@@ -2440,6 +2440,7 @@ name = "mirage-launcher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clipboard-win",
  "hickory-resolver",
  "image",
  "reqwest",
