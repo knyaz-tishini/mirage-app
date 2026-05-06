@@ -11,7 +11,10 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MONITOR_URLS: &[&str] = &["https://lm.zen-geldmaschine.net:19443"];
+const MONITOR_URLS: &[&str] = &[
+    "https://lm.zen-geldmaschine.net:19443",
+    "https://lm-nl.zen-geldmaschine.net:19443",
+];
 const API_KEY:    &str = "ae08d625-6a22-48a5-b175-65e011d76f16";
 const CLIENT_ID:  &str = "tester2";
 
@@ -27,15 +30,14 @@ async fn main() {
         .with_target(false)
         .init();
 
-    let monitor_url = MONITOR_URLS[0];
-
     println!("=== mirage-sentinel-test ===");
-    println!("monitor : {}", monitor_url);
+    println!("monitors:");
+    for u in MONITOR_URLS { println!("  - {u}"); }
     println!("client  : {}", CLIENT_ID);
     println!();
 
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(8))
         .build()
     {
         Ok(c) => c,
@@ -46,26 +48,30 @@ async fn main() {
         }
     };
 
-    // Step 1: GET /health (no auth)
-    print!("[1/3] GET {monitor_url}/health ... ");
-    match client.get(format!("{monitor_url}/health")).send().await {
-        Ok(r) if r.status().is_success() => {
-            let body = r.text().await.unwrap_or_default();
-            println!("OK -> {}", body.trim().chars().take(80).collect::<String>());
-        }
-        Ok(r) => {
-            println!("HTTP {}", r.status());
-            eprintln!("monitor health rejected — wrong URL or TLS broken");
-            wait_and_exit(1);
-            return;
-        }
-        Err(e) => {
-            println!("FAIL");
-            eprintln!("monitor unreachable: {e}");
-            wait_and_exit(1);
-            return;
+    // Step 1: race /health across all URLs, pick first that answers 2xx.
+    let mut monitor_url: Option<&str> = None;
+    for u in MONITOR_URLS {
+        print!("[1/3] GET {u}/health ... ");
+        match client.get(format!("{u}/health")).send().await {
+            Ok(r) if r.status().is_success() => {
+                let body = r.text().await.unwrap_or_default();
+                println!("OK -> {}", body.trim().chars().take(80).collect::<String>());
+                monitor_url = Some(*u);
+                break;
+            }
+            Ok(r) => println!("HTTP {} (try next)", r.status()),
+            Err(e) => println!("FAIL ({e}) (try next)"),
         }
     }
+    let monitor_url = match monitor_url {
+        Some(u) => u,
+        None => {
+            eprintln!("all monitors unreachable");
+            wait_and_exit(1);
+            return;
+        }
+    };
+    println!("active monitor: {monitor_url}");
 
     // Step 2: POST /relay/clients/<id>/heartbeat (public — no auth, anyone
     // with a client_id can ping).  Confirms client_id mapping works.

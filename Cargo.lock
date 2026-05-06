@@ -2423,6 +2423,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "libc",
  "mirage-client-core",
  "mirage-core",
  "mirage-runtime-guard",

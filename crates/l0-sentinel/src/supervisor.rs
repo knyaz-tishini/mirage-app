@@ -296,24 +296,24 @@ fn adopt_raw_pid(pid: u32) -> Result<tokio::process::Child> {
 fn adopt_raw_pid(pid: u32) -> Result<tokio::process::Child> {
     use std::os::unix::process::CommandExt;
 
-    // Shell one-liner: loop until the PID disappears from /proc, then exit.
-    let script = format!("while [ -d /proc/{} ]; do sleep 1; done; exit 0", pid);
-    let mut cmd = std::process::Command::new("sh");
+    // Portable: poll `kill -0` instead of /proc (which doesn't exist on macOS).
+    let script = format!("while kill -0 {} 2>/dev/null; do sleep 1; done; exit 0", pid);
+    let mut cmd = tokio::process::Command::new("sh");
     cmd.args(["-c", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     // Detach from terminal so the watcher doesn't receive Ctrl-C.
     unsafe {
         cmd.pre_exec(|| {
-            // setsid() syscall number = 112 on x86_64 Linux
-            #[cfg(target_arch = "x86_64")]
-            std::arch::asm!("syscall", in("rax") 112u64, options(nostack, nomem));
+            // libc::setsid() — portable POSIX, no inline asm.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
-    let child = cmd.spawn().context("failed to spawn unix adopt-watcher")?;
-    Ok(tokio::process::Child::from(child))
+    cmd.spawn().context("failed to spawn unix adopt-watcher")
 }
 
 // ── Background drain ──────────────────────────────────────────────────────────

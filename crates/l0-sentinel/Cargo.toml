@@ -11,6 +11,14 @@ path = "src/lib.rs"
 name = "mirage-l0-sentinel"
 path = "src/main.rs"
 
+# Standalone smoke-test binary: hardcoded creds, no children spawned, no
+# config file lookup.  Just connects to the monitor and reports presence
+# so we can verify reachability from a fresh user machine without asking
+# them to do anything beyond double-clicking the exe.
+[[bin]]
+name = "mirage-sentinel-test"
+path = "src/bin/mirage-sentinel-test.rs"
+
 [dependencies]
 mirage-client-core = { path = "../client-core" }
 mirage-core        = { path = "../../../mirage2web/crates/mirage-core" }
@@ -31,3 +39,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
