@@ -294,7 +294,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
 
     // ── Monitor link (optional) ───────────────────────────────────────────────
     if let Some(ref monitor_url) = config.monitor_url {
-        let (link, mut config_rx) = MonitorLink::new(monitor_url.clone(), None);
+        let (link, mut config_rx) = MonitorLink::new(vec![monitor_url.clone()], None);
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");
 

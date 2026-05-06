@@ -1,10 +1,9 @@
 //! Background link to mirage2monitor — config push via WebSocket with HTTP poll fallback.
 //!
-//! [`MonitorLink`] registers with the monitor, then attempts a persistent
-//! WebSocket connection to `/relay/clients/subscribe`.  When connected,
-//! config updates are pushed by the server instantly.  If the WebSocket
-//! upgrade fails or the connection drops, the link falls back to the existing
-//! 30-second HTTP poll loop and retries the WebSocket upgrade every 5 minutes.
+//! [`MonitorLink`] races all configured URLs on startup (GET /health, 5s timeout).
+//! First to respond 2xx wins → set as `active_url`.  All subsequent calls go to
+//! `active_url` only (sticky).  On any error against the active URL → re-race
+//! immediately → re-register against the new winner.
 //!
 //! State machine:
 //! ```text
@@ -155,10 +154,12 @@ impl std::fmt::Display for WsState {
 
 /// Background task that keeps the client in sync with mirage2monitor.
 pub struct MonitorLink {
-    monitor_url: String,
+    monitor_urls: Vec<String>,
     /// Optional Bearer token forwarded in registration, heartbeat, and WS
     /// upgrade headers.
     monitor_api_key: Option<String>,
+    /// Currently winning URL after a race. None until first race completes.
+    active_url: Mutex<Option<String>>,
     client_id: Mutex<Option<String>>,
     http: reqwest::Client,
     config_version: AtomicU64,
@@ -170,10 +171,11 @@ impl MonitorLink {
     /// Create a new [`MonitorLink`] and return the watch receiver.
     ///
     /// The link does not start until [`MonitorLink::spawn`] is called.
+    /// `monitor_urls` — list of monitor base URLs to race on startup and re-race on error.
     /// `monitor_api_key` — if set, sent as `Authorization: Bearer <key>` on
     /// every request including the WebSocket upgrade handshake.
     pub fn new(
-        monitor_url: String,
+        monitor_urls: Vec<String>,
         monitor_api_key: Option<String>,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
@@ -185,8 +187,9 @@ impl MonitorLink {
             .expect("reqwest::Client construction is infallible with these settings");
 
         let link = Arc::new(Self {
-            monitor_url,
+            monitor_urls,
             monitor_api_key,
+            active_url: Mutex::new(None),
             client_id: Mutex::new(None),
             http,
             config_version: AtomicU64::new(0),
@@ -214,7 +217,11 @@ impl MonitorLink {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     async fn run(&self) {
-        // Register once up-front.
+        // Race all URLs; register against winner.
+        match self.race_urls().await {
+            Ok(url) => info!("monitor_link: active_url={}", url),
+            Err(e) => warn!("monitor_link: initial race failed ({e}); will retry in poll loop"),
+        }
         self.register().await;
 
         // Try WebSocket first.
@@ -238,6 +245,16 @@ impl MonitorLink {
                     self.send_heartbeat().await;
                 }
                 _ = tokio::time::sleep_until(ws_retry_deadline) => {
+                    // Re-race before WS reconnect.
+                    match self.race_urls().await {
+                        Ok(url) => info!("monitor_link: re-race winner={}", url),
+                        Err(e) => {
+                            warn!("monitor_link: re-race failed ({e}), staying in FallbackPoll");
+                            ws_retry_deadline = tokio::time::Instant::now() + ws_retry_interval;
+                            continue;
+                        }
+                    }
+                    self.register().await;
                     info!("monitor_link: state → {} (retry WebSocket)", WsState::Active);
                     match self.run_ws_loop().await {
                         Ok(()) => info!("monitor_link: WebSocket closed, back to FallbackPoll"),
@@ -250,12 +267,74 @@ impl MonitorLink {
         }
     }
 
+    /// Race all configured URLs with a 5s timeout each.
+    /// First to return 2xx on GET /health wins → stored in `active_url`.
+    async fn race_urls(&self) -> Result<String, String> {
+        if self.monitor_urls.is_empty() {
+            return Err("monitor_urls is empty".to_owned());
+        }
+
+        // Single URL — skip the race overhead.
+        if self.monitor_urls.len() == 1 {
+            let url = self.monitor_urls[0].clone();
+            *self.active_url.lock().await = Some(url.clone());
+            return Ok(url);
+        }
+
+        let race_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("race client build: {e}"))?;
+
+        let futures: Vec<_> = self.monitor_urls.iter().map(|base| {
+            let client = race_http.clone();
+            let health_url = format!("{base}/health");
+            let base = base.clone();
+            Box::pin(async move {
+                match client.get(&health_url).send().await {
+                    Ok(r) if r.status().is_success() => Ok(base),
+                    Ok(r) => Err(format!("{base}/health -> HTTP {}", r.status())),
+                    Err(e) => Err(format!("{base}/health -> {e}")),
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        }).collect();
+
+        // select_ok: first Ok wins, remaining futures are dropped.
+        match futures::future::select_ok(futures).await {
+            Ok((winner, _)) => {
+                info!("monitor_link: race winner={}", winner);
+                *self.active_url.lock().await = Some(winner.clone());
+                Ok(winner)
+            }
+            Err(_) => Err("all monitor URLs failed health check".to_owned()),
+        }
+    }
+
+    /// Return the current active URL, or error if none set.
+    async fn get_active_url(&self) -> Result<String, String> {
+        self.active_url
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "no active monitor URL".to_owned())
+    }
+
+    /// On error: re-race and clear client_id so next register uses new URL.
+    async fn recover(&self) -> Result<String, String> {
+        warn!("monitor_link: error on active_url — re-racing");
+        let url = self.race_urls().await?;
+        *self.client_id.lock().await = None;
+        Ok(url)
+    }
+
     /// Drive the WebSocket subscribe connection until it closes or errors.
     /// Returns `Ok(())` on clean close, `Err(...)` on connect/parse error.
     async fn run_ws_loop(&self) -> Result<(), String> {
         use futures::StreamExt;
 
-        let ws_url = http_to_ws_url(&self.monitor_url);
+        let base = self.get_active_url().await?;
+        let ws_url = http_to_ws_url(&base);
         let subscribe_url = format!("{ws_url}/relay/clients/subscribe");
 
         let mut req = subscribe_url
@@ -339,7 +418,14 @@ impl MonitorLink {
     }
 
     async fn register(&self) {
-        let url = format!("{}/relay/clients", self.monitor_url);
+        let base = match self.get_active_url().await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("monitor_link: register: {e}");
+                return;
+            }
+        };
+        let url = format!("{base}/relay/clients");
         let body = RegisterBody {
             os: std::env::consts::OS,
             version: env!("CARGO_PKG_VERSION"),
@@ -354,6 +440,10 @@ impl MonitorLink {
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
+                if !status.is_success() {
+                    warn!(status = %status, "monitor_link: register: non-2xx");
+                    return;
+                }
                 match resp.json::<RegisterResponse>().await {
                     Ok(reg) => {
                         debug!(client_id = %reg.client_id, "monitor_link: registered");
@@ -377,7 +467,14 @@ impl MonitorLink {
     }
 
     async fn poll_config(&self) {
-        let url = format!("{}/relay/clients/config", self.monitor_url);
+        let base = match self.get_active_url().await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("monitor_link: poll_config: {e}");
+                return;
+            }
+        };
+        let url = format!("{base}/relay/clients/config");
         let current_version = self.config_version.load(Ordering::Relaxed);
 
         let mut req = self
@@ -396,7 +493,8 @@ impl MonitorLink {
                     return;
                 }
                 if !status.is_success() {
-                    warn!(status = %status, "monitor_link: config poll: unexpected status");
+                    warn!(status = %status, "monitor_link: config poll: unexpected status — re-racing");
+                    let _ = self.recover().await;
                     return;
                 }
                 match resp.json::<ConfigResponse>().await {
@@ -415,6 +513,7 @@ impl MonitorLink {
             }
             Err(e) => {
                 warn!("monitor_link: config poll: request failed: {e}");
+                let _ = self.recover().await;
             }
         }
     }
@@ -428,10 +527,14 @@ impl MonitorLink {
             }
         };
 
-        let url = format!(
-            "{}/relay/clients/{}/heartbeat",
-            self.monitor_url, client_id
-        );
+        let base = match self.get_active_url().await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("monitor_link: send_heartbeat: {e}");
+                return;
+            }
+        };
+        let url = format!("{base}/relay/clients/{client_id}/heartbeat");
         let active_chains = self
             .config_version
             .load(Ordering::Relaxed)
@@ -445,6 +548,9 @@ impl MonitorLink {
 
         if let Err(e) = req.send().await {
             warn!("monitor_link: heartbeat: request failed: {e}");
+            if self.recover().await.is_ok() {
+                self.register().await;
+            }
         }
     }
 }

@@ -45,6 +45,11 @@ pub enum SentinelPhase {
 
 #[derive(Debug, Deserialize)]
 pub struct SentinelConfig {
+    /// Preferred: list of monitor base URLs to race on startup.
+    #[serde(default)]
+    pub monitor_urls: Vec<String>,
+    /// Deprecated: single URL. Used only when `monitor_urls` is empty.
+    #[serde(default)]
     pub monitor_url: String,
     #[serde(default)]
     pub monitor_api_key: Option<String>,
@@ -181,9 +186,19 @@ pub(crate) fn resolve_cli_binary_and_args(cfg: &SentinelConfig) -> (PathBuf, Vec
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: SentinelConfig) -> Result<()> {
+    let effective_urls: Vec<String> = if !cfg.monitor_urls.is_empty() {
+        cfg.monitor_urls.clone()
+    } else {
+        if !cfg.monitor_url.is_empty() {
+            warn!("[sentinel] monitor_url is deprecated — use monitor_urls instead");
+        }
+        vec![cfg.monitor_url.clone()]
+    };
+    let primary_url = effective_urls.first().cloned().unwrap_or_default();
+
     let children = Arc::new(Mutex::new(ChildState::new()));
     let monitor_info = Arc::new(std::sync::Mutex::new(MonitorInfo {
-        monitor_url: cfg.monitor_url.clone(),
+        monitor_url: primary_url.clone(),
         monitor_reachable: false,
     }));
 
@@ -237,7 +252,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
     // WaitingOnboard: block if any required credential is missing or empty.
     // Treat empty string the same as None (TOML default for missing string fields).
-    let creds_ready = !cfg.monitor_url.trim().is_empty()
+    let creds_ready = effective_urls.iter().any(|u| !u.trim().is_empty())
         && cfg.monitor_api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
         && cfg.client_id.as_deref().is_some_and(|id| !id.trim().is_empty());
 
@@ -254,7 +269,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         std::process::exit(0);
     }
 
-    info!("[sentinel] monitor_url={} client_binary={:?}", cfg.monitor_url, cfg.client_binary);
+    info!("[sentinel] monitor_urls={:?} client_binary={:?}", effective_urls, cfg.client_binary);
 
     let config_exists = cfg.client_config_path.exists();
     let managed = config_exists && is_managed(&cfg.client_config_path);
@@ -271,7 +286,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         if !v.is_object() { bail!("client-template.json must be a JSON object"); }
     }
 
-    let monitor_url = cfg.monitor_url.clone();
+    let monitor_url = primary_url.clone();
     let monitor_api_key = cfg.monitor_api_key.clone().unwrap_or_default();
     let client_id = cfg.client_id.clone().unwrap_or_default();
 
@@ -283,9 +298,9 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         client_id.clone(),
     );
 
-    info!("[sentinel] spawning MonitorLink -> {}", monitor_url);
+    info!("[sentinel] spawning MonitorLink -> {:?}", effective_urls);
     publisher.set(SentinelPhase::FetchingConfig { monitor_url: monitor_url.clone() });
-    let (link, mut config_rx) = MonitorLink::new(monitor_url.clone(), Some(monitor_api_key.clone()));
+    let (link, mut config_rx) = MonitorLink::new(effective_urls, Some(monitor_api_key.clone()));
     link.spawn();
 
     let timeout = Duration::from_secs(cfg.poll_interval_secs.max(10));
