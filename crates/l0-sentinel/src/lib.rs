@@ -192,13 +192,22 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let (tun_alive_tx, tun_alive_rx) = watch::channel(false);
     let tun_alive_tx = Arc::new(tun_alive_tx);
 
+    // Resolve cli binary + args up front so /connect (status server route)
+    // can spawn them on demand.
+    let (cli_binary_for_status, cli_args_for_status) = resolve_cli_binary_and_args(&cfg);
+
     let (phase_tx, phase_rx) = status_server::phase_channel();
     let (reboot_tx, mut reboot_rx) = reboot_channel();
     let publisher = status_server::spawn(
         phase_rx,
         phase_tx,
         Arc::clone(&children),
-        TunSpawnCfg { tun_binary: cfg.tun_binary.clone(), tun_args: cfg.tun_args.clone() },
+        TunSpawnCfg {
+            tun_binary: cfg.tun_binary.clone(),
+            tun_args: cfg.tun_args.clone(),
+            cli_binary: cli_binary_for_status,
+            cli_args: cli_args_for_status,
+        },
         Arc::clone(&monitor_info),
         Arc::clone(&reboot_tx),
         cfg.cli_variant.clone(),
@@ -368,23 +377,23 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
     // ── End adopt-on-startup ──────────────────────────────────────────────────
 
-    // Only spawn cli if we did not adopt an existing one.
-    let need_spawn_cli = children.lock().await.cli.is_none();
-    if need_spawn_cli {
-        info!("[sentinel] spawning cli ({}) {:?}", cfg.cli_variant, cli_binary);
-        let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
-        let cli_handle = match spawn_child_with_flags(&cli_binary, &child_args, flags) {
-            Ok(h) => h,
-            Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
-        };
-        let cli_pid = cli_handle.process.id();
-        if let Some(pid) = cli_pid {
-            if let Some(path) = pid_file::cli_pid_path() {
-                pid_file::write(&path, pid);
-            }
-        }
-        children.lock().await.cli = Some(cli_handle);
-        publisher.set(SentinelPhase::ChildRunning { pid: cli_pid });
+    // Sentinel does NOT auto-spawn cli at startup.  Cli (and tun) are
+    // launched on demand by `POST /connect` from the GUI.  This keeps the
+    // launcher window alive even when cli/tun would crash, and lets the
+    // user trigger the connection explicitly.
+    //
+    // If we adopted a cli from a previous run via the PID file (pre-existing
+    // managed child still alive), we keep it; otherwise we just announce
+    // ConfigReady and idle until /connect.
+    let already_running = children.lock().await.cli.is_some();
+    if already_running {
+        publisher.set(SentinelPhase::ChildRunning { pid: None });
+    } else {
+        publisher.set(SentinelPhase::ConfigReady {
+            version: first_cfg.version,
+            chains: first_cfg.chains.len(),
+            materialised_at_ms: unix_now_u64() as u128,
+        });
     }
 
     // Task 5

@@ -56,6 +56,10 @@ pub struct ServerState {
 pub struct TunSpawnCfg {
     pub tun_binary: Option<PathBuf>,
     pub tun_args: Vec<String>,
+    /// Cli binary (resolved at startup — could be cli1 or cli2 supervisor).
+    pub cli_binary: PathBuf,
+    /// Cli args with `{client_config_path}` already substituted.
+    pub cli_args: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -126,12 +130,46 @@ async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
         return (StatusCode::CONFLICT, "tun already running").into_response();
     }
 
+    let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+
+    // Step 1: ensure cli is running.  Cli is required before tun activates
+    // because tun forwards traffic to cli's SOCKS5 listeners.
+    if children.cli.is_none() {
+        info!("[sentinel] /connect: spawning cli first ({:?})", state.spawn_cfg.cli_binary);
+        match spawn_child_with_flags(
+            &state.spawn_cfg.cli_binary,
+            &state.spawn_cfg.cli_args,
+            flags,
+        ) {
+            Ok(handle) => {
+                let cli_pid = handle.process.id();
+                info!("[sentinel] cli spawned pid={:?}", cli_pid);
+                if let Some(pid) = cli_pid {
+                    if let Some(path) = pid_file::cli_pid_path() {
+                        pid_file::write(&path, pid);
+                    }
+                }
+                children.cli = Some(handle);
+            }
+            Err(e) => {
+                warn!("[sentinel] cli spawn failed: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("cli spawn: {e}"))
+                    .into_response();
+            }
+        }
+        // Brief warmup so cli's SOCKS5 listeners are bound before tun
+        // tries to forward.
+        drop(children);
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        children = state.children.lock().await;
+    }
+
+    // Step 2: spawn tun.
     let binary = resolve_tun_binary(state.spawn_cfg.tun_binary.as_ref());
     let Some(binary) = binary else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "tun binary not found").into_response();
     };
 
-    let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
     match spawn_child_with_flags(&binary, &state.spawn_cfg.tun_args, flags) {
         Ok(handle) => {
             let tun_pid = handle.process.id();
@@ -142,7 +180,7 @@ async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
                 }
             }
             children.tun = Some(handle);
-            (StatusCode::OK, "tun started").into_response()
+            (StatusCode::OK, "cli + tun started").into_response()
         }
         Err(e) => {
             warn!("[sentinel] tun spawn failed: {}", e);
