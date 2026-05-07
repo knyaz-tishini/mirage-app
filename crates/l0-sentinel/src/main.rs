@@ -26,6 +26,13 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    match rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider()
+    ) {
+        Ok(()) => tracing::info!("[sentinel] rustls crypto provider: ring (installed)"),
+        Err(_) => tracing::info!("[sentinel] rustls crypto provider: already installed"),
+    }
+
     let args = Args::parse();
 
     tracing::info!("[sentinel] loading config {:?}", args.config);

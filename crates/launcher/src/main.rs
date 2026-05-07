@@ -1283,7 +1283,7 @@ impl ApplicationHandler for LauncherHandler {
                 let mut tb_min_click = false;
                 let mut tb_close_click = false;
                 for (id, resp) in &responses {
-                    match id.0.as_str() {
+                    match id.as_str() {
                         "tb_min" => {
                             tb_hover.minimize = resp.hovered;
                             if resp.clicked { tb_min_click = true; }
@@ -1325,7 +1325,7 @@ impl ApplicationHandler for LauncherHandler {
                     app.sentinel_phase_since_ms,
                 );
                 for (id, resp) in &responses {
-                    if !resp.clicked || id.0 != "btn" {
+                    if !resp.clicked || id.as_str() != "btn" {
                         continue;
                     }
 
