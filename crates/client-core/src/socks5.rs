@@ -940,7 +940,7 @@ fn build_udp_response_header(src: SocketAddr) -> Vec<u8> {
 }
 
 /// Send SOCKS5 UDP ASSOCIATE success reply with the bound UDP socket address.
-async fn send_socks5_udp_success(
+pub(crate) async fn send_socks5_udp_success(
     stream: &mut TcpStream,
     addr: SocketAddr,
 ) -> Result<(), MirageError> {
@@ -960,4 +960,141 @@ async fn send_socks5_udp_success(
     }
     stream.write_all(&reply).await?;
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::{
+        build_udp_response_header, parse_destination, parse_udp_request_header,
+        SOCKS5_ATYP_IPV4, SOCKS5_ATYP_IPV6,
+    };
+
+    /// Create a connected loopback TCP pair.  Returns `(writer, reader)`.
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (writer, accept_result) = tokio::join!(connect, accept);
+        let (reader, _) = accept_result.unwrap();
+        (writer.unwrap(), reader)
+    }
+
+    /// SOCKS5 CONNECT ATYP=4 (IPv6): 16-byte addr + 2-byte port.
+    #[tokio::test]
+    async fn parse_destination_ipv6_atyp4() {
+        let (mut writer, mut reader) = tcp_pair().await;
+
+        // Write: 16 bytes of IPv6 addr + 2 bytes port (big-endian).
+        let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let port: u16 = 4700;
+        writer.write_all(&ip.octets()).await.unwrap();
+        writer.write_all(&port.to_be_bytes()).await.unwrap();
+        drop(writer);
+
+        let dest = parse_destination(&mut reader, SOCKS5_ATYP_IPV6)
+            .await
+            .expect("parse_destination ATYP=4 must succeed");
+
+        match dest {
+            super::Destination::Ip(addr) => {
+                assert_eq!(addr.port(), port);
+                match addr {
+                    SocketAddr::V6(v6) => assert_eq!(*v6.ip(), ip),
+                    SocketAddr::V4(_) => panic!("expected V6 address"),
+                }
+            }
+            super::Destination::Domain(_, _) => panic!("expected Ip destination"),
+        }
+    }
+
+    /// SOCKS5 CONNECT ATYP=1 (IPv4) still works after the IPv6 arm is present.
+    #[tokio::test]
+    async fn parse_destination_ipv4_atyp1_still_works() {
+        let (mut writer, mut reader) = tcp_pair().await;
+
+        let ip: std::net::Ipv4Addr = "192.168.1.1".parse().unwrap();
+        let port: u16 = 80;
+        writer.write_all(&ip.octets()).await.unwrap();
+        writer.write_all(&port.to_be_bytes()).await.unwrap();
+        drop(writer);
+
+        let dest = parse_destination(&mut reader, SOCKS5_ATYP_IPV4)
+            .await
+            .expect("parse_destination ATYP=1 must succeed");
+
+        match dest {
+            super::Destination::Ip(addr) => {
+                assert_eq!(addr.port(), port);
+                match addr {
+                    SocketAddr::V4(v4) => assert_eq!(*v4.ip(), ip),
+                    SocketAddr::V6(_) => panic!("expected V4 address"),
+                }
+            }
+            super::Destination::Domain(_, _) => panic!("expected Ip destination"),
+        }
+    }
+
+    /// UDP request header ATYP=4 (IPv6) parses to correct addr + header length.
+    #[test]
+    fn parse_udp_request_header_ipv6() {
+        let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let port: u16 = 9999;
+
+        let mut data = vec![SOCKS5_ATYP_IPV6];
+        data.extend_from_slice(&ip.octets());
+        data.extend_from_slice(&port.to_be_bytes());
+
+        let (hdr_len, addr) =
+            parse_udp_request_header(&data).expect("parse_udp_request_header IPv6 must succeed");
+
+        assert_eq!(hdr_len, 19); // 1 atyp + 16 addr + 2 port
+        assert_eq!(addr.port(), port);
+        match addr {
+            SocketAddr::V6(v6) => assert_eq!(*v6.ip(), ip),
+            SocketAddr::V4(_) => panic!("expected V6 address"),
+        }
+    }
+
+    /// UDP reply header for a v6 src emits ATYP=4 + 16 bytes + 2-byte port.
+    #[test]
+    fn build_udp_response_header_ipv6() {
+        let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let port: u16 = 9999;
+        let src = SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
+
+        let hdr = build_udp_response_header(src);
+
+        // RSV(2) + FRAG(1) + ATYP(1) + 16 + 2 = 22 bytes
+        assert_eq!(hdr.len(), 22);
+        assert_eq!(hdr[0], 0x00); // RSV
+        assert_eq!(hdr[1], 0x00); // RSV
+        assert_eq!(hdr[2], 0x00); // FRAG=0
+        assert_eq!(hdr[3], SOCKS5_ATYP_IPV6);
+        assert_eq!(&hdr[4..20], &ip.octets());
+        let parsed_port = u16::from_be_bytes([hdr[20], hdr[21]]);
+        assert_eq!(parsed_port, port);
+    }
+
+    /// UDP reply header for a v4 src emits ATYP=1 + 4 bytes + 2-byte port.
+    #[test]
+    fn build_udp_response_header_ipv4() {
+        let ip: std::net::Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let port: u16 = 1234;
+        let src = SocketAddr::from((ip, port));
+
+        let hdr = build_udp_response_header(src);
+
+        assert_eq!(hdr.len(), 10); // RSV(2) + FRAG(1) + ATYP(1) + 4 + 2
+        assert_eq!(hdr[3], SOCKS5_ATYP_IPV4);
+        assert_eq!(&hdr[4..8], &ip.octets());
+        let parsed_port = u16::from_be_bytes([hdr[8], hdr[9]]);
+        assert_eq!(parsed_port, port);
+    }
 }

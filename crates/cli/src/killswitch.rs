@@ -12,8 +12,9 @@
 //! removes the chain.  If the process is killed, the rules persist — this is
 //! the safe failure mode (traffic blocked rather than leaked).
 //!
-//! IPv6 is blocked unconditionally via `ip6tables -I OUTPUT 1 -j DROP` because
-//! the relay is always IPv4 and any IPv6 traffic would bypass the tunnel.
+//! IPv6 is handled by a parallel `MIRAGE_KS` chain in `ip6tables` that permits
+//! loopback and each IPv6 relay address, then drops the rest.  When no IPv6
+//! relay addresses are present, all outbound IPv6 is dropped.
 
 use std::{net::SocketAddr, process::Command};
 
@@ -114,8 +115,8 @@ impl KillSwitch {
         // 7. Insert jump at the front of OUTPUT.
         run_iptables(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME])?;
 
-        // 8. Block all IPv6 output (relays are IPv4; IPv6 would bypass the tunnel).
-        run_ip6tables_tolerant(&["-I", "OUTPUT", "1", "-j", "DROP"]);
+        // 8. IPv6 kill-switch via a parallel MIRAGE_KS chain in ip6tables.
+        install_ip6_chain(&self.relay_addrs);
 
         self.active = true;
         info!(
@@ -151,8 +152,8 @@ impl KillSwitch {
             warn!("kill switch deactivate: delete chain failed: {e}");
         }
 
-        // Remove the IPv6 drop rule (tolerant — may not exist).
-        run_ip6tables_tolerant(&["-D", "OUTPUT", "-j", "DROP"]);
+        // Remove the IPv6 MIRAGE_KS chain (tolerant — may not exist).
+        remove_ip6_chain();
 
         self.active = false;
         info!("kill switch: deactivated — normal routing restored");
@@ -224,6 +225,56 @@ fn run_iptables_tolerant(args: &[&str]) -> Result<(), KillSwitchError> {
     }
 }
 
+/// Install an `ip6tables` MIRAGE_KS chain that permits loopback and any IPv6
+/// relay addresses, then drops the rest.
+///
+/// When no IPv6 relay addresses are in `addrs`, all outbound IPv6 is dropped.
+/// All operations are tolerant — ip6tables may not exist on the host.
+fn install_ip6_chain(addrs: &[SocketAddr]) {
+    // Create chain (ignore "already exists").
+    run_ip6tables_tolerant(&["-N", CHAIN_NAME]);
+
+    // Loopback.
+    run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"]);
+    run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-d", "::1", "-j", "ACCEPT"]);
+
+    // Established / related.
+    run_ip6tables_tolerant(&[
+        "-A", CHAIN_NAME,
+        "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+        "-j", "ACCEPT",
+    ]);
+
+    // Per-relay IPv6 ACCEPT rules.
+    for addr in addrs {
+        if addr.is_ipv6() {
+            let relay_ip = addr.ip().to_string();
+            let relay_port = addr.port().to_string();
+            info!(relay = %addr, "kill switch: adding ip6tables ACCEPT rule for v6 relay");
+            run_ip6tables_tolerant(&[
+                "-A", CHAIN_NAME,
+                "-d", &relay_ip,
+                "-p", "tcp",
+                "--dport", &relay_port,
+                "-j", "ACCEPT",
+            ]);
+        }
+    }
+
+    // Drop everything else.
+    run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-j", "DROP"]);
+
+    // Insert jump at front of OUTPUT.
+    run_ip6tables_tolerant(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME]);
+}
+
+/// Remove the ip6tables MIRAGE_KS chain.  Tolerant of missing chain / missing ip6tables.
+fn remove_ip6_chain() {
+    run_ip6tables_tolerant(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
+    run_ip6tables_tolerant(&["-F", CHAIN_NAME]);
+    run_ip6tables_tolerant(&["-X", CHAIN_NAME]);
+}
+
 /// Run an `ip6tables` command, tolerating all failures (ip6tables may not be
 /// installed or IPv6 may be disabled in the kernel).
 fn run_ip6tables_tolerant(args: &[&str]) {
@@ -282,6 +333,29 @@ mod tests {
         ks.activate().expect("activate should succeed");
         assert!(ks.active);
         ks.deactivate().expect("deactivate should succeed");
+        assert!(!ks.active);
+    }
+
+    /// `install_ip6_chain` / `remove_ip6_chain` compile and are callable on
+    /// non-Linux (ip6tables tolerant).  No assertions on output — just no panic.
+    #[test]
+    fn ip6_chain_install_remove_tolerant() {
+        let addrs: Vec<SocketAddr> = vec![
+            "[2001:db8::1]:4430".parse().unwrap(),
+            "10.0.0.1:4431".parse().unwrap(), // v4 — should be skipped by install_ip6_chain
+        ];
+        install_ip6_chain(&addrs);
+        remove_ip6_chain();
+    }
+
+    /// KillSwitch with a mix of v4 and v6 relay addresses is created without error.
+    #[test]
+    fn new_with_mixed_addrs() {
+        let addrs: Vec<SocketAddr> = vec![
+            "10.0.0.1:4430".parse().unwrap(),
+            "[2001:db8::1]:4430".parse().unwrap(),
+        ];
+        let ks = KillSwitch::new(addrs);
         assert!(!ks.active);
     }
 }

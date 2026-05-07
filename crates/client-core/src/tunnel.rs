@@ -19,6 +19,38 @@ use crate::cover_tunnel::CoverTunnel;
 use crate::onion_tunnel::OnionTunnel;
 use crate::shaped_tunnel::ShapedTunnel;
 
+/// Dial `node.addr_v6` first (1 s timeout); on failure fall back to `node.addr`.
+///
+/// When `addr_v6` is absent or `addr` is already IPv6, dials `addr` directly.
+/// This is a sequential v6-then-v4 strategy (Happy Eyeballs v2 parallel race
+/// is a follow-up).
+async fn resolve_dial_addr(
+    node: &mirage_core::config::ChainNode,
+) -> std::net::SocketAddr {
+    if let Some(v6_addr) = node.addr_v6 {
+        // addr is already v6 — addr_v6 is unused per ChainNode doc.
+        if node.addr.is_ipv6() {
+            return node.addr;
+        }
+        // Try v6 with a 1 s probe.
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(v6_addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                debug!(v6 = %v6_addr, "v6 probe succeeded, dialing v6");
+                return v6_addr;
+            }
+            _ => {
+                debug!(v6 = %v6_addr, v4 = %node.addr, "v6 probe failed, falling back to v4");
+            }
+        }
+    }
+    node.addr
+}
+
 /// Establish an encrypted tunnel through the L1 relay node, without sending a
 /// target address.
 ///
@@ -100,9 +132,12 @@ pub async fn establish_raw_tunnel(
         (pk, l1.sni.as_deref().unwrap_or("").to_owned())
     };
 
+    // When addr_v6 is present, probe v6 first; fall back to v4 on failure.
+    let dial_addr = resolve_dial_addr(l1).await;
+
     debug!(
         chain_id = %chain.chain_id,
-        l1_addr = %l1.addr,
+        dial_addr = %dial_addr,
         l1_transparent = chain.l1_transparent,
         "establishing raw chain tunnel (no target)"
     );
@@ -113,7 +148,7 @@ pub async fn establish_raw_tunnel(
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     let (_proto_id, tunnel) = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        chain_protocols.connect(l1.addr, &handshake_pubkey, &handshake_sni, chain.camouflage.clone()),
+        chain_protocols.connect(dial_addr, &handshake_pubkey, &handshake_sni, chain.camouflage.clone()),
     )
     .await
     .map_err(|_| {
@@ -270,6 +305,7 @@ mod tests {
                 public_key: "0".repeat(64),
                 sni: None,
                 role: HopRole::Exit,
+                display_name: None,
             }],
             handshake: HandshakeStrategy::Telescopic,
             reply: mirage_core::config::ReplyMode::Raw,
