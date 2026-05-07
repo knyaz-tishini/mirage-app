@@ -18,6 +18,7 @@ pub mod pid_file;
 pub mod status_server;
 pub mod supervisor;
 pub mod telemetry;
+pub mod tun_config;
 
 use crash_report::{report_crash, spawn_queue_drain};
 use status_server::{MonitorInfo, TunSpawnCfg, reboot_channel};
@@ -98,6 +99,14 @@ pub struct SentinelConfig {
     /// `["{client_config_path}"]` (bare path, no flag).
     #[serde(default = "default_supervisor_args")]
     pub supervisor_args: Vec<String>,
+    /// Path where sentinel writes auto-generated tun.json (relay_addrs etc).
+    /// If None, sentinel does not generate tun.json.
+    #[serde(default)]
+    pub tun_config_path: Option<PathBuf>,
+    /// Template tun.json — copied into tun_config_path with relay_addrs filled in.
+    /// If None, sentinel writes a minimal default tun.json stub.
+    #[serde(default)]
+    pub tun_template_path: Option<PathBuf>,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -331,7 +340,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     info!("[sentinel] first config: version={} chains={}", first_cfg.version, first_cfg.chains.len());
 
     let chains: Vec<_> = first_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-    let full_json = match materialise(&template_raw, chains) {
+    let full_json = match materialise(&template_raw, chains.clone()) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -340,6 +349,16 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         return Err(e);
     }
     info!("[sentinel] wrote {:?}", cfg.client_config_path);
+    if let Some(ref tun_path) = cfg.tun_config_path {
+        if let Err(e) = tun_config::write_tun_config(
+            &chains,
+            tun_path,
+            cfg.tun_template_path.as_deref(),
+            cfg.respect_user_config,
+        ) {
+            error!("[sentinel] tun config write failed: {}", e);
+        }
+    }
 
     let materialised_at_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
     publisher.set(SentinelPhase::ConfigReady {
@@ -548,9 +567,21 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
                 info!("[sentinel] config updated: v={} chains={}", new_cfg.version, new_cfg.chains.len());
                 let chains: Vec<_> = new_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-                match materialise(&template_raw, chains) {
+                match materialise(&template_raw, chains.clone()) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
-                        Ok(()) => info!("[sentinel] config rewritten"),
+                        Ok(()) => {
+                            info!("[sentinel] config rewritten");
+                            if let Some(ref tun_path) = cfg.tun_config_path {
+                                if let Err(e) = tun_config::write_tun_config(
+                                    &chains,
+                                    tun_path,
+                                    cfg.tun_template_path.as_deref(),
+                                    cfg.respect_user_config,
+                                ) {
+                                    error!("[sentinel] tun config rewrite failed: {}", e);
+                                }
+                            }
+                        }
                         Err(e) => error!("[sentinel] rewrite failed: {}", e),
                     },
                     Err(e) => error!("[sentinel] materialise error: {}", e),
