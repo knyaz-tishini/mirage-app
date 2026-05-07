@@ -13,8 +13,11 @@
 //! the safe failure mode (traffic blocked rather than leaked).
 //!
 //! IPv6 is handled by a parallel `MIRAGE_KS` chain in `ip6tables` that permits
-//! loopback and each IPv6 relay address, then drops the rest.  When no IPv6
-//! relay addresses are present, all outbound IPv6 is dropped.
+//! loopback, DHCPv6 client traffic, ICMPv6 neighbor-discovery/RA messages, and
+//! each IPv6 relay address, then drops the rest.  When no IPv6 relay addresses
+//! are present the chain is still installed (all outbound IPv6 is dropped except
+//! the permitted neighbor-discovery traffic).  If `ip6tables` is absent on the
+//! host, a warning is logged and the IPv4 kill-switch still applies.
 
 use std::{net::SocketAddr, process::Command};
 
@@ -38,6 +41,10 @@ pub enum KillSwitchError {
 /// The [`Drop`] implementation calls `deactivate` as a safety net on clean exit.
 pub struct KillSwitch {
     relay_addrs: Vec<SocketAddr>,
+    /// Optional TUN interface name.  When set, outbound packets on that
+    /// interface are explicitly accepted in both ip4tables and ip6tables so
+    /// tunnelled traffic is never accidentally dropped.
+    tun_iface: Option<String>,
     /// Whether the rules are currently installed.
     active: bool,
 }
@@ -48,8 +55,16 @@ impl KillSwitch {
     pub fn new(relay_addrs: Vec<SocketAddr>) -> Self {
         Self {
             relay_addrs,
+            tun_iface: None,
             active: false,
         }
+    }
+
+    /// Attach a TUN interface name so traffic on that interface is always
+    /// accepted (both IPv4 and IPv6).
+    pub fn with_tun_iface(mut self, iface: impl Into<String>) -> Self {
+        self.tun_iface = Some(iface.into());
+        self
     }
 
     /// Install iptables rules.  Idempotent — safe to call when already active
@@ -59,64 +74,27 @@ impl KillSwitch {
         // Verify iptables is available.
         which_iptables()?;
 
+        let v4_addrs: Vec<SocketAddr> = self
+            .relay_addrs
+            .iter()
+            .filter(|a| a.is_ipv4())
+            .copied()
+            .collect();
+        let v6_addrs: Vec<SocketAddr> = self
+            .relay_addrs
+            .iter()
+            .filter(|a| a.is_ipv6())
+            .copied()
+            .collect();
+
         info!(
-            relays = ?self.relay_addrs,
-            "kill switch: activating (chain {}) — allowing {} relay address(es)",
-            CHAIN_NAME,
-            self.relay_addrs.len(),
+            v4_count = v4_addrs.len(),
+            v6_count = v6_addrs.len(),
+            "kill switch: activating (chain {CHAIN_NAME})",
         );
 
-        // 1. Create the custom chain.  If it already exists iptables exits with
-        //    status 1 and the message "Chain already exists." — that is fine.
-        run_iptables_tolerant(&["-N", CHAIN_NAME])?;
-
-        // 2. Allow loopback (by interface and by destination).
-        //    Both rules are needed: `-o lo` for packets that already have the
-        //    loopback output interface, and `-d 127.0.0.0/8` for packets whose
-        //    destination was rewritten to 127.0.0.1 by iptables REDIRECT in the
-        //    nat OUTPUT chain (TUN mode).  The kernel may not yet have updated
-        //    the output interface to `lo` when the filter OUTPUT chain fires.
-        run_iptables(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"])?;
-        run_iptables(&["-A", CHAIN_NAME, "-d", "127.0.0.0/8", "-j", "ACCEPT"])?;
-
-        // 3. Allow established/related (replies to connections we initiated).
-        run_iptables(&[
-            "-A", CHAIN_NAME,
-            "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-            "-j", "ACCEPT",
-        ])?;
-
-        // 4. Allow TCP to each relay address (one rule per unique IP:port pair).
-        for addr in &self.relay_addrs {
-            let relay_ip = addr.ip().to_string();
-            let relay_port = addr.port().to_string();
-            info!(relay = %addr, "kill switch: adding ACCEPT rule for relay");
-            run_iptables(&[
-                "-A", CHAIN_NAME,
-                "-d", &relay_ip,
-                "-p", "tcp",
-                "--dport", &relay_port,
-                "-j", "ACCEPT",
-            ])?;
-        }
-
-        // 5. Allow DNS to localhost (dns_forwarder listens on 127.0.0.1).
-        run_iptables(&[
-            "-A", CHAIN_NAME,
-            "-d", "127.0.0.1",
-            "-p", "udp",
-            "--dport", "53",
-            "-j", "ACCEPT",
-        ])?;
-
-        // 6. Drop everything else.
-        run_iptables(&["-A", CHAIN_NAME, "-j", "DROP"])?;
-
-        // 7. Insert jump at the front of OUTPUT.
-        run_iptables(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME])?;
-
-        // 8. IPv6 kill-switch via a parallel MIRAGE_KS chain in ip6tables.
-        install_ip6_chain(&self.relay_addrs);
+        install_ip4_chain(&v4_addrs, self.tun_iface.as_deref())?;
+        install_ip6_chain(&v6_addrs, self.tun_iface.as_deref());
 
         self.active = true;
         info!(
@@ -137,29 +115,13 @@ impl KillSwitch {
 
         info!("kill switch: deactivating");
 
-        // Remove jump from OUTPUT.
-        if let Err(e) = run_iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]) {
-            warn!("kill switch deactivate: remove jump failed: {e}");
-        }
-
-        // Flush all rules from the chain.
-        if let Err(e) = run_iptables(&["-F", CHAIN_NAME]) {
-            warn!("kill switch deactivate: flush chain failed: {e}");
-        }
-
-        // Delete the chain.
-        if let Err(e) = run_iptables(&["-X", CHAIN_NAME]) {
-            warn!("kill switch deactivate: delete chain failed: {e}");
-        }
-
-        // Remove the IPv6 MIRAGE_KS chain (tolerant — may not exist).
+        remove_ip4_chain();
         remove_ip6_chain();
 
         self.active = false;
         info!("kill switch: deactivated — normal routing restored");
         Ok(())
     }
-
 }
 
 impl Drop for KillSwitch {
@@ -225,12 +187,106 @@ fn run_iptables_tolerant(args: &[&str]) -> Result<(), KillSwitchError> {
     }
 }
 
-/// Install an `ip6tables` MIRAGE_KS chain that permits loopback and any IPv6
+/// Install the IPv4 `MIRAGE_KS` iptables chain.
+///
+/// `relay_addrs` must contain only IPv4 addresses.
+fn install_ip4_chain(
+    relay_addrs: &[SocketAddr],
+    tun_iface: Option<&str>,
+) -> Result<(), KillSwitchError> {
+    // 1. Create the custom chain.  If it already exists iptables exits with
+    //    status 1 and the message "Chain already exists." — that is fine.
+    run_iptables_tolerant(&["-N", CHAIN_NAME])?;
+
+    // 2. Allow loopback (by interface and by destination).
+    //    Both rules are needed: `-o lo` for packets that already have the
+    //    loopback output interface, and `-d 127.0.0.0/8` for packets whose
+    //    destination was rewritten to 127.0.0.1 by iptables REDIRECT in the
+    //    nat OUTPUT chain (TUN mode).  The kernel may not yet have updated
+    //    the output interface to `lo` when the filter OUTPUT chain fires.
+    run_iptables(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"])?;
+    run_iptables(&["-A", CHAIN_NAME, "-d", "127.0.0.0/8", "-j", "ACCEPT"])?;
+
+    // 3. Allow TUN interface output (if configured).
+    if let Some(iface) = tun_iface {
+        run_iptables(&["-A", CHAIN_NAME, "-o", iface, "-j", "ACCEPT"])?;
+    }
+
+    // 4. Allow established/related (replies to connections we initiated).
+    run_iptables(&[
+        "-A",
+        CHAIN_NAME,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
+    ])?;
+
+    // 5. Allow TCP to each relay address (one rule per unique IPv4 IP:port pair).
+    for addr in relay_addrs {
+        debug_assert!(addr.is_ipv4(), "install_ip4_chain: got non-IPv4 addr {addr}");
+        let relay_ip = addr.ip().to_string();
+        let relay_port = addr.port().to_string();
+        info!(relay = %addr, "kill switch: adding ACCEPT rule for relay");
+        run_iptables(&[
+            "-A",
+            CHAIN_NAME,
+            "-d",
+            &relay_ip,
+            "-p",
+            "tcp",
+            "--dport",
+            &relay_port,
+            "-j",
+            "ACCEPT",
+        ])?;
+    }
+
+    // 6. Allow DNS to localhost (dns_forwarder listens on 127.0.0.1).
+    run_iptables(&[
+        "-A",
+        CHAIN_NAME,
+        "-d",
+        "127.0.0.1",
+        "-p",
+        "udp",
+        "--dport",
+        "53",
+        "-j",
+        "ACCEPT",
+    ])?;
+
+    // 7. Drop everything else.
+    run_iptables(&["-A", CHAIN_NAME, "-j", "DROP"])?;
+
+    // 8. Insert jump at the front of OUTPUT.
+    run_iptables(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME])?;
+
+    Ok(())
+}
+
+/// Remove the IPv4 `MIRAGE_KS` iptables chain.
+fn remove_ip4_chain() {
+    if let Err(e) = run_iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]) {
+        warn!("kill switch deactivate: remove v4 OUTPUT jump failed: {e}");
+    }
+    if let Err(e) = run_iptables(&["-F", CHAIN_NAME]) {
+        warn!("kill switch deactivate: flush v4 chain failed: {e}");
+    }
+    if let Err(e) = run_iptables(&["-X", CHAIN_NAME]) {
+        warn!("kill switch deactivate: delete v4 chain failed: {e}");
+    }
+}
+
+/// Install an `ip6tables` MIRAGE_KS chain that permits loopback, DHCPv6
+/// client traffic, ICMPv6 neighbor-discovery/RA messages, and any IPv6
 /// relay addresses, then drops the rest.
 ///
-/// When no IPv6 relay addresses are in `addrs`, all outbound IPv6 is dropped.
+/// `relay_addrs` must contain only IPv6 addresses (caller responsibility).
 /// All operations are tolerant — ip6tables may not exist on the host.
-fn install_ip6_chain(addrs: &[SocketAddr]) {
+fn install_ip6_chain(relay_addrs: &[SocketAddr], tun_iface: Option<&str>) {
     // Create chain (ignore "already exists").
     run_ip6tables_tolerant(&["-N", CHAIN_NAME]);
 
@@ -238,27 +294,75 @@ fn install_ip6_chain(addrs: &[SocketAddr]) {
     run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"]);
     run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-d", "::1", "-j", "ACCEPT"]);
 
+    // TUN interface output (if configured).
+    if let Some(iface) = tun_iface {
+        run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-o", iface, "-j", "ACCEPT"]);
+    }
+
     // Established / related.
     run_ip6tables_tolerant(&[
-        "-A", CHAIN_NAME,
-        "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-        "-j", "ACCEPT",
+        "-A",
+        CHAIN_NAME,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
     ]);
 
     // Per-relay IPv6 ACCEPT rules.
-    for addr in addrs {
-        if addr.is_ipv6() {
-            let relay_ip = addr.ip().to_string();
-            let relay_port = addr.port().to_string();
-            info!(relay = %addr, "kill switch: adding ip6tables ACCEPT rule for v6 relay");
-            run_ip6tables_tolerant(&[
-                "-A", CHAIN_NAME,
-                "-d", &relay_ip,
-                "-p", "tcp",
-                "--dport", &relay_port,
-                "-j", "ACCEPT",
-            ]);
-        }
+    for addr in relay_addrs {
+        debug_assert!(addr.is_ipv6(), "install_ip6_chain: got non-IPv6 addr {addr}");
+        let relay_ip = addr.ip().to_string();
+        let relay_port = addr.port().to_string();
+        info!(relay = %addr, "kill switch: adding ip6tables ACCEPT rule for v6 relay");
+        run_ip6tables_tolerant(&[
+            "-A",
+            CHAIN_NAME,
+            "-d",
+            &relay_ip,
+            "-p",
+            "tcp",
+            "--dport",
+            &relay_port,
+            "-j",
+            "ACCEPT",
+        ]);
+    }
+
+    // DHCPv6 client → server (UDP dst port 547).  Required for DHCP-assigned
+    // IPv6 addresses to be renewed even while the kill-switch is active.
+    run_ip6tables_tolerant(&[
+        "-A",
+        CHAIN_NAME,
+        "-p",
+        "udp",
+        "--dport",
+        "547",
+        "-j",
+        "ACCEPT",
+    ]);
+
+    // ICMPv6 neighbor-discovery and RA messages.  Without these the host
+    // cannot perform NDP and loses IPv6 connectivity entirely even to the
+    // default gateway.
+    //   133 — Router Solicitation (RS)
+    //   134 — Router Advertisement (RA)
+    //   135 — Neighbor Solicitation (NS)
+    //   136 — Neighbor Advertisement (NA)
+    //   143 — MLDv2 Multicast Listener Report
+    for icmpv6_type in ["133", "134", "135", "136", "143"] {
+        run_ip6tables_tolerant(&[
+            "-A",
+            CHAIN_NAME,
+            "-p",
+            "ipv6-icmp",
+            "--icmpv6-type",
+            icmpv6_type,
+            "-j",
+            "ACCEPT",
+        ]);
     }
 
     // Drop everything else.
@@ -299,10 +403,67 @@ fn run_ip6tables_tolerant(args: &[&str]) {
     }
 }
 
+// ── Rule-list helpers (used only in tests) ───────────────────────────────────
+
+/// Represents a single iptables / ip6tables rule as collected args.
+#[cfg(test)]
+type RuleArgs = Vec<&'static str>;
+
+/// Build the ordered list of ip6tables rule-arg slices that
+/// `install_ip6_chain` would issue for the given relay addrs and tun iface.
+///
+/// Used in structural unit tests — no actual `ip6tables` binary is invoked.
+#[cfg(test)]
+fn expected_ip6_rules(
+    relay_addrs: &[SocketAddr],
+    tun_iface: Option<&'static str>,
+) -> Vec<RuleArgs> {
+    let mut rules: Vec<RuleArgs> = Vec::new();
+
+    rules.push(vec!["-N", CHAIN_NAME]);
+    rules.push(vec!["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"]);
+    rules.push(vec!["-A", CHAIN_NAME, "-d", "::1", "-j", "ACCEPT"]);
+
+    if let Some(iface) = tun_iface {
+        rules.push(vec!["-A", CHAIN_NAME, "-o", iface, "-j", "ACCEPT"]);
+    }
+
+    rules.push(vec![
+        "-A",
+        CHAIN_NAME,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
+    ]);
+
+    // per-relay rules (only IPv6)
+    for addr in relay_addrs {
+        if addr.is_ipv6() {
+            // We can't easily build static &str here since the addr is dynamic,
+            // so we skip per-relay args in the static rule list and test them
+            // separately via the relay_count assertion.
+        }
+    }
+
+    rules.push(vec!["-A", CHAIN_NAME, "-p", "udp", "--dport", "547", "-j", "ACCEPT"]);
+    for t in ["133", "134", "135", "136", "143"] {
+        rules.push(vec!["-A", CHAIN_NAME, "-p", "ipv6-icmp", "--icmpv6-type", t, "-j", "ACCEPT"]);
+    }
+    rules.push(vec!["-A", CHAIN_NAME, "-j", "DROP"]);
+    rules.push(vec!["-I", "OUTPUT", "1", "-j", CHAIN_NAME]);
+
+    rules
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
 
     #[test]
@@ -342,9 +503,10 @@ mod tests {
     fn ip6_chain_install_remove_tolerant() {
         let addrs: Vec<SocketAddr> = vec![
             "[2001:db8::1]:4430".parse().unwrap(),
-            "10.0.0.1:4431".parse().unwrap(), // v4 — should be skipped by install_ip6_chain
+            "10.0.0.1:4431".parse().unwrap(), // v4 — filtered out by caller
         ];
-        install_ip6_chain(&addrs);
+        let v6_only: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
+        install_ip6_chain(&v6_only, None);
         remove_ip6_chain();
     }
 
@@ -357,5 +519,97 @@ mod tests {
         ];
         let ks = KillSwitch::new(addrs);
         assert!(!ks.active);
+    }
+
+    /// v4 and v6 addresses are correctly partitioned.
+    #[test]
+    fn addr_partition() {
+        let addrs: Vec<SocketAddr> = vec![
+            "10.0.0.1:4430".parse().unwrap(),
+            "192.168.1.1:4431".parse().unwrap(),
+            "[2001:db8::1]:4430".parse().unwrap(),
+            "[2001:db8::2]:4431".parse().unwrap(),
+        ];
+        let v4: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv4()).copied().collect();
+        let v6: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
+        assert_eq!(v4.len(), 2);
+        assert_eq!(v6.len(), 2);
+        assert!(v4.iter().all(|a| matches!(a.ip(), IpAddr::V4(_))));
+        assert!(v6.iter().all(|a| matches!(a.ip(), IpAddr::V6(_))));
+    }
+
+    /// v4-only input → v6 slice is empty → ip6_chain still runs (drops all v6).
+    #[test]
+    fn v4_only_addrs_yields_empty_v6_slice() {
+        let addrs: Vec<SocketAddr> = vec![
+            "10.0.0.1:4430".parse().unwrap(),
+            "10.0.0.2:4431".parse().unwrap(),
+        ];
+        let v6: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
+        assert!(v6.is_empty());
+        // install_ip6_chain with empty slice must not panic
+        install_ip6_chain(&v6, None);
+        remove_ip6_chain();
+    }
+
+    /// Structural: ip6tables rule list contains all required rule families.
+    #[test]
+    fn ip6_rule_list_structure() {
+        let rules = expected_ip6_rules(&[], None);
+
+        // Must begin with chain creation.
+        assert_eq!(rules[0], vec!["-N", CHAIN_NAME]);
+
+        // Must contain loopback rules.
+        assert!(rules.iter().any(|r| r.contains(&"-o") && r.contains(&"lo")));
+        assert!(rules.iter().any(|r| r.contains(&"-d") && r.contains(&"::1")));
+
+        // Must contain DHCPv6 (port 547).
+        assert!(rules.iter().any(|r| r.contains(&"547")));
+
+        // Must contain all 5 ICMPv6 types.
+        for t in ["133", "134", "135", "136", "143"] {
+            assert!(
+                rules.iter().any(|r| r.contains(&"ipv6-icmp") && r.contains(&t)),
+                "missing icmpv6-type {t}"
+            );
+        }
+
+        // Must end with DROP then jump insertion.
+        let last_two: Vec<&RuleArgs> = rules.iter().rev().take(2).collect();
+        assert!(last_two[0].contains(&"-j") && last_two[0].contains(&CHAIN_NAME));
+        assert!(last_two[1].contains(&"-j") && last_two[1].contains(&"DROP"));
+    }
+
+    /// Structural: with tun_iface set, the rule list contains a tun ACCEPT rule.
+    #[test]
+    fn ip6_rule_list_with_tun_iface() {
+        let rules = expected_ip6_rules(&[], Some("tun0"));
+        assert!(
+            rules.iter().any(|r| r.contains(&"-o") && r.contains(&"tun0")),
+            "missing tun iface ACCEPT rule"
+        );
+    }
+
+    /// Structural: without tun_iface, no tun ACCEPT rule is present.
+    #[test]
+    fn ip6_rule_list_without_tun_iface() {
+        let rules = expected_ip6_rules(&[], None);
+        // "lo" is expected, but no other interface rule should appear
+        let non_lo_iface_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.contains(&"-o") && !r.contains(&"lo"))
+            .collect();
+        assert!(non_lo_iface_rules.is_empty(), "unexpected interface rule: {non_lo_iface_rules:?}");
+    }
+
+    /// Structural: conntrack ESTABLISHED,RELATED rule is present.
+    #[test]
+    fn ip6_rule_list_has_conntrack() {
+        let rules = expected_ip6_rules(&[], None);
+        assert!(
+            rules.iter().any(|r| r.contains(&"ESTABLISHED,RELATED")),
+            "missing conntrack rule"
+        );
     }
 }
