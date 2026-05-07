@@ -312,7 +312,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let (link, mut config_rx) = MonitorLink::new(effective_urls, Some(monitor_api_key.clone()));
     link.spawn();
 
-    let timeout = Duration::from_secs(cfg.poll_interval_secs.max(10));
+    // 5s — fast fallback to disk-cached managed config when monitor is slow.
+    // The MonitorLink keeps polling in the background, so a fresh config
+    // arrives without restart whenever the monitor becomes reachable again.
+    let timeout = Duration::from_secs(5);
     info!("[sentinel] waiting for first monitor config (timeout {}s)...", timeout.as_secs());
 
     let first_cfg = match tokio::time::timeout(timeout, async {
@@ -323,9 +326,33 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             }
         }
     }).await {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("timed out waiting for first monitor config: {e}");
+        Ok(c) => Some(c),
+        Err(_) => None,
+    };
+
+    // Fallback: if monitor is unreachable but a managed config from a prior
+    // session is on disk, use it.  Better than bailing — user gets the last
+    // known chains, and config_rx will pick up updates whenever the monitor
+    // becomes reachable again.
+    let first_cfg = match first_cfg {
+        Some(c) => c,
+        None => {
+            warn!(
+                "[sentinel] no monitor config in {}s — checking on-disk managed config",
+                timeout.as_secs()
+            );
+            if cfg.client_config_path.exists() && is_managed(&cfg.client_config_path) {
+                info!("[sentinel] using stale managed config as fallback");
+                publisher.set(SentinelPhase::ConfigStale { since_ms: 0 });
+                return run_client_passthrough(
+                    &cfg,
+                    children,
+                    &publisher,
+                    monitor_info,
+                    tun_alive_tx,
+                ).await;
+            }
+            let msg = "no monitor config and no on-disk fallback".to_string();
             publisher.set(SentinelPhase::Error { message: msg.clone() });
             anyhow::bail!(msg);
         }
@@ -411,14 +438,14 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
     // ── End adopt-on-startup ──────────────────────────────────────────────────
 
-    // Sentinel does NOT auto-spawn cli at startup.  Cli (and tun) are
-    // launched on demand by `POST /connect` from the GUI.  This keeps the
-    // launcher window alive even when cli/tun would crash, and lets the
-    // user trigger the connection explicitly.
+    // Phase sequence for the GUI:
+    //   ConfigReady → cli auto-spawn → ChildRunning (amber/dancing cube,
+    //                                  user can now click Connect) →
+    //   /connect → tun spawn → tunnel up.
     //
-    // If we adopted a cli from a previous run via the PID file (pre-existing
-    // managed child still alive), we keep it; otherwise we just announce
-    // ConfigReady and idle until /connect.
+    // Tun stays user-triggered (it needs sudo and replaces system routes).
+    // Cli is cheap (just SOCKS5 listeners) and we want the "ready" animation
+    // to fire as soon as everything backend-side is up.
     let already_running = children.lock().await.cli.is_some();
     if already_running {
         publisher.set(SentinelPhase::ChildRunning { pid: None });
@@ -428,6 +455,27 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             chains: first_cfg.chains.len(),
             materialised_at_ms: unix_now_u64() as u128,
         });
+
+        // Auto-spawn cli immediately so the launcher gets ChildRunning
+        // (amber dancing cube = "ready, click to connect").
+        let (cli_binary_auto, cli_args_auto) = resolve_cli_binary_and_args(&cfg);
+        let spawn_flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+        match spawn_child_with_flags(&cli_binary_auto, &cli_args_auto, spawn_flags) {
+            Ok(handle) => {
+                let cli_pid = handle.process.id();
+                info!("[sentinel] auto-spawned cli pid={:?}", cli_pid);
+                if let Some(pid) = cli_pid {
+                    if let Some(path) = pid_file::cli_pid_path() {
+                        pid_file::write(&path, pid);
+                    }
+                }
+                children.lock().await.cli = Some(handle);
+                publisher.set(SentinelPhase::ChildRunning { pid: cli_pid });
+            }
+            Err(e) => {
+                warn!("[sentinel] auto-spawn cli failed: {} — staying ConfigReady", e);
+            }
+        }
     }
 
     // Task 5

@@ -194,14 +194,43 @@ respect_user_config = true
 
 /// Spawn `mirage-l0-sentinel.exe` from `exe_dir()` with `--config sentinel.toml`.
 /// stdout/stderr are null — sentinel logs internally.
-fn spawn_sentinel() -> anyhow::Result<tokio::process::Child> {
+#[cfg(unix)]
+fn reap_orphans() {
+    use std::process::Command;
+    // Best-effort: kill any leftover sentinel/cli from a previous (crashed)
+    // launcher run.  These are user-owned, so plain pkill works.  Tun runs
+    // as root and is killed via sudo (already cached if user just OK'd it
+    // this session; harmless prompt if not).
+    for name in &["mirage-l0-sentinel", "mirage-client-cli"] {
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg(name).status();
+    }
+    // Tun (root) — try sudo -n (cached), don't prompt; if no cache, skip.
+    let _ = Command::new("sudo").args(["-n", "pkill", "-9", "-x", "mirage2tun"]).status();
+    // Brief sleep so OS releases ports/utun before next spawn.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+fn spawn_sentinel() -> anyhow::Result<std::process::Child> {
+    // std::process::Command, not tokio: this fn is called before the tokio
+    // runtime is entered (Init handler), and tokio::process requires an
+    // active reactor.  We don't need to async-await this child anyway —
+    // we only kill it on shutdown.
+    //
+    // Reap orphans first.  On macOS our tun runs as root via osascript, so
+    // it is NOT in our process group — KILL_ON_JOB_CLOSE (Win) has no
+    // analogue.  If a previous launcher crashed, the old cli/tun keep their
+    // ports/utun and the fresh cli would hit AddrInUse.  pkill clears that.
+    #[cfg(unix)]
+    reap_orphans();
+
     let dir = exe_dir();
     let config = dir.join("sentinel.toml");
 
     #[cfg(windows)]
     let child = {
+        use std::os::windows::process::CommandExt;
         let sentinel_exe = dir.join("mirage-l0-sentinel.exe");
-        tokio::process::Command::new(&sentinel_exe)
+        std::process::Command::new(&sentinel_exe)
             .arg("--config").arg(&config)
             .current_dir(&dir)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
@@ -211,10 +240,17 @@ fn spawn_sentinel() -> anyhow::Result<tokio::process::Child> {
     #[cfg(not(windows))]
     let child = {
         let sentinel_exe = dir.join("mirage-l0-sentinel");
-        tokio::process::Command::new(&sentinel_exe)
+        let log = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/tmp/mirage-sentinel.log")
+            .map_err(|e| anyhow::anyhow!("open log: {e}"))?;
+        let log2 = log.try_clone().map_err(|e| anyhow::anyhow!("clone log: {e}"))?;
+        std::process::Command::new(&sentinel_exe)
             .arg("--config").arg(&config)
             .current_dir(&dir)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log2))
             .spawn()?
     };
 
@@ -240,7 +276,7 @@ struct LauncherApp {
     startup: Instant,
     state: LauncherState,
     /// Handle to the sentinel child process.
-    sentinel: Arc<Mutex<Option<tokio::process::Child>>>,
+    sentinel: Arc<Mutex<Option<std::process::Child>>>,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<LauncherEvent>,
     event_tx: tokio::sync::mpsc::UnboundedSender<LauncherEvent>,
     rt: Arc<tokio::runtime::Runtime>,
@@ -999,10 +1035,16 @@ fn click_target_rect(state: &LauncherState, sentinel_phase: &SentinelPhaseLocal)
     match state {
         LauncherState::On { .. } => uzor::Rect::new(0.0, TITLEBAR_H, W, H - TITLEBAR_H),
         _ => {
-            // Enable click for: connect flow (ChildRunning/Error) and onboarding.
+            // Enable click whenever sentinel has at least bootstrapped enough to
+            // accept /connect.  ConfigReady = sent has chains and is ready to
+            // spawn cli/tun.  ChildRunning = cli already up (Win flow).  Stale
+            // = lost monitor heartbeat but local config still valid; user can
+            // still toggle.  Error / WaitingOnboard handled here too.
             let enabled = matches!(
                 sentinel_phase,
-                SentinelPhaseLocal::ChildRunning
+                SentinelPhaseLocal::ConfigReady
+                    | SentinelPhaseLocal::ChildRunning
+                    | SentinelPhaseLocal::ConfigStale
                     | SentinelPhaseLocal::Error(_)
                     | SentinelPhaseLocal::WaitingOnboard
             );
@@ -1187,12 +1229,8 @@ impl ApplicationHandler for LauncherHandler {
                 // Kill sentinel — Job Object KILL_ON_JOB_CLOSE reaps cli + tun.
                 let owned_sentinel = app.sentinel.lock().expect("not poisoned").take();
                 if let Some(mut s) = owned_sentinel {
-                    app.rt.block_on(async move {
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            s.kill(),
-                        ).await;
-                    });
+                    let _ = s.kill();
+                    let _ = s.wait();
                 }
                 event_loop.exit();
             }
@@ -1298,12 +1336,8 @@ impl ApplicationHandler for LauncherHandler {
                 if tb_close_click {
                     let owned_sentinel = app.sentinel.lock().expect("not poisoned").take();
                     if let Some(mut s) = owned_sentinel {
-                        app.rt.block_on(async move {
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(3),
-                                s.kill(),
-                            ).await;
-                        });
+                        let _ = s.kill();
+                        let _ = s.wait();
                     }
                     event_loop.exit();
                     return;
@@ -1484,7 +1518,7 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(1500);
 /// shared sentinel handle so the task exits naturally when the app drops.
 fn spawn_sentinel_watchdog(
     rt: &tokio::runtime::Handle,
-    sentinel: std::sync::Weak<Mutex<Option<tokio::process::Child>>>,
+    sentinel: std::sync::Weak<Mutex<Option<std::process::Child>>>,
 ) {
     rt.spawn(async move {
         let mut burst_count: u32 = 0;

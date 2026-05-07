@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::onboarding::{OnboardRequest, default_toml_path, log_onboard_result, patch_sentinel_toml};
 use crate::pid_file;
 use crate::supervisor::{
-    ChildState, ChildStatus, kill_tun, resolve_tun_binary, spawn_child_with_flags,
+    ChildHandle, ChildState, ChildStatus, kill_tun, resolve_tun_binary, spawn_child_with_flags,
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
 };
 use crate::SentinelPhase;
@@ -124,6 +124,97 @@ async fn status_handler(State(state): State<ServerState>) -> impl IntoResponse {
     Json(body)
 }
 
+// ── Tun spawn (platform-aware) ────────────────────────────────────────────────
+
+/// Spawn the tun child process.
+///
+/// * Windows / Linux — direct [`spawn_child_with_flags`], same as before.
+/// * macOS — wraps the invocation in an `osascript` admin-privilege prompt so
+///   that the child can open a `utun` device without being root.
+///   **Caveat**: the returned [`ChildHandle`] wraps the `osascript` process,
+///   not `mirage2tun` itself.  The real tun process runs as root and is
+///   backgrounded (`&` in the shell command); its PID is not tracked by
+///   sentinel in v1.  Requires a GUI (Aqua) session — fails over SSH/headless.
+fn spawn_tun(binary: &std::path::Path, tun_args: &[String], flags: u32) -> anyhow::Result<ChildHandle> {
+    #[cfg(target_os = "macos")]
+    {
+        spawn_tun_macos(binary, tun_args)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        spawn_child_with_flags(&binary.to_path_buf(), tun_args, flags)
+    }
+}
+
+/// Quote a single token for Bourne shell using single-quote escaping.
+/// `it's` → `'it'"'"'s'`
+#[cfg(target_os = "macos")]
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_tun_macos(binary: &std::path::Path, tun_args: &[String]) -> anyhow::Result<ChildHandle> {
+    use anyhow::Context;
+    use std::process::Stdio;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use crate::supervisor::RingBuffer;
+
+    // Build a fully-quoted shell command:
+    //   '/path/to/mirage2tun' '--arg1' 'val1' ... >/tmp/mirage2tun.log 2>&1 &
+    let mut cmd_parts = Vec::with_capacity(tun_args.len() + 1);
+    cmd_parts.push(sh_quote(&binary.to_string_lossy()));
+    for arg in tun_args {
+        cmd_parts.push(sh_quote(arg));
+    }
+    let shell_cmd = format!(
+        "{} >/tmp/mirage2tun.log 2>&1 &",
+        cmd_parts.join(" ")
+    );
+
+    // Escape double-quotes inside the shell command for the AppleScript string.
+    let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("do shell script \"{}\" with administrator privileges", escaped);
+
+    tracing::info!("[sentinel] tun macOS elevate: osascript prompt");
+
+    let child = tokio::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "failed to spawn osascript for tun elevation")?;
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    Ok(ChildHandle {
+        process: child,
+        stdout_buf: Arc::new(Mutex::new(RingBuffer::new(64 * 1024))),
+        stderr_buf: Arc::new(Mutex::new(RingBuffer::new(64 * 1024))),
+        started_at: std::time::Instant::now(),
+        started_at_ms: now_ms,
+        adopted: false,
+        pid_file: None,
+    })
+}
+
 async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
     let mut children = state.children.lock().await;
     if children.tun.is_some() {
@@ -170,7 +261,7 @@ async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
         return (StatusCode::INTERNAL_SERVER_ERROR, "tun binary not found").into_response();
     };
 
-    match spawn_child_with_flags(&binary, &state.spawn_cfg.tun_args, flags) {
+    match spawn_tun(&binary, &state.spawn_cfg.tun_args, flags) {
         Ok(handle) => {
             let tun_pid = handle.process.id();
             info!("[sentinel] tun spawned pid={:?}", tun_pid);
