@@ -1,6 +1,6 @@
 //! Tunnel establishment through the Mirage chain.
 
-use std::time::Duration;
+use std::{io, net::SocketAddr, time::Duration};
 
 use mirage_core::{
     config::{ChainConfig, ShapingPreset},
@@ -13,42 +13,112 @@ use mirage_protocol::{
     onion::layer::NextHop,
     traits::Tunnel,
 };
+use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::cover_tunnel::CoverTunnel;
 use crate::onion_tunnel::OnionTunnel;
 use crate::shaped_tunnel::ShapedTunnel;
 
-/// Dial `node.addr_v6` first (1 s timeout); on failure fall back to `node.addr`.
+/// RFC 8305 Happy Eyeballs v2: race v6 vs v4 probes, v6 gets a 200 ms head-start.
 ///
-/// When `addr_v6` is absent or `addr` is already IPv6, dials `addr` directly.
-/// This is a sequential v6-then-v4 strategy (Happy Eyeballs v2 parallel race
-/// is a follow-up).
-async fn resolve_dial_addr(
-    node: &mirage_core::config::ChainNode,
-) -> std::net::SocketAddr {
-    if let Some(v6_addr) = node.addr_v6 {
-        // addr is already v6 — addr_v6 is unused per ChainNode doc.
-        if node.addr.is_ipv6() {
-            return node.addr;
+/// Returns the address whose probe succeeded first.  Both probes use a 5 s
+/// per-address TCP timeout.  `chain_protocols.connect` will re-dial the winner.
+///
+/// Cancellation: the loser future is dropped at the end of `select!`; the OS
+/// TCP stack may have a half-open connection in flight for the loser, which the
+/// OS cleans up after its own SYN timeout (~20 s).  This is the standard
+/// Happy Eyeballs trade-off — one extra SYN at most, no fd leak on our side.
+pub(crate) async fn happy_eyeballs(v4: SocketAddr, v6: SocketAddr) -> io::Result<SocketAddr> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    const V6_HEAD_START: Duration = Duration::from_millis(200);
+
+    // Each probe returns `(tag, Result<SocketAddr, io::Error>)`.
+    // We spawn both as tasks so we can independently await them and cancel the
+    // loser by dropping its JoinHandle.
+    let v6_task = tokio::spawn(async move {
+        match tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(v6)).await {
+            Ok(Ok(_stream)) => Ok(v6),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "v6 probe timed out")),
         }
-        // Try v6 with a 1 s probe.
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::net::TcpStream::connect(v6_addr),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                debug!(v6 = %v6_addr, "v6 probe succeeded, dialing v6");
-                return v6_addr;
-            }
-            _ => {
-                debug!(v6 = %v6_addr, v4 = %node.addr, "v6 probe failed, falling back to v4");
-            }
+    });
+    let v4_task = tokio::spawn(async move {
+        tokio::time::sleep(V6_HEAD_START).await;
+        match tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(v4)).await {
+            Ok(Ok(_stream)) => Ok(v4),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "v4 probe timed out")),
+        }
+    });
+
+    // First winner takes it; loser task is aborted when its JoinHandle is
+    // dropped.  At most one stray SYN may be in flight in the OS after abort —
+    // standard Happy Eyeballs trade-off.
+    let mut v6_done = false;
+    let mut v4_done = false;
+    let mut errors: Vec<io::Error> = Vec::new();
+
+    tokio::pin!(v6_task);
+    tokio::pin!(v4_task);
+
+    loop {
+        tokio::select! {
+            r = &mut v6_task, if !v6_done => {
+                v6_done = true;
+                match r {
+                    Ok(Ok(addr)) => {
+                        debug!(v6 = %addr, "happy eyeballs: v6 probe won");
+                        return Ok(addr);
+                    }
+                    Ok(Err(e)) => {
+                        debug!(v6 = %v6, error = %e, "happy eyeballs: v6 probe failed");
+                        errors.push(e);
+                    }
+                    Err(e) => {
+                        debug!(v6 = %v6, "happy eyeballs: v6 task panicked: {e}");
+                        errors.push(io::Error::new(io::ErrorKind::Other, "v6 task panicked"));
+                    }
+                }
+                if v4_done { break; }
+            },
+            r = &mut v4_task, if !v4_done => {
+                v4_done = true;
+                match r {
+                    Ok(Ok(addr)) => {
+                        debug!(v4 = %addr, "happy eyeballs: v4 probe won");
+                        return Ok(addr);
+                    }
+                    Ok(Err(e)) => {
+                        debug!(v4 = %v4, error = %e, "happy eyeballs: v4 probe failed");
+                        errors.push(e);
+                    }
+                    Err(e) => {
+                        debug!(v4 = %v4, "happy eyeballs: v4 task panicked: {e}");
+                        errors.push(io::Error::new(io::ErrorKind::Other, "v4 task panicked"));
+                    }
+                }
+                if v6_done { break; }
+            },
         }
     }
-    node.addr
+
+    Err(errors.into_iter().next().unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "no address succeeded")
+    }))
+}
+
+/// Select the dial address for `node` using Happy Eyeballs v2 (RFC 8305).
+///
+/// - No `addr_v6`: dial `addr` directly (v4-only, zero overhead).
+/// - `addr` already IPv6: dial it directly (`addr_v6` is unused per ChainNode doc).
+/// - Both present: race v6 (immediate) vs v4 (200 ms delay); return the winner.
+async fn resolve_dial_addr(node: &mirage_core::config::ChainNode) -> io::Result<SocketAddr> {
+    match node.addr_v6 {
+        None => Ok(node.addr),
+        Some(_) if node.addr.is_ipv6() => Ok(node.addr),
+        Some(v6_addr) => happy_eyeballs(node.addr, v6_addr).await,
+    }
 }
 
 /// Establish an encrypted tunnel through the L1 relay node, without sending a
@@ -132,8 +202,13 @@ pub async fn establish_raw_tunnel(
         (pk, l1.sni.as_deref().unwrap_or("").to_owned())
     };
 
-    // When addr_v6 is present, probe v6 first; fall back to v4 on failure.
-    let dial_addr = resolve_dial_addr(l1).await;
+    // Happy Eyeballs v2 (RFC 8305): race v6 vs v4, v6 gets 200 ms head start.
+    let dial_addr = resolve_dial_addr(l1).await.map_err(|e| {
+        MirageError::NodeUnreachable(format!(
+            "chain {}: both v4 and v6 probes failed: {e}",
+            chain.chain_id
+        ))
+    })?;
 
     debug!(
         chain_id = %chain.chain_id,
@@ -348,5 +423,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Happy Eyeballs tests ──────────────────────────────────────────────────
+
+    use std::net::SocketAddr;
+    use super::happy_eyeballs;
+
+    /// Bind two local TCP listeners (v4 + v6) and verify v6 wins the race.
+    ///
+    /// Both listeners are ready before the race starts, so v6 wins because it
+    /// has no 200 ms delay.
+    #[tokio::test]
+    async fn happy_eyeballs_prefers_v6() {
+        let v4_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v6_listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+
+        let v4_addr: SocketAddr = v4_listener.local_addr().unwrap();
+        let v6_addr: SocketAddr = v6_listener.local_addr().unwrap();
+
+        let winner = happy_eyeballs(v4_addr, v6_addr).await.unwrap();
+        assert_eq!(winner, v6_addr, "v6 should win when both are reachable");
+    }
+
+    /// v4-only path: `happy_eyeballs` is not called; `resolve_dial_addr` returns
+    /// `node.addr` directly.  This test exercises `resolve_dial_addr` via a
+    /// `ChainNode` with `addr_v6 = None`.
+    #[tokio::test]
+    async fn happy_eyeballs_v4_only() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v4_addr: SocketAddr = listener.local_addr().unwrap();
+
+        let node = mirage_core::config::ChainNode {
+            addr: v4_addr,
+            addr_v6: None,
+            public_key: "0".repeat(64),
+            sni: None,
+            display_name: None,
+        };
+
+        let result = super::resolve_dial_addr(&node).await.unwrap();
+        assert_eq!(result, v4_addr);
+    }
+
+    /// When v6 is unreachable (unrouted documentation address 2001:db8::1),
+    /// the race should fall back to v4 and succeed.
+    ///
+    /// Uses a short per-probe timeout so the test completes quickly.  The
+    /// 2001:db8:: prefix is IANA-reserved and never routed — connect returns
+    /// an error quickly (network unreachable) or times out within the 5 s probe
+    /// window.  Either way, v4 must win before the overall test timeout.
+    #[tokio::test]
+    async fn happy_eyeballs_falls_back_to_v4() {
+        let v4_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v4_addr: SocketAddr = v4_listener.local_addr().unwrap();
+
+        // 2001:db8::1 — documentation range, never routed.
+        // Port 1 is almost certainly closed on any system.
+        let v6_addr: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+
+        let winner = happy_eyeballs(v4_addr, v6_addr).await.unwrap();
+        assert_eq!(winner, v4_addr, "v4 must win when v6 is unreachable");
     }
 }
