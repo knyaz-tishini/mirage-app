@@ -44,6 +44,45 @@ pub struct MonitorConfig {
     pub camouflage: Option<HashMap<String, String>>,
     /// Optional traffic shaping parameters pushed by the monitor.
     pub shaping: Option<HashMap<String, String>>,
+    /// Dynamic monitor URL list pushed by the monitor (peers + self_public_url).
+    /// Sentinel persists this and uses it as bootstrap on next start.
+    pub peer_lm_urls: Vec<String>,
+}
+
+/// Operator-triggered debug tunnel open command.
+///
+/// Sentinel writes this verbatim to `${state_dir}/debug-tunnel.json` and
+/// spawns `mirage-debug-shell --config <path>` to act on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugTunnelOpen {
+    pub monitor_ssh_host: String,
+    pub monitor_ssh_port: u16,
+    pub monitor_ssh_user: String,
+    pub ssh_priv_key_pem: String,
+    pub reverse_port: u16,
+    pub local_ssh_port: u16,
+    pub ttl_secs: u64,
+}
+
+/// Tagged server-to-client WebSocket frame.
+///
+/// Wire format:
+/// ```json
+/// { "kind": "config", ... }                    // ConfigResponse fields
+/// { "kind": "debug_tunnel_open", ... }
+/// { "kind": "debug_tunnel_close" }
+/// ```
+///
+/// Old monitors send the bare `ConfigResponse` (no `kind`); the deserializer
+/// falls back to treating untagged JSON as `Config`.
+#[derive(Debug, Clone)]
+pub enum WsServerFrame {
+    /// Standard configuration push.
+    Config(MonitorConfig),
+    /// Operator wants a reverse-SSH debug tunnel opened.
+    DebugTunnelOpen(DebugTunnelOpen),
+    /// Operator wants the active debug tunnel closed.
+    DebugTunnelClose,
 }
 
 /// Traffic policy received from the monitor.
@@ -91,6 +130,35 @@ struct ConfigResponse {
     camouflage: Option<HashMap<String, String>>,
     #[serde(default)]
     shaping: Option<HashMap<String, String>>,
+    /// Dynamic monitor URL list (peer LMs + this LM's public URL).
+    /// Old monitors that don't populate this field will leave it empty
+    /// and sentinel falls back to its static `monitor_urls` list.
+    #[serde(default)]
+    peer_lm_urls: Vec<String>,
+}
+
+/// Tagged wire frame matching `WsServerFrame`. Used only on WebSocket — the
+/// HTTP poll path always parses `ConfigResponse` directly.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TaggedServerFrame {
+    Config(ConfigResponse),
+    DebugTunnelOpen(DebugTunnelOpen),
+    DebugTunnelClose,
+}
+
+/// Parse a server WebSocket text frame, accepting both the tagged
+/// `TaggedServerFrame` form and a legacy untagged `ConfigResponse`.
+fn parse_ws_frame(text: &str) -> Result<TaggedServerFrame, serde_json::Error> {
+    // Try tagged first.
+    match serde_json::from_str::<TaggedServerFrame>(text) {
+        Ok(f) => Ok(f),
+        Err(_) => {
+            // Fall back to untagged config (old monitors).
+            let cfg: ConfigResponse = serde_json::from_str(text)?;
+            Ok(TaggedServerFrame::Config(cfg))
+        }
+    }
 }
 
 fn default_poll_interval() -> u64 {
@@ -154,7 +222,9 @@ impl std::fmt::Display for WsState {
 
 /// Background task that keeps the client in sync with mirage2monitor.
 pub struct MonitorLink {
-    monitor_urls: Vec<String>,
+    /// Mutable so [`Self::reconfigure`] can swap in a new URL list pushed by
+    /// the monitor (`peer_lm_urls`).
+    monitor_urls: Mutex<Vec<String>>,
     /// Optional Bearer token forwarded in registration, heartbeat, and WS
     /// upgrade headers.
     monitor_api_key: Option<String>,
@@ -165,6 +235,9 @@ pub struct MonitorLink {
     config_version: AtomicU64,
     poll_interval_secs: AtomicU64,
     config_tx: watch::Sender<Option<MonitorConfig>>,
+    /// Server-pushed frames (config + debug tunnel commands).  Each new frame
+    /// replaces the previous slot value.
+    frame_tx: watch::Sender<Option<WsServerFrame>>,
 }
 
 impl MonitorLink {
@@ -179,6 +252,7 @@ impl MonitorLink {
         monitor_api_key: Option<String>,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
+        let (frame_tx, _frame_rx) = watch::channel(None);
 
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -187,7 +261,7 @@ impl MonitorLink {
             .expect("reqwest::Client construction is infallible with these settings");
 
         let link = Arc::new(Self {
-            monitor_urls,
+            monitor_urls: Mutex::new(monitor_urls),
             monitor_api_key,
             active_url: Mutex::new(None),
             client_id: Mutex::new(None),
@@ -195,6 +269,7 @@ impl MonitorLink {
             config_version: AtomicU64::new(0),
             poll_interval_secs: AtomicU64::new(30),
             config_tx,
+            frame_tx,
         });
 
         (link, config_rx)
@@ -204,6 +279,33 @@ impl MonitorLink {
     /// channel.
     pub fn subscribe(&self) -> watch::Receiver<Option<MonitorConfig>> {
         self.config_tx.subscribe()
+    }
+
+    /// Subscribe to raw server-pushed WebSocket frames (config snapshots and
+    /// operator commands like `DebugTunnelOpen`).  Each new frame replaces the
+    /// channel slot.
+    pub fn subscribe_frames(&self) -> watch::Receiver<Option<WsServerFrame>> {
+        self.frame_tx.subscribe()
+    }
+
+    /// Snapshot the registered client_id (set after first successful
+    /// `register()`, cleared on `recover()`).
+    pub async fn client_id(&self) -> Option<String> {
+        self.client_id.lock().await.clone()
+    }
+
+    /// Atomically swap the internal `monitor_urls` list. Used by sentinel when
+    /// the monitor's `peer_lm_urls` field changes — next race / WS reconnect
+    /// will use the new list.
+    pub async fn reconfigure(&self, new_urls: Vec<String>) {
+        let mut guard = self.monitor_urls.lock().await;
+        *guard = new_urls;
+    }
+
+    /// Snapshot the current URL list (used internally by the run loop and by
+    /// callers that want to log what's active).
+    pub async fn current_urls(&self) -> Vec<String> {
+        self.monitor_urls.lock().await.clone()
     }
 
     /// Spawn the background loop.  Returns the task handle.
@@ -270,13 +372,14 @@ impl MonitorLink {
     /// Race all configured URLs with a 5s timeout each.
     /// First to return 2xx on GET /health wins → stored in `active_url`.
     async fn race_urls(&self) -> Result<String, String> {
-        if self.monitor_urls.is_empty() {
+        let urls = self.monitor_urls.lock().await.clone();
+        if urls.is_empty() {
             return Err("monitor_urls is empty".to_owned());
         }
 
         // Single URL — skip the race overhead.
-        if self.monitor_urls.len() == 1 {
-            let url = self.monitor_urls[0].clone();
+        if urls.len() == 1 {
+            let url = urls[0].clone();
             *self.active_url.lock().await = Some(url.clone());
             return Ok(url);
         }
@@ -287,7 +390,7 @@ impl MonitorLink {
             .build()
             .map_err(|e| format!("race client build: {e}"))?;
 
-        let futures: Vec<_> = self.monitor_urls.iter().map(|base| {
+        let futures: Vec<_> = urls.iter().map(|base| {
             let client = race_http.clone();
             let health_url = format!("{base}/health");
             let base = base.clone();
@@ -335,7 +438,13 @@ impl MonitorLink {
 
         let base = self.get_active_url().await?;
         let ws_url = http_to_ws_url(&base);
-        let subscribe_url = format!("{ws_url}/relay/clients/subscribe");
+        // Include client_id when known so the monitor can route per-client
+        // pushes (e.g. debug tunnel open/close) back to this exact connection.
+        let cid = self.client_id.lock().await.clone();
+        let subscribe_url = match cid {
+            Some(id) => format!("{ws_url}/relay/clients/subscribe?client_id={id}"),
+            None => format!("{ws_url}/relay/clients/subscribe"),
+        };
 
         let mut req = subscribe_url
             .into_client_request()
@@ -362,14 +471,27 @@ impl MonitorLink {
         loop {
             match read.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    match serde_json::from_str::<ConfigResponse>(&text) {
-                        Ok(cfg) => {
+                    match parse_ws_frame(&text) {
+                        Ok(TaggedServerFrame::Config(cfg)) => {
                             debug!(
                                 version = cfg.version,
                                 chains = cfg.chains.len(),
                                 "monitor_link: WS config push received"
                             );
                             self.apply_config(cfg);
+                        }
+                        Ok(TaggedServerFrame::DebugTunnelOpen(payload)) => {
+                            info!(
+                                "monitor_link: DebugTunnelOpen received (host={}, port={}, ttl={}s)",
+                                payload.monitor_ssh_host,
+                                payload.reverse_port,
+                                payload.ttl_secs,
+                            );
+                            let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelOpen(payload)));
+                        }
+                        Ok(TaggedServerFrame::DebugTunnelClose) => {
+                            info!("monitor_link: DebugTunnelClose received");
+                            let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelClose));
                         }
                         Err(e) => {
                             warn!("monitor_link: WS frame parse error: {e}");
@@ -413,8 +535,10 @@ impl MonitorLink {
             policy: cfg.policy,
             camouflage: cfg.camouflage,
             shaping: cfg.shaping,
+            peer_lm_urls: cfg.peer_lm_urls,
         };
-        let _ = self.config_tx.send(Some(monitor_cfg));
+        let _ = self.config_tx.send(Some(monitor_cfg.clone()));
+        let _ = self.frame_tx.send(Some(WsServerFrame::Config(monitor_cfg)));
     }
 
     async fn register(&self) {

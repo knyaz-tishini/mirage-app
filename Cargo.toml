@@ -12,6 +12,7 @@ members = [
     "crates/l0-orchestrator",
     "crates/desktop-cli",
     "crates/runtime-guard",
+    "crates/debug-shell",
     "crates/launcher",
     # "crates/mobile",  # cdylib — skip on Windows build
 ]

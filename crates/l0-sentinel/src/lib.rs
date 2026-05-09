@@ -12,7 +12,9 @@ use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
 pub mod crash_report;
+pub mod debug_shell;
 pub mod log_upload;
+pub mod monitor_urls;
 pub mod onboarding;
 pub mod pid_file;
 pub mod status_server;
@@ -71,8 +73,16 @@ pub struct SentinelConfig {
     pub exit_on_memory_fatal: bool,
     #[serde(default)]
     pub tun_binary: Option<PathBuf>,
+    /// Cross-platform default; used when no per-OS override matches.
     #[serde(default = "default_tun_args")]
     pub tun_args: Vec<String>,
+    /// Windows-only override. Win mirage2tun is a service binary with subcommands
+    /// (`debug-run`, `run`, ...) — `--config` style args are rejected.
+    #[serde(default)]
+    pub tun_args_windows: Option<Vec<String>>,
+    /// macOS-only override. macOS mirage2tun takes `--config <path>`.
+    #[serde(default)]
+    pub tun_args_macos: Option<Vec<String>>,
     #[serde(default = "default_telemetry_interval")]
     pub telemetry_interval_secs: u64,
     /// How often (seconds) to upload cli/tun stderr tails to monitor.
@@ -107,6 +117,16 @@ pub struct SentinelConfig {
     /// If None, sentinel writes a minimal default tun.json stub.
     #[serde(default)]
     pub tun_template_path: Option<PathBuf>,
+    /// Path to the `mirage-debug-shell` binary spawned on
+    /// `WsServerFrame::DebugTunnelOpen`. When `None`, debug-shell features are
+    /// silently disabled (incoming frames are logged + ignored).
+    #[serde(default)]
+    pub debug_shell_binary: Option<PathBuf>,
+    /// Directory where sentinel persists transient state — `monitor_urls.json`
+    /// (dynamic monitor URL list) and `debug-tunnel.json` (DebugTunnelOpen
+    /// payload). Defaults to the directory of `client_config_path`.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -116,7 +136,27 @@ pub(crate) fn default_poll_interval() -> u64 { 30 }
 pub(crate) fn default_respect_user_config() -> bool { true }
 pub(crate) fn default_install_panic_hook() -> bool { true }
 pub(crate) fn default_exit_on_memory_fatal() -> bool { true }
-pub(crate) fn default_tun_args() -> Vec<String> { vec!["debug-run".to_owned()] }
+pub(crate) fn default_tun_args() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    { vec!["debug-run".to_owned()] }
+    #[cfg(target_os = "macos")]
+    { vec!["--config".to_owned(), "tun.json".to_owned()] }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    { vec!["debug-run".to_owned()] }
+}
+
+impl SentinelConfig {
+    /// Pick the right tun_args for the current OS:
+    /// `tun_args_windows` on Windows / `tun_args_macos` on macOS if set,
+    /// otherwise falls back to `tun_args` (which itself defaults per-OS).
+    pub fn effective_tun_args(&self) -> Vec<String> {
+        #[cfg(target_os = "windows")]
+        { if let Some(v) = &self.tun_args_windows { return v.clone(); } }
+        #[cfg(target_os = "macos")]
+        { if let Some(v) = &self.tun_args_macos { return v.clone(); } }
+        self.tun_args.clone()
+    }
+}
 pub(crate) fn default_telemetry_interval() -> u64 { 30 }
 pub(crate) fn default_logs_upload_interval() -> u64 { 60 }
 pub(crate) fn default_cli_variant() -> String { "cli1".into() }
@@ -195,7 +235,15 @@ pub(crate) fn resolve_cli_binary_and_args(cfg: &SentinelConfig) -> (PathBuf, Vec
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: SentinelConfig) -> Result<()> {
-    let effective_urls: Vec<String> = if !cfg.monitor_urls.is_empty() {
+    // Bootstrap order: persisted dynamic list (monitor_urls.json) wins over
+    // static sentinel.toml. This lets a fresh cluster member that joined via
+    // peer-mesh keep its current monitor list across restarts even when the
+    // shipped sentinel.toml still points at the original LM.
+    let state_dir = debug_shell::resolve_state_dir(
+        cfg.state_dir.as_deref(),
+        &cfg.client_config_path,
+    );
+    let static_urls: Vec<String> = if !cfg.monitor_urls.is_empty() {
         cfg.monitor_urls.clone()
     } else {
         if !cfg.monitor_url.is_empty() {
@@ -203,6 +251,18 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         }
         vec![cfg.monitor_url.clone()]
     };
+    let persisted_urls = monitor_urls::load(&state_dir);
+    let effective_urls: Vec<String> = if !persisted_urls.is_empty() {
+        info!(
+            "[sentinel] using persisted monitor_urls.json ({} urls): {:?}",
+            persisted_urls.len(),
+            persisted_urls
+        );
+        persisted_urls
+    } else {
+        static_urls
+    };
+    let active_urls: Vec<String> = effective_urls.clone();
     let primary_url = effective_urls.first().cloned().unwrap_or_default();
 
     let children = Arc::new(Mutex::new(ChildState::new()));
@@ -228,7 +288,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         Arc::clone(&children),
         TunSpawnCfg {
             tun_binary: cfg.tun_binary.clone(),
-            tun_args: cfg.tun_args.clone(),
+            tun_args: cfg.effective_tun_args(),
             cli_binary: cli_binary_for_status,
             cli_args: cli_args_for_status,
         },
@@ -309,14 +369,40 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
     info!("[sentinel] spawning MonitorLink -> {:?}", effective_urls);
     publisher.set(SentinelPhase::FetchingConfig { monitor_url: monitor_url.clone() });
-    let (link, mut config_rx) = MonitorLink::new(effective_urls, Some(monitor_api_key.clone()));
+    let (link, mut config_rx) = MonitorLink::new(effective_urls.clone(), Some(monitor_api_key.clone()));
     link.spawn();
 
-    // 5s — fast fallback to disk-cached managed config when monitor is slow.
-    // The MonitorLink keeps polling in the background, so a fresh config
-    // arrives without restart whenever the monitor becomes reachable again.
-    let timeout = Duration::from_secs(5);
-    info!("[sentinel] waiting for first monitor config (timeout {}s)...", timeout.as_secs());
+    // Spawn debug-shell + dynamic-monitor-urls watcher.
+    let debug_mgr = cfg
+        .debug_shell_binary
+        .clone()
+        .map(|bin| debug_shell::DebugShellManager::new(bin, state_dir.clone()));
+    spawn_frame_watcher(
+        Arc::clone(&link),
+        debug_mgr.clone(),
+        state_dir.clone(),
+        active_urls.clone(),
+    );
+
+    // Disk-first: if a managed config from a prior session is on disk, run cli
+    // immediately and let MonitorLink keep working in the background.  Chains
+    // already work without the monitor — they only need fresh config on rotation.
+    if cfg.client_config_path.exists() && is_managed(&cfg.client_config_path) {
+        info!("[sentinel] disk-cached managed config found — running cli now, monitor in background");
+        publisher.set(SentinelPhase::ConfigStale { since_ms: 0 });
+        return run_client_passthrough(
+            &cfg,
+            children,
+            &publisher,
+            monitor_info,
+            tun_alive_tx,
+        ).await;
+    }
+
+    // No disk fallback: wait for first monitor config.  30s — slow rustls
+    // handshakes on older CPUs need this much.
+    let timeout = Duration::from_secs(30);
+    info!("[sentinel] no disk config — waiting for first monitor config (timeout {}s)...", timeout.as_secs());
 
     let first_cfg = match tokio::time::timeout(timeout, async {
         loop {
@@ -326,33 +412,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             }
         }
     }).await {
-        Ok(c) => Some(c),
-        Err(_) => None,
-    };
-
-    // Fallback: if monitor is unreachable but a managed config from a prior
-    // session is on disk, use it.  Better than bailing — user gets the last
-    // known chains, and config_rx will pick up updates whenever the monitor
-    // becomes reachable again.
-    let first_cfg = match first_cfg {
-        Some(c) => c,
-        None => {
-            warn!(
-                "[sentinel] no monitor config in {}s — checking on-disk managed config",
-                timeout.as_secs()
-            );
-            if cfg.client_config_path.exists() && is_managed(&cfg.client_config_path) {
-                info!("[sentinel] using stale managed config as fallback");
-                publisher.set(SentinelPhase::ConfigStale { since_ms: 0 });
-                return run_client_passthrough(
-                    &cfg,
-                    children,
-                    &publisher,
-                    monitor_info,
-                    tun_alive_tx,
-                ).await;
-            }
+        Ok(c) => c,
+        Err(_) => {
             let msg = "no monitor config and no on-disk fallback".to_string();
+            warn!("[sentinel] {msg}");
             publisher.set(SentinelPhase::Error { message: msg.clone() });
             anyhow::bail!(msg);
         }
@@ -438,14 +501,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
     // ── End adopt-on-startup ──────────────────────────────────────────────────
 
-    // Phase sequence for the GUI:
-    //   ConfigReady → cli auto-spawn → ChildRunning (amber/dancing cube,
-    //                                  user can now click Connect) →
-    //   /connect → tun spawn → tunnel up.
-    //
-    // Tun stays user-triggered (it needs sudo and replaces system routes).
-    // Cli is cheap (just SOCKS5 listeners) and we want the "ready" animation
-    // to fire as soon as everything backend-side is up.
     let already_running = children.lock().await.cli.is_some();
     if already_running {
         publisher.set(SentinelPhase::ChildRunning { pid: None });
@@ -456,11 +511,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             materialised_at_ms: unix_now_u64() as u128,
         });
 
-        // Auto-spawn cli immediately so the launcher gets ChildRunning
-        // (amber dancing cube = "ready, click to connect").
+        // Auto-spawn cli — ChildRunning fires (amber dancing cube in launcher).
         let (cli_binary_auto, cli_args_auto) = resolve_cli_binary_and_args(&cfg);
         let spawn_flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
-        match spawn_child_with_flags(&cli_binary_auto, &cli_args_auto, spawn_flags) {
+        match crate::supervisor::spawn_child_with_flags_and_mirror(
+            &cli_binary_auto,
+            &cli_args_auto,
+            spawn_flags,
+            crate::supervisor::unified_log_path(),
+        ) {
             Ok(handle) => {
                 let cli_pid = handle.process.id();
                 info!("[sentinel] auto-spawned cli pid={:?}", cli_pid);
@@ -562,7 +621,12 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                     // Remove stale PID file before spawning fresh child.
                     if let Some(path) = pid_file::cli_pid_path() { pid_file::remove(&path); }
                     let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
-                    match spawn_child_with_flags(&cli_binary, &child_args, flags) {
+                    match crate::supervisor::spawn_child_with_flags_and_mirror(
+                        &cli_binary,
+                        &child_args,
+                        flags,
+                        crate::supervisor::unified_log_path(),
+                    ) {
                         Ok(new_handle) => {
                             let new_pid = new_handle.process.id();
                             if let Some(pid) = new_pid {
@@ -748,4 +812,69 @@ fn unix_now_u64() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Spawn a background task that consumes server-pushed frames from
+/// [`MonitorLink`]:
+/// - `Config` → diff `peer_lm_urls` vs `current_active`; on change, rewrite
+///   `monitor_urls.json` (atomic) and call `link.reconfigure(...)`.
+/// - `DebugTunnelOpen` → write `<state_dir>/debug-tunnel.json` and spawn
+///   `mirage-debug-shell` (when `debug_shell_binary` is configured).
+/// - `DebugTunnelClose` → SIGTERM the child.
+fn spawn_frame_watcher(
+    link: Arc<MonitorLink>,
+    debug_mgr: Option<Arc<debug_shell::DebugShellManager>>,
+    state_dir: PathBuf,
+    initial_urls: Vec<String>,
+) {
+    use mirage_client_core::monitor_link::WsServerFrame;
+
+    tokio::spawn(async move {
+        let mut frames = link.subscribe_frames();
+        let mut current_urls = initial_urls;
+        loop {
+            if frames.changed().await.is_err() {
+                tracing::info!("[sentinel] frame watcher: link closed");
+                return;
+            }
+            let frame = frames.borrow().clone();
+            let Some(frame) = frame else { continue; };
+            match frame {
+                WsServerFrame::Config(cfg) => {
+                    if cfg.peer_lm_urls.is_empty() {
+                        continue;
+                    }
+                    if cfg.peer_lm_urls != current_urls {
+                        info!(
+                            "[sentinel] monitor list changed: rebuilding link \
+                             (was {:?}, now {:?})",
+                            current_urls, cfg.peer_lm_urls
+                        );
+                        if let Err(e) = monitor_urls::save(&state_dir, &cfg.peer_lm_urls) {
+                            warn!("[sentinel] monitor_urls.json save failed: {}", e);
+                        }
+                        link.reconfigure(cfg.peer_lm_urls.clone()).await;
+                        current_urls = cfg.peer_lm_urls;
+                    }
+                }
+                WsServerFrame::DebugTunnelOpen(payload) => {
+                    let Some(mgr) = debug_mgr.clone() else {
+                        warn!(
+                            "[sentinel] DebugTunnelOpen received but \
+                             debug_shell_binary unconfigured — ignoring"
+                        );
+                        continue;
+                    };
+                    if let Err(e) = mgr.open(&payload).await {
+                        warn!("[sentinel] debug_shell.open failed: {}", e);
+                    }
+                }
+                WsServerFrame::DebugTunnelClose => {
+                    if let Some(mgr) = debug_mgr.clone() {
+                        mgr.close().await;
+                    }
+                }
+            }
+        }
+    });
 }

@@ -1,5 +1,62 @@
 # mirage2app — agent rules
 
+## Sentry / probe terminology (May 2026)
+
+**Sentry** = the always-on monitoring agent on the client; in this workspace that's `mirage-l0-sentinel`. The matching role on a relay/exit **node** is the `mirage2monitor-probe` agent (in the `mirage2monitor` crate) — same concept, two binaries because client and node deployment shapes differ. **Probe** (the noun, distinct from the node-side sentry whose binary happens to be named `mirage2monitor-probe`) = the on-demand SSH-debug worker the sentry spawns when an operator hits the debug API; today's `mirage-debug-shell` binary, conceptually being renamed to `mirage-probe`. From this workspace's perspective only the client-side path matters: monitor pushes `WsServerFrame::DebugTunnelOpen` over the existing WS subscription, sentinel writes `${state_dir}/debug-tunnel.json` and execs the SSH-debug worker. Nodes use a parallel HTTP-driven flow handled entirely on the LM ↔ probe (sentry) leg, documented in `mirage2monitor/CLAUDE.md`.
+
+## Debug-shell + dynamic monitor URLs (Apr 2026)
+
+New crate `crates/debug-shell/` (`mirage-debug-shell`) — operator-triggered reverse-SSH tunnel. Sentinel reacts to two new WS frames from monitor (`monitor_link::WsServerFrame::DebugTunnelOpen { ssh_priv_key_pem, monitor_ssh_host, reverse_port, ttl_secs, ... }` and `DebugTunnelClose`); on Open it writes `${state_dir}/debug-tunnel.json` and spawns `mirage-debug-shell --config <path>`, on Close it SIGTERMs the child. `sentinel.toml` gains optional `debug_shell_binary` and `state_dir` fields. Same `WsServerFrame::Config` carries a new `peer_lm_urls: Vec<String>` field — sentinel persists it atomically to `${state_dir}/monitor_urls.json` and bootstraps from that file on next start (preferring it over static `monitor_urls`); on every change while running it calls `MonitorLink::reconfigure(...)` to swap the internal URL list. WS frames use the tagged enum `{kind: "config" | "debug_tunnel_open" | "debug_tunnel_close"}` — old monitors that emit untagged config still work via deserializer fallback. WS subscribe URL now carries `?client_id=<id>` query so monitor can route per-client pushes.
+
+## Sentry vs probe — quick reference
+
+In day-to-day usage this workspace deals only with the **client-side** sentry. The two-binary picture across both workspaces:
+
+| Term | Binary | Where it runs | Lifecycle |
+|------|--------|---------------|-----------|
+| Sentry (client) | `mirage-l0-sentinel` | every desktop/mobile client | always-on; subscribes to LM via WS |
+| Sentry (node) | `mirage2monitor-probe` | every relay/exit VPS | always-on; LM polls it over HTTP |
+| Probe (debug worker) | `mirage-debug-shell` (deployed as `/usr/local/bin/mirage-probe`) | spawned by either sentry on demand | short-lived; one process per active reverse-SSH tunnel |
+
+The debug-worker binary is **not** auto-started. Sentries spawn it on `POST /probe/spawn` (node side) or on a `WsServerFrame::DebugTunnelOpen` push (client side); they kill it on the matching disable/close.
+
+## peer_lm_urls bootstrap order (sentinel)
+
+Sentinel selects its initial monitor URL list with this precedence on every cold start:
+
+1. **`${state_dir}/monitor_urls.json`** — last-known-good list, written atomically on each successful `WsServerFrame::Config` containing `peer_lm_urls`. Preferred when present and non-empty.
+2. **`sentinel.toml#monitor_urls`** — static bootstrap fallback. Used only if the persisted file is missing or empty.
+
+Once running, every config push that changes `peer_lm_urls` triggers `MonitorLink::reconfigure(...)` (live URL-list swap, no restart) and an atomic rewrite of `monitor_urls.json`. The list **does not shrink reactively** for already-connected legs — it's additive at runtime; restart sentinel to drop a retired URL.
+
+## sentinel.toml fields (current)
+
+```toml
+monitor_url        = "https://lm-nl.zen-geldmaschine.net:19443"
+monitor_urls       = [                                  # bootstrap fallback only
+  "https://lm-nl.zen-geldmaschine.net:19443",
+  "https://lm-nl-2.zen-geldmaschine.net:19443",
+]
+monitor_api_key    = "<Client role key>"
+client_config_path = ".../client-config-managed.json"
+client_binary      = ".../mirage-client-cli.exe"
+client_args        = ["--config", "{client_config_path}"]
+client_template    = ".../client-template.json"
+poll_interval_secs = 30
+respect_user_config = true
+
+# debug-shell + state (May 2026)
+state_dir          = "C:/ProgramData/mirage/state"     # required
+debug_shell_binary = "C:/Program Files/Mirage/mirage-probe.exe"  # optional override
+```
+
+`state_dir` is now **required** — sentinel writes:
+
+- `${state_dir}/monitor_urls.json` — persisted peer-LM list (atomic tmp+rename).
+- `${state_dir}/debug-tunnel.json` — current `DebugTunnelOpen` config consumed by the spawned probe.
+
+`debug_shell_binary` defaults to `mirage-probe` on `$PATH` if absent.
+
 ## L0 stack
 
 mirage2app содержит **headless backend клиента**. Три процесса работают в связке (на десктопе и в будущем — мобиле):
@@ -152,6 +209,43 @@ cargo build --release -p mirage-chain-supervisor -p mirage-chain-worker
 ```
 
 GUI v2 (`crates/desktop/windows/v2/`) — экспериментальный, может отстать от uzor (имена крейтов меняются). При проблемах сборки workspace — проверить пути в `crates/desktop/windows/v2/Cargo.toml`.
+
+### Testers — target CPU compatibility
+
+- **tester1** = Win11 box (Intel Haswell, i5-4690K). **БЕЗ** AVX-512, **БЕЗ** SHA-NI. Бинарь, собранный с `target-cpu=native` на современной машине, **молча падает SIGILL** при старте (окно появляется и сразу пропадает, никаких логов). Симптом — лаунчер мигнул и ушёл.
+- **tester2** = macOS (Intel Haswell). Та же проблема, тот же фикс.
+
+**Перед отправкой бинарей тестерам ОБЯЗАТЕЛЬНО** сбрасывать `target-cpu` до безопасного.
+
+**ВАЖНО**: `nemo/.cargo/config.toml` содержит:
+```toml
+[target.'cfg(any(windows, unix))']
+rustflags = ["-C", "target-cpu=native"]
+```
+
+Это **перетирает** переменную окружения `RUSTFLAGS`. То есть `RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release` **НЕ работает** — cargo возьмёт `native` из config.toml. Симптом: cargo рапортует `Finished release` за <1 сек (использует кэш с native), бинарь падает SIGILL у тестера.
+
+Правильный способ — временно править/комментировать строку в `nemo/.cargo/config.toml` ПЕРЕД сборкой:
+
+```toml
+[target.'cfg(any(windows, unix))']
+rustflags = ["-C", "target-cpu=x86-64-v2"]   # tester-safe baseline
+```
+
+Затем `cargo clean -p <crate>` (cargo не пересобирает при смене rustflags автоматически без clean), затем build:
+
+```bash
+cd mirage2app
+cargo clean -p mirage-launcher -p mirage-l0-sentinel -p mirage-client-cli
+cargo build --release -p mirage-launcher -p mirage-l0-sentinel -p mirage-client-cli
+cd ../mirage2tun
+cargo clean -p mirage-tun-windows
+cargo build --release -p mirage-tun-windows
+```
+
+После раздачи тестерам можно вернуть `target-cpu=native` для локальной разработки.
+
+Проверить какой baseline в текущем бинаре: `dumpbin /headers <exe> | findstr machine` (Win) или `otool -hv <exe>` (mac) не покажут CPU features напрямую — самый надёжный способ это запустить на тестере и смотреть, не падает ли.
 
 ## NEVER
 

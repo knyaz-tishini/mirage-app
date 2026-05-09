@@ -2387,6 +2387,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirage-debug-shell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "mirage-runtime-guard",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mirage-desktop-cli"
 version = "0.1.0"
 dependencies = [
@@ -4718,13 +4733,14 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uzor"
-version = "1.1.8"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99583bfbed046487cf525a35ddc03d7c872a6c5d57bc4f61720440d848ae05fe"
+checksum = "992c81b74988751d4bec2a7c193e5482f01f508ffaa91f8f0fde1c348e2ca713"
 dependencies = [
  "ahash 0.8.12",
  "bitflags 2.11.1",
  "fastrand",
+ "image",
  "log",
  "num-traits",
  "parking_lot",
@@ -4738,15 +4754,15 @@ dependencies = [
 
 [[package]]
 name = "uzor-fonts"
-version = "1.1.8"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21d85406cfc9beefd46f4817914074dd7e9ee800267d8d24dde4c9729c24df1"
+checksum = "ff32142f33d8cc459089ccf4a61ba0e242337488f8133a96a8efaf9ddc114beb"
 
 [[package]]
 name = "uzor-render-tiny-skia"
-version = "1.1.8"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38abe0a20de931a7bad295c42573a7281cbdc5d224b49458e175eb0daa29d85c"
+checksum = "fbe2ebdec2076f5530c885b8db10eb0c0521110d69a8bf076336033494d7717d"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -4755,14 +4771,25 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-desktop"
-version = "1.1.8"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "100816213d16b8735eb04f970bff8d2a1945be70b32e6e01c2c4541ea4e28426"
+checksum = "bdf6b2294ce59ac9566b21977c917c93d184acad92a6435ac0a524a21d159466"
 dependencies = [
  "arboard",
  "dark-light",
+ "softbuffer",
  "uzor",
+ "uzor-window-hub",
  "winit",
+]
+
+[[package]]
+name = "uzor-window-hub"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8332c642e563d6a828c00f5c4088ad5ad70e63a9961d7fdb578612eb9e3c6e6"
+dependencies = [
+ "uzor",
 ]
 
 [[package]]
