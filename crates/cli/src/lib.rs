@@ -7,9 +7,17 @@ use std::{
     sync::Arc,
 };
 
-use mirage_core::{config::{ClientConfig, TcpProtocolId}, routing::RoutingTable};
+use mirage_core::{
+    config::{ChainConfig, ClientConfig, ProtocolId, TcpProtocolId},
+    crypto::KeyPair,
+    routing::RoutingTable,
+};
 use mirage_protocol::{
     aliases::{mirage_base, mirage_tls},
+    canonical::{
+        shadowtls_v3::{ShadowTlsV3Config, ShadowTlsV3Protocol},
+        websocket_xray::WebsocketXrayProtocol,
+    },
     negotiation::ProtocolChain,
     traits::TcpProtocol,
 };
@@ -105,22 +113,31 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
     let _key_bytes = decode_hex_key(&config.private_key)
         .map_err(|e| format!("invalid private_key in config: {}", e))?;
 
-    // ── Build protocol chain ──────────────────────────────────────────────────
-    let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
-
-    protocols.push(Box::new(EndpointProtocol::new(
+    // ── Build default (Mirage-only) protocol chain ────────────────────────────
+    //
+    // Used as a fallback for chains that select a non-canonical protocol or
+    // omit per-chain config blocks. Chains that select WebsocketXray /
+    // ShadowTlsV3 / etc. get a dedicated single-protocol chain built per-chain
+    // below (see `build_chain_protocol_chain`).
+    let mut default_protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
+    default_protocols.push(Box::new(EndpointProtocol::new(
         mirage_base(),
         TcpProtocolId::Mirage,
     )));
-
     if config.psk.is_some() {
-        protocols.push(Box::new(EndpointProtocol::new(
+        default_protocols.push(Box::new(EndpointProtocol::new(
             mirage_tls("cloudflare.com", vec!["h2".into(), "http/1.1".into()]),
             TcpProtocolId::MirageShadowTls,
         )));
     }
+    let default_chain_protocols = Arc::new(ProtocolChain::new(default_protocols));
 
-    let chain_protocols = Arc::new(ProtocolChain::new(protocols));
+    // Client identity keypair (decoded from config.private_key) — required for
+    // canonical protocol constructors that take a KeyPair (WebsocketXray /
+    // ShadowTlsV3 / VlessReality).
+    let client_keypair_bytes: [u8; 32] = decode_hex_key(&config.private_key)
+        .map_err(|e| format!("invalid private_key in config: {}", e))?;
+
     let router = Arc::new(RoutingTable::new(&config.routing));
 
     // ── Build tunnel pools (one per chain) ────────────────────────────────────
@@ -166,7 +183,17 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         );
 
         let chain_owned = (*chain).clone();
-        let protocols = Arc::clone(&chain_protocols);
+        let protocols = match build_chain_protocol_chain(&chain_owned, &client_keypair_bytes) {
+            Ok(Some(p)) => Arc::new(p),
+            Ok(None) => Arc::clone(&default_chain_protocols),
+            Err(e) => {
+                tracing::warn!(
+                    chain = %chain_owned.chain_id,
+                    "per-chain protocol build failed, skipping: {e}"
+                );
+                continue;
+            }
+        };
         pool_tasks.spawn(async move {
             let id = chain_owned.chain_id.clone();
             match TunnelPool::new(chain_owned, protocols, pool_cfg).await {
@@ -203,7 +230,14 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         for chain in &all_chains {
             let chain_owned = (*chain).clone();
             let id = chain.chain_id.clone();
-            let protocols = Arc::clone(&chain_protocols);
+            let protocols = match build_chain_protocol_chain(&chain_owned, &client_keypair_bytes) {
+                Ok(Some(p)) => Arc::new(p),
+                Ok(None) => Arc::clone(&default_chain_protocols),
+                Err(e) => {
+                    tracing::warn!(chain = %id, "per-chain protocol build failed (mux): {e}");
+                    continue;
+                }
+            };
             let cfg = pool_cfg_base.clone();
             mux_tasks.spawn(async move {
                 match MuxPool::new(chain_owned, protocols, cfg).await {
@@ -316,7 +350,8 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         }
 
         let rt_for_watcher = Arc::clone(&runtime);
-        let protocols_for_watcher = Arc::clone(&chain_protocols);
+        let default_protocols_for_watcher = Arc::clone(&default_chain_protocols);
+        let client_kp_for_watcher = client_keypair_bytes;
         let pool_cfg_for_watcher = pool_cfg_base.clone();
         let use_mux_for_watcher = use_mux;
 
@@ -355,10 +390,24 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                         };
 
                         let chain_cfg = monitor_chain.chain.clone();
+                        let protocols_for_chain = match build_chain_protocol_chain(
+                            &chain_cfg,
+                            &client_kp_for_watcher,
+                        ) {
+                            Ok(Some(p)) => Arc::new(p),
+                            Ok(None) => Arc::clone(&default_protocols_for_watcher),
+                            Err(e) => {
+                                tracing::warn!(
+                                    chain = %chain_id,
+                                    "monitor: per-chain protocol build failed: {e}"
+                                );
+                                continue;
+                            }
+                        };
 
                         match TunnelPool::new(
                             chain_cfg,
-                            Arc::clone(&protocols_for_watcher),
+                            protocols_for_chain,
                             pool_cfg,
                         )
                         .await
@@ -567,4 +616,66 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err(format!("invalid hex character: {}", b as char)),
     }
+}
+
+/// Build a per-chain `ProtocolChain` containing exactly the canonical TCP
+/// protocol the chain selected, instantiated from the chain's per-protocol
+/// config block.
+///
+/// Returns:
+/// - `Ok(Some(chain))` — chain selected a canonical protocol and we built it.
+///   The caller MUST use this `ProtocolChain` for that chain (not the global
+///   default Mirage chain).
+/// - `Ok(None)` — chain selected `Mirage` / `MirageShadowTls` (legacy) /
+///   anything not yet wired here. Caller falls back to the default chain.
+/// - `Err(...)` — config block was missing or malformed for a protocol that
+///   requires it (e.g. ShadowTlsV3 PSK hex decode failed). Chain should be
+///   skipped so the cli doesn't silently dial Mirage where ShadowTlsV3 was
+///   asked.
+fn build_chain_protocol_chain(
+    chain: &ChainConfig,
+    client_keypair_bytes: &[u8; 32],
+) -> Result<Option<ProtocolChain>, BoxError> {
+    use mirage_core::config::TcpProtocolId as P;
+
+    let proto_id = match &chain.protocol {
+        ProtocolId::Tcp(id) => *id,
+        ProtocolId::Udp(_) => return Ok(None), // UDP chains use a different driver path
+    };
+
+    let kp = KeyPair::from_secret(*client_keypair_bytes);
+    let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
+    match proto_id {
+        P::WebsocketXray => {
+            let cfg = chain.websocket_xray.clone().ok_or_else(|| {
+                format!(
+                    "chain {}: protocol=WebsocketXray but websocket_xray block missing",
+                    chain.chain_id
+                )
+            })?;
+            protocols.push(Box::new(WebsocketXrayProtocol::new(kp, cfg.path, cfg.host)));
+        }
+        P::ShadowTlsV3 | P::MirageShadowTls => {
+            let cfg = chain.shadowtls_v3.clone().ok_or_else(|| {
+                format!(
+                    "chain {}: protocol={:?} but shadowtls_v3 block missing",
+                    chain.chain_id, proto_id
+                )
+            })?;
+            let runtime_cfg = ShadowTlsV3Config {
+                psk: cfg.psk,
+                backend_host: cfg.backend_host,
+                backend_port: cfg.backend_port,
+            };
+            let proto = ShadowTlsV3Protocol::new(kp, &runtime_cfg)
+                .map_err(|e| format!("chain {}: ShadowTlsV3Protocol::new failed: {e}", chain.chain_id))?;
+            protocols.push(Box::new(proto));
+        }
+        // Mirage / MirageTls / MirageWebsocket / MirageReality / VlessReality /
+        // exit endpoints — fall through to the default Mirage-based protocol
+        // chain. Adding wiring for the remaining canonical xray protocols is
+        // a follow-up (todo: VlessReality, MirageWebsocket).
+        _ => return Ok(None),
+    }
+    Ok(Some(ProtocolChain::new(protocols)))
 }
