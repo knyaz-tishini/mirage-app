@@ -13,7 +13,7 @@ use mirage_core::{
     routing::RoutingTable,
 };
 use mirage_protocol::{
-    aliases::{mirage_base, mirage_tls},
+    aliases::{mirage_base, mirage_tls, mirage_websocket},
     canonical::{
         shadowtls_v3::{ShadowTlsV3Config, ShadowTlsV3Protocol},
         websocket_xray::WebsocketXrayProtocol,
@@ -671,10 +671,23 @@ fn build_chain_protocol_chain(
                 .map_err(|e| format!("chain {}: ShadowTlsV3Protocol::new failed: {e}", chain.chain_id))?;
             protocols.push(Box::new(proto));
         }
-        // Mirage / MirageTls / MirageWebsocket / MirageReality / VlessReality /
-        // exit endpoints — fall through to the default Mirage-based protocol
-        // chain. Adding wiring for the remaining canonical xray protocols is
-        // a follow-up (todo: VlessReality, MirageWebsocket).
+        P::MirageWebsocket => {
+            // Mirage-family WebSocket camouflage. Uses the EndpointProtocol
+            // abstraction (same shape as the legacy `mirage_base` /
+            // `mirage_tls` aliases), with Upgrade path/host pulled from the
+            // chain's `mirage_websocket` block. Falls back to the alias
+            // defaults (`/ws`, `localhost`) when the block is missing —
+            // server may or may not accept those, depending on its own
+            // `mirage_websocket` NodeConfig section.
+            let cfg = chain.mirage_websocket.clone().unwrap_or_default();
+            protocols.push(Box::new(EndpointProtocol::new(
+                mirage_websocket(cfg.path, cfg.host),
+                P::MirageWebsocket,
+            )));
+        }
+        // Mirage / MirageTls / VlessReality / MirageReality / exit endpoints —
+        // fall through to the default Mirage-based protocol chain. Adding
+        // wiring for VlessReality is a follow-up.
         _ => return Ok(None),
     }
     Ok(Some(ProtocolChain::new(protocols)))
