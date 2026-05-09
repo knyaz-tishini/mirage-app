@@ -225,25 +225,27 @@ rustflags = ["-C", "target-cpu=native"]
 
 Это **перетирает** переменную окружения `RUSTFLAGS`. То есть `RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release` **НЕ работает** — cargo возьмёт `native` из config.toml. Симптом: cargo рапортует `Finished release` за <1 сек (использует кэш с native), бинарь падает SIGILL у тестера.
 
-Правильный способ — временно править/комментировать строку в `nemo/.cargo/config.toml` ПЕРЕД сборкой:
+**Рекомендуемый способ** — `nemo/scripts/build-win-bins.sh <profile>`. Каждый профиль пишет в **свой target-dir** (`nemo/target-build/win-<profile>/<crate>/release/...`), без перезаписи и `cargo clean` между прогонами:
+
+```bash
+bash nemo/scripts/build-win-bins.sh native     # для нашего dev box (target-cpu=native)
+bash nemo/scripts/build-win-bins.sh tester1    # для tester1 Haswell (target-cpu=x86-64-v2)
+bash nemo/scripts/build-win-bins.sh haswell    # явный haswell (полный набор Haswell-ISA фич)
+bash nemo/scripts/build-win-bins.sh baseline   # x86-64 minimum, универсал
+```
+
+Профили живут параллельно: одна и та же команда `cargo run --release -p X` всегда возвращает наш-native бинарь из `target/release/`, а tester1-safe лежит отдельно в `target-build/win-tester1/<crate>/release/`. Отправляешь тестеру именно его сборку.
+
+Под капотом: `--target-dir target-build/win-<profile>/<crate>` + `--config 'target."cfg(any(windows, unix))".rustflags=["-C","target-cpu=<cpu>"]'` (cargo 1.63+). Командная строка `--config` имеет приоритет над `nemo/.cargo/config.toml`, **никаких правок config.toml не нужно**.
+
+**Альтернатива** (legacy) — временно править `nemo/.cargo/config.toml`:
 
 ```toml
 [target.'cfg(any(windows, unix))']
 rustflags = ["-C", "target-cpu=x86-64-v2"]   # tester-safe baseline
 ```
 
-Затем `cargo clean -p <crate>` (cargo не пересобирает при смене rustflags автоматически без clean), затем build:
-
-```bash
-cd mirage2app
-cargo clean -p mirage-launcher -p mirage-l0-sentinel -p mirage-client-cli
-cargo build --release -p mirage-launcher -p mirage-l0-sentinel -p mirage-client-cli
-cd ../mirage2tun
-cargo clean -p mirage-tun-windows
-cargo build --release -p mirage-tun-windows
-```
-
-После раздачи тестерам можно вернуть `target-cpu=native` для локальной разработки.
+Затем `cargo clean -p <crate>` (cargo не пересобирает при смене rustflags автоматически без clean), затем build. После — вернуть `target-cpu=native`. Этот путь используем только если build-win-bins.sh почему-то не подходит.
 
 Проверить какой baseline в текущем бинаре: `dumpbin /headers <exe> | findstr machine` (Win) или `otool -hv <exe>` (mac) не покажут CPU features напрямую — самый надёжный способ это запустить на тестере и смотреть, не падает ли.
 
