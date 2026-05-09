@@ -428,16 +428,38 @@ impl TunnelLease {
 
 impl Drop for TunnelLease {
     fn drop(&mut self) {
-        let Some(tunnel) = self.tunnel.take() else { return };
         let pool = Arc::clone(&self.pool);
         let slot_idx = self.slot_idx;
         let poisoned = self.poisoned;
+        let tunnel = self.tunnel.take();
 
+        // Two distinct exit paths:
+        // 1. tunnel still owned by lease → return to pool (or poison if marked).
+        // 2. tunnel was extracted earlier via `take_tunnel()` (run_simple does
+        //    this before wrapping in TunnelCompat for relay_loop) → can't put
+        //    it back. The slot would otherwise stay Idle forever holding a
+        //    dead tunnel (the canonical TCP exit closes the upstream after one
+        //    request, so subsequent leases on that slot fail). When the caller
+        //    flagged the lease as poisoned (always done by run_simple after
+        //    relay_loop ends), poison the slot so the pool reconnects.
+        //    Bug fix May 2026: previously this branch silently returned, and
+        //    multi-request on the same chain was broken on every TCP chain
+        //    incl. baseline Mirage.
         tokio::spawn(async move {
-            if poisoned {
-                pool.poison_slot(slot_idx).await;
-            } else {
-                pool.return_tunnel(slot_idx, tunnel).await;
+            match (tunnel, poisoned) {
+                (Some(t), false) => pool.return_tunnel(slot_idx, t).await,
+                (Some(_), true) => pool.poison_slot(slot_idx).await,
+                (None, true) => pool.poison_slot(slot_idx).await,
+                (None, false) => {
+                    // Lease silently dropped its tunnel without poisoning —
+                    // slot is stuck. Log + poison anyway to recover.
+                    tracing::warn!(
+                        slot = slot_idx,
+                        "TunnelLease dropped without poison and without tunnel — \
+                         poisoning slot to force reconnect"
+                    );
+                    pool.poison_slot(slot_idx).await;
+                }
             }
         });
     }
