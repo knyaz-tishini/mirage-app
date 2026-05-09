@@ -16,6 +16,7 @@ use mirage_protocol::{
     aliases::{mirage_base, mirage_tls, mirage_websocket},
     canonical::{
         shadowtls_v3::{ShadowTlsV3Config, ShadowTlsV3Protocol},
+        vless_reality::{VlessRealityConfig, VlessRealityProtocol},
         websocket_xray::WebsocketXrayProtocol,
     },
     negotiation::ProtocolChain,
@@ -685,9 +686,27 @@ fn build_chain_protocol_chain(
                 P::MirageWebsocket,
             )));
         }
-        // Mirage / MirageTls / VlessReality / MirageReality / exit endpoints —
-        // fall through to the default Mirage-based protocol chain. Adding
-        // wiring for VlessReality is a follow-up.
+        P::VlessReality | P::MirageReality => {
+            // Canonical VLESS+Reality. The wire format embeds a short_id
+            // (8 bytes) in the TLS session_id field and the client's
+            // ephemeral pubkey in key_share — server has to know the
+            // accepted short_ids list (must be a non-empty subset of the
+            // server's NodeConfig.reality.short_ids).
+            let cfg = chain.vless_reality.clone().ok_or_else(|| {
+                format!(
+                    "chain {}: protocol={:?} but vless_reality block missing",
+                    chain.chain_id, proto_id
+                )
+            })?;
+            let runtime_cfg = VlessRealityConfig {
+                short_ids: cfg.short_ids,
+                max_time_diff: cfg.max_time_diff,
+                server_name: cfg.server_name,
+                fallback_dest: cfg.fallback_dest,
+            };
+            protocols.push(Box::new(VlessRealityProtocol::new(kp, runtime_cfg)));
+        }
+        // Mirage / MirageTls / exit endpoints — fall through to default.
         _ => return Ok(None),
     }
     Ok(Some(ProtocolChain::new(protocols)))
