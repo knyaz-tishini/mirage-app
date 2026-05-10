@@ -555,27 +555,41 @@ async fn establish_udp_chain_tunnel(
                 bind_addr: l1.addr,
             }
         }
+        UdpProtocolId::MirageHttp3 => {
+            // No `chain.udp_http3` field on ChainConfig yet — hard-code the
+            // server defaults from the `udp_http3` listener spec block. Add a
+            // typed `UdpHttp3Config` and a `chain.udp_http3` mirror once any
+            // operator needs to override these per-chain.
+            TransportCamouflage::Http3 {
+                authority: "www.cloudflare.com".to_owned(),
+                tunnel_path: "/h3-tunnel".to_owned(),
+                alpn: "h3".to_owned(),
+                bind_addr: l1.addr,
+            }
+        }
         UdpProtocolId::MirageUdp
         | UdpProtocolId::MirageExitMinimalUdp
         | UdpProtocolId::MirageExitFullUdp
         | UdpProtocolId::MirageExitHmacUdp => TransportCamouflage::RawUdp { bind_addr: l1.addr },
         // Canonical wires already returned above; reaching here = enum
-        // exhaustiveness or a future variant we haven't wired yet.
+        // exhaustiveness fall-through.
         UdpProtocolId::Hysteria2Native | UdpProtocolId::QuicXray | UdpProtocolId::AmneziaWg => {
             unreachable!("canonical UDP variants handled above")
         }
-        other => {
-            return Err(MirageError::Config(format!(
-                "chain {}: UDP variant {other:?} not yet wired into client \
-                 establish_udp_chain_tunnel — open issue + add the camouflage arm",
-                chain.chain_id
-            )));
-        }
     };
 
+    // Auth mode must match the server-side `MirageEndpointConfig.auth` so
+    // the canonical handshake dispatch (Blake3 / None / Hmac) lines up.
+    // `MirageExitMinimalUdp` is no-auth; `MirageExitHmacUdp` carries a
+    // per-frame HMAC tag; everything else uses Blake3.
+    let auth_mode = match udp_id {
+        UdpProtocolId::MirageExitMinimalUdp => AuthMode::None,
+        UdpProtocolId::MirageExitHmacUdp => AuthMode::Hmac,
+        _ => AuthMode::Blake3,
+    };
     let endpoint = MirageEndpointConfig {
         transport: TransportKind::Udp,
-        auth: AuthMode::Blake3,
+        auth: auth_mode,
         camouflage,
         byte_cipher: None,
     };
