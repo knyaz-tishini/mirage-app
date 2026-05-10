@@ -316,10 +316,16 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(2000)));
 
     // ── Build ClientRuntime (multi-pool) ──────────────────────────────────────
+    //
+    // `mux_pools` is the full per-chain map — health_watcher chain switches
+    // pick up the matching mux pool without reconnecting. `mux_pool` is the
+    // default chain's pool (legacy single-pool API kept for callers that
+    // don't yet know about the map).
     let runtime = ClientRuntime::new_multi(
         pools.clone(),
         default_chain_id.clone(),
         mux_pool.clone(),
+        mux_pools.clone(),
         config.clone(),
         true,      // mode_socks5 always active
         mode_http,

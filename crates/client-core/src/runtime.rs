@@ -27,8 +27,16 @@ pub struct ClientRuntime {
     /// `chain_id` of the default chain (highest-priority at startup).
     pub default_chain_id: String,
     /// Optional mux pool — present when `config.use_mux` is true.
-    /// Only applies to the default chain.
+    /// Points at the *default chain's* mux pool. Kept for backward compat.
+    /// New code should prefer [`Self::active_mux_pool`] which honours the
+    /// hot-swappable `active_chain_id` for soft cross-chain failover.
     pub mux_pool: Option<Arc<MuxPool>>,
+    /// All mux pools keyed by `chain_id`. Mirrors `pools` so the runtime
+    /// can hold every chain's mux fast-path warm in parallel and the
+    /// health_watcher's chain switch picks up the matching mux pool
+    /// without reconnecting. Empty when `config.use_mux` is false (every
+    /// chain falls back to the plain `TunnelPool` legacy path).
+    pub mux_pools: ArcSwap<HashMap<String, Arc<MuxPool>>>,
     /// `chain_id` of the currently active chain — updated atomically on switch.
     pub active_chain_id: ArcSwap<String>,
     /// Current client configuration.  Stored via ArcSwap to allow future
@@ -67,10 +75,15 @@ impl ClientRuntime {
     ) -> Arc<Self> {
         let mut pools_map = HashMap::new();
         pools_map.insert(active_chain_id.clone(), pool);
+        let mut mux_map: HashMap<String, Arc<MuxPool>> = HashMap::new();
+        if let Some(mp) = mux_pool.clone() {
+            mux_map.insert(active_chain_id.clone(), mp);
+        }
         Arc::new(Self {
             pools: Arc::new(ArcSwap::new(Arc::new(pools_map))),
             default_chain_id: active_chain_id.clone(),
             mux_pool,
+            mux_pools: ArcSwap::new(Arc::new(mux_map)),
             active_chain_id: ArcSwap::new(Arc::new(active_chain_id)),
             config: ArcSwap::new(Arc::new(config)),
             config_version: AtomicU64::new(0),
@@ -84,10 +97,16 @@ impl ClientRuntime {
     }
 
     /// Construct a `ClientRuntime` with multiple pools (multi-chain mode).
+    ///
+    /// `mux_pools` mirrors `pools` keyed by chain_id and is held warm in
+    /// parallel — health_watcher chain switches pick up the matching mux
+    /// pool without reconnecting. Pass an empty map when `use_mux` is off.
+    /// `mux_pool` is the default chain's mux pool (legacy single-pool API).
     pub fn new_multi(
         pools: HashMap<String, Arc<TunnelPool>>,
         default_chain_id: String,
         mux_pool: Option<Arc<MuxPool>>,
+        mux_pools: HashMap<String, Arc<MuxPool>>,
         config: ClientConfig,
         mode_socks5: bool,
         mode_http: bool,
@@ -99,6 +118,7 @@ impl ClientRuntime {
             pools: Arc::new(ArcSwap::new(Arc::new(pools))),
             default_chain_id,
             mux_pool,
+            mux_pools: ArcSwap::new(Arc::new(mux_pools)),
             active_chain_id: ArcSwap::new(Arc::new(active_chain_id)),
             config: ArcSwap::new(Arc::new(config)),
             config_version: AtomicU64::new(0),
@@ -153,6 +173,24 @@ impl ClientRuntime {
         let id = self.active_chain_id.load();
         self.pool_for_chain(id.as_ref())
             .unwrap_or_else(|| self.default_pool())
+    }
+
+    /// Borrow the mux pool for the currently active chain, when present.
+    ///
+    /// On a soft cross-chain failover the health_watcher rotates
+    /// `active_chain_id`; this accessor immediately picks up the new
+    /// chain's mux pool (if it has one) without waiting for a reconnect.
+    /// Returns `None` when the active chain has no mux pool — caller
+    /// drops to the plain `TunnelPool` legacy fallback.
+    pub fn active_mux_pool(&self) -> Option<Arc<MuxPool>> {
+        let id = self.active_chain_id.load();
+        let map = self.mux_pools.load();
+        map.get(id.as_ref()).cloned()
+    }
+
+    /// Atomically replace the entire mux-pool map.
+    pub fn swap_mux_pools(&self, new_pools: HashMap<String, Arc<MuxPool>>) {
+        self.mux_pools.store(Arc::new(new_pools));
     }
 
     /// Load current mode flags as plain bools.

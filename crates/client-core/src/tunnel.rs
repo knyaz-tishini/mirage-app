@@ -544,6 +544,14 @@ mod tests {
             cover_traffic: Default::default(),
             byte_cipher: None,
             socks5_bind: None,
+            websocket_xray: None,
+            shadowtls_v3: None,
+            mirage_websocket: None,
+            vless_reality: None,
+            udp_quic: None,
+            udp_hysteria2: None,
+            udp_hysteria2_native: None,
+            udp_wg: None,
         }
     }
 
