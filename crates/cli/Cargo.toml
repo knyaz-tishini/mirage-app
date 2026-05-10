@@ -11,6 +11,14 @@ path = "src/lib.rs"
 name = "mirage-client-cli"
 path = "src/main.rs"
 
+# Native UDP smoke test — dial a server's `udp_*`-mode endpoint via
+# `run_client_udp`, send a SOCKS-style target frame, print the bytes that
+# come back. Verifies the udp_aggregator NodeConfig path on the server
+# end-to-end without the full SOCKS5/TunnelPool wiring.
+[[bin]]
+name = "mirage-udp-smoke"
+path = "src/bin/udp_smoke.rs"
+
 [dependencies]
 mirage-core          = { workspace = true }
 mirage-protocol      = { workspace = true }
