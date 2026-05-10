@@ -401,23 +401,43 @@ async fn establish_udp_chain_tunnel(
     })?;
     let sni = l1.sni.as_deref().unwrap_or("www.example.com").to_owned();
 
+    // Per-chain UDP secret blocks (`chain.udp_quic` / `udp_hysteria2` /
+    // `udp_hysteria2_native` / `udp_wg`) override the legacy hard-coded
+    // defaults. When the operator has not set a block, we fall back to the
+    // matching `Default::default()` so existing configs keep working — at
+    // the cost of a 32-zero-byte PSK / fixed test password (operator MUST
+    // override these in production, see mirage2monitor/CLAUDE.md).
     let camouflage = match udp_id {
-        UdpProtocolId::MirageQuic => TransportCamouflage::Quic {
-            alpn: vec!["h3".to_owned()],
-            bind_addr: l1.addr,
-        },
-        UdpProtocolId::MirageHysteria2 => TransportCamouflage::Hysteria2 {
-            psk_hex: "00".repeat(32),
-            bind_addr: l1.addr,
-        },
-        UdpProtocolId::MirageWg => TransportCamouflage::WireGuard {
-            magic_byte: 0x04,
-            junk_count: 1,
-            junk_min: 16,
-            junk_max: 64,
-            bind_addr: l1.addr,
-        },
-        UdpProtocolId::MirageUdp => TransportCamouflage::RawUdp { bind_addr: l1.addr },
+        UdpProtocolId::MirageQuic | UdpProtocolId::QuicXray => {
+            let cfg = chain.udp_quic.clone().unwrap_or_default();
+            TransportCamouflage::Quic { alpn: cfg.alpn, bind_addr: l1.addr }
+        }
+        UdpProtocolId::MirageHysteria2 => {
+            let cfg = chain.udp_hysteria2.clone().unwrap_or_default();
+            TransportCamouflage::Hysteria2 { psk_hex: cfg.psk_hex, bind_addr: l1.addr }
+        }
+        UdpProtocolId::Hysteria2Native => {
+            let cfg = chain.udp_hysteria2_native.clone().unwrap_or_default();
+            TransportCamouflage::Hysteria2Native {
+                bind_addr: l1.addr,
+                password: cfg.password,
+                rx_max_mbps: cfg.rx_max_mbps,
+            }
+        }
+        UdpProtocolId::MirageWg => {
+            let cfg = chain.udp_wg.clone().unwrap_or_default();
+            TransportCamouflage::WireGuard {
+                magic_byte: cfg.magic_byte,
+                junk_count: cfg.junk_count,
+                junk_min: cfg.junk_min,
+                junk_max: cfg.junk_max,
+                bind_addr: l1.addr,
+            }
+        }
+        UdpProtocolId::MirageUdp
+        | UdpProtocolId::MirageExitMinimalUdp
+        | UdpProtocolId::MirageExitFullUdp
+        | UdpProtocolId::MirageExitHmacUdp => TransportCamouflage::RawUdp { bind_addr: l1.addr },
         other => {
             return Err(MirageError::Config(format!(
                 "chain {}: UDP variant {other:?} not yet wired into client \
