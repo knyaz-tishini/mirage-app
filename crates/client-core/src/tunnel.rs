@@ -389,17 +389,46 @@ async fn establish_udp_chain_tunnel(
 ) -> Result<Box<dyn Tunnel>, MirageError> {
     let l1 = chain.l1.as_ref().ok_or_else(|| {
         MirageError::Config(format!(
-            "chain {}: UDP chain requires l1 to be set (it carries the UDP exit address)",
+            "chain {}: UDP chain requires l1 to be set (it carries the UDP \
+             dial target — single-hop direct exit OR multi-hop transparent L1)",
             chain.chain_id
         ))
     })?;
-    let server_pubkey = decode_hex_pubkey(&l1.public_key).map_err(|e| {
-        MirageError::Config(format!(
-            "chain {}: L1 public_key invalid: {e}",
-            chain.chain_id
-        ))
-    })?;
-    let sni = l1.sni.as_deref().unwrap_or("www.example.com").to_owned();
+
+    // Multi-hop UDP path: when `chain.l1_transparent == true`, L1 is a plain
+    // `relay::udp_transparent` byte pump (no crypto). Client dials L1's UDP
+    // port but performs the Mirage / QUIC TLS handshake against L2's pubkey
+    // and SNI — same shape as the TCP transparent-relay path. Single-hop UDP
+    // (l1_transparent = false) stays unchanged: handshake against L1 directly.
+    let (server_pubkey, sni) = if chain.l1_transparent {
+        let l2 = chain.l2.as_ref().ok_or_else(|| {
+            MirageError::Config(format!(
+                "chain {}: l1_transparent=true requires l2 to be set (handshake target)",
+                chain.chain_id
+            ))
+        })?;
+        let pk = decode_hex_pubkey(&l2.public_key).map_err(|e| {
+            MirageError::Config(format!(
+                "chain {}: L2 public_key invalid (transparent UDP handshake): {e}",
+                chain.chain_id
+            ))
+        })?;
+        let sni = l2
+            .sni
+            .clone()
+            .or_else(|| l1.sni.clone())
+            .unwrap_or_else(|| "www.example.com".to_owned());
+        (pk, sni)
+    } else {
+        let pk = decode_hex_pubkey(&l1.public_key).map_err(|e| {
+            MirageError::Config(format!(
+                "chain {}: L1 public_key invalid: {e}",
+                chain.chain_id
+            ))
+        })?;
+        let sni = l1.sni.clone().unwrap_or_else(|| "www.example.com".to_owned());
+        (pk, sni)
+    };
 
     // Per-chain UDP secret blocks (`chain.udp_quic` / `udp_hysteria2` /
     // `udp_hysteria2_native` / `udp_wg`) override the legacy hard-coded
