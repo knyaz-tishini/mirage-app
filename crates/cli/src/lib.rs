@@ -13,7 +13,7 @@ use mirage_core::{
     routing::RoutingTable,
 };
 use mirage_protocol::{
-    aliases::{mirage_base, mirage_tls, mirage_websocket},
+    aliases::{mirage_base, mirage_reality, mirage_tls, mirage_websocket},
     canonical::{
         shadowtls_v3::{ShadowTlsV3Config, ShadowTlsV3Protocol},
         vless_reality::{VlessRealityConfig, VlessRealityProtocol},
@@ -692,7 +692,7 @@ fn build_chain_protocol_chain(
                 P::MirageWebsocket,
             )));
         }
-        P::VlessReality | P::MirageReality => {
+        P::VlessReality => {
             // Canonical VLESS+Reality. The wire format embeds a short_id
             // (8 bytes) in the TLS session_id field and the client's
             // ephemeral pubkey in key_share — server has to know the
@@ -720,6 +720,30 @@ fn build_chain_protocol_chain(
                 fallback_dest: cfg.fallback_dest,
             };
             protocols.push(Box::new(VlessRealityProtocol::new(kp, runtime_cfg)));
+        }
+        P::MirageReality => {
+            // Distinct wire — Mirage handshake disguised as Reality. Outer
+            // looks like VLESS+Reality (X25519 in TLS ClientHello) but the
+            // inner stream is Mirage AEAD (Blake3 auth + ChaCha20-Poly1305),
+            // not the canonical VLESS frame.  Server-side dispatch in
+            // `mirage-node::core::management::builder.rs` builds an
+            // EndpointProtocol from `mirage_reality(short_id, server_name)`
+            // — we mirror that here so client + server speak the same wire.
+            //
+            // The short_id and server_name come from the chain's
+            // `vless_reality` block (shared with VlessReality since both
+            // wires use the same Reality outer); fall back to RealityNodeConfig
+            // dev defaults when absent.
+            let cfg = chain.vless_reality.clone().unwrap_or_default();
+            let short_id = cfg
+                .short_ids
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| mirage_core::config::DEFAULT_REALITY_SHORT_ID.to_owned());
+            protocols.push(Box::new(EndpointProtocol::new(
+                mirage_reality(short_id, cfg.server_name),
+                P::MirageReality,
+            )));
         }
         // Mirage / MirageTls / exit endpoints — fall through to default.
         _ => return Ok(None),
