@@ -3,11 +3,15 @@
 use std::{io, net::SocketAddr, time::Duration};
 
 use mirage_core::{
-    config::{ChainConfig, ShapingPreset},
+    config::{
+        AuthMode, ChainConfig, MirageEndpointConfig, ProtocolId, ShapingPreset,
+        TransportCamouflage, TransportKind, UdpProtocolId,
+    },
     error::MirageError,
 };
 use mirage_protocol::{
     byte_cipher::ByteCipherTunnel,
+    driver::run_client_udp,
     frame_obfuscation::patterns,
     negotiation::ProtocolChain,
     onion::layer::NextHop,
@@ -167,6 +171,18 @@ pub async fn establish_raw_tunnel(
             ))
         })??;
         return Ok(Box::new(tunnel));
+    }
+
+    // ── Native UDP chain path ─────────────────────────────────────────────────
+    //
+    // When `chain.protocol` selects a UDP wire variant, we bypass the TCP
+    // ProtocolChain entirely and dial the server's UDP-aggregator endpoint
+    // directly via `mirage_protocol::driver::run_client_udp`. The chain is
+    // single-hop here: `chain.l1` is the UDP exit address; L1 transparent /
+    // hops / l2 are unused. Pairs with stend-gen's UDP aggregator NodeConfig
+    // emission (one per node, all `udp_*` listeners as endpoint_configs[]).
+    if let ProtocolId::Udp(udp_id) = &chain.protocol {
+        return establish_udp_chain_tunnel(chain, *udp_id).await;
     }
 
     // ── Classic two-hop path ──────────────────────────────────────────────────
@@ -354,6 +370,94 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err(format!("invalid hex character: {}", b as char)),
     }
+}
+
+/// Establish a UDP chain tunnel by dialing the server's UDP aggregator
+/// directly via `mirage_protocol::driver::run_client_udp`.
+///
+/// `chain.l1` carries the UDP listener address (the chain is treated as
+/// single-hop for native UDP — no L1 TCP relay). We pick the camouflage
+/// layer based on `udp_id` and use placeholder defaults for any
+/// per-protocol secrets (PSK, password, magic byte) — these MUST match
+/// the values stend-gen wrote into the server's `endpoint_configs[]`. For
+/// production deployments, wire a per-chain config block on `ChainConfig`
+/// (mirroring the TCP `shadowtls_v3` / `vless_reality` fields) so
+/// operators don't have to keep client and server in sync by hand.
+async fn establish_udp_chain_tunnel(
+    chain: &ChainConfig,
+    udp_id: UdpProtocolId,
+) -> Result<Box<dyn Tunnel>, MirageError> {
+    let l1 = chain.l1.as_ref().ok_or_else(|| {
+        MirageError::Config(format!(
+            "chain {}: UDP chain requires l1 to be set (it carries the UDP exit address)",
+            chain.chain_id
+        ))
+    })?;
+    let server_pubkey = decode_hex_pubkey(&l1.public_key).map_err(|e| {
+        MirageError::Config(format!(
+            "chain {}: L1 public_key invalid: {e}",
+            chain.chain_id
+        ))
+    })?;
+    let sni = l1.sni.as_deref().unwrap_or("www.example.com").to_owned();
+
+    let camouflage = match udp_id {
+        UdpProtocolId::MirageQuic => TransportCamouflage::Quic {
+            alpn: vec!["h3".to_owned()],
+            bind_addr: l1.addr,
+        },
+        UdpProtocolId::MirageHysteria2 => TransportCamouflage::Hysteria2 {
+            psk_hex: "00".repeat(32),
+            bind_addr: l1.addr,
+        },
+        UdpProtocolId::MirageWg => TransportCamouflage::WireGuard {
+            magic_byte: 0x04,
+            junk_count: 1,
+            junk_min: 16,
+            junk_max: 64,
+            bind_addr: l1.addr,
+        },
+        UdpProtocolId::MirageUdp => TransportCamouflage::RawUdp { bind_addr: l1.addr },
+        other => {
+            return Err(MirageError::Config(format!(
+                "chain {}: UDP variant {other:?} not yet wired into client \
+                 establish_udp_chain_tunnel — open issue + add the camouflage arm",
+                chain.chain_id
+            )));
+        }
+    };
+
+    let endpoint = MirageEndpointConfig {
+        transport: TransportKind::Udp,
+        auth: AuthMode::Blake3,
+        camouflage,
+        byte_cipher: None,
+    };
+
+    debug!(
+        chain_id = %chain.chain_id,
+        udp_id = ?udp_id,
+        addr = %l1.addr,
+        "establishing UDP chain tunnel"
+    );
+
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+    let tunnel = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        run_client_udp(&endpoint, l1.addr, &server_pubkey, &sni),
+    )
+    .await
+    .map_err(|_| {
+        MirageError::NodeUnreachable(format!(
+            "chain {}: UDP connect to {} timed out after {}s",
+            chain.chain_id,
+            l1.addr,
+            CONNECT_TIMEOUT.as_secs()
+        ))
+    })??;
+
+    debug!(chain_id = %chain.chain_id, "UDP chain tunnel handshake done");
+    Ok(tunnel)
 }
 
 #[cfg(test)]
