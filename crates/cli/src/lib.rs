@@ -13,7 +13,7 @@ use mirage_core::{
     routing::RoutingTable,
 };
 use mirage_protocol::{
-    aliases::{mirage_base, mirage_reality, mirage_tls, mirage_websocket},
+    aliases::{mirage_base, mirage_reality, mirage_tls, mirage_websocket, mirage_xhttp},
     canonical::{
         shadowtls_v3::{ShadowTlsV3Config, ShadowTlsV3Protocol},
         vless_reality::{VlessRealityConfig, VlessRealityProtocol},
@@ -690,6 +690,18 @@ fn build_chain_protocol_chain(
             protocols.push(Box::new(EndpointProtocol::new(
                 mirage_websocket(cfg.path, cfg.host),
                 P::MirageWebsocket,
+            )));
+        }
+        P::Xhttp => {
+            // Mirage handshake + AEAD inside an HTTP/1.1 `Upgrade: xhttp/1`
+            // envelope.  Server and client must agree on path + Host header;
+            // they're carried in the chain's `mirage_xhttp` block, mirrored
+            // from the server-side `NodeConfig.mirage_xhttp` section.  Falls
+            // back to defaults (`/xhttp`, `www.example.com`) when missing.
+            let cfg = chain.mirage_xhttp.clone().unwrap_or_default();
+            protocols.push(Box::new(EndpointProtocol::new(
+                mirage_xhttp(cfg.path, cfg.host),
+                P::Xhttp,
             )));
         }
         P::VlessReality => {
