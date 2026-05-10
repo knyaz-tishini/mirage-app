@@ -4,18 +4,23 @@ use std::{io, net::SocketAddr, time::Duration};
 
 use mirage_core::{
     config::{
-        AuthMode, ChainConfig, MirageEndpointConfig, ProtocolId, ShapingPreset,
-        TransportCamouflage, TransportKind, UdpProtocolId,
+        AmneziaWgConfig, AuthMode, ChainConfig, MirageEndpointConfig, ProtocolId,
+        ShapingPreset, TransportCamouflage, TransportKind, UdpProtocolId,
     },
+    crypto::KeyPair,
     error::MirageError,
 };
 use mirage_protocol::{
     byte_cipher::ByteCipherTunnel,
+    canonical::{
+        amneziawg::AmneziaWgProtocol, hysteria2_native::Hysteria2NativeProtocol,
+        quic_xray::QuicXrayProtocol,
+    },
     driver::run_client_udp,
     frame_obfuscation::patterns,
     negotiation::ProtocolChain,
     onion::layer::NextHop,
-    traits::Tunnel,
+    traits::{Tunnel, UdpProtocol},
 };
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -430,6 +435,101 @@ async fn establish_udp_chain_tunnel(
         (pk, sni)
     };
 
+    // ── Canonical xray-compat UDP wires (Hysteria2Native / QuicXray /
+    // AmneziaWg) — these bypass the Mirage AEAD layer; their `UdpProtocol`
+    // implementations expose a `Tunnel` directly. We must NOT route them
+    // through `run_client_udp` (which explicitly rejects them). Branch off
+    // before building a TransportCamouflage. ───────────────────────────────
+    match udp_id {
+        UdpProtocolId::Hysteria2Native => {
+            let cfg = chain.udp_hysteria2_native.clone().unwrap_or_default();
+            // Canonical Hysteria2 wire: auth via password header, X25519 not
+            // used. Generate a throwaway client KeyPair so the trait signature
+            // is satisfied — server doesn't validate it.
+            let kp = KeyPair::generate();
+            let proto = Hysteria2NativeProtocol::new(kp, cfg.password, cfg.rx_max_mbps)
+                .map_err(|e| MirageError::Config(format!(
+                    "chain {}: Hysteria2NativeProtocol init failed: {e}",
+                    chain.chain_id,
+                )))?;
+            let camouflage_mode = chain.camouflage.clone();
+            const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+            let tunnel = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                proto.connect(l1.addr, &server_pubkey, &sni, camouflage_mode),
+            )
+            .await
+            .map_err(|_| {
+                MirageError::NodeUnreachable(format!(
+                    "chain {}: Hysteria2Native connect to {} timed out after {}s",
+                    chain.chain_id,
+                    l1.addr,
+                    CONNECT_TIMEOUT.as_secs(),
+                ))
+            })??;
+            debug!(chain_id = %chain.chain_id, "Hysteria2Native UDP chain tunnel handshake done");
+            return Ok(tunnel);
+        }
+        UdpProtocolId::QuicXray => {
+            // Canonical xray QUIC: bare QUIC bidirectional stream + ALPN=h3,
+            // no inner Mirage AEAD. `max_streams` defaults to 256 — matches
+            // xray-core defaults.
+            let kp = KeyPair::generate();
+            let proto = QuicXrayProtocol::new(kp, 256).map_err(|e| {
+                MirageError::Config(format!(
+                    "chain {}: QuicXrayProtocol init failed: {e}",
+                    chain.chain_id,
+                ))
+            })?;
+            let camouflage_mode = chain.camouflage.clone();
+            const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+            let tunnel = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                proto.connect(l1.addr, &server_pubkey, &sni, camouflage_mode),
+            )
+            .await
+            .map_err(|_| {
+                MirageError::NodeUnreachable(format!(
+                    "chain {}: QuicXray connect to {} timed out after {}s",
+                    chain.chain_id,
+                    l1.addr,
+                    CONNECT_TIMEOUT.as_secs(),
+                ))
+            })??;
+            debug!(chain_id = %chain.chain_id, "QuicXray UDP chain tunnel handshake done");
+            return Ok(tunnel);
+        }
+        UdpProtocolId::AmneziaWg => {
+            // Canonical amneziawg-go-compat: WireGuard Noise_IK + S1-S4 magic
+            // bytes + Jc/Jmin/Jmax junk burst. Config currently lives at
+            // `mirage_core::config::AmneziaWgConfig` (a node-side block); for
+            // client-only use we accept defaults here. Operators who want
+            // matching server-side params will need a per-chain `udp_amneziawg`
+            // block on `ChainConfig` — pending.
+            let cfg = AmneziaWgConfig::default();
+            let kp = KeyPair::generate();
+            let proto = AmneziaWgProtocol::new(kp, cfg);
+            let camouflage_mode = chain.camouflage.clone();
+            const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+            let tunnel = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                proto.connect(l1.addr, &server_pubkey, &sni, camouflage_mode),
+            )
+            .await
+            .map_err(|_| {
+                MirageError::NodeUnreachable(format!(
+                    "chain {}: AmneziaWg connect to {} timed out after {}s",
+                    chain.chain_id,
+                    l1.addr,
+                    CONNECT_TIMEOUT.as_secs(),
+                ))
+            })??;
+            debug!(chain_id = %chain.chain_id, "AmneziaWg UDP chain tunnel handshake done");
+            return Ok(tunnel);
+        }
+        _ => {} // fall through to the Mirage-over-UDP-camouflage path below
+    }
+
     // Per-chain UDP secret blocks (`chain.udp_quic` / `udp_hysteria2` /
     // `udp_hysteria2_native` / `udp_wg`) override the legacy hard-coded
     // defaults. When the operator has not set a block, we fall back to the
@@ -437,21 +537,13 @@ async fn establish_udp_chain_tunnel(
     // the cost of a 32-zero-byte PSK / fixed test password (operator MUST
     // override these in production, see mirage2monitor/CLAUDE.md).
     let camouflage = match udp_id {
-        UdpProtocolId::MirageQuic | UdpProtocolId::QuicXray => {
+        UdpProtocolId::MirageQuic => {
             let cfg = chain.udp_quic.clone().unwrap_or_default();
             TransportCamouflage::Quic { alpn: cfg.alpn, bind_addr: l1.addr }
         }
         UdpProtocolId::MirageHysteria2 => {
             let cfg = chain.udp_hysteria2.clone().unwrap_or_default();
             TransportCamouflage::Hysteria2 { psk_hex: cfg.psk_hex, bind_addr: l1.addr }
-        }
-        UdpProtocolId::Hysteria2Native => {
-            let cfg = chain.udp_hysteria2_native.clone().unwrap_or_default();
-            TransportCamouflage::Hysteria2Native {
-                bind_addr: l1.addr,
-                password: cfg.password,
-                rx_max_mbps: cfg.rx_max_mbps,
-            }
         }
         UdpProtocolId::MirageWg => {
             let cfg = chain.udp_wg.clone().unwrap_or_default();
@@ -467,6 +559,11 @@ async fn establish_udp_chain_tunnel(
         | UdpProtocolId::MirageExitMinimalUdp
         | UdpProtocolId::MirageExitFullUdp
         | UdpProtocolId::MirageExitHmacUdp => TransportCamouflage::RawUdp { bind_addr: l1.addr },
+        // Canonical wires already returned above; reaching here = enum
+        // exhaustiveness or a future variant we haven't wired yet.
+        UdpProtocolId::Hysteria2Native | UdpProtocolId::QuicXray | UdpProtocolId::AmneziaWg => {
+            unreachable!("canonical UDP variants handled above")
+        }
         other => {
             return Err(MirageError::Config(format!(
                 "chain {}: UDP variant {other:?} not yet wired into client \
