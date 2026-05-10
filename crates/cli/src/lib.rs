@@ -698,14 +698,23 @@ fn build_chain_protocol_chain(
             // ephemeral pubkey in key_share — server has to know the
             // accepted short_ids list (must be a non-empty subset of the
             // server's NodeConfig.reality.short_ids).
-            let cfg = chain.vless_reality.clone().ok_or_else(|| {
-                format!(
-                    "chain {}: protocol={:?} but vless_reality block missing",
-                    chain.chain_id, proto_id
-                )
-            })?;
+            //
+            // When the chain block is absent we fall back to
+            // RealityNodeConfig::default() (shared dev short_id,
+            // cloudflare SNI). Mirrors the server-side default so the
+            // chain still establishes when monitor/registry hasn't been
+            // updated to populate the block. Operators MUST override
+            // for production deploys — same shape as ShadowTlsV3.
+            let cfg = chain
+                .vless_reality
+                .clone()
+                .unwrap_or_default();
             let runtime_cfg = VlessRealityConfig {
-                short_ids: cfg.short_ids,
+                short_ids: if cfg.short_ids.is_empty() {
+                    vec![mirage_core::config::DEFAULT_REALITY_SHORT_ID.to_owned()]
+                } else {
+                    cfg.short_ids
+                },
                 max_time_diff: cfg.max_time_diff,
                 server_name: cfg.server_name,
                 fallback_dest: cfg.fallback_dest,
