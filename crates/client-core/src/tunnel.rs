@@ -592,6 +592,7 @@ async fn establish_udp_chain_tunnel(
         auth: auth_mode,
         camouflage,
         byte_cipher: None,
+        byte_cipher_mode: chain.byte_cipher.clone(),
     };
 
     debug!(

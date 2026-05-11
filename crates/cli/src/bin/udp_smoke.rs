@@ -133,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth: AuthMode::Blake3,
         camouflage,
         byte_cipher: None,
+        byte_cipher_mode: None,
     };
 
     info!(?cli.proto, %cli.addr, "dialing server via UDP camouflage");
