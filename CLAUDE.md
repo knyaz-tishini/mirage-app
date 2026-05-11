@@ -1,5 +1,65 @@
 # mirage2app — agent rules
 
+## Universal `mirage-sentry` + stable cross-LM identity (May 2026)
+
+One crate `crates/sentry/` ships as the **universal sentry binary** — same source deploys to every box (9 server-LMs + N client testers). Mode picked at build time via feature flags:
+
+| Feature | `SENTRY_ROLE` const | Where |
+|---|---|---|
+| `client-mode` (default) | `sentry-client` | tester1 Win, tester2 Mac, future end-user clients |
+| `server-lm-mode` | `sentry-server-lm` | each of the 9 LM boxes |
+| `server-node-mode` | `sentry-server-node` | reserved for relay/exit-only nodes |
+
+Build env:
+
+```bash
+SENTRY_SHORTNAME=tester1 cargo build --release -p mirage-sentry           # client (default)
+SENTRY_SHORTNAME=lm-nl-1 cargo build --release -p mirage-sentry \
+    --no-default-features --features server-lm-mode \
+    --target x86_64-unknown-linux-musl
+```
+
+`SENTRY_SHORTNAME` is **required at build** — `env!` macro panics at compile time if missing. Two reasons:
+- Becomes `SENTRY_SHORTNAME` const that sentry sends in register body so operator can identify the box at a glance.
+- Selects `env/local/slavyanka-<shortname>-ed25519` for slavyanka's `include_str!` embed (each binary embeds a *different* SSH private key, popping one tester loses only its own).
+
+Convenience scripts:
+- `scripts/build-musl-sentry.sh <shortname> [feature]` — Docker musl cross-compile per shortname into `nemo/target-build/sentry-<shortname>/`.
+- `scripts/mirage-sentry.service` — Linux systemd unit (root, restart=always).
+- `scripts/com.zengeld.mirage-sentry.plist` — macOS LaunchAgent (`dev` user, KeepAlive).
+
+### Stable `sentry_id` flow
+
+1. First boot: `ensure_sentry_id(state_dir)` reads `${state_dir}/sentry-id.txt`; if missing, generates UUID v4 and writes atomically (tmp + rename). On subsequent boots the same id is reused.
+2. Register on every reachable LM in parallel, sending `{sentry_id, role, shortname, os, version, supported_transports}`. Monitor (post May-2026 schema, see `mirage2monitor/CLAUDE.md`) accepts the caller-supplied `sentry_id` verbatim as `client_id` — so the same physical box ends up with one identical `client_id` across all 9 LMs instead of 9 random UUIDs.
+3. **Stale-state guard**: if persisted `sentry-state.json` was written by a pre-`sentry_id` build (per-LM `client_id` doesn't match `sentry-id.txt`), wipe and re-register so the converged stable id propagates. No manual cache clear on upgrade.
+4. State directory:
+   - Linux/root: `/root/.local/share/mirage/`
+   - macOS `dev`: `/Users/dev/.local/share/mirage/`
+   - Windows: `%LOCALAPPDATA%/mirage/state/`
+5. Operator-side listing: `GET /relay/clients` on any LM returns rows with `role` + `shortname`; same `client_id` appearing on multiple LMs = same physical sentry, just multi-homed.
+
+### Slave-mode (slavyanka)
+
+`crates/sentry/` spawns `mirage-slavyanka` as an in-process `tokio::task` (NOT a child binary) on `WsServerFrame::debug_tunnel_open { reverse_port }`. Slavyanka opens reverse SSH from the tester out to the dev-box and asks for a remote-port forward back to its own `127.0.0.1:31337` shell wrapper (`cmd.exe` on Windows / `/bin/sh -i` elsewhere). Operator on dev-box does `nc localhost <reverse_port>` and lands in a shell on the tester.
+
+Each sentry embeds its own ed25519 SSH key (`env/local/slavyanka-<shortname>-ed25519`); matching `.pub` must live in dev-box's `~/.ssh/authorized_keys` with a per-shortname comment for auditability.
+
+### Operator triggers slave-mode
+
+```bash
+. nemo/env/mirage2monitor/mirage2monitor.env
+SID=<sentry_id from /relay/clients>            # 32-byte UUID, same across all LMs
+RP=22500                                       # any unused port on dev-box
+curl -sk -X POST -H "Authorization: Bearer $LM_NL_OPERATOR_KEY" \
+  "https://lm-nl-1.zen-geldmaschine.net:19443/relay/clients/$SID/debug/enable" \
+  -H "Content-Type: application/json" -d "{\"reverse_port\":$RP}"
+# Then on dev-box:
+nc localhost $RP                                # shell drops in
+```
+
+`POST .../debug/disable` ends the session and SIGTERMs slavyanka.
+
 ## Sentry / probe terminology (May 2026)
 
 **Sentry** = the always-on monitoring agent on the client; in this workspace that's `mirage-l0-sentinel`. The matching role on a relay/exit **node** is the `mirage2monitor-probe` agent (in the `mirage2monitor` crate) — same concept, two binaries because client and node deployment shapes differ. **Probe** (the noun, distinct from the node-side sentry whose binary happens to be named `mirage2monitor-probe`) = the on-demand SSH-debug worker the sentry spawns when an operator hits the debug API; today's `mirage-debug-shell` binary, conceptually being renamed to `mirage-probe`. From this workspace's perspective only the client-side path matters: monitor pushes `WsServerFrame::DebugTunnelOpen` over the existing WS subscription, sentinel writes `${state_dir}/debug-tunnel.json` and execs the SSH-debug worker. Nodes use a parallel HTTP-driven flow handled entirely on the LM ↔ probe (sentry) leg, documented in `mirage2monitor/CLAUDE.md`.
