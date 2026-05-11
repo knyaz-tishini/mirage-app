@@ -355,7 +355,7 @@ pub async fn establish_mux_tunnel(
 }
 
 /// Decode a 64-character hex string into a 32-byte X25519 public key.
-fn decode_hex_pubkey(hex: &str) -> Result<[u8; 32], String> {
+pub(crate) fn decode_hex_pubkey(hex: &str) -> Result<[u8; 32], String> {
     if hex.len() != 64 {
         return Err(format!("expected 64 hex chars, got {}", hex.len()));
     }

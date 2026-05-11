@@ -29,21 +29,29 @@ use mirage_core::{
     config::{ChainConfig, HandshakeStrategy, HopConfig},
     error::MirageError,
 };
+use crate::tunnel::decode_hex_pubkey;
+use mirage_protocol::camouflage::pipeline::{wrap_tcp_client, BidiStream};
 use mirage_protocol::onion::{
     builder::{build_onion_ephemeral, OnionSession},
     layer::NextHop,
 };
 use mirage_protocol::traits::{TransportInfo, Tunnel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-    TcpStream,
-};
+use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 pub struct OnionTunnel {
-    reader: OwnedReadHalf,
-    writer: OwnedWriteHalf,
+    /// Bidirectional byte stream toward `hops[0]`. May be a raw `TcpStream`
+    /// wrapped in `Box` (legacy / no-camouflage case) or a camouflage-wrapped
+    /// adapter (`Xhttp` / `WebSocket` / `TlsReal` / `Reality` / `Ssh` /
+    /// `Grpc`) when `hops[0].camouflage` is set. The two-axis pipeline
+    /// peels the camouflage at the listener side; this stream just carries
+    /// the onion bytes inside.
+    ///
+    /// Single `Box<dyn BidiStream>` instead of split (read,write) halves
+    /// because the `Tunnel` trait serializes `send` / `recv` through
+    /// `&mut self` — no concurrent r/w on the same tunnel.
+    stream: Box<dyn BidiStream>,
     /// Session keys for reply unwrapping.
     session: OnionSession,
     info: TransportInfo,
@@ -89,19 +97,45 @@ impl OnionTunnel {
             }
         }
 
-        let hop0_addr = resolve_hop_addr(&chain.hops[0]).await?;
+        let hop0 = &chain.hops[0];
+        let hop0_addr = resolve_hop_addr(hop0).await?;
         debug!(hop0 = %hop0_addr, hops = chain.hops.len(), "onion tunnel: connecting to entry hop");
 
         let (onion_bytes, session) =
             build_onion_ephemeral(&chain.hops, &destination, initial_user_data)?;
 
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(hop0_addr),
-        )
-        .await
-        .map_err(|_| MirageError::NodeUnreachable(format!("connect to {} timed out", hop0_addr)))?
-        .map_err(MirageError::Io)?;
+        // Two-axis pipeline: outer camouflage (if `hops[0].camouflage` set)
+        // × inner onion bytes. With camouflage the entry leg looks like
+        // Xhttp / Reality / WS / TLS / SSH / gRPC to DPI; onion bytes ride
+        // inside. The hop's listener must declare the same camouflage in
+        // its `endpoint_configs[]` so the strip pipeline can peel it.
+        let mut stream: Box<dyn BidiStream> = if let Some(cam) = &hop0.camouflage {
+            let pubkey = decode_hex_pubkey(&hop0.public_key).map_err(|e| {
+                MirageError::Config(format!(
+                    "onion tunnel: hop0 public_key invalid: {e}"
+                ))
+            })?;
+            let sni = hop0.sni.as_deref().unwrap_or("");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                wrap_tcp_client(hop0_addr, cam, &pubkey, sni),
+            )
+            .await
+            .map_err(|_| {
+                MirageError::NodeUnreachable(format!(
+                    "camouflage-wrapped connect to {hop0_addr} timed out"
+                ))
+            })??
+        } else {
+            let tcp = tokio::time::timeout(
+                Duration::from_secs(10),
+                TcpStream::connect(hop0_addr),
+            )
+            .await
+            .map_err(|_| MirageError::NodeUnreachable(format!("connect to {} timed out", hop0_addr)))?
+            .map_err(MirageError::Io)?;
+            Box::new(tcp)
+        };
         let len = (onion_bytes.len() as u32).to_be_bytes();
         stream.write_all(&len).await.map_err(MirageError::Io)?;
         stream
@@ -112,11 +146,9 @@ impl OnionTunnel {
         debug!(chain_id = %chain.chain_id, "onion tunnel: initial envelope sent");
 
         let info = TransportInfo::tcp_raw(hop0_addr);
-        let (reader, writer) = stream.into_split();
 
         Ok(OnionTunnel {
-            reader,
-            writer,
+            stream,
             session,
             info,
             recv_buf: Vec::new(),
@@ -238,11 +270,9 @@ impl OnionTunnel {
         .await?;
 
         let info = TransportInfo::tcp_raw(hop0_addr);
-        let (reader, writer) = stream.into_split();
 
         Ok(OnionTunnel {
-            reader,
-            writer,
+            stream: Box::new(stream),
             session,
             info,
             recv_buf: Vec::new(),
@@ -275,7 +305,7 @@ impl Tunnel for OnionTunnel {
     /// After the initial onion envelope the forward direction is unencapsulated:
     /// each intermediate hop simply copies bytes toward the next peer.
     async fn send(&mut self, data: &[u8]) -> Result<(), MirageError> {
-        self.writer.write_all(data).await.map_err(MirageError::Io)
+        self.stream.write_all(data).await.map_err(MirageError::Io)
     }
 
     /// Read and unwrap one framed reply chunk from the onion circuit.
@@ -290,7 +320,7 @@ impl Tunnel for OnionTunnel {
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, MirageError> {
         // Raw mode: server has upgraded to mux framing; bypass AEAD unwrap entirely.
         if self.raw_mode {
-            return self.reader.read(buf).await.map_err(MirageError::Io);
+            return self.stream.read(buf).await.map_err(MirageError::Io);
         }
 
         // Return any bytes that overflowed the caller's buffer on the previous call.
@@ -306,7 +336,7 @@ impl Tunnel for OnionTunnel {
 
         // Accumulate until we have the 4-byte length header.
         while self.recv_buf.len() < 4 {
-            let n = self.reader.read(&mut tmp).await.map_err(MirageError::Io)?;
+            let n = self.stream.read(&mut tmp).await.map_err(MirageError::Io)?;
             if n == 0 {
                 return Ok(0); // EOF
             }
@@ -332,7 +362,7 @@ impl Tunnel for OnionTunnel {
 
         // Accumulate until we have the full frame.
         while self.recv_buf.len() < total {
-            let n = self.reader.read(&mut tmp).await.map_err(MirageError::Io)?;
+            let n = self.stream.read(&mut tmp).await.map_err(MirageError::Io)?;
             if n == 0 {
                 return Err(MirageError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -376,7 +406,7 @@ impl Tunnel for OnionTunnel {
     }
 
     async fn close(&mut self) -> Result<(), MirageError> {
-        let _ = self.writer.shutdown().await;
+        let _ = self.stream.shutdown().await;
         Ok(())
     }
 
