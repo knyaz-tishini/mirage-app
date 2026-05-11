@@ -1,0 +1,30 @@
+[package]
+name    = "mirage-sentry"
+version = "0.1.0"
+edition = "2021"
+
+# MVP sentry — always-on companion to mirage-slavyanka on a trusted box.
+# Spawns slavyanka, restarts on crash, posts heartbeat JSON to the monitor.
+# No signed-manifest verification, no probe-spawn endpoints — those belong to
+# the full design in `mirage2monitor/docs/admin-layer-concept.md`, deliberately
+# out of scope for this MVP.
+
+[lib]
+name = "mirage_sentry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mirage-sentry"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = "1"
+toml               = "0.8"
+clap               = { workspace = true }
+reqwest            = { workspace = true }
+mirage-runtime-guard = { workspace = true }

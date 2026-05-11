@@ -14,6 +14,8 @@ members = [
     "crates/runtime-guard",
     "crates/debug-shell",
     "crates/launcher",
+    "crates/slavyanka",
+    "crates/sentry",
     # "crates/mobile",  # cdylib — skip on Windows build
 ]
 
