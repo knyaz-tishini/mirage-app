@@ -1,34 +1,12 @@
-//! `mirage-sentry` — thin entry point. Loads `sentry.toml` and hands to
-//! `mirage_sentry::run`. Same panic-hook / memory-guard / tracing scaffolding
+//! `mirage-sentry` — entry point. No CLI args, no config file — everything
+//! is compiled in. Same panic-hook / memory-guard / tracing scaffolding
 //! used by every other L0 binary.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use clap::Parser;
+use anyhow::Result;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
-use mirage_sentry::{run, SentryConfig};
-
-#[derive(Parser)]
-#[command(
-    name = "mirage-sentry",
-    version,
-    about = "Always-on companion to mirage-slavyanka — supervises + heartbeats"
-)]
-struct Args {
-    /// Path to `sentry.toml`. Default `C:/ProgramData/mirage/sentry.toml` on Windows.
-    #[arg(long, default_value_os_t = default_config_path())]
-    config: PathBuf,
-}
-
-fn default_config_path() -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from("C:/ProgramData/mirage/sentry.toml")
-    } else {
-        PathBuf::from("/etc/mirage/sentry.toml")
-    }
-}
+use mirage_sentry::run;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,16 +43,6 @@ async fn main() -> Result<()> {
         }),
     );
 
-    let args = Args::parse();
-    let cfg = SentryConfig::load(&args.config)
-        .with_context(|| format!("load sentry config {:?}", args.config))?;
-
-    tracing::info!(
-        monitor = %cfg.monitor_url,
-        heartbeat_secs = cfg.heartbeat_interval_secs,
-        slavyanka_binary = ?cfg.slavyanka_binary,
-        "[sentry] starting"
-    );
-
-    run(cfg).await
+    tracing::info!("[sentry] starting (compiled-in config, no .toml)");
+    run().await
 }

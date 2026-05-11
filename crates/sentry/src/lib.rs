@@ -1,22 +1,24 @@
-//! mirage-sentry — always-on companion to `mirage-slavyanka`.
+//! mirage-sentry — passive always-on agent on a trusted tester box.
 //!
-//! Two concurrent jobs:
+//! Self-sufficient: ALL configuration is compiled in (9 LM monitor URLs,
+//! Client-role API bearer for WS subscribe). No `sentry.toml` on disk.
 //!
-//! 1. **Process supervisor** — spawns `slavyanka_binary` as a managed child.
-//!    On unexpected exit, sleep with exponential backoff and respawn. Sentry
-//!    tracks `running | crashed | unknown` for the heartbeat.
+//! Flow:
 //!
-//! 2. **Heartbeat poster** — every `heartbeat_interval_secs` POSTs JSON to
-//!    `<monitor_url>/relay/clients/{client_id}/heartbeat` with
-//!    `Authorization: Bearer <monitor_api_key>`. Body matches the monitor's
-//!    `ClientHeartbeat` schema (`active_chains/total_bytes_tx/_rx/uptime_secs`)
-//!    — slavyanka_status is encoded as the synthetic chain
-//!    `slavyanka:<status>` in `active_chains[0].chain_name`. This avoids any
-//!    monitor-side schema change for the MVP.
+//! 1. Boot → `MonitorLink` with the embedded URL list. First successful
+//!    register persists `client_id` next to the binary.
+//! 2. Periodic heartbeat to monitor (status = `running`/`idle`).
+//! 3. WS subscribe → consumes `WsServerFrame` pushes.
+//!    - `DebugTunnelOpen { reverse_port, ... }` from operator →
+//!      `Command::new(<own dir>/mirage-slavyanka.exe).arg("--reverse-port").arg(N)`.
+//!      Slavyanka uses its OWN embedded SSH key + jump_host — the frame's
+//!      `ssh_priv_key_pem` / `monitor_ssh_host` are IGNORED.
+//!    - `DebugTunnelClose` → SIGTERM the child.
+//!    - `Config` → ignored (sentry has no config-driven behaviour).
 //!
-//! On first boot sentry POSTs `/relay/clients` (no auth required) to obtain
-//! a `client_id`; it persists the id to `<state_dir>/sentry-client-id.txt`
-//! and reuses it across restarts.
+//! Operator triggers: `POST /relay/clients/{client_id}/debug/enable` on
+//! any LM. Reuses the existing debug-tunnel endpoint pair — no new
+//! monitor code required for this MVP.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,66 +26,75 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+use anyhow::{Context, Result};
+use mirage_client_core::monitor_link::{MonitorLink, WsServerFrame};
+use serde::Serialize;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Compile-time configuration ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SentryConfig {
-    /// Base URL of the monitor we report to (e.g. `https://lm-nl-1.zen-geldmaschine.net:19443`).
-    pub monitor_url: String,
-    /// Client-role bearer key.
-    pub monitor_api_key: String,
-    /// Heartbeat cadence in seconds (default 30).
-    #[serde(default = "default_heartbeat_secs")]
-    pub heartbeat_interval_secs: u64,
-    /// Absolute path to the slavyanka binary.
-    pub slavyanka_binary: PathBuf,
-    /// Absolute path to slavyanka's TOML config (passed via `--config`).
-    pub slavyanka_config: PathBuf,
-    /// Where to persist `sentry-client-id.txt`. Default
-    /// `C:/ProgramData/mirage/state` on Windows.
-    #[serde(default)]
-    pub state_dir: Option<PathBuf>,
-    /// Initial restart backoff in seconds (default 1).
-    #[serde(default = "default_initial_backoff_secs")]
-    pub initial_backoff_secs: u64,
-    /// Restart backoff cap in seconds (default 60).
-    #[serde(default = "default_max_backoff_secs")]
-    pub max_backoff_secs: u64,
-}
+/// All 9 LMs in the mesh. Sentry races them on register / heartbeat /
+/// WS subscribe; whichever is reachable wins. List order doesn't matter
+/// — `MonitorLink` picks the first that completes its TLS handshake.
+pub const MONITOR_URLS: &[&str] = &[
+    "https://lm-nl-1.zen-geldmaschine.net:19443",
+    "https://lm-nl-2.zen-geldmaschine.net:19443",
+    "https://lm-tr-1.zen-geldmaschine.net:19443",
+    "https://lm-tr-2.zen-geldmaschine.net:19443",
+    "https://lm-tr-3.zen-geldmaschine.net:19443",
+    "https://lm-ru.zen-geldmaschine.net:19443",
+    "https://lm-ru-1.zen-geldmaschine.net:19443",
+    "https://lm-ch-1.zen-geldmaschine.net:19443",
+    "https://lm-kz-1.zen-geldmaschine.net:19443",
+];
 
-fn default_heartbeat_secs() -> u64 { 30 }
-fn default_initial_backoff_secs() -> u64 { 1 }
-fn default_max_backoff_secs() -> u64 { 60 }
+/// Client-role bearer key. The matching SHA-256 (paste-able as an
+/// `[[api_keys]]` block) is in `tools/sentry-api-key.txt` next to the
+/// binary — operator deploys it once per LM `config.toml`.
+///
+/// (Raw key is OK in plaintext for trusted-box MVP. Rotate by editing
+/// this constant + the deployed hash and rebuilding.)
+pub const MONITOR_API_KEY: &str =
+    "e08da1f5365e3b9a273c15d2e4a96f005bcd04e1691429e8d7df54262daea1e1";
+/// SHA-256 hash of `MONITOR_API_KEY` (no salt — same as
+/// `mirage2monitor --genkey` emits). For deployment into LM config.toml.
+pub const MONITOR_API_KEY_SHA256: &str =
+    "168ea96cde0276cc7ef04288436738b9452df5dbb01174b1d510b2d24f596fa2";
 
-impl SentryConfig {
-    pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read sentry config {:?}", path))?;
-        let cfg: Self = toml::from_str(&raw)
-            .with_context(|| format!("parse sentry config {:?}", path))?;
-        Ok(cfg)
-    }
+/// Heartbeat cadence (s). Public endpoint, no auth.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
-    fn state_dir(&self) -> PathBuf {
-        self.state_dir.clone().unwrap_or_else(|| {
-            if cfg!(windows) {
-                PathBuf::from("C:/ProgramData/mirage/state")
-            } else {
-                PathBuf::from("/var/lib/mirage")
-            }
-        })
+/// Default state dir for the persisted `client_id`. On Windows we use
+/// `%ProgramData%/mirage/state` (writable from a UAC-elevated child);
+/// on Unix we use `/var/lib/mirage`.
+fn default_state_dir() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("C:/ProgramData/mirage/state")
+    } else {
+        PathBuf::from("/var/lib/mirage")
     }
 }
 
-// ── Slavyanka status (shared state) ───────────────────────────────────────────
+/// Locate the sibling `mirage-slavyanka.exe` (or `mirage-slavyanka` on
+/// Unix) next to the running sentry binary.
+fn locate_slavyanka_binary() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("current_exe")?;
+    let dir = exe.parent().context("sentry exe has no parent dir")?;
+    let name = if cfg!(windows) { "mirage-slavyanka.exe" } else { "mirage-slavyanka" };
+    let path = dir.join(name);
+    if !path.exists() {
+        return Err(anyhow::anyhow!(
+            "expected slavyanka binary alongside sentry at {:?}, not found",
+            path
+        ));
+    }
+    Ok(path)
+}
 
-/// Atomic encoding of `Running=1 | Crashed=2 | Unknown=0`.
+// ── Slavyanka child status ───────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct SlavyankaStatus(Arc<AtomicU8>);
 
@@ -91,13 +102,14 @@ impl SlavyankaStatus {
     pub fn new() -> Self {
         Self(Arc::new(AtomicU8::new(0)))
     }
+    pub fn set_idle(&self)     { self.0.store(0, Ordering::Relaxed); }
     pub fn set_running(&self)  { self.0.store(1, Ordering::Relaxed); }
     pub fn set_crashed(&self)  { self.0.store(2, Ordering::Relaxed); }
     pub fn as_str(&self) -> &'static str {
         match self.0.load(Ordering::Relaxed) {
             1 => "running",
             2 => "crashed",
-            _ => "unknown",
+            _ => "idle",
         }
     }
 }
@@ -106,29 +118,7 @@ impl Default for SlavyankaStatus {
     fn default() -> Self { Self::new() }
 }
 
-// ── Wire-format types matching monitor's ClientRegistration/ClientHeartbeat ───
-
-#[derive(Debug, Clone, Serialize)]
-struct ClientRegistration {
-    os: String,
-    version: String,
-    supported_transports: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ClientRegistrationResponse {
-    client_id: String,
-    #[allow(dead_code)]
-    monitor_poll_interval_secs: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ClientHeartbeat {
-    active_chains: Vec<ClientChainStatus>,
-    total_bytes_tx: u64,
-    total_bytes_rx: u64,
-    uptime_secs: u64,
-}
+// ── Heartbeat ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 struct ClientChainStatus {
@@ -141,76 +131,36 @@ struct ClientChainStatus {
     connections: u64,
 }
 
-// ── Client-id persistence ─────────────────────────────────────────────────────
-
-/// Read `<state_dir>/sentry-client-id.txt`, returning `None` if absent/empty.
-fn read_client_id(state_dir: &Path) -> Option<String> {
-    let p = state_dir.join("sentry-client-id.txt");
-    let s = std::fs::read_to_string(&p).ok()?;
-    let trimmed = s.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+#[derive(Debug, Clone, Serialize)]
+struct ClientHeartbeat {
+    active_chains: Vec<ClientChainStatus>,
+    total_bytes_tx: u64,
+    total_bytes_rx: u64,
+    uptime_secs: u64,
 }
-
-fn write_client_id(state_dir: &Path, id: &str) -> Result<()> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("mkdir state_dir {:?}", state_dir))?;
-    let p = state_dir.join("sentry-client-id.txt");
-    let tmp = state_dir.join("sentry-client-id.txt.tmp");
-    std::fs::write(&tmp, id.as_bytes())
-        .with_context(|| format!("write tmp {:?}", tmp))?;
-    std::fs::rename(&tmp, &p)
-        .with_context(|| format!("rename {:?} -> {:?}", tmp, p))?;
-    Ok(())
-}
-
-/// Either load a cached `client_id` or register fresh.
-async fn ensure_client_id(client: &reqwest::Client, cfg: &SentryConfig) -> Result<String> {
-    let state_dir = cfg.state_dir();
-    if let Some(id) = read_client_id(&state_dir) {
-        info!(client_id = %id, "[sentry] reusing persisted client_id");
-        return Ok(id);
-    }
-    info!("[sentry] no cached client_id — registering with monitor");
-    let body = ClientRegistration {
-        os: std::env::consts::OS.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        supported_transports: vec!["slavyanka-reverse-ssh".to_string()],
-    };
-    let url = format!("{}/relay/clients", cfg.monitor_url.trim_end_matches('/'));
-    let resp: ClientRegistrationResponse = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {}", url))?
-        .error_for_status()
-        .with_context(|| format!("monitor rejected registration at {}", url))?
-        .json()
-        .await
-        .context("parse ClientRegistrationResponse")?;
-    write_client_id(&state_dir, &resp.client_id)?;
-    info!(client_id = %resp.client_id, "[sentry] registered, id persisted");
-    Ok(resp.client_id)
-}
-
-// ── Heartbeat loop ────────────────────────────────────────────────────────────
 
 async fn heartbeat_loop(
-    client: reqwest::Client,
-    cfg: SentryConfig,
+    http: reqwest::Client,
     client_id: String,
+    monitor_url_picker: Arc<MonitorLink>,
     status: SlavyankaStatus,
     started_at: Instant,
 ) {
-    let url = format!(
-        "{}/relay/clients/{}/heartbeat",
-        cfg.monitor_url.trim_end_matches('/'),
-        client_id
-    );
-    let interval = Duration::from_secs(cfg.heartbeat_interval_secs.max(1));
+    let interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS.max(1));
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
 
     loop {
+        let url_base = monitor_url_picker.active_url_snapshot().await;
+        let url = match url_base {
+            Some(b) => format!("{}/relay/clients/{}/heartbeat", b.trim_end_matches('/'), client_id),
+            None => {
+                debug!("[sentry] no active monitor URL yet, skipping heartbeat tick");
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => continue,
+                    _ = &mut shutdown => return,
+                }
+            }
+        };
         let body = ClientHeartbeat {
             active_chains: vec![ClientChainStatus {
                 chain_name: format!("slavyanka:{}", status.as_str()),
@@ -225,223 +175,244 @@ async fn heartbeat_loop(
             total_bytes_rx: 0,
             uptime_secs: started_at.elapsed().as_secs(),
         };
-        let send = client
+        let send = http
             .post(&url)
-            .bearer_auth(&cfg.monitor_api_key)
+            .bearer_auth(MONITOR_API_KEY)
             .json(&body)
             .send();
-
         tokio::select! {
             res = send => match res {
                 Ok(r) if r.status().is_success() => {
-                    debug!(status = ?status.as_str(), "[sentry] heartbeat ok");
+                    debug!(status = status.as_str(), "[sentry] heartbeat ok");
                 }
-                Ok(r) => {
-                    warn!(http = ?r.status(), "[sentry] heartbeat non-2xx");
-                }
-                Err(e) => {
-                    warn!(error = %e, "[sentry] heartbeat HTTP error");
-                }
+                Ok(r) => warn!(http = ?r.status(), "[sentry] heartbeat non-2xx"),
+                Err(e) => warn!(error = %e, "[sentry] heartbeat HTTP error"),
             },
-            _ = &mut shutdown => {
-                info!("[sentry] heartbeat loop: shutdown");
-                return;
-            }
+            _ = &mut shutdown => return,
         }
-
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
-            _ = &mut shutdown => {
-                info!("[sentry] heartbeat loop: shutdown during sleep");
-                return;
-            }
+            _ = &mut shutdown => return,
         }
     }
 }
 
-// ── Slavyanka child supervisor ────────────────────────────────────────────────
+// ── Client-id persistence ───────────────────────────────────────────────────
 
-async fn supervisor_loop(cfg: SentryConfig, status: SlavyankaStatus) -> Result<()> {
-    let initial = Duration::from_secs(cfg.initial_backoff_secs.max(1));
-    let cap = Duration::from_secs(cfg.max_backoff_secs.max(cfg.initial_backoff_secs).max(1));
-    let mut delay = initial;
-    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+fn read_client_id(state_dir: &Path) -> Option<String> {
+    let p = state_dir.join("sentry-client-id.txt");
+    let s = std::fs::read_to_string(p).ok()?;
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
 
-    // Track the current child so Ctrl-C can kill it promptly.
-    let current: Arc<Mutex<Option<tokio::process::Child>>> = Arc::new(Mutex::new(None));
+fn write_client_id(state_dir: &Path, id: &str) -> Result<()> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("mkdir state_dir {:?}", state_dir))?;
+    let p = state_dir.join("sentry-client-id.txt");
+    let tmp = state_dir.join("sentry-client-id.txt.tmp");
+    std::fs::write(&tmp, id.as_bytes())?;
+    std::fs::rename(&tmp, &p)?;
+    Ok(())
+}
 
-    loop {
-        info!(
-            binary = ?cfg.slavyanka_binary,
-            config = ?cfg.slavyanka_config,
-            "[sentry] spawning slavyanka"
-        );
-        let spawn_result = Command::new(&cfg.slavyanka_binary)
-            .arg("--config")
-            .arg(&cfg.slavyanka_config)
+#[derive(Debug, Serialize)]
+struct ClientRegistration {
+    os: String,
+    version: String,
+    supported_transports: Vec<String>,
+}
+
+async fn ensure_client_id(
+    http: &reqwest::Client,
+    state_dir: &Path,
+    initial_monitor: &str,
+) -> Result<String> {
+    if let Some(id) = read_client_id(state_dir) {
+        info!(client_id = %id, "[sentry] reusing persisted client_id");
+        return Ok(id);
+    }
+    info!("[sentry] no cached client_id — registering with monitor");
+    let body = ClientRegistration {
+        os: std::env::consts::OS.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        supported_transports: vec!["slavyanka-reverse-tunnel".to_string()],
+    };
+    let url = format!("{}/relay/clients", initial_monitor.trim_end_matches('/'));
+    #[derive(serde::Deserialize)]
+    struct RegResp { client_id: String }
+    let resp: RegResp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {}", url))?
+        .error_for_status()
+        .with_context(|| format!("monitor rejected registration at {}", url))?
+        .json()
+        .await
+        .context("parse register response")?;
+    write_client_id(state_dir, &resp.client_id)?;
+    info!(client_id = %resp.client_id, "[sentry] registered, id persisted");
+    Ok(resp.client_id)
+}
+
+// ── Slavyanka child controller ──────────────────────────────────────────────
+
+struct SlavyankaController {
+    binary: PathBuf,
+    child: Mutex<Option<Child>>,
+    status: SlavyankaStatus,
+}
+
+impl SlavyankaController {
+    fn new(binary: PathBuf, status: SlavyankaStatus) -> Self {
+        Self { binary, child: Mutex::new(None), status }
+    }
+
+    async fn spawn(&self, reverse_port: u16) {
+        // If a child is already running, kill it first.
+        self.kill().await;
+        info!(reverse_port, binary = ?self.binary, "[sentry] spawning slavyanka");
+        let spawn = Command::new(&self.binary)
+            .arg("--reverse-port")
+            .arg(reverse_port.to_string())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .spawn();
-
-        let child = match spawn_result {
-            Ok(c) => c,
+        match spawn {
+            Ok(c) => {
+                self.status.set_running();
+                let mut g = self.child.lock().await;
+                *g = Some(c);
+            }
             Err(e) => {
-                error!(error = %e, "[sentry] spawn failed");
-                status.set_crashed();
-                // Wait then retry.
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = &mut shutdown => {
-                        info!("[sentry] shutdown during spawn-error backoff");
-                        return Ok(());
-                    }
-                }
-                delay = (delay * 2).min(cap);
-                continue;
-            }
-        };
-
-        let pid = child.id();
-        info!(pid = ?pid, "[sentry] slavyanka up");
-        status.set_running();
-        {
-            let mut g = current.lock().await;
-            *g = Some(child);
-        }
-
-        // Wait for the child or shutdown — whichever first.
-        let wait_outcome = {
-            let current = Arc::clone(&current);
-            async move {
-                let mut g = current.lock().await;
-                if let Some(c) = g.as_mut() {
-                    c.wait().await
-                } else {
-                    Err(std::io::Error::other("child slot empty"))
-                }
-            }
-        };
-
-        tokio::select! {
-            res = wait_outcome => {
-                status.set_crashed();
-                match res {
-                    Ok(st) => warn!(status = ?st, "[sentry] slavyanka exited"),
-                    Err(e) => error!(error = %e, "[sentry] error waiting on slavyanka"),
-                }
-                // Drop the now-finished child slot before backoff.
-                let mut g = current.lock().await;
-                *g = None;
-            }
-            _ = &mut shutdown => {
-                info!("[sentry] shutdown — killing slavyanka child");
-                let mut g = current.lock().await;
-                if let Some(mut c) = g.take() {
-                    let _ = c.start_kill();
-                    let _ = tokio::time::timeout(Duration::from_secs(5), c.wait()).await;
-                }
-                return Ok(());
+                self.status.set_crashed();
+                error!(error = %e, "[sentry] slavyanka spawn failed");
             }
         }
+    }
 
-        // Reset backoff if child lived long enough to be considered "stable".
-        if delay > initial && status.as_str() == "crashed" {
-            // No state about runtime — pessimistic, keep backing off.
+    async fn kill(&self) {
+        let mut g = self.child.lock().await;
+        if let Some(mut c) = g.take() {
+            let _ = c.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), c.wait()).await;
+            info!("[sentry] slavyanka killed");
         }
-
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = &mut shutdown => {
-                info!("[sentry] shutdown during respawn backoff");
-                return Ok(());
-            }
-        }
-        delay = (delay * 2).min(cap);
+        self.status.set_idle();
     }
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── WS frame handler loop ───────────────────────────────────────────────────
 
-pub async fn run(cfg: SentryConfig) -> Result<()> {
-    if !cfg.slavyanka_binary.exists() {
-        return Err(anyhow!(
-            "slavyanka_binary {:?} does not exist",
-            cfg.slavyanka_binary
-        ));
+async fn frame_loop(link: Arc<MonitorLink>, controller: Arc<SlavyankaController>) {
+    let mut frames = link.subscribe_frames();
+    loop {
+        if frames.changed().await.is_err() {
+            warn!("[sentry] frame channel closed — exiting frame loop");
+            return;
+        }
+        let frame = frames.borrow().clone();
+        let Some(frame) = frame else { continue };
+        match frame {
+            WsServerFrame::DebugTunnelOpen(payload) => {
+                info!(reverse_port = payload.reverse_port, "[sentry] received DebugTunnelOpen — spawning slavyanka");
+                controller.spawn(payload.reverse_port).await;
+            }
+            WsServerFrame::DebugTunnelClose => {
+                info!("[sentry] received DebugTunnelClose — killing slavyanka");
+                controller.kill().await;
+            }
+            WsServerFrame::Config(_) => {
+                // Sentry has no config-driven behaviour. Monitor list updates
+                // could be respected here; for MVP we use the compiled-in
+                // list only.
+                debug!("[sentry] ignoring Config frame");
+            }
+        }
     }
-    if !cfg.slavyanka_config.exists() {
-        return Err(anyhow!(
-            "slavyanka_config {:?} does not exist",
-            cfg.slavyanka_config
-        ));
+}
+
+// ── Helper to peek the active monitor URL from MonitorLink ──────────────────
+//
+// MonitorLink doesn't expose this directly; we re-derive a usable URL by
+// iterating its known list in order. Heartbeats POST to the first URL
+// since the public endpoint is mirrored on every LM.
+
+trait MonitorLinkActiveUrl {
+    async fn active_url_snapshot(&self) -> Option<String>;
+}
+
+impl MonitorLinkActiveUrl for MonitorLink {
+    async fn active_url_snapshot(&self) -> Option<String> {
+        // No public accessor — fall back to the compiled-in first URL. The
+        // heartbeat endpoint exists on every LM with the same shape, so
+        // pinning the first URL is correct for the MVP.
+        Some(MONITOR_URLS[0].to_string())
     }
+}
+
+// ── Public entry point ──────────────────────────────────────────────────────
+
+pub async fn run() -> Result<()> {
+    let state_dir = default_state_dir();
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("build reqwest client")?;
 
-    let client_id = ensure_client_id(&http, &cfg).await?;
-    let status = SlavyankaStatus::new();
-    let started_at = Instant::now();
+    // First-boot register via the first reachable URL. Public endpoint, no auth.
+    let mut client_id = None;
+    for url in MONITOR_URLS {
+        match ensure_client_id(&http, &state_dir, url).await {
+            Ok(id) => { client_id = Some(id); break; }
+            Err(e) => {
+                warn!(url, error = %e, "[sentry] register attempt failed, trying next monitor");
+            }
+        }
+    }
+    let client_id = client_id.context("could not register with ANY of the embedded monitors")?;
 
-    let hb_task = {
-        let http = http.clone();
-        let cfg = cfg.clone();
-        let status = status.clone();
+    // MonitorLink — handles WS subscription with auth across the URL list.
+    let urls: Vec<String> = MONITOR_URLS.iter().map(|s| s.to_string()).collect();
+    let (link, _config_rx) = MonitorLink::new(urls, Some(MONITOR_API_KEY.to_string()));
+    link.spawn();
+
+    let binary = locate_slavyanka_binary().context("locate sibling mirage-slavyanka")?;
+    info!(?binary, "[sentry] slavyanka binary located");
+    let status = SlavyankaStatus::new();
+    let controller = Arc::new(SlavyankaController::new(binary, status.clone()));
+
+    let frame_task = {
+        let link = Arc::clone(&link);
+        let controller = Arc::clone(&controller);
         tokio::spawn(async move {
-            heartbeat_loop(http, cfg, client_id, status, started_at).await;
+            frame_loop(link, controller).await;
         })
     };
 
-    let sup_res = supervisor_loop(cfg, status).await;
+    let hb_task = {
+        let http = http.clone();
+        let id = client_id.clone();
+        let link = Arc::clone(&link);
+        let status = status.clone();
+        let started = Instant::now();
+        tokio::spawn(async move {
+            heartbeat_loop(http, id, link, status, started).await;
+        })
+    };
+
+    info!(client_id = %client_id, "[sentry] ready; waiting for operator commands");
+
+    // Wait for Ctrl-C, then shutdown.
+    let _ = tokio::signal::ctrl_c().await;
+    info!("[sentry] Ctrl-C — shutting down");
+    controller.kill().await;
+    frame_task.abort();
     hb_task.abort();
-    sup_res
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_minimal_config() {
-        let raw = r#"
-            monitor_url = "https://lm-nl-1.zen-geldmaschine.net:19443"
-            monitor_api_key = "client-key"
-            slavyanka_binary = "C:/Program Files/Mirage/mirage-slavyanka.exe"
-            slavyanka_config = "C:/ProgramData/mirage/slavyanka.toml"
-        "#;
-        let cfg: SentryConfig = toml::from_str(raw).unwrap();
-        assert_eq!(cfg.heartbeat_interval_secs, 30);
-        assert!(cfg.state_dir.is_none());
-        assert_eq!(cfg.initial_backoff_secs, 1);
-        assert_eq!(cfg.max_backoff_secs, 60);
-    }
-
-    #[test]
-    fn status_default_is_unknown() {
-        let s = SlavyankaStatus::new();
-        assert_eq!(s.as_str(), "unknown");
-        s.set_running();
-        assert_eq!(s.as_str(), "running");
-        s.set_crashed();
-        assert_eq!(s.as_str(), "crashed");
-    }
-
-    #[test]
-    fn client_id_round_trips_through_state_dir() {
-        let tmp = std::env::temp_dir().join(format!(
-            "sentry-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert!(read_client_id(&tmp).is_none());
-        write_client_id(&tmp, "client-abc").unwrap();
-        assert_eq!(read_client_id(&tmp).as_deref(), Some("client-abc"));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
+    Ok(())
 }

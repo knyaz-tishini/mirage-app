@@ -1,33 +1,28 @@
-//! `mirage-slavyanka` — thin entry point that loads `slavyanka.toml` and hands
-//! off to `mirage_slavyanka::run`. Mirrors the panic-hook / memory-guard /
-//! tracing-init boilerplate used by the rest of the L0 binaries.
+//! `mirage-slavyanka` — operator-triggered reverse-tunnel for OUR own box.
+//!
+//! Spawned by `mirage-sentry` on `DebugTunnelOpen` push from the monitor.
+//! Receives ONE runtime arg — `--reverse-port` — the port the LM/dev-box
+//! forwards back to this host. Everything else (SSH key, jump host, user,
+//! SOCKS5 hop) is compiled in.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
-use mirage_slavyanka::{run, SlavyankaConfig};
+use mirage_slavyanka::run;
 
 #[derive(Parser)]
 #[command(
     name = "mirage-slavyanka",
     version,
-    about = "Reverse-SSH worker — punches a hole from this host out to a Mirage LM"
+    about = "Reverse-tunnel worker — spawned by mirage-sentry on operator request"
 )]
 struct Args {
-    /// Path to `slavyanka.toml`. Default `C:/ProgramData/mirage/slavyanka.toml` on Windows.
-    #[arg(long, default_value_os_t = default_config_path())]
-    config: PathBuf,
-}
-
-fn default_config_path() -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from("C:/ProgramData/mirage/slavyanka.toml")
-    } else {
-        PathBuf::from("/etc/mirage/slavyanka.toml")
-    }
+    /// Port on dev-box (or wherever we SSH out to) that ends up forwarded
+    /// to tester1's local shell wrapper.
+    #[arg(long, default_value_t = 22500)]
+    reverse_port: u16,
 }
 
 #[tokio::main]
@@ -66,17 +61,6 @@ async fn main() -> Result<()> {
     );
 
     let args = Args::parse();
-    let cfg = SlavyankaConfig::load(&args.config)
-        .with_context(|| format!("load slavyanka config {:?}", args.config))?;
-
-    tracing::info!(
-        jump_host = %cfg.jump_host,
-        jump_user = %cfg.jump_user,
-        reverse_port = cfg.reverse_port,
-        target_local_port = cfg.target_local_port,
-        socks5 = ?cfg.socks5_proxy,
-        "[slavyanka] starting"
-    );
-
-    run(cfg).await
+    tracing::info!(reverse_port = args.reverse_port, "[slavyanka] starting");
+    run(args.reverse_port).await
 }
