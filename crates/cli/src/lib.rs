@@ -9,16 +9,10 @@ use std::{
 
 use mirage_core::{
     config::{ChainConfig, ClientConfig, ProtocolId, TcpProtocolId},
-    crypto::KeyPair,
     routing::RoutingTable,
 };
 use mirage_protocol::{
-    aliases::{mirage_base, mirage_reality, mirage_tls, mirage_websocket, mirage_xhttp},
-    canonical::{
-        shadowtls_v3::{ShadowTlsV3Config, ShadowTlsV3Protocol},
-        vless_reality::{VlessRealityConfig, VlessRealityProtocol},
-        websocket_xray::WebsocketXrayProtocol,
-    },
+    aliases::{mirage_base, mirage_websocket, mirage_xhttp},
     negotiation::ProtocolChain,
     traits::TcpProtocol,
 };
@@ -125,12 +119,10 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         mirage_base(),
         TcpProtocolId::Mirage,
     )));
-    if config.psk.is_some() {
-        default_protocols.push(Box::new(EndpointProtocol::new(
-            mirage_tls("cloudflare.com", vec!["h2".into(), "http/1.1".into()]),
-            TcpProtocolId::MirageShadowTls,
-        )));
-    }
+    // (Removed: PSK-gated MirageShadowTls fallback — variant deleted from
+    // TcpProtocolId. Foreign ShadowTLS clients now connect directly to an
+    // L1 EntryNode's standalone entrypoint; mirage-client-cli no longer
+    // dials canonical ShadowTLS.)
     let default_chain_protocols = Arc::new(ProtocolChain::new(default_protocols));
 
     // Client identity keypair (decoded from config.private_key) — required for
@@ -650,34 +642,13 @@ fn build_chain_protocol_chain(
         ProtocolId::Udp(_) => return Ok(None), // UDP chains use a different driver path
     };
 
-    let kp = KeyPair::from_secret(*client_keypair_bytes);
+    let _ = client_keypair_bytes; // kept for future canonical-wire reintroduction; mirage-family endpoints don't need it
     let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
     match proto_id {
-        P::WebsocketXray => {
-            let cfg = chain.websocket_xray.clone().ok_or_else(|| {
-                format!(
-                    "chain {}: protocol=WebsocketXray but websocket_xray block missing",
-                    chain.chain_id
-                )
-            })?;
-            protocols.push(Box::new(WebsocketXrayProtocol::new(kp, cfg.path, cfg.host)));
-        }
-        P::ShadowTlsV3 | P::MirageShadowTls => {
-            let cfg = chain.shadowtls_v3.clone().ok_or_else(|| {
-                format!(
-                    "chain {}: protocol={:?} but shadowtls_v3 block missing",
-                    chain.chain_id, proto_id
-                )
-            })?;
-            let runtime_cfg = ShadowTlsV3Config {
-                psk: cfg.psk,
-                backend_host: cfg.backend_host,
-                backend_port: cfg.backend_port,
-            };
-            let proto = ShadowTlsV3Protocol::new(kp, &runtime_cfg)
-                .map_err(|e| format!("chain {}: ShadowTlsV3Protocol::new failed: {e}", chain.chain_id))?;
-            protocols.push(Box::new(proto));
-        }
+        // Foreign vanilla wires (WebsocketXray / ShadowTlsV3 / VlessReality /
+        // MirageReality / MirageShadowTls) are no longer client-side concerns —
+        // variants deleted from TcpProtocolId. Foreign clients connect directly
+        // to L1 EntryNode standalone entrypoints.
         P::MirageWebsocket => {
             // Mirage-family WebSocket camouflage. Uses the EndpointProtocol
             // abstraction (same shape as the legacy `mirage_base` /
@@ -702,59 +673,6 @@ fn build_chain_protocol_chain(
             protocols.push(Box::new(EndpointProtocol::new(
                 mirage_xhttp(cfg.path, cfg.host),
                 P::Xhttp,
-            )));
-        }
-        P::VlessReality => {
-            // Canonical VLESS+Reality. The wire format embeds a short_id
-            // (8 bytes) in the TLS session_id field and the client's
-            // ephemeral pubkey in key_share — server has to know the
-            // accepted short_ids list (must be a non-empty subset of the
-            // server's NodeConfig.reality.short_ids).
-            //
-            // When the chain block is absent we fall back to
-            // RealityNodeConfig::default() (shared dev short_id,
-            // cloudflare SNI). Mirrors the server-side default so the
-            // chain still establishes when monitor/registry hasn't been
-            // updated to populate the block. Operators MUST override
-            // for production deploys — same shape as ShadowTlsV3.
-            let cfg = chain
-                .vless_reality
-                .clone()
-                .unwrap_or_default();
-            let runtime_cfg = VlessRealityConfig {
-                short_ids: if cfg.short_ids.is_empty() {
-                    vec![mirage_core::config::DEFAULT_REALITY_SHORT_ID.to_owned()]
-                } else {
-                    cfg.short_ids
-                },
-                max_time_diff: cfg.max_time_diff,
-                server_name: cfg.server_name,
-                fallback_dest: cfg.fallback_dest,
-            };
-            protocols.push(Box::new(VlessRealityProtocol::new(kp, runtime_cfg)));
-        }
-        P::MirageReality => {
-            // Distinct wire — Mirage handshake disguised as Reality. Outer
-            // looks like VLESS+Reality (X25519 in TLS ClientHello) but the
-            // inner stream is Mirage AEAD (Blake3 auth + ChaCha20-Poly1305),
-            // not the canonical VLESS frame.  Server-side dispatch in
-            // `mirage-node::core::management::builder.rs` builds an
-            // EndpointProtocol from `mirage_reality(short_id, server_name)`
-            // — we mirror that here so client + server speak the same wire.
-            //
-            // The short_id and server_name come from the chain's
-            // `vless_reality` block (shared with VlessReality since both
-            // wires use the same Reality outer); fall back to RealityNodeConfig
-            // dev defaults when absent.
-            let cfg = chain.vless_reality.clone().unwrap_or_default();
-            let short_id = cfg
-                .short_ids
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| mirage_core::config::DEFAULT_REALITY_SHORT_ID.to_owned());
-            protocols.push(Box::new(EndpointProtocol::new(
-                mirage_reality(short_id, cfg.server_name),
-                P::MirageReality,
             )));
         }
         // Mirage / MirageTls / exit endpoints — fall through to default.

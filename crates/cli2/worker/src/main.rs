@@ -29,7 +29,7 @@ use mirage_core::{
     routing::RoutingTable,
 };
 use mirage_protocol::{
-    aliases::{mirage_base, mirage_tls},
+    aliases::mirage_base,
     negotiation::ProtocolChain,
     traits::TcpProtocol,
 };
@@ -139,12 +139,8 @@ async fn main() -> anyhow::Result<()> {
         mirage_base(),
         TcpProtocolId::Mirage,
     )));
-    if client_config.psk.is_some() {
-        protocols.push(Box::new(EndpointProtocol::new(
-            mirage_tls("cloudflare.com", vec!["h2".into(), "http/1.1".into()]),
-            TcpProtocolId::MirageShadowTls,
-        )));
-    }
+    // (Removed: PSK-gated MirageShadowTls fallback — variant deleted from
+    // TcpProtocolId. See mirage2app/crates/cli/src/lib.rs for context.)
     let chain_protocols = Arc::new(ProtocolChain::new(protocols));
 
     // Build tunnel pool.
