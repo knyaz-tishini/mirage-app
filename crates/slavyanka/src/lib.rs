@@ -52,11 +52,17 @@ pub const SHELL_WRAPPER_PORT: u16 = 31337;
 /// back to direct TCP — useful on the same LAN as the dev-box.
 pub const SOCKS5_PROXY: &str = "127.0.0.1:10800";
 
-/// Embedded ed25519 priv key for `DEV_BOX_SSH_USER@DEV_BOX_SSH_HOST`.
-/// Generated once at build-time; the matching pub is in dev-box's
-/// `~/.ssh/authorized_keys`. Trusted-box mode — no passphrase.
-const EMBEDDED_SSH_PRIV: &str =
-    include_str!("../../../../env/local/slavyanka-tester1-ed25519");
+/// Embedded ed25519 priv key, selected at build-time by `SENTRY_SHORTNAME`.
+/// Path: `nemo/env/local/slavyanka-<shortname>-ed25519`.
+/// Matching `.pub` must live in dev-box's `~/.ssh/authorized_keys` (one entry
+/// per shortname so a popped sentry only loses its own key). Trusted-box
+/// mode — no passphrase. Build fails loud if `SENTRY_SHORTNAME` is unset.
+const EMBEDDED_SSH_PRIV: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../env/local/slavyanka-",
+    env!("SENTRY_SHORTNAME"),
+    "-ed25519"
+));
 
 // ── Reconnect backoff bounds ──────────────────────────────────────────────────
 

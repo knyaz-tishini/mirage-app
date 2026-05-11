@@ -17,6 +17,12 @@ path = "src/lib.rs"
 name = "mirage-sentry"
 path = "src/main.rs"
 
+[features]
+default          = ["client-mode"]
+client-mode      = []
+server-lm-mode   = []
+server-node-mode = []
+
 [dependencies]
 tokio              = { workspace = true }
 serde              = { workspace = true }
@@ -26,4 +32,9 @@ tracing-subscriber = { workspace = true }
 anyhow             = "1"
 reqwest            = { workspace = true }
 mirage-runtime-guard = { workspace = true }
-mirage-client-core   = { workspace = true }
+mirage-slavyanka     = { path = "../slavyanka" }
+rustls               = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-tungstenite    = { workspace = true }
+futures-util         = "0.3"
+futures              = "0.3"
+uuid                 = { version = "1", features = ["v4"] }

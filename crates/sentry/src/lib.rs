@@ -21,23 +21,42 @@
 //! monitor code required for this MVP.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use mirage_client_core::monitor_link::{MonitorLink, WsServerFrame};
+use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tracing::{debug, info, warn};
 
 // ── Compile-time configuration ────────────────────────────────────────────────
 
 /// All 9 LMs in the mesh. Sentry races them on register / heartbeat /
 /// WS subscribe; whichever is reachable wins. List order doesn't matter
 /// — `MonitorLink` picks the first that completes its TLS handshake.
+/// All 9 LMs. DNS form only — `reqwest`'s resolver gets pre-populated
+/// (host → IP) below so TLS cert validation works against the hostname
+/// AND we bypass the tester's potentially-broken OS-level DNS.
+///
+/// Source: `mirage2monitor/CLAUDE.md` "9-LM full-clique mesh".
+#[cfg(feature = "server-lm-mode")]
+pub const SENTRY_ROLE: &str = "sentry-server-lm";
+#[cfg(feature = "server-node-mode")]
+pub const SENTRY_ROLE: &str = "sentry-server-node";
+#[cfg(any(
+    feature = "client-mode",
+    not(any(feature = "server-lm-mode", feature = "server-node-mode"))
+))]
+pub const SENTRY_ROLE: &str = "sentry-client";
+
+/// Optional human label baked at build time via SENTRY_SHORTNAME env var.
+/// Examples: "tester1", "tester2", "lm-nl-1", "box-91.218".
+pub const SENTRY_SHORTNAME: Option<&str> = option_env!("SENTRY_SHORTNAME");
+
 pub const MONITOR_URLS: &[&str] = &[
     "https://lm-nl-1.zen-geldmaschine.net:19443",
     "https://lm-nl-2.zen-geldmaschine.net:19443",
@@ -48,6 +67,20 @@ pub const MONITOR_URLS: &[&str] = &[
     "https://lm-ru-1.zen-geldmaschine.net:19443",
     "https://lm-ch-1.zen-geldmaschine.net:19443",
     "https://lm-kz-1.zen-geldmaschine.net:19443",
+];
+
+/// `(hostname, ip:port)` pairs fed into `reqwest::ClientBuilder::resolve`.
+/// IPs from `mirage2monitor/CLAUDE.md` "9-LM full-clique mesh" table.
+const HOST_TO_IP: &[(&str, &str)] = &[
+    ("lm-nl-1.zen-geldmaschine.net", "45.12.212.226:19443"),
+    ("lm-nl-2.zen-geldmaschine.net", "151.243.173.104:19443"),
+    ("lm-tr-1.zen-geldmaschine.net", "103.231.75.166:19443"),
+    ("lm-tr-2.zen-geldmaschine.net", "82.26.94.247:19443"),
+    ("lm-tr-3.zen-geldmaschine.net", "103.231.75.144:19443"),
+    ("lm-ru.zen-geldmaschine.net",   "193.187.94.74:19443"),
+    ("lm-ru-1.zen-geldmaschine.net", "91.218.245.247:19443"),
+    ("lm-ch-1.zen-geldmaschine.net", "45.59.119.139:19443"),
+    ("lm-kz-1.zen-geldmaschine.net", "91.212.166.95:19443"),
 ];
 
 /// Client-role bearer key. The matching SHA-256 (paste-able as an
@@ -66,34 +99,30 @@ pub const MONITOR_API_KEY_SHA256: &str =
 /// Heartbeat cadence (s). Public endpoint, no auth.
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
-/// Default state dir for the persisted `client_id`. On Windows we use
-/// `%ProgramData%/mirage/state` (writable from a UAC-elevated child);
-/// on Unix we use `/var/lib/mirage`.
+/// Default state dir for persisted state. Uses `%LOCALAPPDATA%/mirage/state`
+/// on Windows (writable for the current user — no UAC), `~/.local/share/
+/// mirage` on Unix, falls back to the system temp dir as a last resort.
 fn default_state_dir() -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from("C:/ProgramData/mirage/state")
-    } else {
-        PathBuf::from("/var/lib/mirage")
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            if !local.is_empty() {
+                return PathBuf::from(local).join("mirage").join("state");
+            }
+        }
     }
+    #[cfg(unix)]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                return PathBuf::from(home).join(".local/share/mirage");
+            }
+        }
+    }
+    std::env::temp_dir().join("mirage").join("state")
 }
 
-/// Locate the sibling `mirage-slavyanka.exe` (or `mirage-slavyanka` on
-/// Unix) next to the running sentry binary.
-fn locate_slavyanka_binary() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("current_exe")?;
-    let dir = exe.parent().context("sentry exe has no parent dir")?;
-    let name = if cfg!(windows) { "mirage-slavyanka.exe" } else { "mirage-slavyanka" };
-    let path = dir.join(name);
-    if !path.exists() {
-        return Err(anyhow::anyhow!(
-            "expected slavyanka binary alongside sentry at {:?}, not found",
-            path
-        ));
-    }
-    Ok(path)
-}
-
-// ── Slavyanka child status ───────────────────────────────────────────────────
+// ── Slavyanka task status ───────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct SlavyankaStatus(Arc<AtomicU8>);
@@ -139,10 +168,10 @@ struct ClientHeartbeat {
     uptime_secs: u64,
 }
 
+/// Heartbeat to ALL registered LMs in parallel every interval.
 async fn heartbeat_loop(
     http: reqwest::Client,
-    client_id: String,
-    monitor_url_picker: Arc<MonitorLink>,
+    registrations: Vec<LmRegistration>,
     status: SlavyankaStatus,
     started_at: Instant,
 ) {
@@ -150,17 +179,6 @@ async fn heartbeat_loop(
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
 
     loop {
-        let url_base = monitor_url_picker.active_url_snapshot().await;
-        let url = match url_base {
-            Some(b) => format!("{}/relay/clients/{}/heartbeat", b.trim_end_matches('/'), client_id),
-            None => {
-                debug!("[sentry] no active monitor URL yet, skipping heartbeat tick");
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => continue,
-                    _ = &mut shutdown => return,
-                }
-            }
-        };
         let body = ClientHeartbeat {
             active_chains: vec![ClientChainStatus {
                 chain_name: format!("slavyanka:{}", status.as_str()),
@@ -175,19 +193,28 @@ async fn heartbeat_loop(
             total_bytes_rx: 0,
             uptime_secs: started_at.elapsed().as_secs(),
         };
-        let send = http
-            .post(&url)
-            .bearer_auth(MONITOR_API_KEY)
-            .json(&body)
-            .send();
-        tokio::select! {
-            res = send => match res {
-                Ok(r) if r.status().is_success() => {
-                    debug!(status = status.as_str(), "[sentry] heartbeat ok");
+        let body_arc = Arc::new(body);
+        let mut tasks = Vec::new();
+        for reg in &registrations {
+            let url = format!(
+                "{}/relay/clients/{}/heartbeat",
+                reg.url.trim_end_matches('/'),
+                reg.client_id
+            );
+            let http = http.clone();
+            let body = Arc::clone(&body_arc);
+            let lm_label = reg.url.clone();
+            tasks.push(tokio::spawn(async move {
+                match http.post(&url).bearer_auth(MONITOR_API_KEY).json(&*body).send().await {
+                    Ok(r) if r.status().is_success() => debug!(lm = %lm_label, "[sentry] heartbeat ok"),
+                    Ok(r) => warn!(lm = %lm_label, http = ?r.status(), "[sentry] heartbeat non-2xx"),
+                    Err(e) => debug!(lm = %lm_label, error = %e, "[sentry] heartbeat HTTP error"),
                 }
-                Ok(r) => warn!(http = ?r.status(), "[sentry] heartbeat non-2xx"),
-                Err(e) => warn!(error = %e, "[sentry] heartbeat HTTP error"),
-            },
+            }));
+        }
+        let heartbeats = futures::future::join_all(tasks);
+        tokio::select! {
+            _ = heartbeats => {}
             _ = &mut shutdown => return,
         }
         tokio::select! {
@@ -197,21 +224,44 @@ async fn heartbeat_loop(
     }
 }
 
-// ── Client-id persistence ───────────────────────────────────────────────────
+// ── State persistence ───────────────────────────────────────────────────────
 
-fn read_client_id(state_dir: &Path) -> Option<String> {
-    let p = state_dir.join("sentry-client-id.txt");
-    let s = std::fs::read_to_string(p).ok()?;
-    let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+/// One LM registration. `client_id` is what THAT LM minted for us; it's
+/// not usable against any other LM (peer replication is async and
+/// unreliable). We persist the full list so reachability survives
+/// individual LMs going dark.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct LmRegistration {
+    url: String,
+    client_id: String,
 }
 
-fn write_client_id(state_dir: &Path, id: &str) -> Result<()> {
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct SentryState {
+    /// All LMs where we successfully registered, paired with each one's
+    /// minted client_id. We hold WS subscription + heartbeat against
+    /// every entry simultaneously so an operator hitting `/debug/enable`
+    /// on ANY of these LMs reaches us.
+    registrations: Vec<LmRegistration>,
+}
+
+fn state_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("sentry-state.json")
+}
+
+fn read_state(state_dir: &Path) -> Option<SentryState> {
+    let p = state_file(state_dir);
+    let s = std::fs::read_to_string(&p).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn write_state(state_dir: &Path, state: &SentryState) -> Result<()> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("mkdir state_dir {:?}", state_dir))?;
-    let p = state_dir.join("sentry-client-id.txt");
-    let tmp = state_dir.join("sentry-client-id.txt.tmp");
-    std::fs::write(&tmp, id.as_bytes())?;
+    let p = state_file(state_dir);
+    let tmp = state_dir.join("sentry-state.json.tmp");
+    let bytes = serde_json::to_vec_pretty(state).context("serialize SentryState")?;
+    std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, &p)?;
     Ok(())
 }
@@ -221,137 +271,290 @@ struct ClientRegistration {
     os: String,
     version: String,
     supported_transports: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sentry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shortname: Option<String>,
 }
 
-async fn ensure_client_id(
+/// Read or generate a stable per-box sentry id, persisted next to the other
+/// sentry state. The same id is sent to every LM as `sentry_id` so all 9
+/// `LmRegistration` rows end up with one common `client_id` — operator can
+/// recognise "this is the same physical sentry, registered everywhere".
+fn ensure_sentry_id(state_dir: &Path) -> Result<String> {
+    let p = state_dir.join("sentry-id.txt");
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("mkdir state_dir {:?}", state_dir))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let tmp = state_dir.join("sentry-id.txt.tmp");
+    std::fs::write(&tmp, &id).with_context(|| format!("write tmp {:?}", tmp))?;
+    std::fs::rename(&tmp, &p).with_context(|| format!("rename {:?} -> {:?}", tmp, p))?;
+    Ok(id)
+}
+
+#[derive(serde::Deserialize)]
+struct RegResp {
+    client_id: String,
+}
+
+/// Register on ALL 9 LMs in parallel, collect every success. Sentry needs
+/// to be reachable from any LM the operator might choose, so we hold
+/// concurrent WS + heartbeat against each one (their per-LM client_ids
+/// can differ since LM peer replication is unreliable; we track every
+/// pair). Errors on failed LMs are non-fatal — partial coverage still
+/// works for ops on the LMs that DID accept us.
+async fn ensure_state(
     http: &reqwest::Client,
     state_dir: &Path,
-    initial_monitor: &str,
-) -> Result<String> {
-    if let Some(id) = read_client_id(state_dir) {
-        info!(client_id = %id, "[sentry] reusing persisted client_id");
-        return Ok(id);
+    sentry_id: &str,
+) -> Result<SentryState> {
+    if let Some(st) = read_state(state_dir) {
+        // Invalidate stale state from pre-sentry_id builds: if any cached row
+        // disagrees with the persisted `sentry-id.txt`, force fresh register
+        // so all 9 LMs converge on the stable id.
+        let all_match = !st.registrations.is_empty()
+            && st.registrations.iter().all(|r| r.client_id == sentry_id);
+        if all_match {
+            info!(
+                count = st.registrations.len(),
+                "[sentry] reusing persisted state ({} LMs, stable id confirmed)",
+                st.registrations.len()
+            );
+            return Ok(st);
+        }
+        warn!(
+            cached = st.registrations.len(),
+            "[sentry] cached state predates stable sentry_id — re-registering everywhere"
+        );
     }
-    info!("[sentry] no cached client_id — registering with monitor");
-    let body = ClientRegistration {
+    info!("[sentry] no usable cached state — registering on ALL 9 monitors in parallel");
+
+    let body = Arc::new(ClientRegistration {
         os: std::env::consts::OS.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         supported_transports: vec!["slavyanka-reverse-tunnel".to_string()],
-    };
-    let url = format!("{}/relay/clients", initial_monitor.trim_end_matches('/'));
-    #[derive(serde::Deserialize)]
-    struct RegResp { client_id: String }
-    let resp: RegResp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {}", url))?
-        .error_for_status()
-        .with_context(|| format!("monitor rejected registration at {}", url))?
-        .json()
-        .await
-        .context("parse register response")?;
-    write_client_id(state_dir, &resp.client_id)?;
-    info!(client_id = %resp.client_id, "[sentry] registered, id persisted");
-    Ok(resp.client_id)
+        sentry_id: Some(sentry_id.to_string()),
+        role: Some(SENTRY_ROLE.to_string()),
+        shortname: SENTRY_SHORTNAME.map(String::from),
+    });
+
+    let mut tasks = Vec::new();
+    for url in MONITOR_URLS {
+        let http = http.clone();
+        let body = Arc::clone(&body);
+        let url_owned = (*url).to_string();
+        tasks.push(tokio::spawn(async move {
+            let endpoint = format!("{}/relay/clients", url_owned.trim_end_matches('/'));
+            let resp = http
+                .post(&endpoint)
+                .json(&*body)
+                .send()
+                .await
+                .map_err(|e| (url_owned.clone(), anyhow::anyhow!("{e}")))?;
+            if !resp.status().is_success() {
+                return Err((url_owned, anyhow::anyhow!("HTTP {}", resp.status())));
+            }
+            let parsed: RegResp = resp
+                .json()
+                .await
+                .map_err(|e| (url_owned.clone(), anyhow::anyhow!("parse: {e}")))?;
+            Ok::<LmRegistration, (String, anyhow::Error)>(LmRegistration {
+                url: url_owned,
+                client_id: parsed.client_id,
+            })
+        }));
+    }
+
+    // Collect ALL — wait for every task, keep successes.
+    let mut registrations = Vec::new();
+    for h in tasks {
+        match h.await {
+            Ok(Ok(reg)) => {
+                info!(url = %reg.url, client_id = %reg.client_id, "[sentry] registered");
+                registrations.push(reg);
+            }
+            Ok(Err((url, e))) => {
+                warn!(url, error = %e, "[sentry] register failed on this LM");
+            }
+            Err(je) => warn!(error = %je, "[sentry] register task panicked"),
+        }
+    }
+
+    if registrations.is_empty() {
+        return Err(anyhow::anyhow!("ALL 9 monitors rejected registration"));
+    }
+
+    let st = SentryState { registrations };
+    if let Err(e) = write_state(state_dir, &st) {
+        warn!(error = %e, "[sentry] failed to persist state — continuing in-memory");
+    }
+    info!(count = st.registrations.len(), "[sentry] persisted state");
+    Ok(st)
 }
 
-// ── Slavyanka child controller ──────────────────────────────────────────────
+// ── Slavyanka task controller ─────────────────────────────────────────────
+//
+// Slavyanka lives as an in-process tokio task — NOT a child binary. The
+// `mirage-slavyanka` library exposes `pub async fn run(reverse_port)`;
+// we spawn it under a `JoinHandle` and abort the handle on the close
+// command. This eliminates the path-lookup, child-process, separate-log
+// failure modes the operator pushed back on.
 
 struct SlavyankaController {
-    binary: PathBuf,
-    child: Mutex<Option<Child>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
     status: SlavyankaStatus,
 }
 
 impl SlavyankaController {
-    fn new(binary: PathBuf, status: SlavyankaStatus) -> Self {
-        Self { binary, child: Mutex::new(None), status }
+    fn new(status: SlavyankaStatus) -> Self {
+        Self { handle: Mutex::new(None), status }
     }
 
     async fn spawn(&self, reverse_port: u16) {
-        // If a child is already running, kill it first.
+        // If a task is already running, abort it first.
         self.kill().await;
-        info!(reverse_port, binary = ?self.binary, "[sentry] spawning slavyanka");
-        let spawn = Command::new(&self.binary)
-            .arg("--reverse-port")
-            .arg(reverse_port.to_string())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn();
-        match spawn {
-            Ok(c) => {
-                self.status.set_running();
-                let mut g = self.child.lock().await;
-                *g = Some(c);
+        info!(reverse_port, "[sentry] spawning slavyanka (in-process task)");
+        let status = self.status.clone();
+        let h = tokio::spawn(async move {
+            status.set_running();
+            if let Err(e) = mirage_slavyanka::run(reverse_port).await {
+                warn!(error = %e, "[sentry] slavyanka task ended with error");
+                status.set_crashed();
+            } else {
+                info!("[sentry] slavyanka task ended cleanly");
+                status.set_idle();
             }
-            Err(e) => {
-                self.status.set_crashed();
-                error!(error = %e, "[sentry] slavyanka spawn failed");
-            }
-        }
+        });
+        let mut g = self.handle.lock().await;
+        *g = Some(h);
     }
 
     async fn kill(&self) {
-        let mut g = self.child.lock().await;
-        if let Some(mut c) = g.take() {
-            let _ = c.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(5), c.wait()).await;
-            info!("[sentry] slavyanka killed");
+        let mut g = self.handle.lock().await;
+        if let Some(h) = g.take() {
+            h.abort();
+            info!("[sentry] slavyanka task aborted");
         }
         self.status.set_idle();
     }
 }
 
-// ── WS frame handler loop ───────────────────────────────────────────────────
+// ── WS subscription (one task per registered LM) ───────────────────────────
+//
+// Each registered LM gets its own WS subscription. All subscriptions feed
+// into one shared mpsc<DispatchFrame> consumed by the controller below.
 
-async fn frame_loop(link: Arc<MonitorLink>, controller: Arc<SlavyankaController>) {
-    let mut frames = link.subscribe_frames();
+#[derive(Debug)]
+enum DispatchFrame {
+    SpawnSlavyanka { reverse_port: u16 },
+    KillSlavyanka,
+}
+
+/// Keep a WS subscription to one (url, client_id) pair alive forever,
+/// auto-reconnecting on failure. Each incoming server frame is parsed and
+/// dispatched via `tx`.
+async fn ws_subscribe_loop(
+    reg: LmRegistration,
+    tx: mpsc::Sender<DispatchFrame>,
+) {
+    // Build the wss:// subscribe URL. Original LM URL is `https://host:port`;
+    // for WebSocket the scheme becomes `wss`, path is `/relay/clients/subscribe`,
+    // query carries `client_id` so monitor routes per-client pushes.
+    let ws_url = {
+        let base = reg
+            .url
+            .trim_end_matches('/')
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+        format!("{}/relay/clients/subscribe?client_id={}", base, reg.client_id)
+    };
+
     loop {
-        if frames.changed().await.is_err() {
-            warn!("[sentry] frame channel closed — exiting frame loop");
-            return;
+        match ws_once(&ws_url, &tx).await {
+            Ok(()) => debug!(lm = %reg.url, "[sentry] ws connection closed cleanly, reconnecting in 5s"),
+            Err(e) => debug!(lm = %reg.url, error = %e, "[sentry] ws error, reconnecting in 5s"),
         }
-        let frame = frames.borrow().clone();
-        let Some(frame) = frame else { continue };
-        match frame {
-            WsServerFrame::DebugTunnelOpen(payload) => {
-                info!(reverse_port = payload.reverse_port, "[sentry] received DebugTunnelOpen — spawning slavyanka");
-                controller.spawn(payload.reverse_port).await;
-            }
-            WsServerFrame::DebugTunnelClose => {
-                info!("[sentry] received DebugTunnelClose — killing slavyanka");
-                controller.kill().await;
-            }
-            WsServerFrame::Config(_) => {
-                // Sentry has no config-driven behaviour. Monitor list updates
-                // could be respected here; for MVP we use the compiled-in
-                // list only.
-                debug!("[sentry] ignoring Config frame");
-            }
-        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
-// ── Helper to peek the active monitor URL from MonitorLink ──────────────────
-//
-// MonitorLink doesn't expose this directly; we re-derive a usable URL by
-// iterating its known list in order. Heartbeats POST to the first URL
-// since the public endpoint is mirrored on every LM.
+async fn ws_once(ws_url: &str, tx: &mpsc::Sender<DispatchFrame>) -> Result<()> {
+    // Bearer auth on the upgrade request. Build a Request manually so we
+    // can attach headers.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = ws_url
+        .into_client_request()
+        .context("ws url -> request")?;
+    let auth = format!("Bearer {}", MONITOR_API_KEY);
+    req.headers_mut().insert(
+        "Authorization",
+        auth.parse().context("invalid auth header")?,
+    );
 
-trait MonitorLinkActiveUrl {
-    async fn active_url_snapshot(&self) -> Option<String>;
+    let (ws_stream, _resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .context("ws connect")?;
+    debug!("[sentry] ws connected");
+
+    let (mut write, mut read) = ws_stream.split();
+
+    while let Some(msg) = read.next().await {
+        let msg = msg.context("ws recv")?;
+        match msg {
+            WsMessage::Text(text) => {
+                if let Some(frame) = parse_frame(&text) {
+                    let _ = tx.send(frame).await;
+                }
+            }
+            WsMessage::Ping(p) => {
+                let _ = write.send(WsMessage::Pong(p)).await;
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
-impl MonitorLinkActiveUrl for MonitorLink {
-    async fn active_url_snapshot(&self) -> Option<String> {
-        // No public accessor — fall back to the compiled-in first URL. The
-        // heartbeat endpoint exists on every LM with the same shape, so
-        // pinning the first URL is correct for the MVP.
-        Some(MONITOR_URLS[0].to_string())
+/// Parse one server-pushed JSON frame. Only the spawn / kill variants
+/// matter for sentry — Config and unknown kinds are dropped silently.
+fn parse_frame(text: &str) -> Option<DispatchFrame> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let kind = v.get("kind").and_then(|k| k.as_str())?;
+    match kind {
+        "debug_tunnel_open" => {
+            let reverse_port = v.get("reverse_port").and_then(|p| p.as_u64())? as u16;
+            Some(DispatchFrame::SpawnSlavyanka { reverse_port })
+        }
+        "debug_tunnel_close" => Some(DispatchFrame::KillSlavyanka),
+        _ => None,
+    }
+}
+
+/// Drain the dispatch mpsc and act on each frame.
+async fn dispatch_loop(
+    mut rx: mpsc::Receiver<DispatchFrame>,
+    controller: Arc<SlavyankaController>,
+) {
+    while let Some(frame) = rx.recv().await {
+        match frame {
+            DispatchFrame::SpawnSlavyanka { reverse_port } => {
+                info!(reverse_port, "[sentry] spawn-slavyanka requested");
+                controller.spawn(reverse_port).await;
+            }
+            DispatchFrame::KillSlavyanka => {
+                info!("[sentry] kill-slavyanka requested");
+                controller.kill().await;
+            }
+        }
     }
 }
 
@@ -359,60 +562,92 @@ impl MonitorLinkActiveUrl for MonitorLink {
 
 pub async fn run() -> Result<()> {
     let state_dir = default_state_dir();
+    info!(?state_dir, "[sentry] state dir");
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("build reqwest client")?;
+    // Stable id minted once on this box, shared with every LM so all 9
+    // registrations collapse to one logical client.
+    let sentry_id = ensure_sentry_id(&state_dir)?;
+    info!(sentry_id = %sentry_id, role = SENTRY_ROLE, "[sentry] identity");
 
-    // First-boot register via the first reachable URL. Public endpoint, no auth.
-    let mut client_id = None;
-    for url in MONITOR_URLS {
-        match ensure_client_id(&http, &state_dir, url).await {
-            Ok(id) => { client_id = Some(id); break; }
-            Err(e) => {
-                warn!(url, error = %e, "[sentry] register attempt failed, trying next monitor");
-            }
+    // Pre-populate DNS so reqwest bypasses the OS resolver. TLS cert
+    // still validates against hostname (matches LM cert), no
+    // danger_accept_invalid_certs needed.
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+    for (host, ipport) in HOST_TO_IP {
+        match ipport.parse::<std::net::SocketAddr>() {
+            Ok(sa) => builder = builder.resolve(host, sa),
+            Err(e) => warn!(host, ipport, error = %e, "[sentry] bad HOST_TO_IP"),
         }
     }
-    let client_id = client_id.context("could not register with ANY of the embedded monitors")?;
+    let http = builder.build().context("build reqwest client")?;
 
-    // MonitorLink — handles WS subscription with auth across the URL list.
-    let urls: Vec<String> = MONITOR_URLS.iter().map(|s| s.to_string()).collect();
-    let (link, _config_rx) = MonitorLink::new(urls, Some(MONITOR_API_KEY.to_string()));
-    link.spawn();
+    // Register on ALL reachable LMs. Sentry NEVER exits on register
+    // failure — retry forever every 60s if NONE accept.
+    let state = loop {
+        match ensure_state(&http, &state_dir, &sentry_id).await {
+            Ok(s) => break s,
+            Err(e) => {
+                warn!(error = %e, "[sentry] register failed on every LM — retrying in 60s");
+                let mut sleep = Box::pin(tokio::time::sleep(Duration::from_secs(60)));
+                let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+                tokio::select! {
+                    _ = &mut sleep => continue,
+                    _ = &mut shutdown => {
+                        info!("[sentry] shutdown during register retry");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
 
-    let binary = locate_slavyanka_binary().context("locate sibling mirage-slavyanka")?;
-    info!(?binary, "[sentry] slavyanka binary located");
+    info!(
+        count = state.registrations.len(),
+        "[sentry] active on {} LMs: {:?}",
+        state.registrations.len(),
+        state.registrations.iter().map(|r| &r.url).collect::<Vec<_>>()
+    );
+
+    // Slavyanka as in-process tokio task.
     let status = SlavyankaStatus::new();
-    let controller = Arc::new(SlavyankaController::new(binary, status.clone()));
+    let controller = Arc::new(SlavyankaController::new(status.clone()));
 
-    let frame_task = {
-        let link = Arc::clone(&link);
+    // Multi-WS subscriber: one task per LM, feeding into a single mpsc.
+    let (frame_tx, frame_rx) = mpsc::channel::<DispatchFrame>(64);
+    let mut ws_tasks: Vec<JoinHandle<()>> = Vec::new();
+    for reg in &state.registrations {
+        let tx = frame_tx.clone();
+        let reg = reg.clone();
+        ws_tasks.push(tokio::spawn(async move {
+            ws_subscribe_loop(reg, tx).await;
+        }));
+    }
+    drop(frame_tx); // dispatch_loop exits when all senders drop.
+
+    let dispatch_task = {
         let controller = Arc::clone(&controller);
         tokio::spawn(async move {
-            frame_loop(link, controller).await;
+            dispatch_loop(frame_rx, controller).await;
         })
     };
 
     let hb_task = {
         let http = http.clone();
-        let id = client_id.clone();
-        let link = Arc::clone(&link);
+        let regs = state.registrations.clone();
         let status = status.clone();
         let started = Instant::now();
         tokio::spawn(async move {
-            heartbeat_loop(http, id, link, status, started).await;
+            heartbeat_loop(http, regs, status, started).await;
         })
     };
 
-    info!(client_id = %client_id, "[sentry] ready; waiting for operator commands");
+    info!("[sentry] ready — WS subscribed on {} LMs, heartbeating to all", state.registrations.len());
 
-    // Wait for Ctrl-C, then shutdown.
     let _ = tokio::signal::ctrl_c().await;
     info!("[sentry] Ctrl-C — shutting down");
     controller.kill().await;
-    frame_task.abort();
+    for h in ws_tasks { h.abort(); }
+    dispatch_task.abort();
     hb_task.abort();
     Ok(())
 }
