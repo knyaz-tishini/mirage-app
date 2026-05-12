@@ -16,6 +16,7 @@ members = [
     "crates/launcher",
     "crates/awg-share-gen",
     "crates/v2ray-share-gen",
+    "crates/foreign-probe",
     # "crates/_deprecated/slavyanka",  # archived: reverse-SSH experiment, replaced by mirage2sentry submodule
     # "crates/_deprecated/sentry",     # archived: pre-mirage2sentry sentry, kept for reference
     # "crates/mobile",  # cdylib — skip on Windows build
