@@ -7,10 +7,11 @@ edition.workspace = true
 name = "mirage_client_core"
 
 [dependencies]
-mirage-core     = { workspace = true }
-mirage-mux      = { workspace = true, features = ["tokio-compat"] }
-futures         = { workspace = true }
-mirage-protocol = { workspace = true }
+mirage-core      = { workspace = true }
+mirage-mux       = { workspace = true, features = ["tokio-compat"] }
+mirage-dial-core = { workspace = true }
+futures          = { workspace = true }
+mirage-protocol  = { workspace = true }
 tokio           = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }

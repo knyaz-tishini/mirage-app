@@ -1336,6 +1336,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "foreign-probe"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "chacha20poly1305",
+ "clap",
+ "hex",
+ "hkdf",
+ "md-5",
+ "rand 0.8.6",
+ "rustls",
+ "sha1",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2426,6 +2447,7 @@ dependencies = [
  "futures",
  "libc",
  "mirage-core",
+ "mirage-dial-core",
  "mirage-mux",
  "mirage-protocol",
  "rand 0.8.6",
@@ -2481,6 +2503,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mirage-dial-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mirage-core",
+ "mirage-protocol",
+ "rand 0.8.6",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
