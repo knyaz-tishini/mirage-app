@@ -4,9 +4,11 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use mirage_core::{
     config::{ChainConfig, TunnelPoolConfig},
     error::MirageError,
+    peer_table::PeerTable,
 };
 use mirage_mux::MuxError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
@@ -152,6 +154,8 @@ struct PoolInner {
     chain_protocols: Arc<ProtocolChain>,
     config: TunnelPoolConfig,
     mesh_id: Vec<u8>,
+    /// Live peer table shared with the monitor link (Phase 8.5).
+    peer_table: Arc<ArcSwap<PeerTable>>,
 }
 
 /// Maximum number of open_stream attempts before giving up.
@@ -173,11 +177,15 @@ pub struct MuxPool {
 }
 
 impl MuxPool {
+    /// `peer_table` — shared live peer table from the monitor link (Phase 8.5).
+    /// Pass `Arc::new(ArcSwap::from_pointee(PeerTable::empty()))` when there
+    /// is no monitor link.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
         config: TunnelPoolConfig,
         mesh_id: Vec<u8>,
+        peer_table: Arc<ArcSwap<PeerTable>>,
     ) -> Result<Arc<Self>, MirageError> {
         let is_onion = !chain.hops.is_empty();
         let pool_size = config.pool_size.max(1).min(8);
@@ -193,7 +201,9 @@ impl MuxPool {
             let cp = Arc::clone(&chain_protocols);
             let ch = chain.clone();
             let mid = mesh_id.clone();
-            join_set.spawn(async move { (idx, build_session(&cp, &ch, &mid).await) });
+            // Load a peer_table snapshot for the initial dial (Phase 8.5).
+            let pt = peer_table.load_full();
+            join_set.spawn(async move { (idx, build_session(&cp, &ch, &pt, &mid).await) });
         }
 
         let threshold = (pool_size / 5).max(1);
@@ -239,6 +249,7 @@ impl MuxPool {
             chain_protocols,
             config,
             mesh_id,
+            peer_table,
         }));
 
         let pool = Arc::new(Self {
@@ -419,12 +430,13 @@ impl MuxPool {
 async fn build_session(
     chain_protocols: &Arc<ProtocolChain>,
     chain: &ChainConfig,
+    peer_table: &PeerTable,
     mesh_id: &[u8],
 ) -> Result<SessionHandle, MirageError> {
     // Onion chains send MUX\0 magic so the exit upgrades to a mux server.
     // Direct chains use the raw tunnel path (no magic needed — they connect
     // directly to a relay that already runs a mux server).
-    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, mesh_id).await?;
+    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, peer_table, mesh_id).await?;
     let compat = TunnelCompat::wrap(tunnel);
     Ok(SessionHandle::client(compat))
 }
@@ -584,7 +596,7 @@ mod tests {
 }
 
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
-    let (max_attempts, base_ms, chain, chain_protocols, mesh_id) = {
+    let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -592,6 +604,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             guard.chain.clone(),
             Arc::clone(&guard.chain_protocols),
             guard.mesh_id.clone(),
+            Arc::clone(&guard.peer_table),
         )
     };
 
@@ -600,7 +613,10 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         attempt += 1;
         debug!(slot = slot_idx, attempt, "mux reconnect attempt");
 
-        match build_session(&chain_protocols, &chain, &mesh_id).await {
+        // Load a fresh peer_table snapshot on each attempt so we pick up
+        // any key rotations that arrived between retries.
+        let peer_table_snap = peer_table_shared.load_full();
+        match build_session(&chain_protocols, &chain, &peer_table_snap, &mesh_id).await {
             Ok(session) => {
                 info!(slot = slot_idx, attempt, "mux reconnect succeeded");
                 {

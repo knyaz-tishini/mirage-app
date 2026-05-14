@@ -2402,6 +2402,7 @@ name = "mirage-chain-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "libc",
  "mirage-chain-ipc",
  "mirage-client-core",
@@ -2419,6 +2420,7 @@ dependencies = [
 name = "mirage-client-cli"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "clap",
  "libloading",
@@ -2541,6 +2543,7 @@ name = "mirage-l0-sentinel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum",
  "clap",
  "libc",

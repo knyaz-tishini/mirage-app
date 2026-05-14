@@ -22,6 +22,7 @@ path = "src/bin/mirage-sentinel-test.rs"
 [dependencies]
 mirage-client-core = { path = "../client-core" }
 mirage-core        = { path = "../../../mirage2web/crates/mirage-core" }
+arc-swap           = { workspace = true }
 tokio              = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

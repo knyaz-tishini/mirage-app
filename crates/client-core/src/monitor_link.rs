@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+use mirage_core::peer_table::PeerTable;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::{
@@ -135,6 +137,11 @@ struct ConfigResponse {
     /// and sentinel falls back to its static `monitor_urls` list.
     #[serde(default)]
     peer_lm_urls: Vec<String>,
+    /// Peer table snapshot pushed by the monitor (Phase 8.5).
+    /// Old monitors that don't include this field will leave it as `None`,
+    /// and the client will use only chains with hardcoded `hop.public_key`.
+    #[serde(default)]
+    peer_table: Option<PeerTable>,
 }
 
 /// Tagged wire frame matching `WsServerFrame`. Used only on WebSocket — the
@@ -238,18 +245,33 @@ pub struct MonitorLink {
     /// Server-pushed frames (config + debug tunnel commands).  Each new frame
     /// replaces the previous slot value.
     frame_tx: watch::Sender<Option<WsServerFrame>>,
+    /// Latest peer table snapshot from the monitor (Phase 8.5).
+    /// Initialised as an empty table; updated on every `Config` frame that
+    /// carries a non-`None` `peer_table` field.
+    /// Shared with `TunnelPool` / `MuxPool` via `Arc::clone`.
+    pub peer_table: Arc<ArcSwap<PeerTable>>,
 }
 
 impl MonitorLink {
     /// Create a new [`MonitorLink`] and return the watch receiver.
     ///
     /// The link does not start until [`MonitorLink::spawn`] is called.
-    /// `monitor_urls` — list of monitor base URLs to race on startup and re-race on error.
+    ///
+    /// `monitor_urls` — list of monitor base URLs to race on startup and re-race
+    /// on error.
+    ///
     /// `monitor_api_key` — if set, sent as `Authorization: Bearer <key>` on
     /// every request including the WebSocket upgrade handshake.
+    ///
+    /// `peer_table` — shared [`ArcSwap`] that the link writes to on every config
+    /// frame containing a `peer_table` snapshot (Phase 8.5). Pass a freshly
+    /// created `Arc::new(ArcSwap::from_pointee(PeerTable::empty()))` and share
+    /// that same arc with `TunnelPool::new` / `MuxPool::new` so pools always see
+    /// the latest peer table without extra plumbing.
     pub fn new(
         monitor_urls: Vec<String>,
         monitor_api_key: Option<String>,
+        peer_table: Arc<ArcSwap<PeerTable>>,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
         let (frame_tx, _frame_rx) = watch::channel(None);
@@ -270,6 +292,7 @@ impl MonitorLink {
             poll_interval_secs: AtomicU64::new(30),
             config_tx,
             frame_tx,
+            peer_table,
         });
 
         (link, config_rx)
@@ -520,6 +543,16 @@ impl MonitorLink {
         self.config_version.store(cfg.version, Ordering::Relaxed);
         self.poll_interval_secs
             .store(cfg.monitor_poll_interval_secs, Ordering::Relaxed);
+
+        // Phase 8.5: update peer_table when the monitor includes a snapshot.
+        if let Some(pt) = cfg.peer_table {
+            debug!(
+                generation = pt.generation,
+                peers = pt.peers.len(),
+                "monitor_link: peer_table snapshot received"
+            );
+            self.peer_table.store(Arc::new(pt));
+        }
 
         let monitor_cfg = MonitorConfig {
             version: cfg.version,

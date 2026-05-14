@@ -29,9 +29,11 @@ use std::{
     time::Instant,
 };
 
+use arc_swap::ArcSwap;
 use mirage_core::{
     config::{ChainConfig, TunnelPoolConfig},
     error::MirageError,
+    peer_table::PeerTable,
 };
 use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::{Mutex, Notify};
@@ -76,6 +78,9 @@ struct PoolInner {
     chain_protocols: Arc<ProtocolChain>,
     config: TunnelPoolConfig,
     mesh_id: Vec<u8>,
+    /// Live peer table shared with the monitor link.  Each dial loads a
+    /// snapshot via `ArcSwap::load()` and passes it to `establish_raw_tunnel`.
+    peer_table: Arc<ArcSwap<PeerTable>>,
 }
 
 // ── Pool statistics ───────────────────────────────────────────────────────────
@@ -115,11 +120,17 @@ pub struct TunnelPool {
 impl TunnelPool {
     /// Create the pool, fill it with `config.pool_size` tunnels, and spawn the
     /// idle-timeout background task.
+    ///
+    /// `peer_table` — shared live peer table from the monitor link (Phase 8.5).
+    /// Pass `Arc::new(ArcSwap::from_pointee(PeerTable::empty()))` when there
+    /// is no monitor link; only chains with `hop.public_key = Some(hex)` will
+    /// be dialable in that case.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
         config: TunnelPoolConfig,
         mesh_id: Vec<u8>,
+        peer_table: Arc<ArcSwap<PeerTable>>,
     ) -> Result<Arc<Self>, MirageError> {
         let is_onion = !chain.hops.is_empty();
         let pool_size = config.pool_size.max(1);
@@ -130,7 +141,9 @@ impl TunnelPool {
             let cp = Arc::clone(&chain_protocols);
             let ch = chain.clone();
             let mid = mesh_id.clone();
-            join_set.spawn(async move { (idx, establish_raw_tunnel(&cp, &ch, &mid).await) });
+            // Load a peer_table snapshot for the initial dial (Phase 8.5).
+            let pt = peer_table.load_full();
+            join_set.spawn(async move { (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid).await) });
         }
 
         // Collect until 20% threshold is reached, then return early.
@@ -183,6 +196,7 @@ impl TunnelPool {
             chain_protocols,
             config,
             mesh_id,
+            peer_table,
         }));
 
         let pool = Arc::new(Self {
@@ -627,7 +641,7 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
 
 /// Attempt to reconnect a single slot with exponential backoff.
 async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
-    let (max_attempts, base_ms, chain, chain_protocols, mesh_id) = {
+    let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -635,6 +649,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             guard.chain.clone(),
             Arc::clone(&guard.chain_protocols),
             guard.mesh_id.clone(),
+            Arc::clone(&guard.peer_table),
         )
     };
 
@@ -643,7 +658,10 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
         attempt += 1;
         debug!(slot = slot_idx, attempt, "reconnect attempt");
 
-        match establish_raw_tunnel(&chain_protocols, &chain, &mesh_id).await {
+        // Load a fresh peer_table snapshot on each attempt so we pick up
+        // any key rotations that arrived between retries.
+        let peer_table_snap = peer_table_shared.load_full();
+        match establish_raw_tunnel(&chain_protocols, &chain, &peer_table_snap, &mesh_id).await {
             Ok(tunnel) => {
                 info!(slot = slot_idx, attempt, "reconnect succeeded");
                 let mut guard = pool.inner.lock().await;

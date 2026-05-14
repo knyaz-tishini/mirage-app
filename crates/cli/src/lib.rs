@@ -7,9 +7,11 @@ use std::{
     sync::Arc,
 };
 
+use arc_swap::ArcSwap;
 use mirage_core::{
     config::{AuthMode, ChainConfig, ClientConfig, MirageEndpointConfig, ProtocolId,
              TransportCamouflage, TransportKind},
+    peer_table::PeerTable,
     routing::RoutingTable,
 };
 use mirage_protocol::{
@@ -106,6 +108,19 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
     let mesh_id = config.mesh_id.as_bytes().to_vec();
     let router = Arc::new(RoutingTable::new(&config.routing));
 
+    // ── Shared peer table (Phase 8.5) ─────────────────────────────────────────
+    //
+    // Created upfront as an empty table and shared with all TunnelPool /
+    // MuxPool instances.  When a MonitorLink is present it writes into this
+    // same Arc on every Config frame, so pools transparently pick up rotated
+    // node keys on the next dial without any additional wiring.
+    //
+    // Without a monitor link only chains with `hop.public_key = Some(hex)`
+    // are dialable; chains relying on dynamic resolution will fail at the
+    // first dial with `PubkeyUnresolved`.
+    let peer_table: Arc<ArcSwap<PeerTable>> =
+        Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+
     // ── Build tunnel pools (one per chain) ────────────────────────────────────
     let all_chains = select_all_chains(&config);
     if all_chains.is_empty() {
@@ -160,9 +175,10 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             }
         };
         let mid = mesh_id.clone();
+        let pt = Arc::clone(&peer_table);
         pool_tasks.spawn(async move {
             let id = chain_owned.chain_id.clone();
-            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid).await {
+            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt).await {
                 Ok(pool) => Some((id, pool)),
                 Err(e) => {
                     tracing::warn!(chain = %id, "pool init failed, skipping: {e}");
@@ -205,8 +221,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             };
             let cfg = pool_cfg_base.clone();
             let mid = mesh_id.clone();
+            let pt = Arc::clone(&peer_table);
             mux_tasks.spawn(async move {
-                match MuxPool::new(chain_owned, protocols, cfg, mid).await {
+                match MuxPool::new(chain_owned, protocols, cfg, mid, pt).await {
                     Ok(mux) => Some((id, mux)),
                     Err(e) => {
                         tracing::warn!(
@@ -304,7 +321,11 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
 
     // ── Monitor link (optional) ───────────────────────────────────────────────
     if let Some(ref monitor_url) = config.monitor_url {
-        let (link, mut config_rx) = MonitorLink::new(vec![monitor_url.clone()], None);
+        let (link, mut config_rx) = MonitorLink::new(
+            vec![monitor_url.clone()],
+            None,
+            Arc::clone(&peer_table),
+        );
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");
 
@@ -329,6 +350,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         let mesh_id_for_watcher = mesh_id.clone();
         let pool_cfg_for_watcher = pool_cfg_base.clone();
         let use_mux_for_watcher = use_mux;
+        let peer_table_for_watcher = Arc::clone(&peer_table);
 
         tokio::spawn(async move {
             loop {
@@ -384,6 +406,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             protocols_for_chain,
                             pool_cfg,
                             mesh_id_for_watcher.clone(),
+                            Arc::clone(&peer_table_for_watcher),
                         )
                         .await
                         {

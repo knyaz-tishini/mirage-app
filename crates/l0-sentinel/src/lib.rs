@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use arc_swap::ArcSwap;
 use mirage_client_core::monitor_link::MonitorLink;
+use mirage_core::peer_table::PeerTable;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
@@ -369,7 +371,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
     info!("[sentinel] spawning MonitorLink -> {:?}", effective_urls);
     publisher.set(SentinelPhase::FetchingConfig { monitor_url: monitor_url.clone() });
-    let (link, mut config_rx) = MonitorLink::new(effective_urls.clone(), Some(monitor_api_key.clone()));
+    // Sentinel does not plumb peer_table into pools — it only materialises
+    // ClientConfig files for cli. An empty table is sufficient here.
+    let _sentinel_peer_table: Arc<ArcSwap<PeerTable>> =
+        Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+    let (link, mut config_rx) = MonitorLink::new(
+        effective_urls.clone(),
+        Some(monitor_api_key.clone()),
+        Arc::clone(&_sentinel_peer_table),
+    );
     link.spawn();
 
     // Spawn debug-shell + dynamic-monitor-urls watcher.

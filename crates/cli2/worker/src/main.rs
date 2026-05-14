@@ -12,6 +12,7 @@
 use std::{net::SocketAddr, sync::Arc, time::SystemTime};
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use mirage_chain_ipc::{
     SupervisorMsg, WorkerMsg, WorkerState,
     pid_file_path, pipe_path,
@@ -25,6 +26,7 @@ use mirage_client_core::{
 };
 use mirage_core::{
     config::{ClientConfig, TcpProtocolId},
+    peer_table::PeerTable,
     routing::RoutingTable,
 };
 use mirage_protocol::{
@@ -157,8 +159,19 @@ async fn main() -> anyhow::Result<()> {
         pool_cfg.pool_size = 3;
     }
 
+    // Worker has no monitor link — use an empty peer_table.
+    // Only chains with hardcoded `hop.public_key = Some(hex)` will be dialable.
+    let peer_table: Arc<ArcSwap<PeerTable>> =
+        Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+
     let mux_pool_opt: Option<Arc<MuxPool>> = if client_config.use_mux {
-        match MuxPool::new(chain.clone(), Arc::clone(&chain_protocols), pool_cfg.clone(), mesh_id.clone()).await {
+        match MuxPool::new(
+            chain.clone(),
+            Arc::clone(&chain_protocols),
+            pool_cfg.clone(),
+            mesh_id.clone(),
+            Arc::clone(&peer_table),
+        ).await {
             Ok(mp) => {
                 info!(chain_id = %chain_id, "mux pool ready");
                 Some(mp)
@@ -172,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg, mesh_id)
+    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg, mesh_id, peer_table)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 
