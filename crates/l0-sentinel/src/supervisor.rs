@@ -14,6 +14,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use std::fs::OpenOptions;
+use std::io::Write;
+
 use crate::crash_report::{CrashKind, CrashReport};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -178,6 +181,19 @@ pub fn spawn_child_with_flags(
     args: &[String],
     #[cfg_attr(not(windows), allow(unused_variables))] creation_flags: u32,
 ) -> Result<ChildHandle> {
+    spawn_child_with_flags_and_mirror(binary, args, creation_flags, None)
+}
+
+/// Same as `spawn_child_with_flags` but additionally appends every line of
+/// child stdout/stderr into the file at `mirror_path` (each line prefixed
+/// with `[<tag>] `, where tag is the binary stem).  Used so testers see
+/// cli/tun output in the unified `mirage-launcher.log`.
+pub fn spawn_child_with_flags_and_mirror(
+    binary: &PathBuf,
+    args: &[String],
+    #[cfg_attr(not(windows), allow(unused_variables))] creation_flags: u32,
+    mirror_path: Option<PathBuf>,
+) -> Result<ChildHandle> {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -201,16 +217,25 @@ pub fn spawn_child_with_flags(
     let stdout_buf = Arc::new(Mutex::new(RingBuffer::new(RING_CAPACITY)));
     let stderr_buf = Arc::new(Mutex::new(RingBuffer::new(RING_CAPACITY)));
 
+    let tag = binary
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "child".to_owned());
+
     // Drain stdout
     if let Some(stdout) = child.stdout.take() {
         let buf = Arc::clone(&stdout_buf);
-        tokio::spawn(drain_pipe(stdout, buf));
+        let mirror = mirror_path.clone();
+        let tag = tag.clone();
+        tokio::spawn(drain_pipe(stdout, buf, mirror, tag));
     }
 
     // Drain stderr
     if let Some(stderr) = child.stderr.take() {
         let buf = Arc::clone(&stderr_buf);
-        tokio::spawn(drain_pipe(stderr, buf));
+        let mirror = mirror_path.clone();
+        let tag = format!("{tag}!stderr");
+        tokio::spawn(drain_pipe(stderr, buf, mirror, tag));
     }
 
     let now_ms = SystemTime::now()
@@ -319,13 +344,39 @@ fn adopt_raw_pid(pid: u32) -> Result<tokio::process::Child> {
 // ── Background drain ──────────────────────────────────────────────────────────
 
 /// Background task: read from pipe into ring buffer until EOF.
-async fn drain_pipe<R: AsyncReadExt + Unpin>(mut reader: R, buf: Arc<Mutex<RingBuffer>>) {
+/// If `mirror_path` is Some, each chunk is also appended to that file with
+/// a `[<tag>]` prefix per line.
+async fn drain_pipe<R: AsyncReadExt + Unpin>(
+    mut reader: R,
+    buf: Arc<Mutex<RingBuffer>>,
+    mirror_path: Option<PathBuf>,
+    tag: String,
+) {
     let mut tmp = vec![0u8; 4096];
+    let mut line_buf: Vec<u8> = Vec::with_capacity(8192);
     loop {
         match reader.read(&mut tmp).await {
-            Ok(0) => break,
+            Ok(0) => {
+                if !line_buf.is_empty() {
+                    if let Some(ref p) = mirror_path {
+                        let _ = mirror_write_line(p, &tag, &line_buf);
+                    }
+                    line_buf.clear();
+                }
+                break;
+            }
             Ok(n) => {
                 buf.lock().await.push(&tmp[..n]);
+                if let Some(ref p) = mirror_path {
+                    for &b in &tmp[..n] {
+                        if b == b'\n' {
+                            let _ = mirror_write_line(p, &tag, &line_buf);
+                            line_buf.clear();
+                        } else if b != b'\r' {
+                            line_buf.push(b);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!("[supervisor] pipe read error: {}", e);
@@ -333,6 +384,27 @@ async fn drain_pipe<R: AsyncReadExt + Unpin>(mut reader: R, buf: Arc<Mutex<RingB
             }
         }
     }
+}
+
+/// Path of the unified launcher log next to sentinel.exe.
+/// `<exe_dir>/mirage-launcher.log` — same file the launcher itself writes to.
+pub fn unified_log_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    Some(dir.join("mirage-launcher.log"))
+}
+
+fn mirror_write_line(path: &std::path::Path, tag: &str, line: &[u8]) -> std::io::Result<()> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(b"[")?;
+    f.write_all(tag.as_bytes())?;
+    f.write_all(b"] ")?;
+    f.write_all(line)?;
+    f.write_all(b"\n")?;
+    Ok(())
 }
 
 // ── Cli respawn logic ─────────────────────────────────────────────────────────
@@ -463,11 +535,16 @@ pub fn resolve_supervisor_binary(configured: Option<&PathBuf>) -> Option<PathBuf
 /// Log a supervisor error to tracing.
 pub fn log_crash(report: &CrashReport) {
     error!(
-        "[supervisor] {} crashed: kind={:?} exit_code={:?} uptime_ms={} stderr={}",
+        "[supervisor] {} crashed: kind={:?} exit_code={:?} uptime_ms={}",
         report.process,
         report.kind,
         report.exit_code,
         report.uptime_ms,
-        report.stderr_tail.lines().last().unwrap_or(""),
     );
+    if !report.stderr_tail.is_empty() {
+        error!("[supervisor] {} stderr tail:\n{}", report.process, report.stderr_tail);
+    }
+    if !report.stdout_tail.is_empty() {
+        error!("[supervisor] {} stdout tail:\n{}", report.process, report.stdout_tail);
+    }
 }

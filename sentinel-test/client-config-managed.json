@@ -1,0 +1,211 @@
+{
+  "_managed_by": "mirage-l0-sentinel",
+  "chains": [
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "classic-direct",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [],
+      "l1": {
+        "addr": "91.218.245.247:4700",
+        "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+        "sni": null
+      },
+      "l1_transparent": true,
+      "l2": {
+        "addr": "45.59.119.139:4700",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "priority": 10,
+      "protocol": "Mirage",
+      "reply": "raw",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19482"
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "byte-cipher-classic",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [],
+      "l1": {
+        "addr": "91.218.245.247:4702",
+        "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "l2": {
+        "addr": "45.59.119.139:4700",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "priority": 10,
+      "protocol": "MirageTls",
+      "reply": "raw",
+      "shaping": "none",
+      "socks5_bind": null
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "crypto-relay-classic",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [],
+      "l1": {
+        "addr": "91.218.245.247:4703",
+        "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "l2": {
+        "addr": "45.59.119.139:4700",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "priority": 10,
+      "protocol": "Mirage",
+      "reply": "raw",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19483"
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "three-hop-onion",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [
+        {
+          "addr": "91.218.245.247:4701",
+          "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+          "role": "entry",
+          "sni": null
+        },
+        {
+          "addr": "91.218.245.247:4710",
+          "public_key": "4996667ce03371bcbb4f974b466b01da4dee9fb21f13e20de5656dbb60625e6f",
+          "role": "middle",
+          "sni": null
+        },
+        {
+          "addr": "45.59.119.139:4701",
+          "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+          "role": "exit",
+          "sni": null
+        }
+      ],
+      "l1": null,
+      "l1_transparent": false,
+      "l2": {
+        "addr": "45.59.119.139:4701",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "priority": 0,
+      "protocol": "Mirage",
+      "reply": "onion",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19484"
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "three-hop-telescopic",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "telescopic",
+      "hops": [
+        {
+          "addr": "91.218.245.247:4701",
+          "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+          "role": "entry",
+          "sni": null
+        },
+        {
+          "addr": "91.218.245.247:4710",
+          "public_key": "4996667ce03371bcbb4f974b466b01da4dee9fb21f13e20de5656dbb60625e6f",
+          "role": "middle",
+          "sni": null
+        },
+        {
+          "addr": "45.59.119.139:4701",
+          "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+          "role": "exit",
+          "sni": null
+        }
+      ],
+      "l1": null,
+      "l1_transparent": false,
+      "l2": {
+        "addr": "45.59.119.139:4701",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "priority": 0,
+      "protocol": "Mirage",
+      "reply": "onion",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19486"
+    }
+  ],
+  "client_id": "stend-client",
+  "http_proxy": {
+    "bind_addr": "127.0.0.1:19481",
+    "enabled": true
+  },
+  "management_addr": "0.0.0.0:4498",
+  "management_key": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "monitor_url": "http://127.0.0.1:19410",
+  "pool": {
+    "pool_size": 200
+  },
+  "private_key": "40667380fe85ce090fc9390b5dcdc62a617d0a690e1a0301001ee32e2443c850",
+  "psk": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "routing": {
+    "blocked_domains": [],
+    "default_chain": "byte-cipher-classic",
+    "direct_cidrs": [],
+    "direct_domains": [],
+    "rules": []
+  },
+  "use_mux": true
+}

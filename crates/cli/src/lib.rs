@@ -635,28 +635,42 @@ fn build_chain_protocol_chain(
     chain: &ChainConfig,
     client_keypair_bytes: &[u8; 32],
 ) -> Result<Option<ProtocolChain>, BoxError> {
-    use mirage_core::config::TcpProtocolId as P;
+    use mirage_core::config::{
+        AuthMode, MirageEndpointConfig, TcpProtocolId as P, TransportCamouflage, TransportKind,
+    };
 
     let proto_id = match &chain.protocol {
         ProtocolId::Tcp(id) => *id,
         ProtocolId::Udp(_) => return Ok(None), // UDP chains use a different driver path
     };
 
-    let _ = client_keypair_bytes; // kept for future canonical-wire reintroduction; mirage-family endpoints don't need it
+    let _ = client_keypair_bytes;
+
+    // v2 path: if `chain.l1.camouflage` is set, build a single EndpointProtocol
+    // dynamically — same TcpProtocol type for every camouflage variant. The
+    // legacy `Mirage*` aliases are now equivalent to specific TransportCamouflage
+    // values on a bare Mirage wire (see `mirage-protocol/src/aliases.rs`).
+    let v2_camouflage = chain.l1.as_ref().and_then(|n| n.camouflage.clone());
+    let v2_byte_cipher = chain.l1.as_ref().and_then(|n| n.byte_cipher.clone());
+    if v2_camouflage.is_some() || v2_byte_cipher.is_some() {
+        let endpoint = MirageEndpointConfig {
+            transport: TransportKind::Tcp,
+            auth: AuthMode::Blake3,
+            camouflage: v2_camouflage.unwrap_or(TransportCamouflage::None),
+            byte_cipher: None,
+            byte_cipher_mode: v2_byte_cipher,
+        };
+        let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
+        protocols.push(Box::new(EndpointProtocol::new(endpoint, proto_id)));
+        return Ok(Some(ProtocolChain::new(protocols)));
+    }
+
+    // Legacy aliases: chain selects a specific TcpProtocolId, camouflage is
+    // baked into the alias. Kept for backward-compat with pre-v2 monitor
+    // configs that still emit `protocol: "MirageWebsocket"` etc.
     let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
     match proto_id {
-        // Foreign vanilla wires (WebsocketXray / ShadowTlsV3 / VlessReality /
-        // MirageReality / MirageShadowTls) are no longer client-side concerns —
-        // variants deleted from TcpProtocolId. Foreign clients connect directly
-        // to L1 EntryNode standalone entrypoints.
         P::MirageWebsocket => {
-            // Mirage-family WebSocket camouflage. Uses the EndpointProtocol
-            // abstraction (same shape as the legacy `mirage_base` /
-            // `mirage_tls` aliases), with Upgrade path/host pulled from the
-            // chain's `mirage_websocket` block. Falls back to the alias
-            // defaults (`/ws`, `localhost`) when the block is missing —
-            // server may or may not accept those, depending on its own
-            // `mirage_websocket` NodeConfig section.
             let cfg = chain.mirage_websocket.clone().unwrap_or_default();
             protocols.push(Box::new(EndpointProtocol::new(
                 mirage_websocket(cfg.path, cfg.host),
@@ -664,18 +678,14 @@ fn build_chain_protocol_chain(
             )));
         }
         P::Xhttp => {
-            // Mirage handshake + AEAD inside an HTTP/1.1 `Upgrade: xhttp/1`
-            // envelope.  Server and client must agree on path + Host header;
-            // they're carried in the chain's `mirage_xhttp` block, mirrored
-            // from the server-side `NodeConfig.mirage_xhttp` section.  Falls
-            // back to defaults (`/xhttp`, `www.example.com`) when missing.
             let cfg = chain.mirage_xhttp.clone().unwrap_or_default();
             protocols.push(Box::new(EndpointProtocol::new(
                 mirage_xhttp(cfg.path, cfg.host),
                 P::Xhttp,
             )));
         }
-        // Mirage / MirageTls / exit endpoints — fall through to default.
+        // Mirage / MirageTls / exit endpoints — fall through to default chain
+        // (built once in `run` from `mirage_base()`).
         _ => return Ok(None),
     }
     Ok(Some(ProtocolChain::new(protocols)))

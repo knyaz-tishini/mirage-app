@@ -1,0 +1,30 @@
+monitor_url = "http://127.0.0.1:19410"
+ota_pubkey = "RWS_REPLACE_WITH_REAL_KEY"
+ota_poll_interval_secs = 86400
+worker_binary = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2app/target/release/mirage-chain-worker.exe"
+tun_api_url = "http://127.0.0.1:19485"
+
+[[chains]]
+id = "byte-cipher-classic"
+socks5_bind = "127.0.0.1:19480"
+config_path = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2tun/client-config.json"
+
+[[chains]]
+id = "classic-direct"
+socks5_bind = "127.0.0.1:19482"
+config_path = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2tun/client-config.json"
+
+[[chains]]
+id = "crypto-relay-classic"
+socks5_bind = "127.0.0.1:19483"
+config_path = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2tun/client-config.json"
+
+[[chains]]
+id = "three-hop-onion"
+socks5_bind = "127.0.0.1:19484"
+config_path = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2tun/client-config.json"
+
+[[chains]]
+id = "three-hop-telescopic"
+socks5_bind = "127.0.0.1:19486"
+config_path = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2tun/client-config.json"

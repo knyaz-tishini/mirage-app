@@ -1,0 +1,14 @@
+monitor_urls = [
+    "https://lm.zen-geldmaschine.net:19443",
+    "https://lm-nl.zen-geldmaschine.net:19443",
+]
+monitor_api_key      = "ae08d625-6a22-48a5-b175-65e011d76f16"
+client_id            = "tester2"
+client_config_path   = "/Users/dev/mirage-build/runtime/client-config-managed.json"
+client_binary        = "/Users/dev/mirage-build/mirage2app/target/release/mirage-client-cli"
+client_args          = ["--config", "{client_config_path}"]
+client_template      = "/Users/dev/mirage-build/runtime/client-template.json"
+poll_interval_secs   = 30
+respect_user_config  = true
+install_panic_hook   = true
+exit_on_memory_fatal = false

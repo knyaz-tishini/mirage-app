@@ -2,6 +2,7 @@
 //!
 //! Parses CLI args, reads sentinel TOML, delegates to [`mirage_l0_sentinel::run`].
 
+use std::error::Error as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -40,5 +41,24 @@ async fn main() -> Result<()> {
         .with_context(|| format!("cannot read sentinel config {:?}", args.config))?;
     let cfg: SentinelConfig = toml::from_str(&cfg_raw).context("failed to parse sentinel TOML")?;
 
-    mirage_l0_sentinel::run(cfg).await
+    match mirage_l0_sentinel::run(cfg).await {
+        Ok(()) => {
+            tracing::error!("[sentinel] run() returned Ok — should never exit cleanly");
+            eprintln!("[FATAL] sentinel run() returned Ok unexpectedly");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("[sentinel] run() failed: {e:#}");
+            eprintln!("[FATAL] sentinel run() failed: {e:#}");
+            // chain
+            let mut src = e.source();
+            while let Some(s) = src {
+                eprintln!("  caused by: {s}");
+                src = s.source();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Err(e)
+        }
+    }
 }

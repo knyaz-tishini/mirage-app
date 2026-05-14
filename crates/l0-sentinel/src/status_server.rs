@@ -142,7 +142,13 @@ fn spawn_tun(binary: &std::path::Path, tun_args: &[String], flags: u32) -> anyho
     }
     #[cfg(not(target_os = "macos"))]
     {
-        spawn_child_with_flags(&binary.to_path_buf(), tun_args, flags)
+        let mirror = crate::supervisor::unified_log_path();
+        crate::supervisor::spawn_child_with_flags_and_mirror(
+            &binary.to_path_buf(),
+            tun_args,
+            flags,
+            mirror,
+        )
     }
 }
 
@@ -227,10 +233,11 @@ async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
     // because tun forwards traffic to cli's SOCKS5 listeners.
     if children.cli.is_none() {
         info!("[sentinel] /connect: spawning cli first ({:?})", state.spawn_cfg.cli_binary);
-        match spawn_child_with_flags(
+        match crate::supervisor::spawn_child_with_flags_and_mirror(
             &state.spawn_cfg.cli_binary,
             &state.spawn_cfg.cli_args,
             flags,
+            crate::supervisor::unified_log_path(),
         ) {
             Ok(handle) => {
                 let cli_pid = handle.process.id();

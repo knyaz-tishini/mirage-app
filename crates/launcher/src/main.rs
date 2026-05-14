@@ -23,13 +23,6 @@ mod jobobj {
 
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     struct JobHandle { _raw: HANDLE }
     unsafe impl Send for JobHandle {}
@@ -38,25 +31,11 @@ mod jobobj {
     static JOB: OnceLock<JobHandle> = OnceLock::new();
 
     pub fn init() {
-        JOB.get_or_init(|| unsafe {
-            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if h.is_null() {
-                return JobHandle { _raw: std::ptr::null_mut() };
-            }
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation = JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-                ..std::mem::zeroed()
-            };
-            let _ = SetInformationJobObject(
-                h,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            let _ = AssignProcessToJobObject(h, GetCurrentProcess());
-            JobHandle { _raw: h }
-        });
+        // Disabled in v2: a self-job with KILL_ON_JOB_CLOSE risks killing the
+        // launcher itself when any child wraps badly.  Children are tracked by
+        // PID + watchdog respawn instead; on launcher close we kill them
+        // explicitly in the WindowEvent::CloseRequested handler.
+        let _ = JOB;
     }
 }
 
@@ -194,20 +173,39 @@ respect_user_config = true
 
 /// Spawn `mirage-l0-sentinel.exe` from `exe_dir()` with `--config sentinel.toml`.
 /// stdout/stderr are null — sentinel logs internally.
-#[cfg(unix)]
 fn reap_orphans() {
     use std::process::Command;
-    // Best-effort: kill any leftover sentinel/cli from a previous (crashed)
-    // launcher run.  These are user-owned, so plain pkill works.  Tun runs
-    // as root and is killed via sudo (already cached if user just OK'd it
-    // this session; harmless prompt if not).
-    for name in &["mirage-l0-sentinel", "mirage-client-cli"] {
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg(name).status();
+    #[cfg(unix)]
+    {
+        // Best-effort: kill any leftover sentinel/cli from a previous (crashed)
+        // launcher run.  These are user-owned, so plain pkill works.  Tun runs
+        // as root and is killed via sudo (already cached if user just OK'd it
+        // this session; harmless prompt if not).
+        for name in &["mirage-l0-sentinel", "mirage-client-cli"] {
+            let _ = Command::new("pkill").arg("-9").arg("-x").arg(name).status();
+        }
+        // Tun (root) — try sudo -n (cached), don't prompt; if no cache, skip.
+        let _ = Command::new("sudo").args(["-n", "pkill", "-9", "-x", "mirage2tun"]).status();
     }
-    // Tun (root) — try sudo -n (cached), don't prompt; if no cache, skip.
-    let _ = Command::new("sudo").args(["-n", "pkill", "-9", "-x", "mirage2tun"]).status();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        for name in &[
+            "mirage-l0-sentinel.exe",
+            "mirage-client-cli.exe",
+            "mirage2tun.exe",
+            "mirage-chain-supervisor.exe",
+            "mirage-chain-worker.exe",
+        ] {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/IM", name])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+    }
     // Brief sleep so OS releases ports/utun before next spawn.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(300));
 }
 
 fn spawn_sentinel() -> anyhow::Result<std::process::Child> {
@@ -220,11 +218,19 @@ fn spawn_sentinel() -> anyhow::Result<std::process::Child> {
     // it is NOT in our process group — KILL_ON_JOB_CLOSE (Win) has no
     // analogue.  If a previous launcher crashed, the old cli/tun keep their
     // ports/utun and the fresh cli would hit AddrInUse.  pkill clears that.
-    #[cfg(unix)]
     reap_orphans();
 
     let dir = exe_dir();
     let config = dir.join("sentinel.toml");
+
+    // All child stdout/stderr → unified mirage-launcher.log (single source of
+    // truth; testers send only one file).
+    let log_path = dir.join("mirage-launcher.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&log_path)
+        .map_err(|e| anyhow::anyhow!("open {:?}: {e}", log_path))?;
+    let log2 = log.try_clone().map_err(|e| anyhow::anyhow!("clone log: {e}"))?;
 
     #[cfg(windows)]
     let child = {
@@ -233,18 +239,15 @@ fn spawn_sentinel() -> anyhow::Result<std::process::Child> {
         std::process::Command::new(&sentinel_exe)
             .arg("--config").arg(&config)
             .current_dir(&dir)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log2))
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()?
     };
     #[cfg(not(windows))]
     let child = {
         let sentinel_exe = dir.join("mirage-l0-sentinel");
-        let log = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("/tmp/mirage-sentinel.log")
-            .map_err(|e| anyhow::anyhow!("open log: {e}"))?;
-        let log2 = log.try_clone().map_err(|e| anyhow::anyhow!("clone log: {e}"))?;
         std::process::Command::new(&sentinel_exe)
             .arg("--config").arg(&config)
             .current_dir(&dir)
@@ -1116,6 +1119,7 @@ impl ApplicationHandler for LauncherHandler {
         if self.app.is_some() {
             return;
         }
+        tracing::info!("[stage] resumed: creating window");
 
         let icon = load_icon();
 
@@ -1128,16 +1132,33 @@ impl ApplicationHandler for LauncherHandler {
             attrs = attrs.with_window_icon(Some(ic));
         }
 
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("window creation never fails on supported platforms"),
-        );
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                tracing::error!("create_window failed: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        tracing::info!("[stage] window created");
 
-        let context = softbuffer::Context::new(window.clone())
-            .expect("softbuffer context init always succeeds on Windows");
-        let surface = softbuffer::Surface::new(&context, window.clone())
-            .expect("softbuffer surface init always succeeds on Windows");
+        let context = match softbuffer::Context::new(window.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("softbuffer Context::new failed: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let surface = match softbuffer::Surface::new(&context, window.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("softbuffer Surface::new failed: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        tracing::info!("[stage] softbuffer ready");
 
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let now = Instant::now();
@@ -1149,13 +1170,20 @@ impl ApplicationHandler for LauncherHandler {
         let sentinel_rx = sentinel_status::spawn_poller(self.rt.handle());
 
         ensure_sentinel_toml();
-        let initial_sentinel = match spawn_sentinel() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!("failed to spawn sentinel: {}", e);
-                None
+
+        // Defer sentinel spawn by 3s so the window paints first — testers see
+        // the GUI immediately, and any sent crash that follows is logged but
+        // does NOT block window creation.
+        tracing::info!("[stage] window up — deferring sentinel spawn 3s");
+        let initial_sentinel: Option<std::process::Child> = None;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            tracing::info!("[stage] deferred: spawning sentinel");
+            match spawn_sentinel() {
+                Ok(_c) => tracing::info!("[stage] sentinel spawned"),
+                Err(e) => tracing::warn!("failed to spawn sentinel: {}", e),
             }
-        };
+        });
 
         // If a mirage:// URL was passed on the CLI, POST it to sentinel
         // once sentinel's HTTP server becomes reachable (poll up to 15s).
@@ -1226,12 +1254,15 @@ impl ApplicationHandler for LauncherHandler {
 
         match event {
             WindowEvent::CloseRequested => {
-                // Kill sentinel — Job Object KILL_ON_JOB_CLOSE reaps cli + tun.
+                // Kill sentinel; then reap any cli/tun the sentinel spawned —
+                // JobObject is disabled (it could kill launcher itself), so
+                // children are not auto-killed when sentinel dies.
                 let owned_sentinel = app.sentinel.lock().expect("not poisoned").take();
                 if let Some(mut s) = owned_sentinel {
                     let _ = s.kill();
                     let _ = s.wait();
                 }
+                reap_orphans();
                 event_loop.exit();
             }
 
@@ -1664,7 +1695,33 @@ async fn post_onboard_url(url: String) {
 // ── Entry ────────────────────────────────────────────────────────────────────
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    // Tracing → file in exe dir + panic hook so crashes leave a trace.
+    // Without this, windows_subsystem="windows" eats stderr and the app
+    // disappears silently — testers cannot diagnose.
+    let log_path = exe_dir().join("mirage-launcher.log");
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(f))
+            .with_ansi(false)
+            .try_init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+
+    let log_path_for_panic = log_path.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let msg = format!("{info}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&log_path_for_panic)
+        {
+            let _ = writeln!(f, "[PANIC] {}", msg);
+        }
+        tracing::error!("launcher panic: {msg}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }));
+
+    tracing::info!("launcher start: log={:?}", log_path);
 
     #[cfg(windows)]
     jobobj::init();
@@ -1676,17 +1733,36 @@ fn main() {
         .find(|a| a.starts_with("mirage://"))
         .map(|s| s.trim().to_owned());
 
-    let rt = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("tokio runtime always initializes"),
-    );
+    tracing::info!("[stage] tokio runtime build");
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => Arc::new(rt),
+        Err(e) => {
+            tracing::error!("tokio runtime build failed: {e}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("[stage] tokio runtime ready");
 
-    let event_loop = EventLoop::new().expect("winit event loop init always succeeds");
+    tracing::info!("[stage] winit event loop init");
+    let event_loop = match EventLoop::new() {
+        Ok(el) => el,
+        Err(e) => {
+            tracing::error!("winit EventLoop::new failed: {e}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::process::exit(1);
+        }
+    };
     event_loop.set_control_flow(ControlFlow::Poll);
+    tracing::info!("[stage] winit event loop ready, entering run_app");
 
     let mut handler = LauncherHandler { app: None, rt, cli_onboard_url };
-    event_loop.run_app(&mut handler).expect("event loop run always succeeds");
+    if let Err(e) = event_loop.run_app(&mut handler) {
+        tracing::error!("event loop run_app returned error: {e}");
+    }
+    tracing::info!("[stage] event loop exited");
 }
