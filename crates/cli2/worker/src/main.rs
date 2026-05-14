@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0);
 
     // Wait for the first supervisor connection and the Start message.
-    let (socks5_bind, config_path, initial_ipc) =
+    let (socks5_bind, config_path, initial_peer_table_json, initial_ipc) =
         wait_for_start(&mut listener, &chain_id, pid, started_at_unix, WorkerState::Starting).await?;
 
     let addr: SocketAddr = socks5_bind.parse().with_context(|| {
@@ -159,10 +159,27 @@ async fn main() -> anyhow::Result<()> {
         pool_cfg.pool_size = 3;
     }
 
-    // Worker has no monitor link — use an empty peer_table.
-    // Only chains with hardcoded `hop.public_key = Some(hex)` will be dialable.
-    let peer_table: Arc<ArcSwap<PeerTable>> =
-        Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+    // Build initial peer_table: use snapshot from supervisor if provided,
+    // otherwise fall back to empty (only hardcoded public_key hops will dial).
+    let initial_pt = initial_peer_table_json
+        .as_deref()
+        .and_then(|json| match serde_json::from_str::<PeerTable>(json) {
+            Ok(pt) => {
+                info!(
+                    chain_id = %chain_id,
+                    generation = pt.generation,
+                    peers = pt.peers.len(),
+                    "worker: loaded initial peer_table from Start"
+                );
+                Some(pt)
+            }
+            Err(e) => {
+                warn!(chain_id = %chain_id, "worker: failed to parse initial peer_table_json: {e} — using empty");
+                None
+            }
+        })
+        .unwrap_or_else(PeerTable::empty);
+    let peer_table: Arc<ArcSwap<PeerTable>> = Arc::new(ArcSwap::from_pointee(initial_pt));
 
     let mux_pool_opt: Option<Arc<MuxPool>> = if client_config.use_mux {
         match MuxPool::new(
@@ -185,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg, mesh_id, peer_table)
+    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table))
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 
@@ -245,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
         ipc,
         Arc::clone(&pool),
         Arc::clone(&current_state),
+        Arc::clone(&peer_table),
         stop_tx,
         orphan_timeout_secs,
     )
@@ -273,6 +291,7 @@ async fn supervisor_loop(
     initial_ipc: PipePair,
     pool: Arc<TunnelPool>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
+    peer_table: Arc<ArcSwap<PeerTable>>,
     stop_tx: watch::Sender<bool>,
     orphan_timeout_secs: u64,
 ) -> anyhow::Result<()> {
@@ -285,6 +304,7 @@ async fn supervisor_loop(
             chain_id,
             Arc::clone(&pool),
             Arc::clone(&state),
+            Arc::clone(&peer_table),
             &stop_tx,
         )
         .await;
@@ -381,6 +401,7 @@ async fn handle_session(
     chain_id: &str,
     pool: Arc<TunnelPool>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
+    peer_table: Arc<ArcSwap<PeerTable>>,
     stop_tx: &watch::Sender<bool>,
 ) -> SessionEnd {
     loop {
@@ -392,6 +413,22 @@ async fn handle_session(
             Err(e) => {
                 warn!(chain_id, "IPC read error: {e} — treating as disconnect");
                 return SessionEnd::Disconnect;
+            }
+            Ok(Some(SupervisorMsg::PeerTableUpdate { peer_table_json })) => {
+                match serde_json::from_str::<PeerTable>(&peer_table_json) {
+                    Ok(pt) => {
+                        info!(
+                            chain_id,
+                            generation = pt.generation,
+                            peers = pt.peers.len(),
+                            "worker: PeerTableUpdate applied"
+                        );
+                        peer_table.store(Arc::new(pt));
+                    }
+                    Err(e) => {
+                        warn!(chain_id, "worker: PeerTableUpdate parse error: {e}");
+                    }
+                }
             }
             Ok(Some(SupervisorMsg::Drain { timeout_secs })) => {
                 info!(chain_id, timeout_secs, "received Drain");
@@ -471,17 +508,20 @@ async fn handle_session(
 
 /// Wait for the first supervisor connection and the `Start` message.
 ///
+/// Returns `(socks5_bind, config_path, peer_table_json, ipc)`.
+///
 /// The worker sends `Hello` immediately on connect (with `Starting` state).
 /// After `Hello`, the supervisor either sends `Start` (fresh spawn) or
 /// `Continue` (reattach path — but this function is only called on first boot
-/// so `Start` is expected).
+/// so `Start` is expected).  `PeerTableUpdate` arriving before `Start` is
+/// handled and stored; the latest JSON is returned together with `Start`.
 async fn wait_for_start(
     listener: &mut PipeListener,
     chain_id: &str,
     pid: u32,
     started_at_unix: u64,
     worker_state: WorkerState,
-) -> anyhow::Result<(String, String, PipePair)> {
+) -> anyhow::Result<(String, String, Option<String>, PipePair)> {
     loop {
         let mut ipc = listener.accept().await
             .with_context(|| "accepting first supervisor connection")?;
@@ -500,7 +540,10 @@ async fn wait_for_start(
         .await
         .with_context(|| "sending Hello")?;
 
-        // Read Start (or Shutdown to abort).
+        // Read Start (or Shutdown to abort).  PeerTableUpdate may arrive
+        // before Start if supervisor already has a snapshot — buffer the
+        // latest JSON so the caller can initialise the ArcSwap immediately.
+        let mut buffered_peer_table_json: Option<String> = None;
         loop {
             match ipc.read_msg::<SupervisorMsg>().await? {
                 None => {
@@ -511,9 +554,17 @@ async fn wait_for_start(
                     chain_id: _,
                     socks5_bind,
                     config_path,
+                    peer_table_json,
                 }) => {
                     info!(chain_id, bind = %socks5_bind, "received Start");
-                    return Ok((socks5_bind, config_path, ipc));
+                    // Prefer peer_table_json from Start; fall back to any
+                    // PeerTableUpdate that arrived before Start.
+                    let resolved_pt = peer_table_json.or(buffered_peer_table_json);
+                    return Ok((socks5_bind, config_path, resolved_pt, ipc));
+                }
+                Some(SupervisorMsg::PeerTableUpdate { peer_table_json }) => {
+                    info!(chain_id, "PeerTableUpdate received before Start — buffering");
+                    buffered_peer_table_json = Some(peer_table_json);
                 }
                 Some(SupervisorMsg::Shutdown) => {
                     info!(chain_id, "Shutdown before Start — exiting");

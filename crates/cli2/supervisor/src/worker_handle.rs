@@ -274,14 +274,24 @@ impl WorkerHandle {
             .with_context(|| format!("sending to worker {}", self.chain_id))
     }
 
-    /// Send `Start` with the chain config.
+    /// Send `Start` with the chain config and an optional initial peer table.
     pub async fn send_start(&mut self, chain: &ChainConfig) -> anyhow::Result<()> {
         self.send(SupervisorMsg::Start {
             chain_id: chain.id.clone(),
             socks5_bind: chain.socks5_bind.clone(),
             config_path: chain.config_path.clone(),
+            peer_table_json: None,
         })
         .await
+    }
+
+    /// Push a live peer table update to the worker (Phase 8.5).
+    pub async fn send_peer_table_update(
+        &mut self,
+        peer_table_json: String,
+    ) -> anyhow::Result<()> {
+        self.send(SupervisorMsg::PeerTableUpdate { peer_table_json })
+            .await
     }
 
     /// Send `Continue` to a reattached orphan worker.

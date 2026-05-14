@@ -11,10 +11,14 @@ mod tun_registry;
 mod worker_handle;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
+use mirage_client_core::monitor_link::MonitorLink;
+use mirage_core::peer_table::PeerTable;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use config::Config;
 use mirage_chain_ipc::WorkerMsg;
@@ -134,6 +138,61 @@ async fn main() -> anyhow::Result<()> {
     // Push chain → SOCKS5 mapping to the local TUN process.
     push_tun_registry(&config).await;
 
+    // ── MonitorLink: peer_table broadcast ─────────────────────────────────────
+    // Supervisor owns a MonitorLink to receive peer_table snapshots.
+    // On each new snapshot, it serializes the peer_table and broadcasts
+    // PeerTableUpdate to all workers so they can resolve dynamic public keys.
+    //
+    // The shared ArcSwap is written by MonitorLink and read by the broadcast
+    // task below — supervisor does NOT share it with workers (workers get the
+    // JSON copy over IPC instead).
+    let peer_table_arc: Arc<ArcSwap<PeerTable>> =
+        Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+
+    let (monitor_link, mut monitor_cfg_rx) = MonitorLink::new(
+        vec![config.monitor_url.clone()],
+        config.monitor_api_key.clone(),
+        Arc::clone(&peer_table_arc),
+    );
+    monitor_link.spawn();
+    info!("monitor_link spawned for peer_table tracking");
+
+    // Channel from monitor-watch-task to the main loop for peer_table updates.
+    let (pt_tx, mut pt_rx) = mpsc::channel::<String>(8);
+
+    // Background task: watch MonitorLink config channel, extract peer_table,
+    // serialize and forward to main loop via pt_tx.
+    let pt_tx_bg = pt_tx.clone();
+    let _ml_watch = tokio::spawn(async move {
+        let mut last_generation: u64 = 0;
+        loop {
+            // Wait for a new config snapshot from MonitorLink.
+            if monitor_cfg_rx.changed().await.is_err() {
+                // Channel closed (MonitorLink dropped) — stop watching.
+                break;
+            }
+            // Read current peer_table generation from the ArcSwap.
+            let snapshot = peer_table_arc.load();
+            let generation = snapshot.generation;
+            if generation <= last_generation && last_generation != 0 {
+                // Not a new generation — skip broadcast.
+                continue;
+            }
+            last_generation = generation;
+            match serde_json::to_string(&**snapshot) {
+                Ok(json) => {
+                    debug!(generation, "supervisor: broadcasting PeerTableUpdate");
+                    if pt_tx_bg.send(json).await.is_err() {
+                        break; // main loop dropped receiver — exit
+                    }
+                }
+                Err(e) => {
+                    warn!("supervisor: peer_table serialize error: {e}");
+                }
+            }
+        }
+    });
+
     // OTA poller channel.
     let (ota_tx, mut ota_rx) = mpsc::channel::<UpdateAvailable>(4);
     let current_version = mirage_chain_ota::current_version().to_string();
@@ -233,6 +292,20 @@ async fn main() -> anyhow::Result<()> {
                 warn!("memory guard: fatal threshold — shutting down workers and exiting");
                 shutdown_all(&mut handles).await;
                 std::process::exit(0);
+            }
+
+            pt_json = pt_rx.recv() => {
+                if let Some(json) = pt_json {
+                    // Broadcast PeerTableUpdate to all live workers.
+                    for (chain_id, handle) in handles.iter_mut() {
+                        if handle.state == HandleState::Exited {
+                            continue;
+                        }
+                        if let Err(e) = handle.send_peer_table_update(json.clone()).await {
+                            warn!(chain_id = %chain_id, "send PeerTableUpdate failed: {e:#}");
+                        }
+                    }
+                }
             }
 
             update = ota_rx.recv() => {

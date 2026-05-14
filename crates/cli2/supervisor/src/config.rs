@@ -19,6 +19,17 @@ pub struct Config {
     /// If unset or unreachable, supervisor logs a warning and continues.
     #[serde(default)]
     pub tun_api_url: Option<String>,
+    /// Bearer token for `Authorization` header when talking to the monitor.
+    /// Required for `POST /relay/clients` and `GET /relay/clients/subscribe`.
+    /// If absent, requests are sent without auth (works only on monitors with
+    /// open registration).
+    #[serde(default)]
+    pub monitor_api_key: Option<String>,
+    /// Persist directory for supervisor state: `sentry-id.txt` and
+    /// `last-peer-table.json`.  Created on first run if absent.
+    /// Defaults to the OS temp dir / `mirage-cli2-state/`.
+    #[serde(default)]
+    pub state_dir: Option<String>,
     /// Chain definitions.
     pub chains: Vec<ChainConfig>,
 }

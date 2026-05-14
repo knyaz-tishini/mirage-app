@@ -19,6 +19,12 @@ pub enum SupervisorMsg {
         chain_id: String,
         socks5_bind: String,
         config_path: String,
+        /// Initial peer table JSON snapshot from monitor (Phase 8.5).
+        /// `None` on cold start before any monitor config is received;
+        /// worker falls back to `PeerTable::empty()` and waits for
+        /// `PeerTableUpdate` to arrive before attempting dynamic-key dials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_table_json: Option<String>,
     },
     /// Stop accepting new connections, drain existing.
     Drain { timeout_secs: u64 },
@@ -30,6 +36,15 @@ pub enum SupervisorMsg {
     Continue,
     /// Supervisor requests worker to drain and exit (will be respawned fresh).
     Restart { reason: String },
+    /// Live peer table update pushed by supervisor from MonitorLink (Phase 8.5).
+    ///
+    /// Worker deserializes and stores into its `Arc<ArcSwap<PeerTable>>`.
+    /// Sent on every config snapshot that contains a changed `peer_table`
+    /// generation, and also when supervisor first receives the initial snapshot.
+    PeerTableUpdate {
+        /// JSON-serialized `mirage_core::peer_table::PeerTable`.
+        peer_table_json: String,
+    },
 }
 
 /// Messages sent from worker to supervisor.
@@ -138,4 +153,137 @@ pub fn pid_file_path(chain_id: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join("mirage-cli2")
         .join(format!("{chain_id}.pid"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SupervisorMsg serialization ───────────────────────────────────────────
+
+    #[test]
+    fn peer_table_update_round_trip() {
+        let pt_json = r#"{"generation":7,"peers":[{"node_id":"v2-nl","pubkey_hex":"aabb","addr":"1.2.3.4:5000","mesh_id":"staging-v2","responsible_monitor_id":"","labels":[],"updated_at_ms":0}]}"#;
+        let msg = SupervisorMsg::PeerTableUpdate {
+            peer_table_json: pt_json.to_string(),
+        };
+        let serialized = serde_json::to_string(&msg).expect("serialize PeerTableUpdate");
+        // Must contain the discriminator tag.
+        assert!(
+            serialized.contains(r#""type":"peer_table_update""#),
+            "expected tag in: {serialized}"
+        );
+        let deserialized: SupervisorMsg =
+            serde_json::from_str(&serialized).expect("deserialize PeerTableUpdate");
+        match deserialized {
+            SupervisorMsg::PeerTableUpdate {
+                peer_table_json: got,
+            } => {
+                assert_eq!(got, pt_json);
+            }
+            other => panic!("expected PeerTableUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_without_peer_table_omits_field() {
+        let msg = SupervisorMsg::Start {
+            chain_id: "chain-a".to_string(),
+            socks5_bind: "127.0.0.1:1080".to_string(),
+            config_path: "/tmp/cfg.json".to_string(),
+            peer_table_json: None,
+        };
+        let serialized = serde_json::to_string(&msg).expect("serialize Start (no peer_table)");
+        // peer_table_json is skip_serializing_if = None → must NOT appear in wire.
+        assert!(
+            !serialized.contains("peer_table_json"),
+            "expected field absent, got: {serialized}"
+        );
+        let deserialized: SupervisorMsg =
+            serde_json::from_str(&serialized).expect("deserialize Start (no peer_table)");
+        match deserialized {
+            SupervisorMsg::Start {
+                peer_table_json: None,
+                ..
+            } => {}
+            other => panic!("expected Start{{peer_table_json:None}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_with_peer_table_round_trip() {
+        let pt_json = r#"{"generation":3,"peers":[]}"#;
+        let msg = SupervisorMsg::Start {
+            chain_id: "chain-b".to_string(),
+            socks5_bind: "127.0.0.1:1081".to_string(),
+            config_path: "/tmp/cfg2.json".to_string(),
+            peer_table_json: Some(pt_json.to_string()),
+        };
+        let serialized = serde_json::to_string(&msg).expect("serialize Start (with peer_table)");
+        let deserialized: SupervisorMsg =
+            serde_json::from_str(&serialized).expect("deserialize Start (with peer_table)");
+        match deserialized {
+            SupervisorMsg::Start {
+                peer_table_json: Some(got),
+                chain_id,
+                ..
+            } => {
+                assert_eq!(got, pt_json);
+                assert_eq!(chain_id, "chain-b");
+            }
+            other => panic!("expected Start{{peer_table_json:Some}}, got {other:?}"),
+        }
+    }
+
+    // ── Supervisor: extract peer_table JSON from a config snapshot ────────────
+    //
+    // This unit-test mocks the supervisor's extraction logic without pulling in
+    // the full MonitorLink / mirage-core dependency.  It verifies that a
+    // JSON string holding a PeerTable can be re-serialized from a known
+    // serde_json::Value and compared.
+
+    #[test]
+    fn supervisor_extract_peer_table_from_config_snapshot() {
+        // Simulated raw config snapshot as the supervisor receives it.
+        let snapshot_json = r#"{
+            "version": 5,
+            "chains": [],
+            "peer_table": {
+                "generation": 12,
+                "peers": [
+                    {
+                        "node_id": "entry-nl",
+                        "pubkey_hex": "deadbeef",
+                        "addr": "10.0.0.1:4000",
+                        "mesh_id": "staging-v2",
+                        "responsible_monitor_id": "",
+                        "updated_at_ms": 1700000000000
+                    }
+                ]
+            }
+        }"#;
+
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot_json).expect("parse snapshot");
+
+        // Supervisor extracts the peer_table sub-object and serializes it.
+        let pt_value = value
+            .get("peer_table")
+            .expect("peer_table key present")
+            .clone();
+        let pt_json = serde_json::to_string(&pt_value).expect("serialize peer_table");
+
+        // Must be valid JSON containing expected fields.
+        assert!(pt_json.contains("entry-nl"), "node_id present");
+        assert!(pt_json.contains("12"), "generation present");
+
+        // Roundtrip: parse back and check generation.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pt_json).expect("roundtrip parse");
+        assert_eq!(
+            parsed["generation"].as_u64().unwrap_or(0),
+            12,
+            "generation roundtrip"
+        );
+    }
 }

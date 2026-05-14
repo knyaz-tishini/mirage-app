@@ -2383,9 +2383,12 @@ name = "mirage-chain-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "libc",
  "mirage-chain-ipc",
  "mirage-chain-ota",
+ "mirage-client-core",
+ "mirage-core",
  "mirage-runtime-guard",
  "reqwest",
  "serde",
