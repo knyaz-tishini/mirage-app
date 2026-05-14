@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timeout_dur = Duration::from_secs(cli.timeout);
     let mut tunnel: Box<dyn Tunnel> = match timeout(
         timeout_dur,
-        run_client_udp(&endpoint, cli.addr, &pubkey, &cli.sni),
+        run_client_udp(&endpoint, cli.addr, &pubkey, &cli.sni, b"staging-v2"),
     )
     .await
     {

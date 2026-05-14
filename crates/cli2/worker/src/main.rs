@@ -19,7 +19,6 @@ use mirage_chain_ipc::{
 };
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use mirage_client_core::{
-    endpoint_protocol::EndpointProtocol,
     mux_pool::MuxPool,
     pool::TunnelPool,
     socks5::Socks5Server,
@@ -29,7 +28,7 @@ use mirage_core::{
     routing::RoutingTable,
 };
 use mirage_protocol::{
-    aliases::mirage_base,
+    endpoint_protocol::EndpointProtocol as ProtocolEP,
     negotiation::ProtocolChain,
     traits::TcpProtocol,
 };
@@ -133,15 +132,24 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("chain '{}' not found in config", chain_id))?
         .clone();
 
-    // Build protocol chain.
-    let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
-    protocols.push(Box::new(EndpointProtocol::new(
-        mirage_base(),
-        TcpProtocolId::Mirage,
-    )));
-    // (Removed: PSK-gated MirageShadowTls fallback — variant deleted from
-    // TcpProtocolId. See mirage2app/crates/cli/src/lib.rs for context.)
-    let chain_protocols = Arc::new(ProtocolChain::new(protocols));
+    // Build protocol chain — single Mirage wire for the entry hop.
+    let mesh_id = client_config.mesh_id.as_bytes().to_vec();
+    use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
+    let entry_camouflage = chain.hops.first()
+        .and_then(|h| h.camouflage.clone())
+        .unwrap_or(TransportCamouflage::None);
+    let entry_byte_cipher = chain.hops.first().and_then(|h| h.byte_cipher.clone());
+    let ep_config = MirageEndpointConfig {
+        transport: TransportKind::Tcp,
+        auth: AuthMode::Blake3,
+        camouflage: entry_camouflage,
+        byte_cipher: None,
+        byte_cipher_mode: entry_byte_cipher,
+    };
+    let proto: Box<dyn TcpProtocol> = Box::new(ProtocolEP::new(
+        ep_config, TcpProtocolId::Mirage, mesh_id.clone(),
+    ));
+    let chain_protocols = Arc::new(ProtocolChain::new(vec![proto]));
 
     // Build tunnel pool.
     let mut pool_cfg = client_config.pool.clone();
@@ -150,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mux_pool_opt: Option<Arc<MuxPool>> = if client_config.use_mux {
-        match MuxPool::new(chain.clone(), Arc::clone(&chain_protocols), pool_cfg.clone()).await {
+        match MuxPool::new(chain.clone(), Arc::clone(&chain_protocols), pool_cfg.clone(), mesh_id.clone()).await {
             Ok(mp) => {
                 info!(chain_id = %chain_id, "mux pool ready");
                 Some(mp)
@@ -164,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg)
+    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg, mesh_id)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 

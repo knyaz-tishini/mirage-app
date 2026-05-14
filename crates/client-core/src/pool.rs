@@ -75,6 +75,7 @@ struct PoolInner {
     chain: ChainConfig,
     chain_protocols: Arc<ProtocolChain>,
     config: TunnelPoolConfig,
+    mesh_id: Vec<u8>,
 }
 
 // ── Pool statistics ───────────────────────────────────────────────────────────
@@ -118,6 +119,7 @@ impl TunnelPool {
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
         config: TunnelPoolConfig,
+        mesh_id: Vec<u8>,
     ) -> Result<Arc<Self>, MirageError> {
         let is_onion = !chain.hops.is_empty();
         let pool_size = config.pool_size.max(1);
@@ -127,7 +129,8 @@ impl TunnelPool {
         for idx in 0..pool_size {
             let cp = Arc::clone(&chain_protocols);
             let ch = chain.clone();
-            join_set.spawn(async move { (idx, establish_raw_tunnel(&cp, &ch).await) });
+            let mid = mesh_id.clone();
+            join_set.spawn(async move { (idx, establish_raw_tunnel(&cp, &ch, &mid).await) });
         }
 
         // Collect until 20% threshold is reached, then return early.
@@ -179,6 +182,7 @@ impl TunnelPool {
             chain,
             chain_protocols,
             config,
+            mesh_id,
         }));
 
         let pool = Arc::new(Self {
@@ -623,13 +627,14 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
 
 /// Attempt to reconnect a single slot with exponential backoff.
 async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
-    let (max_attempts, base_ms, chain, chain_protocols) = {
+    let (max_attempts, base_ms, chain, chain_protocols, mesh_id) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
             guard.config.reconnect_base_ms,
             guard.chain.clone(),
             Arc::clone(&guard.chain_protocols),
+            guard.mesh_id.clone(),
         )
     };
 
@@ -638,7 +643,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
         attempt += 1;
         debug!(slot = slot_idx, attempt, "reconnect attempt");
 
-        match establish_raw_tunnel(&chain_protocols, &chain).await {
+        match establish_raw_tunnel(&chain_protocols, &chain, &mesh_id).await {
             Ok(tunnel) => {
                 info!(slot = slot_idx, attempt, "reconnect succeeded");
                 let mut guard = pool.inner.lock().await;

@@ -8,17 +8,17 @@ use std::{
 };
 
 use mirage_core::{
-    config::{ChainConfig, ClientConfig, ProtocolId, TcpProtocolId},
+    config::{AuthMode, ChainConfig, ClientConfig, MirageEndpointConfig, ProtocolId,
+             TransportCamouflage, TransportKind},
     routing::RoutingTable,
 };
 use mirage_protocol::{
-    aliases::{mirage_base, mirage_websocket, mirage_xhttp},
+    endpoint_protocol::EndpointProtocol,
     negotiation::ProtocolChain,
     traits::TcpProtocol,
 };
 use mirage_client_core::{
     dns_forwarder, management,
-    endpoint_protocol::EndpointProtocol,
     discovery::select_all_chains,
     http_proxy::HttpProxyServer,
     monitor_link::MonitorLink,
@@ -103,34 +103,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
     let config: ClientConfig =
         serde_json::from_str(&raw).map_err(|e| format!("failed to parse config: {}", e))?;
 
-    // Validate the private key format (64-char hex) even though the new driver
-    // API derives its own key material internally.  This catches config errors early.
-    let _key_bytes = decode_hex_key(&config.private_key)
-        .map_err(|e| format!("invalid private_key in config: {}", e))?;
-
-    // ── Build default (Mirage-only) protocol chain ────────────────────────────
-    //
-    // Used as a fallback for chains that select a non-canonical protocol or
-    // omit per-chain config blocks. Chains that select WebsocketXray /
-    // ShadowTlsV3 / etc. get a dedicated single-protocol chain built per-chain
-    // below (see `build_chain_protocol_chain`).
-    let mut default_protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
-    default_protocols.push(Box::new(EndpointProtocol::new(
-        mirage_base(),
-        TcpProtocolId::Mirage,
-    )));
-    // (Removed: PSK-gated MirageShadowTls fallback — variant deleted from
-    // TcpProtocolId. Foreign ShadowTLS clients now connect directly to an
-    // L1 EntryNode's standalone entrypoint; mirage-client-cli no longer
-    // dials canonical ShadowTLS.)
-    let default_chain_protocols = Arc::new(ProtocolChain::new(default_protocols));
-
-    // Client identity keypair (decoded from config.private_key) — required for
-    // canonical protocol constructors that take a KeyPair (WebsocketXray /
-    // ShadowTlsV3 / VlessReality).
-    let client_keypair_bytes: [u8; 32] = decode_hex_key(&config.private_key)
-        .map_err(|e| format!("invalid private_key in config: {}", e))?;
-
+    let mesh_id = config.mesh_id.as_bytes().to_vec();
     let router = Arc::new(RoutingTable::new(&config.routing));
 
     // ── Build tunnel pools (one per chain) ────────────────────────────────────
@@ -176,9 +149,8 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         );
 
         let chain_owned = (*chain).clone();
-        let protocols = match build_chain_protocol_chain(&chain_owned, &client_keypair_bytes) {
-            Ok(Some(p)) => Arc::new(p),
-            Ok(None) => Arc::clone(&default_chain_protocols),
+        let protocols = match build_chain_protocol_chain(&chain_owned, &mesh_id) {
+            Ok(p) => Arc::new(p),
             Err(e) => {
                 tracing::warn!(
                     chain = %chain_owned.chain_id,
@@ -187,9 +159,10 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                 continue;
             }
         };
+        let mid = mesh_id.clone();
         pool_tasks.spawn(async move {
             let id = chain_owned.chain_id.clone();
-            match TunnelPool::new(chain_owned, protocols, pool_cfg).await {
+            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid).await {
                 Ok(pool) => Some((id, pool)),
                 Err(e) => {
                     tracing::warn!(chain = %id, "pool init failed, skipping: {e}");
@@ -223,17 +196,17 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         for chain in &all_chains {
             let chain_owned = (*chain).clone();
             let id = chain.chain_id.clone();
-            let protocols = match build_chain_protocol_chain(&chain_owned, &client_keypair_bytes) {
-                Ok(Some(p)) => Arc::new(p),
-                Ok(None) => Arc::clone(&default_chain_protocols),
+            let protocols = match build_chain_protocol_chain(&chain_owned, &mesh_id) {
+                Ok(p) => Arc::new(p),
                 Err(e) => {
                     tracing::warn!(chain = %id, "per-chain protocol build failed (mux): {e}");
                     continue;
                 }
             };
             let cfg = pool_cfg_base.clone();
+            let mid = mesh_id.clone();
             mux_tasks.spawn(async move {
-                match MuxPool::new(chain_owned, protocols, cfg).await {
+                match MuxPool::new(chain_owned, protocols, cfg, mid).await {
                     Ok(mux) => Some((id, mux)),
                     Err(e) => {
                         tracing::warn!(
@@ -259,10 +232,14 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         if config.chains.is_empty() {
             return Err("no chains configured for kill switch".into());
         }
+        // Entry hop (hops[0]) is the relay the kill-switch must allow through.
         let relay_addrs: Vec<SocketAddr> = config
             .chains
             .iter()
-            .filter_map(|c| c.l1.as_ref().map(|n| n.addr))
+            .filter_map(|c| {
+                let addr_str = c.hops.first()?.addr.clone();
+                addr_str.parse::<SocketAddr>().ok()
+            })
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -349,8 +326,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         }
 
         let rt_for_watcher = Arc::clone(&runtime);
-        let default_protocols_for_watcher = Arc::clone(&default_chain_protocols);
-        let client_kp_for_watcher = client_keypair_bytes;
+        let mesh_id_for_watcher = mesh_id.clone();
         let pool_cfg_for_watcher = pool_cfg_base.clone();
         let use_mux_for_watcher = use_mux;
 
@@ -391,10 +367,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                         let chain_cfg = monitor_chain.chain.clone();
                         let protocols_for_chain = match build_chain_protocol_chain(
                             &chain_cfg,
-                            &client_kp_for_watcher,
+                            &mesh_id_for_watcher,
                         ) {
-                            Ok(Some(p)) => Arc::new(p),
-                            Ok(None) => Arc::clone(&default_protocols_for_watcher),
+                            Ok(p) => Arc::new(p),
                             Err(e) => {
                                 tracing::warn!(
                                     chain = %chain_id,
@@ -408,6 +383,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             chain_cfg,
                             protocols_for_chain,
                             pool_cfg,
+                            mesh_id_for_watcher.clone(),
                         )
                         .await
                         {
@@ -592,101 +568,42 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
 // ── Re-export LogCaptureLayer for main.rs ─────────────────────────────────────
 pub use mirage_client_core::log_capture::LogCaptureLayer;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Decode a 64-character hex string into a 32-byte array.
-fn decode_hex_key(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", hex.len()));
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Result<u8, String> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(format!("invalid hex character: {}", b as char)),
-    }
-}
-
-/// Build a per-chain `ProtocolChain` containing exactly the canonical TCP
-/// protocol the chain selected, instantiated from the chain's per-protocol
-/// config block.
+/// Build a per-chain `ProtocolChain` for a single Mirage TCP chain.
 ///
-/// Returns:
-/// - `Ok(Some(chain))` — chain selected a canonical protocol and we built it.
-///   The caller MUST use this `ProtocolChain` for that chain (not the global
-///   default Mirage chain).
-/// - `Ok(None)` — chain selected `Mirage` / `MirageShadowTls` (legacy) /
-///   anything not yet wired here. Caller falls back to the default chain.
-/// - `Err(...)` — config block was missing or malformed for a protocol that
-///   requires it (e.g. ShadowTlsV3 PSK hex decode failed). Chain should be
-///   skipped so the cli doesn't silently dial Mirage where ShadowTlsV3 was
-///   asked.
+/// Reads `chain.hops[0].camouflage` and `chain.hops[0].byte_cipher` for the
+/// entry-leg outer wrap. `mesh_id` is baked into every `EndpointProtocol` so
+/// the Blake3 confirm label binds the handshake to this mesh.
+///
+/// Returns `Err` if the chain has no hops or if the protocol is not TCP
+/// (UDP chains use `establish_udp_chain_tunnel` directly).
 fn build_chain_protocol_chain(
     chain: &ChainConfig,
-    client_keypair_bytes: &[u8; 32],
-) -> Result<Option<ProtocolChain>, BoxError> {
-    use mirage_core::config::{
-        AuthMode, MirageEndpointConfig, TcpProtocolId as P, TransportCamouflage, TransportKind,
-    };
-
+    mesh_id: &[u8],
+) -> Result<ProtocolChain, BoxError> {
     let proto_id = match &chain.protocol {
         ProtocolId::Tcp(id) => *id,
-        ProtocolId::Udp(_) => return Ok(None), // UDP chains use a different driver path
+        ProtocolId::Udp(_) => {
+            return Err("UDP chains do not use ProtocolChain; handled by dial-core".into());
+        }
     };
 
-    let _ = client_keypair_bytes;
+    let entry_hop = chain.hops.first().ok_or_else(|| {
+        format!("chain {}: hops list is empty — cannot build ProtocolChain", chain.chain_id)
+    })?;
 
-    // v2 path: if `chain.l1.camouflage` is set, build a single EndpointProtocol
-    // dynamically — same TcpProtocol type for every camouflage variant. The
-    // legacy `Mirage*` aliases are now equivalent to specific TransportCamouflage
-    // values on a bare Mirage wire (see `mirage-protocol/src/aliases.rs`).
-    let v2_camouflage = chain.l1.as_ref().and_then(|n| n.camouflage.clone());
-    let v2_byte_cipher = chain.l1.as_ref().and_then(|n| n.byte_cipher.clone());
-    if v2_camouflage.is_some() || v2_byte_cipher.is_some() {
-        let endpoint = MirageEndpointConfig {
-            transport: TransportKind::Tcp,
-            auth: AuthMode::Blake3,
-            camouflage: v2_camouflage.unwrap_or(TransportCamouflage::None),
-            byte_cipher: None,
-            byte_cipher_mode: v2_byte_cipher,
-        };
-        let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
-        protocols.push(Box::new(EndpointProtocol::new(endpoint, proto_id)));
-        return Ok(Some(ProtocolChain::new(protocols)));
-    }
+    let endpoint = MirageEndpointConfig {
+        transport: TransportKind::Tcp,
+        auth: AuthMode::Blake3,
+        camouflage: entry_hop.camouflage.clone().unwrap_or(TransportCamouflage::None),
+        byte_cipher: None,
+        byte_cipher_mode: entry_hop.byte_cipher.clone(),
+    };
 
-    // Legacy aliases: chain selects a specific TcpProtocolId, camouflage is
-    // baked into the alias. Kept for backward-compat with pre-v2 monitor
-    // configs that still emit `protocol: "MirageWebsocket"` etc.
     let mut protocols: Vec<Box<dyn TcpProtocol>> = Vec::new();
-    match proto_id {
-        P::MirageWebsocket => {
-            let cfg = chain.mirage_websocket.clone().unwrap_or_default();
-            protocols.push(Box::new(EndpointProtocol::new(
-                mirage_websocket(cfg.path, cfg.host),
-                P::MirageWebsocket,
-            )));
-        }
-        P::Xhttp => {
-            let cfg = chain.mirage_xhttp.clone().unwrap_or_default();
-            protocols.push(Box::new(EndpointProtocol::new(
-                mirage_xhttp(cfg.path, cfg.host),
-                P::Xhttp,
-            )));
-        }
-        // Mirage / MirageTls / exit endpoints — fall through to default chain
-        // (built once in `run` from `mirage_base()`).
-        _ => return Ok(None),
-    }
-    Ok(Some(ProtocolChain::new(protocols)))
+    protocols.push(Box::new(EndpointProtocol::new(
+        endpoint,
+        proto_id,
+        mesh_id.to_vec(),
+    )));
+    Ok(ProtocolChain::new(protocols))
 }

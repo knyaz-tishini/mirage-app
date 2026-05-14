@@ -90,7 +90,7 @@ fn chain_to_json(c: &MonitorChain) -> serde_json::Value {
         .chain
         .socks5_bind
         .clone()
-        .or_else(|| c.chain.l1.as_ref().map(|n| n.addr.to_string()))
+        .or_else(|| c.chain.hops.first().map(|h| h.addr.clone()))
         .unwrap_or_default();
     serde_json::json!({
         "name":        c.chain.chain_id,

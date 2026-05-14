@@ -151,6 +151,7 @@ struct PoolInner {
     chain: ChainConfig,
     chain_protocols: Arc<ProtocolChain>,
     config: TunnelPoolConfig,
+    mesh_id: Vec<u8>,
 }
 
 /// Maximum number of open_stream attempts before giving up.
@@ -176,6 +177,7 @@ impl MuxPool {
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
         config: TunnelPoolConfig,
+        mesh_id: Vec<u8>,
     ) -> Result<Arc<Self>, MirageError> {
         let is_onion = !chain.hops.is_empty();
         let pool_size = config.pool_size.max(1).min(8);
@@ -190,7 +192,8 @@ impl MuxPool {
         for idx in 0..pool_size {
             let cp = Arc::clone(&chain_protocols);
             let ch = chain.clone();
-            join_set.spawn(async move { (idx, build_session(&cp, &ch).await) });
+            let mid = mesh_id.clone();
+            join_set.spawn(async move { (idx, build_session(&cp, &ch, &mid).await) });
         }
 
         let threshold = (pool_size / 5).max(1);
@@ -235,6 +238,7 @@ impl MuxPool {
             chain,
             chain_protocols,
             config,
+            mesh_id,
         }));
 
         let pool = Arc::new(Self {
@@ -415,11 +419,12 @@ impl MuxPool {
 async fn build_session(
     chain_protocols: &Arc<ProtocolChain>,
     chain: &ChainConfig,
+    mesh_id: &[u8],
 ) -> Result<SessionHandle, MirageError> {
     // Onion chains send MUX\0 magic so the exit upgrades to a mux server.
     // Direct chains use the raw tunnel path (no magic needed — they connect
     // directly to a relay that already runs a mux server).
-    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain).await?;
+    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, mesh_id).await?;
     let compat = TunnelCompat::wrap(tunnel);
     Ok(SessionHandle::client(compat))
 }
@@ -579,13 +584,14 @@ mod tests {
 }
 
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
-    let (max_attempts, base_ms, chain, chain_protocols) = {
+    let (max_attempts, base_ms, chain, chain_protocols, mesh_id) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
             guard.config.reconnect_base_ms,
             guard.chain.clone(),
             Arc::clone(&guard.chain_protocols),
+            guard.mesh_id.clone(),
         )
     };
 
@@ -594,7 +600,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         attempt += 1;
         debug!(slot = slot_idx, attempt, "mux reconnect attempt");
 
-        match build_session(&chain_protocols, &chain).await {
+        match build_session(&chain_protocols, &chain, &mesh_id).await {
             Ok(session) => {
                 info!(slot = slot_idx, attempt, "mux reconnect succeeded");
                 {
