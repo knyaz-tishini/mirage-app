@@ -593,6 +593,141 @@ mod tests {
         assert_eq!(&magic[..3], b"MUX");
         assert_eq!(magic[3], 0u8); // null terminator
     }
+
+    /// `establish_mux_tunnel` for an onion chain where hops have
+    /// `public_key = None` and matching `node_id` entries in the peer_table must
+    /// NOT fail with the config error "hop public_key must be 64 hex chars, got 0".
+    ///
+    /// The chain has 2 hops (→ onion path), so `chain_protocols` is never called
+    /// (onion connect goes directly over TCP).  The test confirms pubkey resolution
+    /// succeeds and the error is network-level (connection refused), not a
+    /// validation error from the onion builder.
+    #[tokio::test]
+    async fn mux_pool_peer_table_resolution_passes_pubkey_validation() {
+        use arc_swap::ArcSwap;
+        use mirage_core::{
+            config::{
+                ChainConfig, HandshakeStrategy, HopConfig, HopRole, ProtocolId, TcpProtocolId,
+            },
+            peer_table::{PeerEntry, PeerTable},
+        };
+        use mirage_protocol::negotiation::ProtocolChain;
+        use std::sync::Arc;
+
+        let pubkey = "b".repeat(64);
+        let peer_table = Arc::new(ArcSwap::from_pointee(PeerTable {
+            generation: 1,
+            peers: vec![
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-entry".into(),
+                    pubkey_hex: pubkey.clone(),
+                    addr: "127.0.0.1:19988".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-exit".into(),
+                    pubkey_hex: "c".repeat(64),
+                    addr: "127.0.0.1:19989".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+            ],
+        }));
+
+        // Two hops → onion path in establish_mux_tunnel (no chain_protocols needed).
+        let chain = ChainConfig {
+            chain_id: "test-mux-peer".into(),
+            hops: vec![
+                HopConfig {
+                    addr: "127.0.0.1:19988".into(),
+                    // Deliberately None — must be resolved from peer_table.
+                    public_key: None,
+                    node_id: Some("v2-entry".into()),
+                    sni: None,
+                    role: HopRole::Entry,
+                    display_name: None,
+                    camouflage: None,
+                    byte_cipher: None,
+                },
+                HopConfig {
+                    addr: "127.0.0.1:19989".into(),
+                    public_key: None,
+                    node_id: Some("v2-exit".into()),
+                    sni: None,
+                    role: HopRole::Exit,
+                    display_name: None,
+                    camouflage: None,
+                    byte_cipher: None,
+                },
+            ],
+            handshake: HandshakeStrategy::Ephemeral,
+            reply: mirage_core::config::ReplyMode::Raw,
+            protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
+            priority: 0,
+            shaping: Default::default(),
+            camouflage: Default::default(),
+            cover_traffic: Default::default(),
+            socks5_bind: None,
+            websocket_xray: None,
+            shadowtls_v3: None,
+            vless_reality: None,
+            udp_hysteria2_native: None,
+        };
+
+        // Build a minimal ProtocolChain (unused for the 2-hop onion path — onion
+        // connect goes directly over TCP and never calls chain_protocols.connect).
+        use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
+        use mirage_protocol::endpoint_protocol::EndpointProtocol;
+        let ep_cfg = MirageEndpointConfig {
+            transport: TransportKind::Tcp,
+            auth: AuthMode::Blake3,
+            camouflage: TransportCamouflage::None,
+            byte_cipher: None,
+            byte_cipher_mode: None,
+        };
+        let chain_protocols = Arc::new(
+            ProtocolChain::new(vec![Box::new(EndpointProtocol::new(
+                ep_cfg,
+                TcpProtocolId::Mirage,
+                vec![],
+            ))]),
+        );
+
+        let pt_snap = peer_table.load_full();
+        let result = crate::tunnel::establish_mux_tunnel(
+            &chain_protocols,
+            &chain,
+            &pt_snap,
+            &[],
+        )
+        .await;
+
+        match result {
+            Ok(_) => panic!("expected a network-level error (no server on :19988/:19989)"),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                // Must NOT be a config error about "64 hex chars".
+                assert!(
+                    !msg.contains("64 hex chars"),
+                    "pubkey resolution must have succeeded before dial; \
+                     got unexpected config error: {msg}"
+                );
+                // Must be a network-level failure.
+                assert!(
+                    msg.contains("refused")
+                        || msg.contains("timed out")
+                        || msg.contains("Io")
+                        || msg.contains("NodeUnreachable"),
+                    "expected network-level error, got: {msg}"
+                );
+            }
+        }
+    }
 }
 
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
