@@ -174,6 +174,11 @@ pub struct MuxPool {
     circuit_breaker: Arc<CircuitBreaker>,
     /// Limits burst of requests immediately after recovery to avoid thundering herd.
     reconnect_limiter: Arc<Semaphore>,
+    /// Notified when the shared peer_table receives a new generation.
+    ///
+    /// Sleeping reconnect tasks subscribe to this so they wake immediately
+    /// and retry with fresh peer data instead of waiting out exponential backoff.
+    peer_table_notify: Arc<tokio::sync::Notify>,
 }
 
 impl MuxPool {
@@ -264,6 +269,7 @@ impl MuxPool {
                 5,  // stay open for 5 seconds
             )),
             reconnect_limiter: Arc::new(Semaphore::new(RECONNECT_BURST_LIMIT)),
+            peer_table_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let pool_weak = Arc::downgrade(&pool);
@@ -424,6 +430,19 @@ impl MuxPool {
         self.is_onion
             .store(!guard.chain.hops.is_empty(), Ordering::Release);
         info!("mux pool chain switched: active and dormant sessions marked reconnecting");
+    }
+
+    /// Signal that the shared peer_table has received a new generation.
+    ///
+    /// Wakes all sleeping mux reconnect tasks so they retry immediately with
+    /// fresh peer data instead of waiting out their exponential backoff delay.
+    /// Also resets their attempt counter so they do not hit the max-attempts
+    /// cap prematurely.
+    ///
+    /// Call this whenever `ArcSwap<PeerTable>::store(new_table)` is called on
+    /// the table that was passed to [`MuxPool::new`].
+    pub fn notify_peer_table_change(&self) {
+        self.peer_table_notify.notify_waiters();
     }
 }
 
@@ -887,10 +906,86 @@ mod tests {
             }
         }
     }
+
+    // ── Stale-slot lockup reproducer (Track 2 fix, May 2026) ─────────────────
+
+    /// `notify_peer_table_change()` must wake a task that is blocked on
+    /// `peer_table_notify.notified()` in the mux pool.
+    ///
+    /// Mirrors the TunnelPool test.  The mechanism is symmetric: mux reconnect
+    /// tasks that exhaust `max_attempts` block on `peer_table_notify` and are
+    /// woken immediately when new peer data arrives.
+    #[tokio::test]
+    async fn mux_notify_peer_table_change_wakes_blocked_reconnect() {
+        use super::MuxPool;
+        use arc_swap::ArcSwap;
+        use mirage_core::{config::TunnelPoolConfig, peer_table::PeerTable};
+        use std::sync::Arc;
+
+        let chain = make_two_hop_chain("node-a", "node-b");
+        let chain_protocols = make_chain_protocols();
+        let peer_table = Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+        let config = TunnelPoolConfig {
+            pool_size: 1,
+            max_reconnect_attempts: 1,
+            reconnect_base_ms: 10,
+            idle_timeout_secs: 300,
+        };
+
+        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table)
+            .await
+            .expect("MuxPool::new must not fail during construction");
+
+        let notified = {
+            let n = Arc::clone(&pool.peer_table_notify);
+            tokio::spawn(async move {
+                n.notified().await;
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        pool.notify_peer_table_change();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            notified,
+        )
+        .await
+        .expect("mux notify_peer_table_change must wake blocked task within 500 ms")
+        .expect("task must not panic");
+    }
+
+    /// `notify_peer_table_change()` with no subscribers must not panic or block.
+    #[tokio::test]
+    async fn mux_notify_peer_table_change_no_subscribers_is_noop() {
+        use super::MuxPool;
+        use arc_swap::ArcSwap;
+        use mirage_core::{config::TunnelPoolConfig, peer_table::PeerTable};
+        use std::sync::Arc;
+
+        let chain = make_two_hop_chain("node-c", "node-d");
+        let chain_protocols = make_chain_protocols();
+        let peer_table = Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+        let config = TunnelPoolConfig {
+            pool_size: 1,
+            max_reconnect_attempts: 1,
+            reconnect_base_ms: 10,
+            idle_timeout_secs: 300,
+        };
+
+        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table)
+            .await
+            .expect("MuxPool::new must not fail during construction");
+
+        pool.notify_peer_table_change();
+        pool.notify_peer_table_change();
+    }
 }
 
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
-    let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared) = {
+    let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
+         peer_table_notify) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -899,6 +994,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             Arc::clone(&guard.chain_protocols),
             guard.mesh_id.clone(),
             Arc::clone(&guard.peer_table),
+            Arc::clone(&pool.peer_table_notify),
         )
     };
 
@@ -908,7 +1004,8 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         debug!(slot = slot_idx, attempt, "mux reconnect attempt");
 
         // Load a fresh peer_table snapshot on each attempt so we pick up
-        // any key rotations that arrived between retries.
+        // any updates that arrived between retries (including the transition
+        // from empty → populated when the monitor link first delivers peers).
         let peer_table_snap = peer_table_shared.load_full();
         match build_session(&chain_protocols, &chain, &peer_table_snap, &mesh_id).await {
             Ok(session) => {
@@ -932,9 +1029,15 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                         slot = slot_idx,
                         attempt,
                         error = %e,
-                        "mux reconnect gave up after max attempts"
+                        "mux reconnect gave up after max attempts — waiting for peer_table change"
                     );
-                    return;
+                    // Block until a peer_table update arrives, then restart the
+                    // attempt counter.  This prevents permanent lockup when the
+                    // peer_table was empty at dial time and arrives later.
+                    peer_table_notify.notified().await;
+                    info!(slot = slot_idx, "mux: peer_table changed — resetting attempt counter");
+                    attempt = 0;
+                    continue;
                 }
                 let delay_ms = base_ms.saturating_mul(1u64 << attempt.min(10));
                 warn!(
@@ -944,7 +1047,20 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                     error = %e,
                     "mux reconnect failed, retrying"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                // Sleep for the backoff delay, but wake early if the peer_table
+                // is updated — stale-slot lockup fix (May 2026).
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                    _ = peer_table_notify.notified() => {
+                        info!(
+                            slot = slot_idx,
+                            attempt,
+                            "mux: peer_table changed during backoff — retrying immediately"
+                        );
+                        // Reset attempt so fresh peer data gets a clean counter.
+                        attempt = 0;
+                    }
+                }
             }
         }
     }
