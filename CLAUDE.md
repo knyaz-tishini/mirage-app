@@ -1,5 +1,76 @@
 # mirage2app — agent rules
 
+## Phase 8 ephemeral client identity (May 2026 clean-room rewrite)
+
+См. `nemo/docs/plans/phase-8-report.md` + `phase-9-plan.md`.
+
+After Phase 5+8 — **`ClientConfig.private_key` field is DELETED**. Client
+generates a fresh ephemeral X25519 keypair per dial in
+`mirage-protocol::handshake_client_stream` (`StaticSecret::random_from_rng(OsRng)`).
+No long-term client identity stored on disk.
+
+`ClientConfig.mesh_id: String` is **mandatory** (default `"staging-v2"`
+via `#[serde(default)]`). Baked into Blake3 confirm — client with wrong
+mesh_id cryptographically fails handshake. Used in `EndpointProtocol::new(..., mesh_id)` plumbed through `TunnelPool::new(mesh_id, peer_table)` / `MuxPool::new(mesh_id, peer_table)`.
+
+### Single ProtocolChain path (Phase 5)
+
+`build_chain_protocol_chain` no longer has alias-arms (`MirageTls` / `MirageWebsocket` / `Xhttp`). Single path:
+
+```rust
+let endpoint = MirageEndpointConfig {
+    transport: chain.protocol.transport(),
+    auth: AuthMode::Blake3,
+    camouflage: chain.hops[0].camouflage.unwrap_or(None),
+    byte_cipher: None,
+    byte_cipher_mode: chain.hops[0].byte_cipher.clone(),
+};
+EndpointProtocol::new(endpoint, /* ephemeral keypair generated in driver */,
+    chain.protocol, chain.mesh_id.as_bytes().to_vec())
+```
+
+`TcpProtocolId::Mirage` / `UdpProtocolId::MirageUdp` are the only variants.
+
+### peer_table runtime resolution (Phase 8.4/8.5)
+
+`HopConfig.public_key: Option<String>` — if `None`, resolve via live
+`Arc<ArcSwap<PeerTable>>` shared between `MonitorLink` and `TunnelPool` /
+`MuxPool`. MonitorLink парсит peer_table из WS Config frame, stores в
+ArcSwap. Pool loads snapshot on each dial.
+
+`HopConfig.node_id: Option<String>` — lookup key (prefer over `display_name`).
+
+`ClientConfig` schema:
+```json
+{
+  "client_id": "...",
+  "mesh_id": "staging-v2",
+  "chains": [{
+    "chain_id": "...",
+    "hops": [{
+      "addr": "ip:port",
+      "public_key": null,    // resolved via peer_table at dial
+      "node_id": "v2-entry", // lookup key
+      "camouflage": {...},   // per-leg outer wrap
+      "byte_cipher": null
+    }],
+    "protocol": "Mirage",
+    ...
+  }],
+  "routing": {...}
+}
+```
+
+NO `private_key`, NO `l1`, NO `l2`, NO `l1_transparent`, NO `udp_quic` / `udp_hysteria2` / `udp_wg` / `udp_http3`, NO `mirage_websocket` / `mirage_xhttp` blocks — все эти поля удалены.
+
+### Offline/no-monitor-link path
+
+If client runs without monitor link (debug, isolated test), construct
+`Arc::new(ArcSwap::from_pointee(PeerTable::default()))` — empty table.
+Only chains with hardcoded `hop.public_key = Some(hex)` work; chains
+relying on dynamic resolution fail at first dial with `UnknownNode` /
+`BadPubkey`.
+
 ## Universal `mirage-sentry` + stable cross-LM identity (May 2026)
 
 One crate `crates/sentry/` ships as the **universal sentry binary** — same source deploys to every box (9 server-LMs + N client testers). Mode picked at build time via feature flags:
@@ -308,6 +379,26 @@ rustflags = ["-C", "target-cpu=x86-64-v2"]   # tester-safe baseline
 Затем `cargo clean -p <crate>` (cargo не пересобирает при смене rustflags автоматически без clean), затем build. После — вернуть `target-cpu=native`. Этот путь используем только если build-win-bins.sh почему-то не подходит.
 
 Проверить какой baseline в текущем бинаре: `dumpbin /headers <exe> | findstr machine` (Win) или `otool -hv <exe>` (mac) не покажут CPU features напрямую — самый надёжный способ это запустить на тестере и смотреть, не падает ли.
+
+## Phase 10 changes (May 2026) — ref: `docs/plans/phase-9-session-end-2026-05-15.md`
+
+### 10.1.1 Wire V3 (mesh_id in ss_hint)
+
+Client now sends `BLAKE3(ecdh || e_pub || "MIRAGE-AUTH-V3" || mesh_id)` as ss_hint.
+Both sides enforce mesh_id — wrong-mesh handshake fails at server hint check, not just confirm.
+See `mirage-dial-core/src/tunnel.rs`.
+
+### 10.2.1 freshen_chain_pubkeys (per-attempt pubkey refresh)
+
+`freshen_chain_pubkeys(chain, peer_table)` helper in `mirage-dial-core/src/tunnel.rs`.
+Called at the top of every reconnect attempt (both `reconnect_slot` and `reconnect_mux_slot`).
+Overrides `hop.public_key` from the current peer_table snapshot — discards stale static pub from initial `ClientConfig`. Fixes UDP client recovery after node ephemeral-keypair rotation.
+
+### 9.7 is_onion gate (CRITICAL — fixes 10/10 camouflage smoke)
+
+`is_onion = chain.hops.len() > 1` in TunnelPool + MuxPool + establish_mux_tunnel (5 sites).
+Single-hop direct-exit chains with `hops=[Exit]` use raw path. Wrong `!hops.is_empty()` check
+caused HTTP/0.9 + TLS alert + UDP timeout across all 10 camouflages — all closed by this fix.
 
 ## NEVER
 
