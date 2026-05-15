@@ -2471,6 +2471,7 @@ dependencies = [
 name = "mirage-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "blake3",
  "bytes",
  "chacha20poly1305",

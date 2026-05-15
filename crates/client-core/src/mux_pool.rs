@@ -700,6 +700,7 @@ mod tests {
             shadowtls_v3: None,
             vless_reality: None,
             udp_hysteria2_native: None,
+            aead_suite: mirage_core::crypto::AeadSuite::ChaCha20Poly1305,
         };
 
         // Build a minimal ProtocolChain (unused for the 2-hop onion path — onion
@@ -795,6 +796,7 @@ mod tests {
             shadowtls_v3: None,
             vless_reality: None,
             udp_hysteria2_native: None,
+            aead_suite: mirage_core::crypto::AeadSuite::ChaCha20Poly1305,
         }
     }
 
