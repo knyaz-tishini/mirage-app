@@ -39,7 +39,7 @@ use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
-use crate::tunnel::establish_raw_tunnel;
+use crate::tunnel::{establish_raw_tunnel, freshen_chain_pubkeys};
 
 // ── Reaper constants ──────────────────────────────────────────────────────────
 
@@ -1021,7 +1021,25 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
         // any updates that arrived between retries (including the transition
         // from empty → populated when the monitor link first delivers peers).
         let peer_table_snap = peer_table_shared.load_full();
-        match establish_raw_tunnel(&chain_protocols, &chain, &peer_table_snap, &mesh_id).await {
+
+        // Freshen the chain's hop pubkeys from the live peer_table.  This is
+        // necessary for ephemeral-key rotation recovery: when a node restarts its
+        // X25519 keypair changes and the peer_table is updated, but the chain
+        // stored in pool.inner.chain still carries the old static public_key.
+        // freshen_chain_pubkeys() overrides any stale static key with the live
+        // peer_table entry whenever node_id is set — fixing UDP (and TCP) pools
+        // after rotation without requiring switch_chain or a full worker restart.
+        let fresh_chain = match freshen_chain_pubkeys(&chain, &peer_table_snap) {
+            Ok(c) => c,
+            Err(e) => {
+                // peer_table not populated yet — fall back to original chain and
+                // let the dial fail with the usual "not in peer_table" error so
+                // the retry/backoff logic handles it normally.
+                debug!(slot = slot_idx, error = %e, "freshen_chain_pubkeys: using original chain");
+                chain.clone()
+            }
+        };
+        match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id).await {
             Ok(tunnel) => {
                 info!(slot = slot_idx, attempt, "reconnect succeeded");
                 let mut guard = pool.inner.lock().await;

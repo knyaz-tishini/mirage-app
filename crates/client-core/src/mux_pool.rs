@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::relay::TunnelCompat;
-use crate::tunnel::establish_mux_tunnel;
+use crate::tunnel::{establish_mux_tunnel, freshen_chain_pubkeys};
 
 // ── Circuit breaker state constants ──────────────────────────────────────────
 const CIRCUIT_CLOSED: u8 = 0;
@@ -1011,7 +1011,17 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         // any updates that arrived between retries (including the transition
         // from empty → populated when the monitor link first delivers peers).
         let peer_table_snap = peer_table_shared.load_full();
-        match build_session(&chain_protocols, &chain, &peer_table_snap, &mesh_id).await {
+
+        // Freshen hop pubkeys from live peer_table — fixes UDP (and TCP) recovery
+        // after ephemeral-key rotation without requiring switch_chain.
+        let fresh_chain = match freshen_chain_pubkeys(&chain, &peer_table_snap) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(slot = slot_idx, error = %e, "mux: freshen_chain_pubkeys: using original chain");
+                chain.clone()
+            }
+        };
+        match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id).await {
             Ok(session) => {
                 info!(slot = slot_idx, attempt, "mux reconnect succeeded");
                 {
