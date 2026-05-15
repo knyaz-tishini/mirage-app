@@ -640,6 +640,245 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
 }
 
 /// Attempt to reconnect a single slot with exponential backoff.
+// ── Smoke tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod pool_smoke_tests {
+    use mirage_core::config::{
+        AuthMode, ChainConfig, HandshakeStrategy, HopConfig, HopRole, MirageEndpointConfig,
+        ProtocolId, TcpProtocolId, TransportCamouflage, TransportKind,
+    };
+    use mirage_protocol::{endpoint_protocol::EndpointProtocol, negotiation::ProtocolChain};
+    use std::sync::Arc;
+
+    /// Build a minimal `ProtocolChain` backed by a Blake3/TCP endpoint.
+    fn minimal_chain_protocols() -> Arc<ProtocolChain> {
+        let ep_cfg = MirageEndpointConfig {
+            transport: TransportKind::Tcp,
+            auth: AuthMode::Blake3,
+            camouflage: TransportCamouflage::None,
+            byte_cipher: None,
+            byte_cipher_mode: None,
+        };
+        Arc::new(ProtocolChain::new(vec![Box::new(EndpointProtocol::new(
+            ep_cfg,
+            TcpProtocolId::Mirage,
+            vec![],
+        ))]))
+    }
+
+    /// Build a 2-hop onion `ChainConfig` whose hops have `public_key = None`
+    /// and `node_id` set to the given ids.
+    fn two_hop_chain(entry_id: &str, exit_id: &str) -> ChainConfig {
+        ChainConfig {
+            chain_id: "test-pool-smoke".into(),
+            hops: vec![
+                HopConfig {
+                    addr: "127.0.0.1:19971".into(),
+                    public_key: None,
+                    node_id: Some(entry_id.into()),
+                    sni: None,
+                    role: HopRole::Entry,
+                    display_name: None,
+                    camouflage: None,
+                    byte_cipher: None,
+                },
+                HopConfig {
+                    addr: "127.0.0.1:19972".into(),
+                    public_key: None,
+                    node_id: Some(exit_id.into()),
+                    sni: None,
+                    role: HopRole::Exit,
+                    display_name: None,
+                    camouflage: None,
+                    byte_cipher: None,
+                },
+            ],
+            handshake: HandshakeStrategy::Ephemeral,
+            reply: mirage_core::config::ReplyMode::Raw,
+            protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
+            priority: 0,
+            shaping: Default::default(),
+            camouflage: Default::default(),
+            cover_traffic: Default::default(),
+            socks5_bind: None,
+            websocket_xray: None,
+            shadowtls_v3: None,
+            vless_reality: None,
+            udp_hysteria2_native: None,
+        }
+    }
+
+    /// Empty peer_table → `establish_raw_tunnel` must fail with the specific
+    /// "not in peer_table — node may not be registered yet" config error.
+    ///
+    /// This is the regression guard for the "Connection refused recovery race"
+    /// bug: before Phase 9.6 the resolve step was missing, so the error was
+    /// the generic "hop public_key must be 64 hex chars, got 0" from the onion
+    /// builder, not the actionable peer_table message.
+    #[tokio::test]
+    async fn pool_empty_peer_table_returns_specific_error() {
+        use mirage_core::peer_table::PeerTable;
+        use crate::tunnel::establish_raw_tunnel;
+
+        let chain = two_hop_chain("v2-entry", "v2-exit");
+        let pt = PeerTable::empty();
+        let chain_protocols = minimal_chain_protocols();
+
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[]).await;
+
+        assert!(result.is_err(), "must fail when peer_table is empty");
+        let e = result.err().expect("just checked is_err");
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains("not in peer_table"),
+            "error must mention 'not in peer_table' (got): {msg}"
+        );
+        // Must NOT be the pre-Phase-9.6 config error about hex chars.
+        assert!(
+            !msg.contains("64 hex chars"),
+            "must not be the old pubkey-validation error (got): {msg}"
+        );
+    }
+
+    /// After `peer_table` contains a matching entry, `establish_raw_tunnel`
+    /// must resolve pubkey and fail at network-level (connection refused),
+    /// NOT at the config-validation stage.
+    ///
+    /// This proves that peer_table → pubkey resolve path works end-to-end and
+    /// that the "must be 64 hex chars" config error is gone for valid entries.
+    #[tokio::test]
+    async fn pool_peer_table_resolve_passes_pubkey_validation() {
+        use mirage_core::peer_table::{PeerEntry, PeerTable};
+        use crate::tunnel::establish_raw_tunnel;
+
+        let pubkey = "d".repeat(64);
+        let pt = PeerTable {
+            generation: 1,
+            peers: vec![
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-entry".into(),
+                    pubkey_hex: pubkey.clone(),
+                    addr: "127.0.0.1:19971".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-exit".into(),
+                    pubkey_hex: "e".repeat(64),
+                    addr: "127.0.0.1:19972".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+            ],
+        };
+
+        let chain = two_hop_chain("v2-entry", "v2-exit");
+        let chain_protocols = minimal_chain_protocols();
+
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[]).await;
+
+        match result {
+            Ok(_) => panic!("expected network-level error (no server on :19971/:19972)"),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                // Must NOT be a config error about "64 hex chars".
+                assert!(
+                    !msg.contains("64 hex chars"),
+                    "pubkey resolution must have succeeded; got unexpected config error: {msg}"
+                );
+                // Must be network-level failure.
+                assert!(
+                    msg.contains("refused")
+                        || msg.contains("timed out")
+                        || msg.contains("Io")
+                        || msg.contains("NodeUnreachable"),
+                    "expected network-level error, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Recovery from reconnect-failed state: simulate that the pool starts with
+    /// an empty peer_table (all slots fail → Reconnecting), then the peer_table
+    /// is populated with correct entries. The next `establish_raw_tunnel` call
+    /// (simulating what `reconnect_slot` would do) must resolve, not fail with
+    /// the config error.
+    ///
+    /// We can't easily test pool internals without actually constructing a
+    /// `TunnelPool` (which dials on startup), so we test the underlying
+    /// `establish_raw_tunnel` function directly — the function that
+    /// `reconnect_slot` calls — to confirm the state machine recovery path.
+    #[tokio::test]
+    async fn pool_recovery_after_peer_table_arrives() {
+        use mirage_core::peer_table::{PeerEntry, PeerTable};
+        use crate::tunnel::establish_raw_tunnel;
+
+        let chain = two_hop_chain("v2-entry", "v2-exit");
+        let chain_protocols = minimal_chain_protocols();
+
+        // Step 1: empty peer_table — expect config error (simulates failed startup).
+        let pt_empty = PeerTable::empty();
+        let err = establish_raw_tunnel(&chain_protocols, &chain, &pt_empty, &[]).await;
+        assert!(err.is_err());
+        let msg_empty = format!("{:?}", err.err().expect("just checked is_err"));
+        assert!(
+            msg_empty.contains("not in peer_table"),
+            "startup fail must cite peer_table absence: {msg_empty}"
+        );
+
+        // Step 2: peer_table arrives (simulates monitor push via ArcSwap.store).
+        let pt_full = PeerTable {
+            generation: 2,
+            peers: vec![
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-entry".into(),
+                    pubkey_hex: "f".repeat(64),
+                    addr: "127.0.0.1:19971".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-exit".into(),
+                    pubkey_hex: "0".repeat(64),
+                    addr: "127.0.0.1:19972".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+            ],
+        };
+
+        // Step 3: retry with filled peer_table — must reach network, not config error.
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt_full, &[]).await;
+        match result {
+            Ok(_) => panic!("expected network error, no server running on test ports"),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                assert!(
+                    !msg.contains("64 hex chars"),
+                    "after peer_table arrives, config error must not reappear: {msg}"
+                );
+                assert!(
+                    msg.contains("refused")
+                        || msg.contains("timed out")
+                        || msg.contains("Io")
+                        || msg.contains("NodeUnreachable"),
+                    "expected network-level error on retry, got: {msg}"
+                );
+            }
+        }
+    }
+
+}
+
 async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared) = {
         let guard = pool.inner.lock().await;

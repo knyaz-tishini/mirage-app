@@ -573,7 +573,7 @@ async fn mux_maintenance_loop(
 
 #[cfg(test)]
 mod tests {
-    use crate::tunnel::ONION_MUX_MAGIC;
+    use crate::tunnel::{establish_mux_tunnel, ONION_MUX_MAGIC};
 
     /// Assert the magic constant is the right 4 bytes.
     #[test]
@@ -724,6 +724,165 @@ mod tests {
                         || msg.contains("Io")
                         || msg.contains("NodeUnreachable"),
                     "expected network-level error, got: {msg}"
+                );
+            }
+        }
+    }
+
+    // ── Additional mux_pool smoke tests ──────────────────────────────────────
+
+    fn make_two_hop_chain(entry_id: &str, exit_id: &str) -> mirage_core::config::ChainConfig {
+        use mirage_core::config::{
+            ChainConfig, HandshakeStrategy, HopConfig, HopRole, ProtocolId,
+            TcpProtocolId,
+        };
+        ChainConfig {
+            chain_id: "test-mux-smoke".into(),
+            hops: vec![
+                HopConfig {
+                    addr: "127.0.0.1:19981".into(),
+                    public_key: None,
+                    node_id: Some(entry_id.into()),
+                    sni: None,
+                    role: HopRole::Entry,
+                    display_name: None,
+                    camouflage: None,
+                    byte_cipher: None,
+                },
+                HopConfig {
+                    addr: "127.0.0.1:19982".into(),
+                    public_key: None,
+                    node_id: Some(exit_id.into()),
+                    sni: None,
+                    role: HopRole::Exit,
+                    display_name: None,
+                    camouflage: None,
+                    byte_cipher: None,
+                },
+            ],
+            handshake: HandshakeStrategy::Ephemeral,
+            reply: mirage_core::config::ReplyMode::Raw,
+            protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
+            priority: 0,
+            shaping: Default::default(),
+            camouflage: Default::default(),
+            cover_traffic: Default::default(),
+            socks5_bind: None,
+            websocket_xray: None,
+            shadowtls_v3: None,
+            vless_reality: None,
+            udp_hysteria2_native: None,
+        }
+    }
+
+    fn make_chain_protocols() -> std::sync::Arc<mirage_protocol::negotiation::ProtocolChain> {
+        use mirage_core::config::{
+            AuthMode, MirageEndpointConfig, TcpProtocolId, TransportCamouflage, TransportKind,
+        };
+        use mirage_protocol::{endpoint_protocol::EndpointProtocol, negotiation::ProtocolChain};
+        let ep_cfg = MirageEndpointConfig {
+            transport: TransportKind::Tcp,
+            auth: AuthMode::Blake3,
+            camouflage: TransportCamouflage::None,
+            byte_cipher: None,
+            byte_cipher_mode: None,
+        };
+        std::sync::Arc::new(ProtocolChain::new(vec![Box::new(EndpointProtocol::new(
+            ep_cfg,
+            TcpProtocolId::Mirage,
+            vec![],
+        ))]))
+    }
+
+    /// Empty peer_table → `establish_mux_tunnel` must return the specific
+    /// "not in peer_table" error, NOT the generic "64 hex chars" config error.
+    ///
+    /// Regression guard for the "config error 'must be 64 hex chars'" bug
+    /// that existed before Phase 9.6 (commit d438661).
+    #[tokio::test]
+    async fn mux_pool_empty_peer_table_returns_specific_error() {
+        use mirage_core::peer_table::PeerTable;
+
+        let chain = make_two_hop_chain("v2-entry", "v2-exit");
+        let chain_protocols = make_chain_protocols();
+        let pt = PeerTable::empty();
+
+        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt, &[]).await;
+
+        assert!(result.is_err(), "must fail when peer_table is empty");
+        let msg = format!("{:?}", result.err().expect("just checked is_err"));
+        assert!(
+            msg.contains("not in peer_table"),
+            "error must mention 'not in peer_table' (got): {msg}"
+        );
+        assert!(
+            !msg.contains("64 hex chars"),
+            "must not be the pre-Phase-9.6 config validation error (got): {msg}"
+        );
+    }
+
+    /// Mux session fails on startup (empty peer_table) → peer_table arrives with
+    /// correct entries → next attempt must resolve pubkeys and fail at network
+    /// level (not config level). Simulates the "Connection refused recovery race"
+    /// fix from Phase 9.6.
+    #[tokio::test]
+    async fn mux_pool_recovery_after_peer_table_arrives() {
+        use mirage_core::peer_table::{PeerEntry, PeerTable};
+
+        let chain = make_two_hop_chain("v2-entry", "v2-exit");
+        let chain_protocols = make_chain_protocols();
+
+        // Phase 1: empty peer_table → config error (simulated startup failure).
+        let pt_empty = PeerTable::empty();
+        let err = establish_mux_tunnel(&chain_protocols, &chain, &pt_empty, &[]).await;
+        assert!(err.is_err());
+        let startup_msg = format!("{:?}", err.err().expect("just checked is_err"));
+        assert!(
+            startup_msg.contains("not in peer_table"),
+            "startup fail must cite peer_table absence: {startup_msg}"
+        );
+
+        // Phase 2: peer_table arrives (monitor push simulated as new snapshot).
+        let pt_full = PeerTable {
+            generation: 1,
+            peers: vec![
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-entry".into(),
+                    pubkey_hex: "a".repeat(64),
+                    addr: "127.0.0.1:19981".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+                PeerEntry {
+                    mesh_id: "test".into(),
+                    responsible_monitor_id: String::new(),
+                    node_id: "v2-exit".into(),
+                    pubkey_hex: "b".repeat(64),
+                    addr: "127.0.0.1:19982".into(),
+                    labels: vec![],
+                    updated_at_ms: 0,
+                },
+            ],
+        };
+
+        // Phase 3: retry — pubkey resolve succeeds, fails at network (no server).
+        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt_full, &[]).await;
+        match result {
+            Ok(_) => panic!("expected network error; no server on :19981/:19982"),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                assert!(
+                    !msg.contains("64 hex chars"),
+                    "config error must not reappear after peer_table arrives: {msg}"
+                );
+                assert!(
+                    msg.contains("refused")
+                        || msg.contains("timed out")
+                        || msg.contains("Io")
+                        || msg.contains("NodeUnreachable"),
+                    "expected network-level error on retry, got: {msg}"
                 );
             }
         }
