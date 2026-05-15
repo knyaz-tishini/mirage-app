@@ -137,7 +137,13 @@ impl TunnelPool {
         mesh_id: Vec<u8>,
         peer_table: Arc<ArcSwap<PeerTable>>,
     ) -> Result<Arc<Self>, MirageError> {
-        let is_onion = !chain.hops.is_empty();
+        // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
+        // (hops[0].role == Exit) reaches `handle_exit` server-side as a
+        // classic direct tunnel — it must NOT prefix the address with
+        // a 2-byte length, because that length's high byte (0x00 for
+        // any address < 256 chars) collides with the mux-detect byte
+        // and the server routes the connection into `run_mux_session`.
+        let is_onion = chain.hops.len() > 1;
         let pool_size = config.pool_size.max(1);
 
         // Spawn all tunnel establishes in parallel.
@@ -382,7 +388,7 @@ impl TunnelPool {
                 *slot = Slot::Reconnecting;
             }
         }
-        self.is_onion.store(!guard.chain.hops.is_empty(), Ordering::Release);
+        self.is_onion.store(guard.chain.hops.len() > 1, Ordering::Release);
         info!("chain switched (drain): idle and dormant slots marked for reconnect");
         self.available.notify_waiters();
     }
@@ -395,7 +401,7 @@ impl TunnelPool {
     pub async fn switch_chain_lazy(&self, new_chain: mirage_core::config::ChainConfig) {
         let mut guard = self.inner.lock().await;
         guard.chain = new_chain;
-        self.is_onion.store(!guard.chain.hops.is_empty(), Ordering::Release);
+        self.is_onion.store(guard.chain.hops.len() > 1, Ordering::Release);
         info!("chain switched (lazy): new reconnects will use new chain");
     }
 

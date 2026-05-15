@@ -192,7 +192,11 @@ impl MuxPool {
         mesh_id: Vec<u8>,
         peer_table: Arc<ArcSwap<PeerTable>>,
     ) -> Result<Arc<Self>, MirageError> {
-        let is_onion = !chain.hops.is_empty();
+        // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
+        // sends the address bytes raw (no length-prefix) so the
+        // server's `handle_exit` auto-detector reads the first byte
+        // as ASCII (>=0x30), not 0x00 (mux marker).
+        let is_onion = chain.hops.len() > 1;
         let pool_size = config.pool_size.max(1).min(8);
 
         let chain_label = chain
@@ -428,7 +432,7 @@ impl MuxPool {
             }
         }
         self.is_onion
-            .store(!guard.chain.hops.is_empty(), Ordering::Release);
+            .store(guard.chain.hops.len() > 1, Ordering::Release);
         info!("mux pool chain switched: active and dormant sessions marked reconnecting");
     }
 
