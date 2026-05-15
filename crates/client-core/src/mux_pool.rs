@@ -649,6 +649,7 @@ mod tests {
                     addr: "127.0.0.1:19988".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
                 PeerEntry {
                     mesh_id: "test".into(),
@@ -658,6 +659,7 @@ mod tests {
                     addr: "127.0.0.1:19989".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
             ],
         }));
@@ -879,6 +881,7 @@ mod tests {
                     addr: "127.0.0.1:19981".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
                 PeerEntry {
                     mesh_id: "test".into(),
@@ -888,6 +891,7 @@ mod tests {
                     addr: "127.0.0.1:19982".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
             ],
         };

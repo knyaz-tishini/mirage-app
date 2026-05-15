@@ -790,6 +790,7 @@ mod pool_smoke_tests {
                     addr: "127.0.0.1:19971".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
                 PeerEntry {
                     mesh_id: "test".into(),
@@ -799,6 +800,7 @@ mod pool_smoke_tests {
                     addr: "127.0.0.1:19972".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
             ],
         };
@@ -869,6 +871,7 @@ mod pool_smoke_tests {
                     addr: "127.0.0.1:19971".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
                 PeerEntry {
                     mesh_id: "test".into(),
@@ -878,6 +881,7 @@ mod pool_smoke_tests {
                     addr: "127.0.0.1:19972".into(),
                     labels: vec![],
                     updated_at_ms: 0,
+                    aead_suite_preference: Vec::new(),
                 },
             ],
         };
