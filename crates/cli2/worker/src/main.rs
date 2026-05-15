@@ -223,6 +223,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn SOCKS5 server.
     let server = Socks5Server::new(addr);
+    // Clone for supervisor_loop; original moves into server closure below.
+    let mux_pool_for_loop = mux_pool_opt.as_ref().map(Arc::clone);
     let server_handle = tokio::spawn({
         let pool = Arc::clone(&pool);
         let mut stop_rx = stop_rx.clone();
@@ -261,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         started_at_unix,
         ipc,
         Arc::clone(&pool),
+        mux_pool_for_loop,
         Arc::clone(&current_state),
         Arc::clone(&peer_table),
         stop_tx,
@@ -290,6 +293,7 @@ async fn supervisor_loop(
     started_at_unix: u64,
     initial_ipc: PipePair,
     pool: Arc<TunnelPool>,
+    mux_pool_opt: Option<Arc<MuxPool>>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
     peer_table: Arc<ArcSwap<PeerTable>>,
     stop_tx: watch::Sender<bool>,
@@ -303,6 +307,7 @@ async fn supervisor_loop(
             &mut ipc,
             chain_id,
             Arc::clone(&pool),
+            mux_pool_opt.as_ref().map(Arc::clone),
             Arc::clone(&state),
             Arc::clone(&peer_table),
             &stop_tx,
@@ -400,6 +405,7 @@ async fn handle_session(
     ipc: &mut PipePair,
     chain_id: &str,
     pool: Arc<TunnelPool>,
+    mux_pool_opt: Option<Arc<MuxPool>>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
     peer_table: Arc<ArcSwap<PeerTable>>,
     stop_tx: &watch::Sender<bool>,
@@ -424,6 +430,10 @@ async fn handle_session(
                             "worker: PeerTableUpdate applied"
                         );
                         peer_table.store(Arc::new(pt));
+                        pool.notify_peer_table_change();
+                        if let Some(mp) = &mux_pool_opt {
+                            mp.notify_peer_table_change();
+                        }
                     }
                     Err(e) => {
                         warn!(chain_id, "worker: PeerTableUpdate parse error: {e}");
