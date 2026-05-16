@@ -275,12 +275,16 @@ impl WorkerHandle {
     }
 
     /// Send `Start` with the chain config and an optional initial peer table.
-    pub async fn send_start(&mut self, chain: &ChainConfig) -> anyhow::Result<()> {
+    pub async fn send_start(
+        &mut self,
+        chain: &ChainConfig,
+        initial_peer_table: Option<String>,
+    ) -> anyhow::Result<()> {
         self.send(SupervisorMsg::Start {
             chain_id: chain.id.clone(),
             socks5_bind: chain.socks5_bind.clone(),
             config_path: chain.config_path.clone(),
-            peer_table_json: None,
+            peer_table_json: initial_peer_table,
         })
         .await
     }

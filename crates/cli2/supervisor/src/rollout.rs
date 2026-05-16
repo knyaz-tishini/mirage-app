@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::ChainConfig,
+    state,
     worker_handle::{HandleState, WorkerHandle},
 };
 
@@ -33,6 +34,7 @@ pub async fn rolling_update(
     handles: &mut HashMap<String, WorkerHandle>,
     chains: &[ChainConfig],
     new_binary: &Path,
+    state_dir: &Path,
 ) -> anyhow::Result<()> {
     info!(
         binary = ?new_binary,
@@ -41,7 +43,7 @@ pub async fn rolling_update(
     );
 
     for chain in chains {
-        if let Err(e) = update_one_chain(handles, chain, new_binary).await {
+        if let Err(e) = update_one_chain(handles, chain, new_binary, state_dir).await {
             error!(chain_id = %chain.id, "update failed: {e:#}");
             // Continue with remaining chains rather than aborting the whole rollout.
         }
@@ -56,13 +58,15 @@ async fn update_one_chain(
     handles: &mut HashMap<String, WorkerHandle>,
     chain: &ChainConfig,
     new_binary: &Path,
+    state_dir: &Path,
 ) -> anyhow::Result<()> {
     info!(chain_id = %chain.id, "updating chain");
 
-    // Spawn new worker.
+    // Spawn new worker with last-known peer_table so pool bootstraps immediately.
+    let rollout_pt = state::load_peer_table(state_dir);
     let mut new_handle = WorkerHandle::spawn(new_binary, chain)
         .with_context(|| format!("spawning new worker for {}", chain.id))?;
-    new_handle.send_start(chain).await?;
+    new_handle.send_start(chain, rollout_pt).await?;
 
     // Wait for new worker to signal Ready.
     wait_for_ready(&mut new_handle).await.with_context(|| {

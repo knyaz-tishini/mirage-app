@@ -8,10 +8,12 @@ mod ota_poller;
 mod reattach;
 mod rollout;
 mod router_listener;
+mod state;
 mod tun_registry;
 mod worker_handle;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use tokio::sync::mpsc;
@@ -25,6 +27,27 @@ use reattach::discover_orphans;
 use rollout::{download_new_binary, rolling_update, shutdown_all};
 use tun_registry::push_tun_registry;
 use worker_handle::{HandleState, WorkerHandle};
+
+/// Fetch the peer_table JSON from monitor's `/relay/clients/config` on cold start.
+async fn bootstrap_peer_table_http(
+    monitor_url: &str,
+    monitor_api_key: Option<&str>,
+) -> anyhow::Result<String> {
+    let url = format!("{}/relay/clients/config", monitor_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let mut req = client.get(&url);
+    if let Some(key) = monitor_api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await?.error_for_status()?;
+    let val: serde_json::Value = resp.json().await?;
+    let pt = val
+        .get("peer_table")
+        .ok_or_else(|| anyhow::anyhow!("missing peer_table field in monitor response"))?;
+    Ok(serde_json::to_string(pt)?)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -100,6 +123,39 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // ── Resolve initial peer_table for cold-start worker bootstrap ───────────
+    let state_dir_path: PathBuf = match &config.state_dir {
+        Some(s) => PathBuf::from(s),
+        None => std::env::temp_dir().join("mirage-cli2-state"),
+    };
+    let initial_pt: Option<String> = match state::load_peer_table(&state_dir_path) {
+        Some(s) => {
+            info!("supervisor: loaded peer_table from {}", state_dir_path.display());
+            Some(s)
+        }
+        None => match bootstrap_peer_table_http(
+            &config.monitor_url,
+            config.monitor_api_key.as_deref(),
+        )
+        .await
+        {
+            Ok(s) => {
+                info!(
+                    "supervisor: bootstrapped peer_table via HTTP from {}",
+                    config.monitor_url
+                );
+                Some(s)
+            }
+            Err(e) => {
+                warn!(
+                    "supervisor: cold-start peer_table bootstrap failed (file+HTTP) — \
+                     workers will start with empty pool: {e:#}"
+                );
+                None
+            }
+        },
+    };
+
     // ── Phase 2: for each chain, reattach or spawn ───────────────────────────
     let mut handles: HashMap<String, WorkerHandle> = HashMap::new();
 
@@ -116,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     Ok(mut new_handle) => {
-                        if let Err(se) = new_handle.send_start(chain).await {
+                        if let Err(se) = new_handle.send_start(chain, initial_pt.clone()).await {
                             error!(chain_id = %chain.id, "send_start failed: {se:#}");
                         }
                         handles.insert(chain.id.clone(), new_handle);
@@ -128,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             let mut handle = WorkerHandle::spawn(&binary_path, chain)
                 .with_context(|| format!("spawning worker for chain {}", chain.id))?;
-            handle.send_start(chain).await?;
+            handle.send_start(chain, initial_pt.clone()).await?;
             handles.insert(chain.id.clone(), handle);
         }
     }
@@ -307,6 +363,9 @@ async fn main() -> anyhow::Result<()> {
                         generation,
                         "supervisor: PeerTableSnapshot from MonitorLink host worker — broadcasting"
                     );
+                    if let Err(e) = state::save_peer_table(&state_dir_path, peer_table_json) {
+                        warn!("supervisor: failed to persist peer_table snapshot: {e}");
+                    }
                     let _ = pt_tx.try_send(peer_table_json.clone());
                 }
                 handle.apply_msg(&event.msg);
@@ -369,7 +428,10 @@ async fn main() -> anyhow::Result<()> {
                     error!(chain_id = %chain_id, "respawn failed: {e:#}");
                 }
                 Ok(mut new_handle) => {
-                    if let Err(e) = new_handle.send_start(chain_cfg).await {
+                    // Use the last persisted peer_table on respawn so the worker
+                    // doesn't start with an empty pool.
+                    let respawn_pt = state::load_peer_table(&state_dir_path);
+                    if let Err(e) = new_handle.send_start(chain_cfg, respawn_pt).await {
                         error!(chain_id = %chain_id, "send_start after respawn failed: {e:#}");
                     }
                     handles.insert(chain_id, new_handle);
@@ -431,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
                                     &mut handles,
                                     &config.chains,
                                     &new_binary,
+                                    &state_dir_path,
                                 )
                                 .await
                                 {
