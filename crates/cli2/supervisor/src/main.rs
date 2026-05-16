@@ -204,11 +204,54 @@ async fn main() -> anyhow::Result<()> {
         Some(host_chain) => {
             let host_chain_id = host_chain.id.clone();
             if let Some(handle) = handles.get_mut(&host_chain_id) {
-                // Serialize the transports list so the worker can deserialize it
-                // using `mirage_chain_ipc::MonitorTransportSpec`.
-                // `MonitorTransportConfig` and `MonitorTransportSpec` share the
-                // same serde shape (same `kind` tag, same fields).
-                match serde_json::to_string(&config.monitor_transports) {
+                // Convert TOML-side MonitorTransportConfig into IPC-side
+                // MonitorTransportSpec. For OverChain we look up the named
+                // chain's socks5_bind from [[chains]] and inject it as
+                // worker_socks5 (option b — transport via SOCKS5 to worker,
+                // not via decrypted Tunnel).
+                use mirage_chain_ipc::MonitorTransportSpec;
+                use config::MonitorTransportConfig;
+                let mut ipc_specs: Vec<MonitorTransportSpec> = Vec::new();
+                let mut conv_err: Option<String> = None;
+                for t in &config.monitor_transports {
+                    match t {
+                        MonitorTransportConfig::DirectWs { url, sni } => {
+                            ipc_specs.push(MonitorTransportSpec::DirectWs {
+                                url: url.clone(),
+                                sni: sni.clone(),
+                            });
+                        }
+                        MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
+                            let chain_cfg = match config.chains.iter().find(|c| &c.id == chain_id) {
+                                Some(c) => c,
+                                None => {
+                                    conv_err = Some(format!(
+                                        "monitor_transports.over_chain references unknown chain_id={chain_id}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            let socks5: std::net::SocketAddr = match chain_cfg.socks5_bind.parse() {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    conv_err = Some(format!(
+                                        "chain {chain_id} socks5_bind invalid: {e}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            ipc_specs.push(MonitorTransportSpec::OverChain {
+                                worker_socks5: socks5,
+                                monitor_addr: *monitor_addr,
+                                chain_id: chain_id.clone(),
+                            });
+                        }
+                    }
+                }
+                if let Some(err) = conv_err {
+                    warn!("supervisor: monitor_transports conversion failed: {err} — MonitorLink not delegated");
+                } else {
+                match serde_json::to_string(&ipc_specs) {
                     Err(e) => {
                         warn!("supervisor: failed to serialize monitor_transports: {e} — MonitorLink not delegated");
                     }
@@ -223,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
                             info!("supervisor: SetupMonitorLink sent to worker {host_chain_id}");
                         }
                     }
+                }
                 }
             } else {
                 warn!(

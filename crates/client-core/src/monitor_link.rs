@@ -48,6 +48,10 @@ const OVER_CHAIN_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const DIRECT_HEALTH_RECHECK: Duration = Duration::from_secs(30);
 const OVER_CHAIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn default_chain_id() -> ChainId {
+    ChainId(String::new())
+}
+
 // ── MonitorTransport ──────────────────────────────────────────────────────────
 
 /// How to reach the monitor control plane.
@@ -68,16 +72,28 @@ pub enum MonitorTransport {
     },
     /// Binary frame protocol over a Mirage tunnel (`OverChain`).
     ///
-    /// The client routes through `chain_id` and connects to the monitor's
-    /// over-chain listener at `monitor_addr`.
+    /// The client connects to the monitor's over-chain listener through the
+    /// designated worker's SOCKS5 port. Worker is the per-chain process
+    /// (cli2 split-arch) that already maintains a tunnel pool on this chain
+    /// for regular SOCKS5 traffic. We piggyback on that — no need for a
+    /// second decrypted Tunnel abstraction.
     OverChain {
-        /// ID of the chain to route through (must exist in [`ChainSet`]).
-        chain_id: ChainId,
-        /// Exit address of the monitor's over-chain listener.
-        ///
-        /// Defaults to `127.0.0.1:19445` (loopback, same machine as the
-        /// Mirage exit node, reachable only from inside the tunnel).
+        /// Local SOCKS5 address of the worker that owns this chain.
+        /// E.g. `127.0.0.1:19516` for `c-control-over-chain`. The worker
+        /// performs the Mirage handshake and pipes plaintext bytes; we
+        /// then speak our binary frame protocol directly on the resulting
+        /// bidirectional stream.
+        worker_socks5: SocketAddr,
+        /// CONNECT target sent to the worker's SOCKS5 (host:port). The
+        /// chain's exit hop forwards this to its `control_target` regardless
+        /// of the value (TunnelControl ignores the target string), but
+        /// SOCKS5 protocol requires a non-empty target. Default
+        /// `127.0.0.1:19445` works because exit hop bridges to its own
+        /// loopback monitor listener.
         monitor_addr: SocketAddr,
+        /// Kept for backward compat with logs / metrics. Not used for dial.
+        #[serde(default = "default_chain_id")]
+        chain_id: ChainId,
     },
 }
 
@@ -548,23 +564,24 @@ impl MonitorLink {
     /// channel, or `None` if all transports fail.
     async fn try_connect_over_chain(&self) -> Option<OverChainChannel> {
         let bearer = self.monitor_api_key.as_deref().unwrap_or("");
-        let chain_set = Arc::clone(&self.chain_set);
 
         for transport in &self.transports {
             if let MonitorTransport::OverChain {
-                chain_id,
+                worker_socks5,
                 monitor_addr,
+                chain_id,
             } = transport
             {
                 match tokio::time::timeout(
                     OVER_CHAIN_CONNECT_TIMEOUT,
-                    OverChainChannel::connect(&chain_set, chain_id, *monitor_addr, bearer),
+                    OverChainChannel::connect(*worker_socks5, *monitor_addr, bearer),
                 )
                 .await
                 {
                     Ok(Ok(ch)) => {
                         info!(
                             chain_id = %chain_id,
+                            worker_socks5 = %worker_socks5,
                             addr = %monitor_addr,
                             "monitor_link: OverChain connected"
                         );
@@ -573,12 +590,14 @@ impl MonitorLink {
                     Ok(Err(e)) => {
                         warn!(
                             chain_id = %chain_id,
+                            worker_socks5 = %worker_socks5,
                             "monitor_link: OverChain connect failed: {e}"
                         );
                     }
                     Err(_) => {
                         warn!(
                             chain_id = %chain_id,
+                            worker_socks5 = %worker_socks5,
                             "monitor_link: OverChain connect timed out"
                         );
                     }

@@ -23,11 +23,19 @@ pub enum MonitorTransportSpec {
         #[serde(default)]
         sni: Option<String>,
     },
-    /// Binary frame protocol over a Mirage tunnel exit hop.
+    /// Binary frame protocol via the worker's SOCKS5 (option b — chain as
+    /// transport, no decrypted tunnel).
     OverChain {
-        chain_id: String,
+        /// Local SOCKS5 address of the chain worker. Supervisor injects this
+        /// from the matching `[[chains]]` entry's `socks5_bind`.
+        worker_socks5: SocketAddr,
+        /// CONNECT target (passed to worker SOCKS5). Loopback of the
+        /// monitor's over-chain listener.
         #[serde(default = "default_monitor_addr")]
         monitor_addr: SocketAddr,
+        /// Chain identifier — informational, used in logs.
+        #[serde(default)]
+        chain_id: String,
     },
 }
 

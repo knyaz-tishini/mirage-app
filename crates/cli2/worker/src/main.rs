@@ -647,10 +647,11 @@ fn spawn_monitor_link_in_worker(
             MonitorTransportSpec::DirectWs { url, sni } => {
                 MonitorTransport::DirectWs { url, sni }
             }
-            MonitorTransportSpec::OverChain { chain_id: cid, monitor_addr } => {
+            MonitorTransportSpec::OverChain { worker_socks5, monitor_addr, chain_id: cid } => {
                 MonitorTransport::OverChain {
-                    chain_id: ChainId(cid),
+                    worker_socks5,
                     monitor_addr,
+                    chain_id: ChainId(cid),
                 }
             }
         })

@@ -189,6 +189,140 @@ async fn write_tunnel_frame(
         .map_err(MonitorChannelError::Lease)
 }
 
+// ── Frame codec — raw TCP stream variant (option b) ───────────────────────────
+
+async fn read_stream_frame(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(u8, Vec<u8>), MonitorChannelError> {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; 5];
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(|e| if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            MonitorChannelError::Closed
+        } else {
+            MonitorChannelError::Io(e.to_string())
+        })?;
+    let tag = header[0];
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > 4 * 1024 * 1024 {
+        return Err(MonitorChannelError::Io(format!(
+            "frame too large: {len} bytes"
+        )));
+    }
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        stream
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| MonitorChannelError::Io(e.to_string()))?;
+    }
+    Ok((tag, payload))
+}
+
+async fn write_stream_frame(
+    stream: &mut tokio::net::TcpStream,
+    tag: u8,
+    payload: &[u8],
+) -> Result<(), MonitorChannelError> {
+    use tokio::io::AsyncWriteExt;
+    let frame = encode_frame(tag, payload);
+    stream
+        .write_all(&frame)
+        .await
+        .map_err(|e| MonitorChannelError::Io(e.to_string()))
+}
+
+// ── SOCKS5 no-auth client handshake to worker ─────────────────────────────────
+async fn socks5_no_auth_handshake(
+    stream: &mut tokio::net::TcpStream,
+    target: SocketAddr,
+) -> Result<(), MonitorChannelError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Greeting: VER=5, NMETHODS=1, METHOD=0 (no-auth).
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .map_err(|e| MonitorChannelError::Io(format!("socks5 greeting write: {e}")))?;
+
+    let mut sel = [0u8; 2];
+    stream
+        .read_exact(&mut sel)
+        .await
+        .map_err(|e| MonitorChannelError::Io(format!("socks5 selection read: {e}")))?;
+    if sel[0] != 0x05 || sel[1] != 0x00 {
+        return Err(MonitorChannelError::Io(format!(
+            "socks5 method selection rejected: ver={:#x} method={:#x}",
+            sel[0], sel[1]
+        )));
+    }
+
+    // CONNECT request: VER=5, CMD=1 (CONNECT), RSV=0, ATYP=1 (IPv4) or 4 (IPv6).
+    let mut req = Vec::with_capacity(22);
+    req.extend_from_slice(&[0x05, 0x01, 0x00]);
+    match target {
+        SocketAddr::V4(a) => {
+            req.push(0x01);
+            req.extend_from_slice(&a.ip().octets());
+            req.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            req.push(0x04);
+            req.extend_from_slice(&a.ip().octets());
+            req.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+    stream
+        .write_all(&req)
+        .await
+        .map_err(|e| MonitorChannelError::Io(format!("socks5 connect write: {e}")))?;
+
+    // Reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT.
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .await
+        .map_err(|e| MonitorChannelError::Io(format!("socks5 reply head: {e}")))?;
+    if head[0] != 0x05 {
+        return Err(MonitorChannelError::Io(format!(
+            "socks5 reply bad version: {:#x}",
+            head[0]
+        )));
+    }
+    if head[1] != 0x00 {
+        return Err(MonitorChannelError::Io(format!(
+            "socks5 CONNECT rejected: rep={:#x}",
+            head[1]
+        )));
+    }
+    // Consume BND.ADDR + BND.PORT.
+    let bnd_skip = match head[3] {
+        0x01 => 4 + 2,            // IPv4
+        0x04 => 16 + 2,           // IPv6
+        0x03 => {
+            let mut l = [0u8; 1];
+            stream
+                .read_exact(&mut l)
+                .await
+                .map_err(|e| MonitorChannelError::Io(format!("socks5 bnd len: {e}")))?;
+            l[0] as usize + 2
+        }
+        other => {
+            return Err(MonitorChannelError::Io(format!(
+                "socks5 unknown ATYP: {other:#x}"
+            )))
+        }
+    };
+    let mut skip = vec![0u8; bnd_skip];
+    stream
+        .read_exact(&mut skip)
+        .await
+        .map_err(|e| MonitorChannelError::Io(format!("socks5 bnd skip: {e}")))?;
+    Ok(())
+}
+
 // ── DirectWsChannel ───────────────────────────────────────────────────────────
 
 type WsStream =
@@ -285,84 +419,116 @@ impl MonitorChannel for DirectWsChannel {
 /// After construction via [`OverChainChannel::connect`] the channel is
 /// authenticated and ready to receive `FRAME_MSG` payloads.
 pub struct OverChainChannel {
-    tunnel: Box<dyn Tunnel>,
+    /// Raw TCP stream to the worker's SOCKS5 port. The worker tunnel-wraps
+    /// our bytes through the chain transparently. We speak our own binary
+    /// frame protocol on top — the chain just transports bytes.
+    stream: tokio::net::TcpStream,
 }
 
 impl OverChainChannel {
-    /// Open a connection to `monitor_addr` through the named chain, then
-    /// complete the `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK` handshake.
+    /// Open a connection to `monitor_addr` through `worker_socks5` (the
+    /// local SOCKS5 port of the chain worker), then complete the
+    /// `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK` handshake.
     ///
     /// # Arguments
     ///
-    /// * `chain_set` — registry of all available chains.
-    /// * `chain_id`  — which chain to route through.
-    /// * `monitor_addr` — the monitor's over-chain listener address
-    ///   (`127.0.0.1:19445` by default).
-    /// * `bearer`    — same Bearer token used for WS auth.
+    /// * `worker_socks5` — local SOCKS5 of the worker process that owns the
+    ///   chain (e.g. `127.0.0.1:19516`). The worker performs the Mirage
+    ///   handshake and pipes plaintext through the chain; we just write/read
+    ///   bytes.
+    /// * `monitor_addr` — CONNECT target sent in the SOCKS5 request. The
+    ///   chain's TunnelControl exit ignores the target string and bridges to
+    ///   its own `control_target` (`127.0.0.1:19445`), but the SOCKS5
+    ///   protocol still requires a target.
+    /// * `bearer`        — Bearer token for FRAME_AUTH.
     ///
-    /// Times out after 5 s for both the pool lease and the auth handshake.
+    /// Times out after 15 s for SOCKS5 connect and 10 s for auth.
     pub async fn connect(
-        chain_set: &Arc<ChainSet>,
-        chain_id: &ChainId,
+        worker_socks5: SocketAddr,
         monitor_addr: SocketAddr,
         bearer: &str,
     ) -> Result<Self, MonitorChannelError> {
-        const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+        const SOCKS5_TIMEOUT: Duration = Duration::from_secs(15);
         const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-        // Resolve chain handle.
-        let handle = chain_set
-            .chains
-            .get(chain_id)
-            .map(|e| Arc::clone(e.value()))
-            .ok_or_else(|| MonitorChannelError::ChainNotFound(chain_id.to_string()))?;
+        info!(%worker_socks5, %monitor_addr, "over_chain: SOCKS5 dial to worker");
 
-        // Lease a tunnel from the pool.
-        info!(chain_id = %chain_id, "over_chain: leasing tunnel from pool");
-        let mut lease = timeout(CONNECT_TIMEOUT, handle.pool.lease())
+        let mut stream = timeout(SOCKS5_TIMEOUT, tokio::net::TcpStream::connect(worker_socks5))
             .await
             .map_err(|_| {
-                warn!(chain_id = %chain_id, "over_chain: pool lease TIMED OUT after {CONNECT_TIMEOUT:?}");
+                warn!(%worker_socks5, "over_chain: SOCKS5 TCP connect TIMED OUT after {SOCKS5_TIMEOUT:?}");
                 MonitorChannelError::Timeout
             })?
             .map_err(|e| {
-                warn!(chain_id = %chain_id, "over_chain: pool lease FAILED: {e}");
-                MonitorChannelError::Lease(e)
+                warn!(%worker_socks5, "over_chain: SOCKS5 TCP connect FAILED: {e}");
+                MonitorChannelError::Io(e.to_string())
             })?;
-        info!(chain_id = %chain_id, "over_chain: tunnel leased from pool");
 
-        // Send target address to the relay entry node (same as SOCKS5 does).
-        let target_str = monitor_addr.to_string();
-        lease
-            .send(target_str.as_bytes())
+        // SOCKS5 handshake: no-auth method.
+        timeout(SOCKS5_TIMEOUT, socks5_no_auth_handshake(&mut stream, monitor_addr))
             .await
-            .map_err(MonitorChannelError::Lease)?;
+            .map_err(|_| {
+                warn!(%worker_socks5, "over_chain: SOCKS5 negotiation TIMED OUT");
+                MonitorChannelError::Timeout
+            })??;
 
-        info!(
-            chain_id = %chain_id,
-            addr = %monitor_addr,
-            "over_chain: tunnel leased, starting auth handshake"
-        );
+        info!(%worker_socks5, %monitor_addr, "over_chain: SOCKS5 CONNECT established, starting auth handshake");
 
-        // Extract the inner tunnel so we can pass `&mut dyn Tunnel` to the
-        // auth handshake. We poison the lease slot so the pool reconnects it
-        // for future flows — this tunnel is owned by the control channel now.
-        lease.poison();
-        let mut inner = lease
-            .take_tunnel()
-            .ok_or_else(|| MonitorChannelError::Io("lease tunnel already taken".to_string()))?;
-
-        // Auth handshake (with timeout).
-        timeout(AUTH_TIMEOUT, Self::do_auth_handshake(inner.as_mut(), bearer))
+        // Auth handshake on the raw stream (with timeout).
+        timeout(AUTH_TIMEOUT, Self::do_auth_handshake_stream(&mut stream, bearer))
             .await
             .map_err(|_| MonitorChannelError::Timeout)??;
 
-        info!(chain_id = %chain_id, "over_chain: AUTH_OK — channel ready");
+        info!(%worker_socks5, %monitor_addr, "over_chain: AUTH_OK — channel ready");
 
-        Ok(Self { tunnel: inner })
+        Ok(Self { stream })
     }
 
-    /// Perform the AUTH_CHALLENGE / AUTH / AUTH_OK handshake.
+    /// Perform the AUTH_CHALLENGE / AUTH / AUTH_OK handshake over a raw stream.
+    async fn do_auth_handshake_stream(
+        stream: &mut tokio::net::TcpStream,
+        bearer: &str,
+    ) -> Result<(), MonitorChannelError> {
+        // Step 1: read FRAME_AUTH_CHALLENGE with 8-byte nonce.
+        let (tag, payload) = read_stream_frame(stream).await?;
+        if tag != FRAME_AUTH_CHALLENGE {
+            return Err(MonitorChannelError::UnexpectedTag(tag));
+        }
+        if payload.len() < 8 {
+            return Err(MonitorChannelError::Auth(
+                "AUTH_CHALLENGE nonce too short".to_string(),
+            ));
+        }
+        let mut nonce_echo = [0u8; 8];
+        nonce_echo.copy_from_slice(&payload[..8]);
+
+        debug!("over_chain: received AUTH_CHALLENGE, sending AUTH");
+
+        let bearer_bytes = bearer.as_bytes();
+        let bearer_len = bearer_bytes.len() as u16;
+        let mut auth_payload = Vec::with_capacity(1 + 2 + bearer_bytes.len() + 8);
+        auth_payload.push(OVER_CHAIN_VERSION);
+        auth_payload.extend_from_slice(&bearer_len.to_be_bytes());
+        auth_payload.extend_from_slice(bearer_bytes);
+        auth_payload.extend_from_slice(&nonce_echo);
+
+        write_stream_frame(stream, FRAME_AUTH, &auth_payload).await?;
+
+        let (ack_tag, _ack_payload) = read_stream_frame(stream).await?;
+        match ack_tag {
+            FRAME_CLOSE => Err(MonitorChannelError::Auth(
+                "server rejected credentials".to_string(),
+            )),
+            FRAME_MSG => {
+                debug!("over_chain: AUTH accepted (first FRAME_MSG received)");
+                Ok(())
+            }
+            _ => Err(MonitorChannelError::UnexpectedTag(ack_tag)),
+        }
+    }
+
+    /// Old tunnel-based handshake — kept for backward-compat tests/unused.
+    #[allow(dead_code)]
     async fn do_auth_handshake(
         tunnel: &mut dyn Tunnel,
         bearer: &str,
@@ -430,7 +596,7 @@ impl OverChainChannel {
 impl MonitorChannel for OverChainChannel {
     async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, MonitorChannelError> {
         loop {
-            let (tag, payload) = match read_tunnel_frame(self.tunnel.as_mut()).await {
+            let (tag, payload) = match read_stream_frame(&mut self.stream).await {
                 Ok(f) => f,
                 Err(MonitorChannelError::Closed) => return Ok(None),
                 Err(e) => return Err(e),
@@ -460,15 +626,15 @@ impl MonitorChannel for OverChainChannel {
     }
 
     async fn send_pong(&mut self, nonce: [u8; 8]) -> Result<(), MonitorChannelError> {
-        write_tunnel_frame(self.tunnel.as_mut(), FRAME_PONG, &nonce).await
+        write_stream_frame(&mut self.stream, FRAME_PONG, &nonce).await
     }
 
     async fn send_text(&mut self, text: &str) -> Result<(), MonitorChannelError> {
-        write_tunnel_frame(self.tunnel.as_mut(), FRAME_MSG, text.as_bytes()).await
+        write_stream_frame(&mut self.stream, FRAME_MSG, text.as_bytes()).await
     }
 
     async fn close(mut self) -> Result<(), MonitorChannelError> {
-        write_tunnel_frame(self.tunnel.as_mut(), FRAME_CLOSE, &[]).await
+        write_stream_frame(&mut self.stream, FRAME_CLOSE, &[]).await
     }
 }
 
