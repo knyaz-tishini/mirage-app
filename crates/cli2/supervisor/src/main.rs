@@ -154,9 +154,14 @@ async fn main() -> anyhow::Result<()> {
                 warn!(bind = %bind_str, "routing.socks5_bind is invalid: {e} — router listener not started");
             }
             Ok(bind_addr) => {
+                let whitelist: Option<&Vec<String>> = routing_cfg.chain_ids.as_ref();
                 let router_chains: Vec<router_listener::RouterChain> = config
                     .chains
                     .iter()
+                    .filter(|c| match whitelist {
+                        Some(ids) => ids.iter().any(|id| id == &c.id),
+                        None => true,
+                    })
                     .filter_map(|c| {
                         c.socks5_bind.parse::<std::net::SocketAddr>().ok().map(|addr| {
                             router_listener::RouterChain {

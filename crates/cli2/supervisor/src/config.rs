@@ -50,6 +50,11 @@ pub struct RoutingConfig {
     /// Bind address for the supervisor-level SOCKS5 router listener.
     #[serde(default = "default_router_bind")]
     pub socks5_bind: String,
+    /// Optional whitelist of chain IDs that the router considers.
+    /// When set, only listed chains rotate through the router. When unset,
+    /// every chain in `[[chains]]` is eligible.
+    #[serde(default)]
+    pub chain_ids: Option<Vec<String>>,
 }
 
 fn default_policy() -> String {
