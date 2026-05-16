@@ -788,15 +788,25 @@ impl MonitorLink {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Keepalive: send a Ping every 10 s; if no frame (any kind) arrives
-        // within 25 s from the last one, treat the connection as dead and
-        // return Err so the caller falls through to FallbackPoll/OverChain.
-        // This fixes "TCP REJECT doesn't kill an idle WS for 5 minutes" —
-        // without active pings the OS only realises the connection died on the
-        // next send attempt.
+        // Keepalive: client sends WebSocket Ping every 10 s and tracks
+        // last_pong separately from last_seen. A connection is "dead" when:
+        //   - we sent a Ping but didn't receive a Pong within `pong_timeout`,
+        //     OR
+        //   - no frame of any kind has arrived for `idle_timeout`.
+        //
+        // Tracking pong separately is the key — a server that keeps pushing
+        // data frames updates last_seen but won't update last_pong unless the
+        // RTT is healthy. With bidirectional iptables REJECT both stop, so
+        // either signal triggers fallback within `ping_interval + pong_timeout`.
+        //
+        // tungstenite auto-responds to incoming Ping with Pong, so the server
+        // side gets the same liveness guarantee from our peer's perspective.
         let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
-        let idle_timeout = Duration::from_secs(25);
+        let pong_timeout = Duration::from_secs(15);
+        let idle_timeout = Duration::from_secs(40);
         let mut last_seen = tokio::time::Instant::now();
+        let mut last_pong = tokio::time::Instant::now();
+        let mut ping_outstanding_since: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -838,7 +848,10 @@ impl MonitorLink {
                             // tungstenite auto-responds with pong, nothing to do.
                         }
                         Some(Ok(Message::Pong(_))) => {
-                            last_seen = tokio::time::Instant::now();
+                            let now = tokio::time::Instant::now();
+                            last_seen = now;
+                            last_pong = now;
+                            ping_outstanding_since = None;
                         }
                         Some(Ok(Message::Close(_))) | None => {
                             info!("monitor_link: WebSocket closed by server");
@@ -854,16 +867,39 @@ impl MonitorLink {
                 }
 
                 _ = ping_interval.tick() => {
-                    // Check idle timeout before sending — if we're already past it,
-                    // the connection is considered dead.
+                    let now = tokio::time::Instant::now();
+                    // Outstanding-ping liveness: if a previous Ping never got a Pong
+                    // within pong_timeout, the peer is dead even if it keeps pushing
+                    // data frames (e.g. one-way iptables block).
+                    if let Some(sent_at) = ping_outstanding_since {
+                        if now.duration_since(sent_at) > pong_timeout {
+                            return Err(format!(
+                                "WS pong timeout: no pong for {:?}",
+                                now.duration_since(sent_at)
+                            ));
+                        }
+                    }
                     if last_seen.elapsed() > idle_timeout {
                         return Err(format!(
                             "WS idle timeout: no frame received for {:?}",
                             last_seen.elapsed()
                         ));
                     }
-                    if let Err(e) = write.send(Message::Ping(vec![])).await {
-                        return Err(format!("WS ping send failed: {e}"));
+                    if last_pong.elapsed() > idle_timeout {
+                        return Err(format!(
+                            "WS pong idle: no pong for {:?}",
+                            last_pong.elapsed()
+                        ));
+                    }
+                    match write.send(Message::Ping(vec![])).await {
+                        Ok(()) => {
+                            if ping_outstanding_since.is_none() {
+                                ping_outstanding_since = Some(now);
+                            }
+                        }
+                        Err(e) => {
+                            return Err(format!("WS ping send failed: {e}"));
+                        }
                     }
                 }
             }
