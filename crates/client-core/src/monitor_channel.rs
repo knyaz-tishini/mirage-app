@@ -448,7 +448,9 @@ impl OverChainChannel {
         monitor_addr: SocketAddr,
         bearer: &str,
     ) -> Result<Self, MonitorChannelError> {
-        const SOCKS5_TIMEOUT: Duration = Duration::from_secs(15);
+        // Greeting reply is instant. CONNECT may block on chain handshake
+        // (worker dials the entry hop on first use) — give it 30 s.
+        const SOCKS5_TIMEOUT: Duration = Duration::from_secs(30);
         const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
         info!(%worker_socks5, %monitor_addr, "over_chain: SOCKS5 dial to worker");
