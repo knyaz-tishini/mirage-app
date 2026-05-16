@@ -1,5 +1,7 @@
 //! Supervisor configuration loaded from a TOML file.
 
+use std::net::SocketAddr;
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +34,13 @@ pub struct Config {
     pub state_dir: Option<String>,
     /// Chain definitions.
     pub chains: Vec<ChainConfig>,
+    /// Optional monitor transports list for [`MonitorLink`] fallback.
+    ///
+    /// When non-empty, `MonitorLink` receives these transports and will
+    /// fall over to any configured `OverChain` transport when all `DirectWs`
+    /// URLs fail. Default: empty (DirectWs-only, current behaviour).
+    #[serde(default)]
+    pub monitor_transports: Vec<MonitorTransportConfig>,
     /// Optional router-level SOCKS5 listener and policy.
     ///
     /// When present, the supervisor binds an additional SOCKS5 listener at
@@ -78,6 +87,35 @@ pub struct ChainConfig {
     pub socks5_bind: String,
     /// Path to the per-chain client config file passed to the worker.
     pub config_path: String,
+}
+
+/// TOML-serialisable mirror of `client_core::monitor_link::MonitorTransport`.
+///
+/// Kept separate so `supervisor/src/config.rs` does not need a direct dep on
+/// `client-core` types at the config-parse level. `main.rs` converts these
+/// to `MonitorTransport` before passing them to `MonitorLink::new`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum MonitorTransportConfig {
+    /// Standard WebSocket subscribe.
+    DirectWs {
+        url: String,
+        #[serde(default)]
+        sni: Option<String>,
+    },
+    /// Binary frame protocol over a Mirage tunnel exit hop.
+    OverChain {
+        /// Chain ID to route through (must match a `[[chains]]` entry).
+        chain_id: String,
+        /// Loopback address of the monitor's over-chain listener.
+        /// Defaults to `127.0.0.1:19445`.
+        #[serde(default = "default_monitor_addr")]
+        monitor_addr: SocketAddr,
+    },
+}
+
+fn default_monitor_addr() -> SocketAddr {
+    "127.0.0.1:19445".parse().expect("static addr is valid")
 }
 
 impl Config {

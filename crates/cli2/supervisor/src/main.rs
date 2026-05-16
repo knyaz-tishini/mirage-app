@@ -205,12 +205,31 @@ async fn main() -> anyhow::Result<()> {
         probe_config: HealthProbeConfig::default(),
     });
 
+    // Convert MonitorTransportConfig entries from the supervisor TOML into
+    // the MonitorTransport variants that MonitorLink understands.
+    let monitor_transports: Vec<MonitorTransport> = config
+        .monitor_transports
+        .iter()
+        .map(|t| match t {
+            config::MonitorTransportConfig::DirectWs { url, sni } => MonitorTransport::DirectWs {
+                url: url.clone(),
+                sni: sni.clone(),
+            },
+            config::MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
+                MonitorTransport::OverChain {
+                    chain_id: mirage_client_core::chain_set::ChainId(chain_id.clone()),
+                    monitor_addr: *monitor_addr,
+                }
+            }
+        })
+        .collect();
+
     let (monitor_link, mut monitor_cfg_rx) = MonitorLink::new(
         vec![config.monitor_url.clone()],
         config.monitor_api_key.clone(),
         Arc::clone(&peer_table_arc),
         empty_chain_set,
-        Vec::<MonitorTransport>::new(),
+        monitor_transports,
     );
     monitor_link.spawn();
     info!("monitor_link spawned for peer_table tracking");
