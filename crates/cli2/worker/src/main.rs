@@ -58,6 +58,11 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .add_directive(
                     "mirage_client_core::monitor_channel=info".parse().expect("valid directive"),
+                )
+                // Pool slot lifecycle (init / reconnect / lease) — visible to
+                // diagnose pool-exhausted errors during chain dial issues.
+                .add_directive(
+                    "mirage_client_core::pool=info".parse().expect("valid directive"),
                 ),
         )
         .with_writer(std::io::stderr)
