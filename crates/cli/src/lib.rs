@@ -356,7 +356,8 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             .chains
                             .iter()
                             .find(|c| c.chain_id == *chain_id)
-                            .and_then(|c| c.socks5_bind.parse::<std::net::SocketAddr>().ok());
+                            .and_then(|c| c.socks5_bind.as_ref())
+                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
                         let monitor_addr = monitor_endpoint.parse::<std::net::SocketAddr>();
                         match (socks5_bind, monitor_addr) {
                             (Some(ws), Ok(addr)) => Some(MonitorTransport::OverChain {
