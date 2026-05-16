@@ -49,6 +49,23 @@ pub struct ChainSet {
 }
 
 impl ChainSet {
+    /// Construct an empty `ChainSet` with no chains.
+    ///
+    /// Used as a no-op placeholder when a component needs an `Arc<ChainSet>`
+    /// but does not use OverChain transports (e.g. the legacy CLI, tests).
+    pub fn empty() -> Arc<Self> {
+        use arc_swap::ArcSwap;
+        use dashmap::DashMap;
+        Arc::new(Self {
+            chains: Arc::new(DashMap::new()),
+            prewarm: PrewarmStrategy::default(),
+            peer_table: Arc::new(ArcSwap::from_pointee(PeerTable::default())),
+            peer_table_notify: Arc::new(Notify::new()),
+            mesh_id: Vec::new(),
+            probe_config: HealthProbeConfig::default(),
+        })
+    }
+
     /// Enumerate only currently Active chains.
     pub fn active_chains(&self) -> Vec<Arc<ChainHandle>> {
         self.chains

@@ -395,7 +395,6 @@ mod tests {
         };
         // Mark all chains Active without real pools (not testing pool internals here).
         for id in ids {
-            use crate::chain_set::types::{ChainMetrics, ChainState};
             // We can't create a real TunnelPool without a running Tokio runtime
             // and actual connection, so we test at the router level using
             // pre-populated metrics only (pool field not accessed in routing logic).

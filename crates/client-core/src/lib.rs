@@ -1,6 +1,7 @@
 pub mod chain_set;
 pub mod health_watcher;
 pub mod log_capture;
+pub mod monitor_channel;
 pub mod monitor_link;
 pub mod tun_bridge;
 pub mod discovery;

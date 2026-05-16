@@ -21,9 +21,10 @@ use mirage_protocol::{
 };
 use mirage_client_core::{
     dns_forwarder, management,
+    chain_set::ChainSet,
     discovery::select_all_chains,
     http_proxy::HttpProxyServer,
-    monitor_link::MonitorLink,
+    monitor_link::{MonitorLink, MonitorTransport},
     mux_pool::MuxPool,
     pool::TunnelPool,
     runtime::ClientRuntime,
@@ -321,10 +322,56 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
 
     // ── Monitor link (optional) ───────────────────────────────────────────────
     if let Some(ref monitor_url) = config.monitor_url {
+        // Convert ClientConfig.monitor_transports (Wave 2 field) to MonitorTransport
+        // enum used by MonitorLink.  Falls back to the legacy monitor_url when the
+        // transports list is absent.
+        use mirage_core::config::MonitorTransportConfig;
+        let transports: Vec<MonitorTransport> = if config.monitor_transports.is_empty() {
+            // Legacy path: single DirectWs entry from monitor_url.
+            vec![MonitorTransport::DirectWs {
+                url: monitor_url.clone(),
+                sni: None,
+            }]
+        } else {
+            config
+                .monitor_transports
+                .iter()
+                .filter_map(|t| match t {
+                    MonitorTransportConfig::DirectWs { url, sni, .. } => {
+                        Some(MonitorTransport::DirectWs {
+                            url: url.clone(),
+                            sni: sni.clone(),
+                        })
+                    }
+                    MonitorTransportConfig::OverChain {
+                        chain_id,
+                        monitor_endpoint,
+                        ..
+                    } => {
+                        match monitor_endpoint.parse::<std::net::SocketAddr>() {
+                            Ok(addr) => Some(MonitorTransport::OverChain {
+                                chain_id: chain_id.clone().into(),
+                                monitor_addr: addr,
+                            }),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "cli: invalid monitor_endpoint '{}': {e}",
+                                    monitor_endpoint
+                                );
+                                None
+                            }
+                        }
+                    }
+                })
+                .collect()
+        };
+
         let (link, mut config_rx) = MonitorLink::new(
             vec![monitor_url.clone()],
             None,
             Arc::clone(&peer_table),
+            ChainSet::empty(),
+            transports,
         );
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");

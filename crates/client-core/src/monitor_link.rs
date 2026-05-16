@@ -1,19 +1,29 @@
-//! Background link to mirage2monitor — config push via WebSocket with HTTP poll fallback.
+//! Background link to mirage2monitor — config push via WebSocket with HTTP poll fallback,
+//! plus an optional `OverChain` fallback when all direct WebSocket URLs are unreachable.
 //!
 //! [`MonitorLink`] races all configured URLs on startup (GET /health, 5s timeout).
 //! First to respond 2xx wins → set as `active_url`.  All subsequent calls go to
 //! `active_url` only (sticky).  On any error against the active URL → re-race
 //! immediately → re-register against the new winner.
 //!
+//! When all DirectWs transports fail, [`MonitorLink`] falls back to any configured
+//! `OverChain` transports (see [`MonitorTransport`]).  A background health-recheck
+//! task runs every 30 s while OverChain is active; on the first 2xx from any DirectWs
+//! URL the client promotes back to DirectWs automatically.
+//!
 //! State machine:
 //! ```text
-//! Connecting ──► Connected
+//! Connecting ──► Connected (DirectWs)
 //!     ▲               │ error/close
 //!     │               ▼
-//!     └──── FallbackPoll (5-min WS retry)
+//!     │     FallbackPoll (5-min WS retry)
+//!     │               │ all DirectWs fail + OverChain configured
+//!     │               ▼
+//!     └── OverChain (health-recheck → promote back to DirectWs on 2xx)
 //! ```
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,12 +34,52 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::{
     connect_async_tls_with_config,
-    tungstenite::{
-        client::IntoClientRequest,
-        Message,
-    },
+    tungstenite::{client::IntoClientRequest, Message},
 };
 use tracing::{debug, info, warn};
+
+use crate::chain_set::{ChainId, ChainSet};
+use crate::monitor_channel::{MonitorChannel, OverChainChannel};
+
+// ── Timeouts ─────────────────────────────────────────────────────────────────
+
+const OVER_CHAIN_BACKOFF_INIT: Duration = Duration::from_secs(5);
+const OVER_CHAIN_BACKOFF_MAX: Duration = Duration::from_secs(60);
+const DIRECT_HEALTH_RECHECK: Duration = Duration::from_secs(30);
+const OVER_CHAIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ── MonitorTransport ──────────────────────────────────────────────────────────
+
+/// How to reach the monitor control plane.
+///
+/// A [`MonitorLink`] accepts a list of transports; they are probed in order
+/// with DirectWs always preferred over OverChain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum MonitorTransport {
+    /// Standard WebSocket subscribe (`wss://` or `ws://`).
+    DirectWs {
+        /// WebSocket URL for the monitor subscribe endpoint.
+        url: String,
+        /// Optional SNI override (unused by current WS impl, reserved for
+        /// future TLS pinning).
+        #[serde(default)]
+        sni: Option<String>,
+    },
+    /// Binary frame protocol over a Mirage tunnel (`OverChain`).
+    ///
+    /// The client routes through `chain_id` and connects to the monitor's
+    /// over-chain listener at `monitor_addr`.
+    OverChain {
+        /// ID of the chain to route through (must exist in [`ChainSet`]).
+        chain_id: ChainId,
+        /// Exit address of the monitor's over-chain listener.
+        ///
+        /// Defaults to `127.0.0.1:19445` (loopback, same machine as the
+        /// Mirage exit node, reachable only from inside the tunnel).
+        monitor_addr: SocketAddr,
+    },
+}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -250,6 +300,11 @@ pub struct MonitorLink {
     /// carries a non-`None` `peer_table` field.
     /// Shared with `TunnelPool` / `MuxPool` via `Arc::clone`.
     pub peer_table: Arc<ArcSwap<PeerTable>>,
+    /// Additional transport options (DirectWs + OverChain).
+    /// If empty, `monitor_urls` is used for DirectWs (legacy path).
+    transports: Vec<MonitorTransport>,
+    /// Chain set used to open OverChain connections.
+    chain_set: Arc<ChainSet>,
 }
 
 impl MonitorLink {
@@ -258,7 +313,7 @@ impl MonitorLink {
     /// The link does not start until [`MonitorLink::spawn`] is called.
     ///
     /// `monitor_urls` — list of monitor base URLs to race on startup and re-race
-    /// on error.
+    /// on error.  Used as the fallback when `transports` is empty.
     ///
     /// `monitor_api_key` — if set, sent as `Authorization: Bearer <key>` on
     /// every request including the WebSocket upgrade handshake.
@@ -268,10 +323,18 @@ impl MonitorLink {
     /// created `Arc::new(ArcSwap::from_pointee(PeerTable::empty()))` and share
     /// that same arc with `TunnelPool::new` / `MuxPool::new` so pools always see
     /// the latest peer table without extra plumbing.
+    ///
+    /// `chain_set` — registry of chains, used for OverChain transport.
+    ///
+    /// `transports` — optional list of [`MonitorTransport`]s from
+    /// `ClientConfig.monitor_transports`.  If empty, `monitor_urls` is used
+    /// (backward-compatible legacy path).
     pub fn new(
         monitor_urls: Vec<String>,
         monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
+        chain_set: Arc<ChainSet>,
+        transports: Vec<MonitorTransport>,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
         let (frame_tx, _frame_rx) = watch::channel(None);
@@ -293,6 +356,8 @@ impl MonitorLink {
             config_tx,
             frame_tx,
             peer_table,
+            transports,
+            chain_set,
         });
 
         (link, config_rx)
@@ -374,7 +439,13 @@ impl MonitorLink {
                     match self.race_urls().await {
                         Ok(url) => info!("monitor_link: re-race winner={}", url),
                         Err(e) => {
-                            warn!("monitor_link: re-race failed ({e}), staying in FallbackPoll");
+                            warn!("monitor_link: re-race failed ({e})");
+                            // If OverChain transports are configured, escalate.
+                            if self.has_over_chain_transports() {
+                                info!("monitor_link: escalating to OverChain fallback");
+                                self.run_over_chain_fallback().await;
+                                info!("monitor_link: promoted back to DirectWs");
+                            }
                             ws_retry_deadline = tokio::time::Instant::now() + ws_retry_interval;
                             continue;
                         }
@@ -392,6 +463,232 @@ impl MonitorLink {
         }
     }
 
+    /// True when any `OverChain` transport is configured.
+    fn has_over_chain_transports(&self) -> bool {
+        self.transports
+            .iter()
+            .any(|t| matches!(t, MonitorTransport::OverChain { .. }))
+    }
+
+    /// Drive the OverChain fallback loop.
+    ///
+    /// Tries all configured `OverChain` transports in parallel.  While active,
+    /// a background task rechecks DirectWs every 30 s.  Returns when:
+    /// - A DirectWs health check succeeds (promote back), or
+    /// - An OverChain connection succeeds, runs, and then all OverChain transports
+    ///   fail (caller retries DirectWs).
+    async fn run_over_chain_fallback(&self) {
+        let mut backoff = OVER_CHAIN_BACKOFF_INIT;
+
+        loop {
+            // First, try to open an OverChain connection.
+            let channel = self.try_connect_over_chain().await;
+
+            match channel {
+                None => {
+                    // All OverChain transports failed — back off and check DirectWs.
+                    info!(
+                        "monitor_link: all OverChain transports failed, backoff={:?}",
+                        backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(OVER_CHAIN_BACKOFF_MAX);
+
+                    // Check if DirectWs is back before retrying OverChain.
+                    if self.check_direct_ws_health().await {
+                        info!("monitor_link: DirectWs health check passed — promoting");
+                        return;
+                    }
+                }
+                Some(mut ch) => {
+                    info!("monitor_link: OverChain connected — entering receive loop");
+                    backoff = OVER_CHAIN_BACKOFF_INIT; // reset on success
+
+                    // Drive the OverChain loop; health-recheck DirectWs in parallel.
+                    let result = self
+                        .run_over_chain_loop_with_health_check(&mut ch)
+                        .await;
+
+                    match result {
+                        OverChainLoopResult::DirectWsRestored => {
+                            info!(
+                                "monitor_link: DirectWs restored while on OverChain — promoting"
+                            );
+                            let _ = ch.close().await;
+                            return;
+                        }
+                        OverChainLoopResult::ChannelClosed => {
+                            warn!(
+                                "monitor_link: OverChain channel closed — will retry"
+                            );
+                            let _ = ch.close().await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to open one OverChain connection.  Returns the first successful
+    /// channel, or `None` if all transports fail.
+    async fn try_connect_over_chain(&self) -> Option<OverChainChannel> {
+        let bearer = self.monitor_api_key.as_deref().unwrap_or("");
+        let chain_set = Arc::clone(&self.chain_set);
+
+        for transport in &self.transports {
+            if let MonitorTransport::OverChain {
+                chain_id,
+                monitor_addr,
+            } = transport
+            {
+                match tokio::time::timeout(
+                    OVER_CHAIN_CONNECT_TIMEOUT,
+                    OverChainChannel::connect(&chain_set, chain_id, *monitor_addr, bearer),
+                )
+                .await
+                {
+                    Ok(Ok(ch)) => {
+                        info!(
+                            chain_id = %chain_id,
+                            addr = %monitor_addr,
+                            "monitor_link: OverChain connected"
+                        );
+                        return Some(ch);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            chain_id = %chain_id,
+                            "monitor_link: OverChain connect failed: {e}"
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            chain_id = %chain_id,
+                            "monitor_link: OverChain connect timed out"
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if any DirectWs URL responds with 2xx on GET /health.
+    async fn check_direct_ws_health(&self) -> bool {
+        let urls = self.monitor_urls.lock().await.clone();
+        // Also include DirectWs URLs from the transports list.
+        let mut all_urls: Vec<String> = urls;
+        for t in &self.transports {
+            if let MonitorTransport::DirectWs { url, .. } = t {
+                all_urls.push(url.clone());
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(OVER_CHAIN_CONNECT_TIMEOUT)
+            .timeout(OVER_CHAIN_CONNECT_TIMEOUT)
+            .build()
+            .ok();
+        let Some(client) = client else {
+            return false;
+        };
+
+        for base in &all_urls {
+            let health_url = format!("{base}/health");
+            if let Ok(Ok(r)) = tokio::time::timeout(
+                OVER_CHAIN_CONNECT_TIMEOUT,
+                client.get(&health_url).send(),
+            )
+            .await
+            {
+                if r.status().is_success() {
+                    info!("monitor_link: DirectWs health OK at {base}");
+                    *self.active_url.lock().await = Some(base.clone());
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Result of [`MonitorLink::run_over_chain_loop_with_health_check`].
+    async fn run_over_chain_loop_with_health_check(
+        &self,
+        channel: &mut OverChainChannel,
+    ) -> OverChainLoopResult {
+        let recheck_interval = DIRECT_HEALTH_RECHECK;
+
+        loop {
+            tokio::select! {
+                // Drive OverChain receive.
+                frame = channel.recv_frame() => {
+                    match frame {
+                        Ok(Some(payload)) => {
+                            let text = match std::str::from_utf8(&payload) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!("monitor_link: OverChain frame not valid UTF-8: {e}");
+                                    continue;
+                                }
+                            };
+                            match parse_ws_frame(text) {
+                                Ok(TaggedServerFrame::Config(cfg)) => {
+                                    debug!(
+                                        version = cfg.version,
+                                        chains = cfg.chains.len(),
+                                        "monitor_link: OverChain config push received"
+                                    );
+                                    self.apply_config(cfg);
+                                }
+                                Ok(TaggedServerFrame::DebugTunnelOpen(payload)) => {
+                                    info!(
+                                        "monitor_link: OverChain DebugTunnelOpen received"
+                                    );
+                                    let _ = self
+                                        .frame_tx
+                                        .send(Some(WsServerFrame::DebugTunnelOpen(payload)));
+                                }
+                                Ok(TaggedServerFrame::DebugTunnelClose) => {
+                                    info!("monitor_link: OverChain DebugTunnelClose received");
+                                    let _ = self
+                                        .frame_tx
+                                        .send(Some(WsServerFrame::DebugTunnelClose));
+                                }
+                                Err(e) => {
+                                    warn!("monitor_link: OverChain frame parse error: {e}");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            return OverChainLoopResult::ChannelClosed;
+                        }
+                        Err(e) => {
+                            warn!("monitor_link: OverChain recv error: {e}");
+                            return OverChainLoopResult::ChannelClosed;
+                        }
+                    }
+                }
+
+                // Background health recheck.
+                _ = tokio::time::sleep(recheck_interval) => {
+                    if self.check_direct_ws_health().await {
+                        return OverChainLoopResult::DirectWsRestored;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Result returned by the OverChain receive loop.
+enum OverChainLoopResult {
+    /// A DirectWs URL responded 2xx — time to promote back.
+    DirectWsRestored,
+    /// The OverChain channel was closed or errored — need reconnect.
+    ChannelClosed,
+}
+
+impl MonitorLink {
     /// Race all configured URLs with a 5s timeout each.
     /// First to return 2xx on GET /health wins → stored in `active_url`.
     async fn race_urls(&self) -> Result<String, String> {

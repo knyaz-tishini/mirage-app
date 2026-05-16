@@ -32,6 +32,32 @@ pub struct Config {
     pub state_dir: Option<String>,
     /// Chain definitions.
     pub chains: Vec<ChainConfig>,
+    /// Optional router-level SOCKS5 listener and policy.
+    ///
+    /// When present, the supervisor binds an additional SOCKS5 listener at
+    /// `routing.socks5_bind` and uses the configured policy to select which
+    /// worker's SOCKS5 port to forward each connection to.
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
+}
+
+/// Router policy used by the supervisor's own SOCKS5 listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RoutingConfig {
+    /// `"round_robin"` | `"latency_weighted"` | `"sticky"`. Default: round-robin.
+    #[serde(default = "default_policy")]
+    pub policy: String,
+    /// Bind address for the supervisor-level SOCKS5 router listener.
+    #[serde(default = "default_router_bind")]
+    pub socks5_bind: String,
+}
+
+fn default_policy() -> String {
+    "round_robin".to_string()
+}
+
+fn default_router_bind() -> String {
+    "127.0.0.1:19489".to_string()
 }
 
 fn default_ota_poll() -> u64 {

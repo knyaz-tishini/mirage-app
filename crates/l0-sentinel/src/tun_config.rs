@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use mirage_core::config::{ChainConfig, ChainNode};
+use mirage_core::config::ChainConfig;
 use tracing::{info, warn};
 
 use crate::MANAGED_BY_VALUE;
@@ -100,21 +100,13 @@ fn is_tun_managed(path: &PathBuf) -> bool {
 
 /// Extract deduplicated (v4 set, v6 set) from all ChainConfig nodes.
 ///
-/// Sources:
-/// - `l1.addr` / `l1.addr_v6`
-/// - `l2.addr` / `l2.addr_v6`
-/// - `hops[*].addr` (host:port string — parse host part only)
+/// Source: `hops[*].addr` (host:port string — parse host part only).
+/// Phase 8+ removed `l1` / `l2` legacy fields; hops carry every node now.
 pub fn extract_relay_addrs(chains: &[ChainConfig]) -> (BTreeSet<IpAddr>, BTreeSet<IpAddr>) {
     let mut v4: BTreeSet<IpAddr> = BTreeSet::new();
     let mut v6: BTreeSet<IpAddr> = BTreeSet::new();
 
     for chain in chains {
-        if let Some(ref node) = chain.l1 {
-            collect_node(node, &mut v4, &mut v6);
-        }
-        if let Some(ref node) = chain.l2 {
-            collect_node(node, &mut v4, &mut v6);
-        }
         for hop in &chain.hops {
             // `hop.addr` is "host:port" string.
             if let Ok(sa) = hop.addr.parse::<std::net::SocketAddr>() {
@@ -124,13 +116,6 @@ pub fn extract_relay_addrs(chains: &[ChainConfig]) -> (BTreeSet<IpAddr>, BTreeSe
     }
 
     (v4, v6)
-}
-
-fn collect_node(node: &ChainNode, v4: &mut BTreeSet<IpAddr>, v6: &mut BTreeSet<IpAddr>) {
-    insert_ip(node.addr.ip(), v4, v6);
-    if let Some(sa6) = node.addr_v6 {
-        insert_ip(sa6.ip(), v4, v6);
-    }
 }
 
 fn insert_ip(ip: IpAddr, v4: &mut BTreeSet<IpAddr>, v6: &mut BTreeSet<IpAddr>) {

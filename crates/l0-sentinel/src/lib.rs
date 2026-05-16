@@ -6,7 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
-use mirage_client_core::monitor_link::MonitorLink;
+use mirage_client_core::{
+    chain_set::ChainSet,
+    monitor_link::{MonitorLink, MonitorTransport},
+};
 use mirage_core::peer_table::PeerTable;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use serde::{Deserialize, Serialize};
@@ -375,10 +378,21 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     // ClientConfig files for cli. An empty table is sufficient here.
     let _sentinel_peer_table: Arc<ArcSwap<PeerTable>> =
         Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+    // Build DirectWs transports from the effective URL list.
+    let direct_ws_transports: Vec<MonitorTransport> = effective_urls
+        .iter()
+        .map(|url| MonitorTransport::DirectWs {
+            url: url.clone(),
+            sni: None,
+        })
+        .collect();
+
     let (link, mut config_rx) = MonitorLink::new(
         effective_urls.clone(),
         Some(monitor_api_key.clone()),
         Arc::clone(&_sentinel_peer_table),
+        ChainSet::empty(),
+        direct_ws_transports,
     );
     link.spawn();
 

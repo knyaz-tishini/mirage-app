@@ -8,31 +8,56 @@
 //! The implementation shares [`TunnelPool`] with the SOCKS5 server and reuses
 //! the same [`relay_loop`] for data forwarding.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use mirage_core::{error::MirageError, routing::RouteDecision, routing::RoutingTable};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use mirage_protocol::traits::Tunnel as _;
 
 use crate::{mux_pool::MuxPool, pool::TunnelPool, relay::{relay_loop, TunnelCompat}};
+use crate::chain_set::{ChainId, Router, TargetKey, FlowKey, ProtocolHint};
 
 // Maximum number of bytes to read while consuming HTTP request headers.
 const MAX_HEADER_BYTES: usize = 8192;
 
 /// A minimal HTTP CONNECT proxy server.
+///
+/// When `chain_router` is set, the Chain routing arm resolves pools via
+/// `Router::pick(target, flow)` instead of using the single primary pool.
 pub struct HttpProxyServer {
     bind_addr: SocketAddr,
+    /// Dynamic chain router — overrides single-pool selection when set.
+    chain_router: Option<Arc<dyn Router>>,
+    /// All pool handles keyed by chain_id — used when `chain_router` is set.
+    all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
 }
 
 impl HttpProxyServer {
     /// Create a new server that will listen on `bind_addr`.
     pub fn new(bind_addr: SocketAddr) -> Self {
-        Self { bind_addr }
+        Self {
+            bind_addr,
+            chain_router: None,
+            all_pools: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// Create a server with a dynamic `Router` driving chain selection.
+    pub fn new_with_router(
+        bind_addr: SocketAddr,
+        chain_router: Arc<dyn Router>,
+        all_pools: HashMap<ChainId, Arc<TunnelPool>>,
+    ) -> Self {
+        Self {
+            bind_addr,
+            chain_router: Some(chain_router),
+            all_pools: Arc::new(all_pools),
+        }
     }
 
     /// Accept connections forever, spawning a handler task per connection.
@@ -45,6 +70,9 @@ impl HttpProxyServer {
         let listener = TcpListener::bind(self.bind_addr).await?;
         tracing::info!(addr = %self.bind_addr, "HTTP CONNECT proxy listening");
 
+        let chain_router = self.chain_router.clone();
+        let all_pools = Arc::clone(&self.all_pools);
+
         loop {
             let (stream, peer) = listener.accept().await?;
             debug!(%peer, "new HTTP proxy connection");
@@ -52,9 +80,11 @@ impl HttpProxyServer {
             let pool = Arc::clone(&pool);
             let mux_pool = mux_pool.clone();
             let router = Arc::clone(&router);
+            let chain_router = chain_router.clone();
+            let all_pools = Arc::clone(&all_pools);
 
             tokio::spawn(async move {
-                if let Err(e) = handle_http_connection(stream, pool, mux_pool, router).await {
+                if let Err(e) = handle_http_connection(stream, peer, pool, mux_pool, router, chain_router, all_pools).await {
                     error!(%peer, "HTTP proxy connection error: {e}");
                 }
             });
@@ -73,9 +103,12 @@ enum ParsedRequest {
 /// Handle one HTTP proxy connection.
 async fn handle_http_connection(
     mut stream: TcpStream,
+    peer: SocketAddr,
     pool: Arc<TunnelPool>,
     mux_pool: Option<Arc<MuxPool>>,
     router: Arc<RoutingTable>,
+    chain_router: Option<Arc<dyn Router>>,
+    all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
 ) -> Result<(), MirageError> {
     // Read until we see the end of the HTTP header block (\r\n\r\n).
     let mut buf = Vec::with_capacity(512);
@@ -103,7 +136,7 @@ async fn handle_http_connection(
 
     match request {
         ParsedRequest::Connect { host, port } => {
-            handle_connect(stream, pool, mux_pool, router, host, port).await
+            handle_connect(stream, peer, pool, mux_pool, router, chain_router, all_pools, host, port).await
         }
         ParsedRequest::Other => {
             // Plain HTTP forwarding is not implemented.
@@ -116,9 +149,12 @@ async fn handle_http_connection(
 /// Handle a `CONNECT host:port` request.
 async fn handle_connect(
     mut stream: TcpStream,
+    peer: SocketAddr,
     pool: Arc<TunnelPool>,
     mux_pool: Option<Arc<MuxPool>>,
     router: Arc<RoutingTable>,
+    chain_router: Option<Arc<dyn Router>>,
+    all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
     host: String,
     port: u16,
 ) -> Result<(), MirageError> {
@@ -143,7 +179,28 @@ async fn handle_connect(
                 .map_err(MirageError::Io)?;
         }
         RouteDecision::Chain => {
-            if let Some(mp) = mux_pool {
+            if let Some(cr) = &chain_router {
+                // Router-driven path.
+                let target_key = TargetKey {
+                    host: host.clone(),
+                    port,
+                    protocol_hint: if port == 443 { ProtocolHint::Tls } else { ProtocolHint::Http },
+                };
+                let flow = FlowKey::HttpConnect {
+                    connection_id: {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        peer.hash(&mut h);
+                        h.finish()
+                    },
+                };
+                let chain_ids = cr.pick(&target_key, &flow);
+                if chain_ids.is_empty() {
+                    write_error_response(&mut stream, 503, "No Chain Available").await;
+                    return Err(MirageError::PoolExhausted);
+                }
+                route_connect_via_router_pools(&mut stream, &chain_ids, &all_pools, &target_addr).await?;
+            } else if let Some(mp) = mux_pool {
                 route_connect_via_mux_pool(&mut stream, mp, &target_addr).await?;
             } else {
                 let mut lease = pool.lease().await?;
@@ -178,6 +235,57 @@ async fn handle_connect(
     }
 
     Ok(())
+}
+
+/// Router-driven HTTP CONNECT path: iterate chains from router, try each pool.
+async fn route_connect_via_router_pools(
+    client: &mut TcpStream,
+    chain_ids: &[ChainId],
+    all_pools: &HashMap<ChainId, Arc<TunnelPool>>,
+    target_addr: &str,
+) -> Result<(), MirageError> {
+    for chain_id in chain_ids {
+        let pool = match all_pools.get(chain_id) {
+            Some(p) => Arc::clone(p),
+            None => {
+                warn!(chain = %chain_id, "HTTP CONNECT router: unknown chain — skipping");
+                continue;
+            }
+        };
+        match pool.lease().await {
+            Err(e) => {
+                warn!(chain = %chain_id, error = %e, "HTTP CONNECT router: lease failed — trying next");
+                continue;
+            }
+            Ok(mut lease) => {
+                let send_result = if lease.is_onion {
+                    let target_bytes = target_addr.as_bytes();
+                    let len_prefix = (target_bytes.len() as u16).to_be_bytes();
+                    let mut framed = Vec::with_capacity(2 + target_bytes.len());
+                    framed.extend_from_slice(&len_prefix);
+                    framed.extend_from_slice(target_bytes);
+                    lease.send(&framed).await
+                } else {
+                    lease.send(target_addr.as_bytes()).await
+                };
+                if let Err(e) = send_result {
+                    warn!(chain = %chain_id, error = %e, "HTTP CONNECT router: target send failed — next");
+                    lease.poison();
+                    write_error_response(client, 502, "Bad Gateway").await;
+                    continue;
+                }
+                write_connect_ok(client).await?;
+                lease.set_relay_active(true);
+                let tunnel = lease.take_tunnel().ok_or(MirageError::TunnelClosed)?;
+                let mut compat = TunnelCompat::wrap(tunnel);
+                let result = relay_loop(client, &mut compat).await;
+                lease.poison();
+                return result;
+            }
+        }
+    }
+    write_error_response(client, 503, "All Chains Exhausted").await;
+    Err(MirageError::PoolExhausted)
 }
 
 /// Open a mux stream, send the target address, then relay.

@@ -7,6 +7,7 @@ mod config;
 mod ota_poller;
 mod reattach;
 mod rollout;
+mod router_listener;
 mod tun_registry;
 mod worker_handle;
 
@@ -15,7 +16,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use mirage_client_core::monitor_link::MonitorLink;
+use dashmap::DashMap;
+use mirage_client_core::{
+    ChainSet, HealthProbeConfig, PrewarmStrategy,
+    monitor_link::{MonitorLink, MonitorTransport},
+};
 use mirage_core::peer_table::PeerTable;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -138,6 +143,41 @@ async fn main() -> anyhow::Result<()> {
     // Push chain → SOCKS5 mapping to the local TUN process.
     push_tun_registry(&config).await;
 
+    // ── Supervisor-level router SOCKS5 listener ───────────────────────────────
+    // When `[routing]` is configured in supervisor.toml, bind a router-facing
+    // SOCKS5 port. Connections to this port are dispatched to worker SOCKS5
+    // ports using the configured policy (default: round-robin).
+    if let Some(routing_cfg) = &config.routing {
+        let bind_str = routing_cfg.socks5_bind.clone();
+        match bind_str.parse::<std::net::SocketAddr>() {
+            Err(e) => {
+                warn!(bind = %bind_str, "routing.socks5_bind is invalid: {e} — router listener not started");
+            }
+            Ok(bind_addr) => {
+                let router_chains: Vec<router_listener::RouterChain> = config
+                    .chains
+                    .iter()
+                    .filter_map(|c| {
+                        c.socks5_bind.parse::<std::net::SocketAddr>().ok().map(|addr| {
+                            router_listener::RouterChain {
+                                chain_id: c.id.clone(),
+                                socks5_addr: addr,
+                            }
+                        })
+                    })
+                    .collect();
+
+                if router_chains.is_empty() {
+                    warn!("routing configured but no valid chain socks5_bind addresses — router listener not started");
+                } else {
+                    let router = router_listener::SupervisorRouter::new(router_chains);
+                    router_listener::spawn_router_listener(bind_addr, router);
+                    info!(addr = %bind_addr, "supervisor router listener spawned");
+                }
+            }
+        }
+    }
+
     // ── MonitorLink: peer_table broadcast ─────────────────────────────────────
     // Supervisor owns a MonitorLink to receive peer_table snapshots.
     // On each new snapshot, it serializes the peer_table and broadcasts
@@ -149,10 +189,23 @@ async fn main() -> anyhow::Result<()> {
     let peer_table_arc: Arc<ArcSwap<PeerTable>> =
         Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
 
+    // Build a minimal empty ChainSet for MonitorLink (supervisor doesn't own
+    // pools; OverChain transport is not used at supervisor level).
+    let empty_chain_set: Arc<ChainSet> = Arc::new(ChainSet {
+        chains: Arc::new(DashMap::new()),
+        prewarm: PrewarmStrategy::default(),
+        peer_table: Arc::clone(&peer_table_arc),
+        peer_table_notify: Arc::new(tokio::sync::Notify::new()),
+        mesh_id: Vec::new(),
+        probe_config: HealthProbeConfig::default(),
+    });
+
     let (monitor_link, mut monitor_cfg_rx) = MonitorLink::new(
         vec![config.monitor_url.clone()],
         config.monitor_api_key.clone(),
         Arc::clone(&peer_table_arc),
+        empty_chain_set,
+        Vec::<MonitorTransport>::new(),
     );
     monitor_link.spawn();
     info!("monitor_link spawned for peer_table tracking");

@@ -26,6 +26,7 @@ use mirage_protocol::traits::Tunnel as _;
 
 use crate::{mux_pool::MuxPool, pool::TunnelPool, relay::{relay_loop, TunnelCompat}};
 use crate::udp_framing::{write_udp_frame, read_udp_frame};
+use crate::chain_set::{ChainId, Router, TargetKey, FlowKey, ProtocolHint};
 
 #[cfg(target_os = "linux")]
 use crate::transparent::{get_original_dst, peek_connection_kind, ConnectionKind};
@@ -64,11 +65,21 @@ impl Destination {
 /// `failover_pools` list (ordered highest-priority first, **excluding** the
 /// primary pool) enables cross-chain failover when the primary pool is
 /// exhausted.
+///
+/// When `chain_router` is set, it overrides the static `failover_pools`
+/// ordering: `Router::pick(target, flow)` returns an ordered `Vec<ChainId>`
+/// which is used to look up pools in `all_pools`. If a chain_id is not found
+/// in `all_pools`, it is silently skipped. When `chain_router` is `None`,
+/// the legacy `failover_pools` path is used unchanged (cli1 backward compat).
 pub struct Socks5Server {
     bind_addr: SocketAddr,
     /// `(chain_id, pool)` pairs used for failover, highest-priority first.
-    /// Does not include the primary pool.
+    /// Does not include the primary pool. Used when `chain_router` is `None`.
     failover_pools: Vec<(String, Arc<TunnelPool>)>,
+    /// Dynamic chain router. When set, overrides `failover_pools` ordering.
+    chain_router: Option<Arc<dyn Router>>,
+    /// All pool handles keyed by chain_id — used when `chain_router` is set.
+    all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
 }
 
 impl Socks5Server {
@@ -77,6 +88,8 @@ impl Socks5Server {
         Self {
             bind_addr,
             failover_pools: Vec::new(),
+            chain_router: None,
+            all_pools: Arc::new(HashMap::new()),
         }
     }
 
@@ -86,7 +99,30 @@ impl Socks5Server {
         bind_addr: SocketAddr,
         failover_pools: Vec<(String, Arc<TunnelPool>)>,
     ) -> Self {
-        Self { bind_addr, failover_pools }
+        Self {
+            bind_addr,
+            failover_pools,
+            chain_router: None,
+            all_pools: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// Create a server with a dynamic `Router` driving chain selection.
+    ///
+    /// `all_pools` must contain every chain pool the router may return,
+    /// keyed by `ChainId`. When the router returns a chain not present in
+    /// `all_pools`, that chain is skipped and the next candidate is tried.
+    pub fn new_with_router(
+        bind_addr: SocketAddr,
+        chain_router: Arc<dyn Router>,
+        all_pools: HashMap<ChainId, Arc<TunnelPool>>,
+    ) -> Self {
+        Self {
+            bind_addr,
+            failover_pools: Vec::new(),
+            chain_router: Some(chain_router),
+            all_pools: Arc::new(all_pools),
+        }
     }
 
     /// Accept connections forever, spawning a handler task per connection.
@@ -101,6 +137,8 @@ impl Socks5Server {
         info!(addr = %self.bind_addr, "SOCKS5 server listening");
 
         let failover = Arc::new(self.failover_pools.clone());
+        let chain_router = self.chain_router.clone();
+        let all_pools = Arc::clone(&self.all_pools);
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -110,6 +148,8 @@ impl Socks5Server {
             let mux_pool = mux_pool.clone();
             let router = Arc::clone(&router);
             let failover = Arc::clone(&failover);
+            let chain_router = chain_router.clone();
+            let all_pools = Arc::clone(&all_pools);
 
             tokio::spawn(async move {
                 #[cfg(target_os = "linux")]
@@ -123,16 +163,16 @@ impl Socks5Server {
                     };
                     match kind {
                         ConnectionKind::Socks5 => {
-                            handle_socks5_connection(stream, pool, mux_pool, router, failover).await
+                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools).await
                         }
                         ConnectionKind::Transparent => {
-                            handle_transparent_connection(stream, pool, mux_pool, router, failover).await
+                            handle_transparent_connection(stream, pool, mux_pool, router, failover, chain_router, all_pools).await
                         }
                     }
                 };
 
                 #[cfg(not(target_os = "linux"))]
-                let result = handle_socks5_connection(stream, pool, mux_pool, router, failover).await;
+                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools).await;
 
                 if let Err(e) = result {
                     error!(%peer, "connection error: {e}");
@@ -304,10 +344,13 @@ async fn consume_socks5_addr(atyp: u8, stream: &mut TcpStream) -> Result<(), Mir
 /// Handle a single SOCKS5 client connection.
 async fn handle_socks5_connection(
     mut stream: TcpStream,
+    peer: SocketAddr,
     pool: Arc<TunnelPool>,
     mux_pool: Option<Arc<MuxPool>>,
     router: Arc<RoutingTable>,
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
+    chain_router: Option<Arc<dyn Router>>,
+    all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
 ) -> Result<(), MirageError> {
     // ── 1. SOCKS5 greeting ────────────────────────────────────────────────
     // Client: [0x05, n_methods, method1, ...]
@@ -371,26 +414,47 @@ async fn handle_socks5_connection(
             match decision {
                 RouteDecision::Direct => route_direct(&mut stream, &target_addr).await,
                 RouteDecision::Chain => {
-                    // Try mux first; on mux open_stream error (session EOF, circuit
-                    // open, write error before SOCKS5 success was sent) fall back
-                    // to TunnelPool with failover so individual mux glitches don't
-                    // kill new connections. Existing in-flight streams over the
-                    // dead mux session still break (TCP semantics), but new ones
-                    // immediately use TCP while mux reconnects in the background.
-                    if let Some(mp) = mux_pool {
-                        match route_via_mux_pool(&mut stream, mp, &target_addr).await {
-                            Ok(()) => Ok(()),
-                            Err(e) if matches!(&e, MirageError::CircuitOpen) => {
-                                tracing::warn!(target = %target_addr, "mux circuit open — falling back to TunnelPool");
-                                route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
-                            }
-                            Err(e) => {
-                                tracing::warn!(target = %target_addr, error = %e, "mux open_stream failed — falling back to TunnelPool");
-                                route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
-                            }
+                    if let Some(cr) = &chain_router {
+                        // Router-driven path: pick ordered chain list, try each pool.
+                        let target_key = TargetKey {
+                            host: match &dest {
+                                Destination::Domain(h, _) => h.clone(),
+                                Destination::Ip(a) => a.ip().to_string(),
+                            },
+                            port: match &dest {
+                                Destination::Domain(_, p) => *p,
+                                Destination::Ip(a) => a.port(),
+                            },
+                            protocol_hint: ProtocolHint::Tcp,
+                        };
+                        let flow = FlowKey::Socks5 {
+                            client_addr: peer,
+                            request_id: 0,
+                        };
+                        let chain_ids = cr.pick(&target_key, &flow);
+                        if chain_ids.is_empty() {
+                            warn!(target = %target_addr, "router returned empty chain list — pool exhausted");
+                            return Err(MirageError::PoolExhausted);
                         }
+                        route_via_router_pools(&mut stream, &chain_ids, &all_pools, &target_addr).await
                     } else {
-                        route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                        // Legacy failover path (cli1 backward compat).
+                        // Try mux first; on mux open_stream error fall back to TunnelPool.
+                        if let Some(mp) = mux_pool {
+                            match route_via_mux_pool(&mut stream, mp, &target_addr).await {
+                                Ok(()) => Ok(()),
+                                Err(e) if matches!(&e, MirageError::CircuitOpen) => {
+                                    tracing::warn!(target = %target_addr, "mux circuit open — falling back to TunnelPool");
+                                    route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                                }
+                                Err(e) => {
+                                    tracing::warn!(target = %target_addr, error = %e, "mux open_stream failed — falling back to TunnelPool");
+                                    route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                                }
+                            }
+                        } else {
+                            route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                        }
                     }
                 }
             }
@@ -407,6 +471,59 @@ async fn handle_socks5_connection(
             )))
         }
     }
+}
+
+/// Route via an ordered list of ChainIds returned by `Router::pick`.
+///
+/// Tries each chain's pool in order; on lease failure or protocol error,
+/// demotes that chain and tries the next. Returns `PoolExhausted` if no chain
+/// succeeds.
+async fn route_via_router_pools(
+    client: &mut TcpStream,
+    chain_ids: &[ChainId],
+    all_pools: &HashMap<ChainId, Arc<TunnelPool>>,
+    target_addr: &str,
+) -> Result<(), MirageError> {
+    for chain_id in chain_ids {
+        let pool = match all_pools.get(chain_id) {
+            Some(p) => Arc::clone(p),
+            None => {
+                warn!(chain = %chain_id, "router returned unknown chain — skipping");
+                continue;
+            }
+        };
+        match pool.lease().await {
+            Err(e) => {
+                warn!(chain = %chain_id, error = %e, "router path: lease failed — trying next chain");
+                continue;
+            }
+            Ok(mut lease) => {
+                let send_result = if lease.is_onion {
+                    let target_bytes = target_addr.as_bytes();
+                    let len_prefix = (target_bytes.len() as u16).to_be_bytes();
+                    let mut framed = Vec::with_capacity(2 + target_bytes.len());
+                    framed.extend_from_slice(&len_prefix);
+                    framed.extend_from_slice(target_bytes);
+                    lease.send(&framed).await
+                } else {
+                    lease.send(target_addr.as_bytes()).await
+                };
+                if let Err(e) = send_result {
+                    warn!(chain = %chain_id, error = %e, "router path: target send failed — trying next chain");
+                    lease.poison();
+                    continue;
+                }
+                send_socks5_success(client).await?;
+                lease.set_relay_active(true);
+                let tunnel = lease.take_tunnel().ok_or(MirageError::TunnelClosed)?;
+                let mut compat = TunnelCompat::wrap(tunnel);
+                let result = relay_loop(client, &mut compat).await;
+                lease.poison();
+                return result;
+            }
+        }
+    }
+    Err(MirageError::PoolExhausted)
 }
 
 /// Connect directly to the target and relay data.
@@ -527,6 +644,8 @@ async fn handle_transparent_connection(
     mux_pool: Option<Arc<MuxPool>>,
     router: Arc<RoutingTable>,
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
+    chain_router: Option<Arc<dyn Router>>,
+    all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
 ) -> Result<(), MirageError> {
     let orig_dst = get_original_dst(&stream)?;
 
@@ -550,7 +669,27 @@ async fn handle_transparent_connection(
                 .map_err(MirageError::Io)?;
         }
         RouteDecision::Chain => {
-            if let Some(mp) = mux_pool {
+            if let Some(cr) = &chain_router {
+                // Router-driven transparent path.
+                let target_key = TargetKey {
+                    host: orig_dst.ip().to_string(),
+                    port: orig_dst.port(),
+                    protocol_hint: ProtocolHint::Tcp,
+                };
+                let flow = FlowKey::TunFlow {
+                    five_tuple_hash: {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        orig_dst.hash(&mut h);
+                        h.finish()
+                    },
+                };
+                let chain_ids = cr.pick(&target_key, &flow);
+                if chain_ids.is_empty() {
+                    return Err(MirageError::PoolExhausted);
+                }
+                route_via_router_pools_transparent(&mut stream, &chain_ids, &all_pools, &target_addr).await?;
+            } else if let Some(mp) = mux_pool {
                 route_via_mux_pool(&mut stream, mp, &target_addr).await?;
             } else {
                 let mut lease = lease_with_failover(&pool, &failover).await?;
@@ -579,6 +718,55 @@ async fn handle_transparent_connection(
     }
 
     Ok(())
+}
+
+/// Router-driven transparent proxy path (no SOCKS5 success reply needed).
+#[cfg(target_os = "linux")]
+async fn route_via_router_pools_transparent(
+    client: &mut TcpStream,
+    chain_ids: &[ChainId],
+    all_pools: &HashMap<ChainId, Arc<TunnelPool>>,
+    target_addr: &str,
+) -> Result<(), MirageError> {
+    for chain_id in chain_ids {
+        let pool = match all_pools.get(chain_id) {
+            Some(p) => Arc::clone(p),
+            None => {
+                warn!(chain = %chain_id, "transparent router: unknown chain — skipping");
+                continue;
+            }
+        };
+        match pool.lease().await {
+            Err(e) => {
+                warn!(chain = %chain_id, error = %e, "transparent router: lease failed — trying next");
+                continue;
+            }
+            Ok(mut lease) => {
+                let send_result = if lease.is_onion {
+                    let target_bytes = target_addr.as_bytes();
+                    let len_prefix = (target_bytes.len() as u16).to_be_bytes();
+                    let mut framed = Vec::with_capacity(2 + target_bytes.len());
+                    framed.extend_from_slice(&len_prefix);
+                    framed.extend_from_slice(target_bytes);
+                    lease.send(&framed).await
+                } else {
+                    lease.send(target_addr.as_bytes()).await
+                };
+                if let Err(e) = send_result {
+                    warn!(chain = %chain_id, error = %e, "transparent router: target send failed — next");
+                    lease.poison();
+                    continue;
+                }
+                lease.set_relay_active(true);
+                let tunnel = lease.take_tunnel().ok_or(MirageError::TunnelClosed)?;
+                let mut compat = TunnelCompat::wrap(tunnel);
+                let result = relay_loop(client, &mut compat).await;
+                lease.poison();
+                return result;
+            }
+        }
+    }
+    Err(MirageError::PoolExhausted)
 }
 
 /// Parse the SOCKS5 destination address from `stream` given `atyp`.
@@ -1096,5 +1284,53 @@ mod tests {
         assert_eq!(&hdr[4..8], &ip.octets());
         let parsed_port = u16::from_be_bytes([hdr[8], hdr[9]]);
         assert_eq!(parsed_port, port);
+    }
+
+    // ── Router-driven pool failover tests ─────────────────────────────────────
+
+    /// When `all_pools` is empty, `route_via_router_pools` returns `PoolExhausted`.
+    ///
+    /// This verifies that the router-driven path iterates the chain list and
+    /// exhausts all candidates before returning an error, rather than crashing
+    /// or silently succeeding.
+    #[tokio::test]
+    async fn router_path_exhausts_empty_pool_map() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use mirage_core::error::MirageError;
+        use tokio::net::TcpListener;
+
+        use crate::{chain_set::ChainId, pool::TunnelPool};
+
+        // Bind a real listener so we can connect to it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect a fake "client" stream.
+        let _accept_task = tokio::spawn(async move {
+            // Just accept and drop immediately.
+            let _ = listener.accept().await;
+        });
+        let mut client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let chain_ids = vec![
+            ChainId("chain-a".to_string()),
+            ChainId("chain-b".to_string()),
+        ];
+        // Empty pool map — both chains will be skipped.
+        let all_pools: HashMap<ChainId, Arc<TunnelPool>> = HashMap::new();
+
+        let result = super::route_via_router_pools(
+            &mut client_stream,
+            &chain_ids,
+            &all_pools,
+            "example.com:443",
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MirageError::PoolExhausted)),
+            "expected PoolExhausted, got: {result:?}"
+        );
     }
 }
