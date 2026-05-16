@@ -87,6 +87,18 @@ pub struct ChainConfig {
     pub socks5_bind: String,
     /// Path to the per-chain client config file passed to the worker.
     pub config_path: String,
+    /// When `true`, the supervisor designates this worker as the MonitorLink host.
+    ///
+    /// The supervisor sends `SupervisorMsg::SetupMonitorLink` to exactly this worker
+    /// after all workers are Ready. The worker constructs `MonitorLink` using its own
+    /// `ChainSet` (single-entry, the chain it manages) so the OverChain transport can
+    /// actually dial. Peer table snapshots flow back to supervisor via
+    /// `WorkerMsg::PeerTableSnapshot` and are broadcast to all other workers.
+    ///
+    /// At most one chain should have `monitor_link_host = true`. If none do, the
+    /// supervisor logs a WARN and runs without MonitorLink (legacy mode).
+    #[serde(default)]
+    pub monitor_link_host: bool,
 }
 
 /// TOML-serialisable mirror of `client_core::monitor_link::MonitorTransport`.

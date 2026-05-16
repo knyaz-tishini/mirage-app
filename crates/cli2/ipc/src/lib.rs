@@ -3,10 +3,37 @@
 //! JSON-line framing over duplex byte stream.
 //! Transport-agnostic: works over named pipe (Windows) and Unix socket (Linux/macOS).
 
+use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 
 pub mod pipe;
 pub mod transport;
+
+/// Wire-format mirror of `MonitorTransportConfig` from `supervisor/src/config.rs`.
+///
+/// Embedded here so the worker crate can deserialize transport specs without
+/// depending on the supervisor crate. Both types must stay structurally in sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum MonitorTransportSpec {
+    /// Standard WebSocket subscribe.
+    DirectWs {
+        url: String,
+        #[serde(default)]
+        sni: Option<String>,
+    },
+    /// Binary frame protocol over a Mirage tunnel exit hop.
+    OverChain {
+        chain_id: String,
+        #[serde(default = "default_monitor_addr")]
+        monitor_addr: SocketAddr,
+    },
+}
+
+fn default_monitor_addr() -> SocketAddr {
+    "127.0.0.1:19445".parse().expect("static addr is valid")
+}
 
 pub use transport::{IpcReader, IpcWriter};
 
@@ -45,6 +72,24 @@ pub enum SupervisorMsg {
         /// JSON-serialized `mirage_core::peer_table::PeerTable`.
         peer_table_json: String,
     },
+    /// Sent by supervisor to the designated `monitor_link_host = true` worker
+    /// after all workers are Ready.
+    ///
+    /// The worker constructs a `MonitorLink` using its own `ChainSet` (single
+    /// chain it manages) and starts it. Peer table snapshots flow back via
+    /// `WorkerMsg::PeerTableSnapshot`. The worker's own `TunnelPool` / `MuxPool`
+    /// share the same `Arc<ArcSwap<PeerTable>>` as the `MonitorLink` so the
+    /// chain self-resolves from its own snapshots.
+    SetupMonitorLink {
+        /// Base URL list for the monitor (DirectWs transport).
+        monitor_urls: Vec<String>,
+        /// Optional Bearer token for monitor auth.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monitor_api_key: Option<String>,
+        /// JSON-serialized `Vec<MonitorTransportConfig>` from supervisor.toml.
+        /// The worker deserializes and converts to `MonitorTransport` variants.
+        transports_json: String,
+    },
 }
 
 /// Messages sent from worker to supervisor.
@@ -76,6 +121,17 @@ pub enum WorkerMsg {
         started_at_unix: u64,
         version: String,
         state: WorkerState,
+    },
+    /// Peer table snapshot from the designated MonitorLink host worker.
+    ///
+    /// Sent whenever the worker's `MonitorLink` receives a config push with a
+    /// new `peer_table` generation. Supervisor broadcasts `PeerTableUpdate` to
+    /// all other workers on receipt.
+    PeerTableSnapshot {
+        /// Monotonically increasing generation counter from the monitor.
+        generation: u64,
+        /// JSON-serialized `mirage_core::peer_table::PeerTable`.
+        peer_table_json: String,
     },
 }
 

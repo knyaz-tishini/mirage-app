@@ -13,13 +13,16 @@ use std::{net::SocketAddr, sync::Arc, time::SystemTime};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use mirage_chain_ipc::{
-    SupervisorMsg, WorkerMsg, WorkerState,
+    MonitorTransportSpec, SupervisorMsg, WorkerMsg, WorkerState,
     pid_file_path, pipe_path,
     pipe::{PipePair, PipeListener},
 };
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use mirage_client_core::{
+    ChainHandle, ChainId, ChainMetrics, ChainSet, ChainState, HealthProbeConfig, PrewarmStrategy,
+    monitor_link::{MonitorLink, MonitorTransport},
     mux_pool::MuxPool,
     pool::TunnelPool,
     socks5::Socks5Server,
@@ -34,8 +37,8 @@ use mirage_protocol::{
     negotiation::ProtocolChain,
     traits::TcpProtocol,
 };
-use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
 
 /// Default max idle seconds before orphaned worker exits.
 const DEFAULT_ORPHAN_TIMEOUT_SECS: u64 = 3600;
@@ -202,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let pool = TunnelPool::new(chain, chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table))
+    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table))
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 
@@ -256,9 +259,16 @@ async fn main() -> anyhow::Result<()> {
     // IPC supervisor loop — handles current session + reconnects.
     let current_state = Arc::new(tokio::sync::Mutex::new(WorkerState::Ready));
 
+    // Channel for background tasks (MonitorLink watcher) to send WorkerMsg
+    // back to the supervisor via the IPC pipe. The receive end lives inside
+    // `supervisor_loop` / `handle_session`.
+    let (outgoing_tx_raw, outgoing_rx) = mpsc::channel::<WorkerMsg>(16);
+    let outgoing_tx = Arc::new(outgoing_tx_raw);
+
     let result = supervisor_loop(
         &mut listener,
         &chain_id,
+        &chain,
         pid,
         started_at_unix,
         ipc,
@@ -267,6 +277,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&current_state),
         Arc::clone(&peer_table),
         stop_tx,
+        outgoing_tx,
+        outgoing_rx,
         orphan_timeout_secs,
     )
     .await;
@@ -289,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
 async fn supervisor_loop(
     listener: &mut PipeListener,
     chain_id: &str,
+    chain_cfg: &mirage_core::config::ChainConfig,
     pid: u32,
     started_at_unix: u64,
     initial_ipc: PipePair,
@@ -297,6 +310,8 @@ async fn supervisor_loop(
     state: Arc<tokio::sync::Mutex<WorkerState>>,
     peer_table: Arc<ArcSwap<PeerTable>>,
     stop_tx: watch::Sender<bool>,
+    outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
+    mut outgoing_rx: mpsc::Receiver<WorkerMsg>,
     orphan_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let mut ipc = initial_ipc;
@@ -306,10 +321,13 @@ async fn supervisor_loop(
         let disconnect_reason = handle_session(
             &mut ipc,
             chain_id,
+            chain_cfg,
             Arc::clone(&pool),
             mux_pool_opt.as_ref().map(Arc::clone),
             Arc::clone(&state),
             Arc::clone(&peer_table),
+            Arc::clone(&outgoing_tx),
+            &mut outgoing_rx,
             &stop_tx,
         )
         .await;
@@ -404,14 +422,34 @@ enum SessionEnd {
 async fn handle_session(
     ipc: &mut PipePair,
     chain_id: &str,
+    chain_cfg: &mirage_core::config::ChainConfig,
     pool: Arc<TunnelPool>,
     mux_pool_opt: Option<Arc<MuxPool>>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
     peer_table: Arc<ArcSwap<PeerTable>>,
+    outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
+    outgoing_rx: &mut mpsc::Receiver<WorkerMsg>,
     stop_tx: &watch::Sender<bool>,
 ) -> SessionEnd {
     loop {
-        match ipc.read_msg::<SupervisorMsg>().await {
+        tokio::select! {
+            // Background tasks (MonitorLink watcher) want to send a message
+            // to the supervisor. Write it to the IPC pipe immediately.
+            msg = outgoing_rx.recv() => {
+                let Some(msg) = msg else {
+                    // Channel closed — no more background tasks; keep running.
+                    // Use a never-resolving future replacement in next iteration.
+                    continue;
+                };
+                if let Err(e) = ipc.write_msg(&msg).await {
+                    warn!(chain_id, "IPC write error sending outgoing message: {e} — treating as disconnect");
+                    return SessionEnd::Disconnect;
+                }
+            }
+
+            // Messages from supervisor.
+            result = ipc.read_msg::<SupervisorMsg>() => {
+        match result {
             Ok(None) => {
                 warn!(chain_id, "supervisor disconnected (EOF on pipe)");
                 return SessionEnd::Disconnect;
@@ -439,6 +477,24 @@ async fn handle_session(
                         warn!(chain_id, "worker: PeerTableUpdate parse error: {e}");
                     }
                 }
+            }
+            Ok(Some(SupervisorMsg::SetupMonitorLink {
+                monitor_urls,
+                monitor_api_key,
+                transports_json,
+            })) => {
+                info!(chain_id, "worker: SetupMonitorLink received — spawning MonitorLink");
+                spawn_monitor_link_in_worker(
+                    chain_id,
+                    monitor_urls,
+                    monitor_api_key,
+                    transports_json,
+                    Arc::clone(&peer_table),
+                    Arc::clone(&pool),
+                    mux_pool_opt.as_ref().map(Arc::clone),
+                    chain_cfg.clone(),
+                    Arc::clone(&outgoing_tx),
+                );
             }
             Ok(Some(SupervisorMsg::Drain { timeout_secs })) => {
                 info!(chain_id, timeout_secs, "received Drain");
@@ -512,8 +568,138 @@ async fn handle_session(
                 *state.lock().await = WorkerState::Exiting;
                 return SessionEnd::Exit;
             }
+        } // end match result
+        } // end result = ipc.read_msg arm
+        } // end tokio::select!
+    } // end loop
+} // end handle_session
+
+/// Build a single-entry `ChainSet` for this worker's chain, construct
+/// `MonitorLink`, spawn it, then watch for peer_table snapshots and forward
+/// them to the supervisor via `outgoing_tx` as `WorkerMsg::PeerTableSnapshot`.
+///
+/// The worker's `TunnelPool` / `MuxPool` and the `MonitorLink` share the SAME
+/// `Arc<ArcSwap<PeerTable>>` so the chain self-resolves from MonitorLink's
+/// own snapshots (no chicken-and-egg: OverChain only activates when direct WS
+/// fails; by then the first DirectWs snapshot has already populated the table).
+fn spawn_monitor_link_in_worker(
+    chain_id: &str,
+    monitor_urls: Vec<String>,
+    monitor_api_key: Option<String>,
+    transports_json: String,
+    peer_table: Arc<ArcSwap<PeerTable>>,
+    pool: Arc<TunnelPool>,
+    mux_pool_opt: Option<Arc<MuxPool>>,
+    chain_cfg: mirage_core::config::ChainConfig,
+    outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
+) {
+    // Parse transport specs from JSON.
+    let transport_specs: Vec<MonitorTransportSpec> = match serde_json::from_str(&transports_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(chain_id, "SetupMonitorLink: failed to parse transports_json: {e} — MonitorLink not spawned");
+            return;
         }
-    }
+    };
+
+    // Build a ChainHandle that wraps the worker's existing pools.
+    // ChainConfig on the handle is needed for OverChain routing — we build a
+    // minimal placeholder since MonitorLink only uses the ChainSet for dial,
+    // and the actual dial config lives in TunnelPool / MuxPool already.
+    let handle_id = ChainId(chain_id.to_string());
+    // Clone mux_pool_opt before moving it into ChainHandle so the watcher task
+    // can also hold a reference for peer_table notifications.
+    let mux_for_handle = mux_pool_opt.as_ref().map(Arc::clone);
+    let handle = Arc::new(ChainHandle {
+        id: handle_id.clone(),
+        config: Arc::new(ArcSwap::from_pointee(chain_cfg)),
+        pool: Arc::clone(&pool),
+        mux: mux_for_handle,
+        metrics: ChainMetrics::new(),
+        state: Arc::new(ArcSwap::from_pointee(ChainState::Active)),
+    });
+
+    // Build ChainSet with this single handle.
+    let chain_map: Arc<DashMap<ChainId, Arc<ChainHandle>>> = Arc::new(DashMap::new());
+    chain_map.insert(handle_id, handle);
+    let chain_set = Arc::new(ChainSet {
+        chains: chain_map,
+        prewarm: PrewarmStrategy::default(),
+        peer_table: Arc::clone(&peer_table),
+        peer_table_notify: Arc::new(tokio::sync::Notify::new()),
+        mesh_id: Vec::new(),  // MonitorLink doesn't use mesh_id directly
+        probe_config: HealthProbeConfig::default(),
+    });
+
+    // Convert MonitorTransportSpec → MonitorTransport.
+    let transports: Vec<MonitorTransport> = transport_specs
+        .into_iter()
+        .map(|spec| match spec {
+            MonitorTransportSpec::DirectWs { url, sni } => {
+                MonitorTransport::DirectWs { url, sni }
+            }
+            MonitorTransportSpec::OverChain { chain_id: cid, monitor_addr } => {
+                MonitorTransport::OverChain {
+                    chain_id: ChainId(cid),
+                    monitor_addr,
+                }
+            }
+        })
+        .collect();
+
+    let (monitor_link, mut config_rx) = MonitorLink::new(
+        monitor_urls,
+        monitor_api_key,
+        Arc::clone(&peer_table),
+        chain_set,
+        transports,
+    );
+    monitor_link.spawn();
+
+    let chain_id_owned = chain_id.to_string();
+    // Watcher task: on each new MonitorLink config with a new peer_table
+    // generation, send WorkerMsg::PeerTableSnapshot to supervisor via outgoing_tx.
+    tokio::spawn(async move {
+        let mut last_generation: u64 = 0;
+        loop {
+            if config_rx.changed().await.is_err() {
+                // MonitorLink dropped — watcher exits.
+                break;
+            }
+            // Read the current peer_table directly from the ArcSwap (already
+            // updated by MonitorLink::apply_config before the watch fires).
+            let snapshot = peer_table.load();
+            let generation = snapshot.generation;
+            if generation <= last_generation && last_generation != 0 {
+                continue;
+            }
+            last_generation = generation;
+            match serde_json::to_string(&**snapshot) {
+                Ok(json) => {
+                    debug!(
+                        chain_id = %chain_id_owned,
+                        generation,
+                        "worker: sending PeerTableSnapshot to supervisor"
+                    );
+                    let msg = WorkerMsg::PeerTableSnapshot {
+                        generation,
+                        peer_table_json: json,
+                    };
+                    if outgoing_tx.send(msg).await.is_err() {
+                        break; // supervisor disconnected — stop
+                    }
+                    // Notify pools so they can re-dial with fresh keys.
+                    pool.notify_peer_table_change();
+                    if let Some(ref mp) = mux_pool_opt {
+                        mp.notify_peer_table_change();
+                    }
+                }
+                Err(e) => {
+                    warn!(chain_id = %chain_id_owned, "worker: peer_table serialize error: {e}");
+                }
+            }
+        }
+    });
 }
 
 /// Wait for the first supervisor connection and the `Start` message.

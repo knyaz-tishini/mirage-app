@@ -294,6 +294,21 @@ impl WorkerHandle {
             .await
     }
 
+    /// Tell the designated MonitorLink host worker to spawn its MonitorLink.
+    pub async fn send_setup_monitor_link(
+        &mut self,
+        monitor_urls: Vec<String>,
+        monitor_api_key: Option<String>,
+        transports_json: String,
+    ) -> anyhow::Result<()> {
+        self.send(SupervisorMsg::SetupMonitorLink {
+            monitor_urls,
+            monitor_api_key,
+            transports_json,
+        })
+        .await
+    }
+
     /// Send `Continue` to a reattached orphan worker.
     pub async fn send_continue(&mut self) -> anyhow::Result<()> {
         self.send(SupervisorMsg::Continue).await
@@ -341,6 +356,9 @@ impl WorkerHandle {
     }
 
     /// Process a received WorkerMsg and update handle state.
+    ///
+    /// `PeerTableSnapshot` is intentionally NOT handled here — the main loop
+    /// routes it to `pt_tx` before calling `apply_msg`.
     pub fn apply_msg(&mut self, msg: &WorkerMsg) {
         match msg {
             WorkerMsg::Ready { pid, .. } => {
@@ -365,6 +383,9 @@ impl WorkerHandle {
                 // Hello on an established connection means supervisor reconnected
                 // to an existing worker. Update PID in case it's useful.
                 self.pid = Some(*pid);
+            }
+            WorkerMsg::PeerTableSnapshot { generation, .. } => {
+                debug!(chain_id = %self.chain_id, generation, "worker sent PeerTableSnapshot");
             }
         }
     }

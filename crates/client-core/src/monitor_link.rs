@@ -754,7 +754,7 @@ impl MonitorLink {
     /// Drive the WebSocket subscribe connection until it closes or errors.
     /// Returns `Ok(())` on clean close, `Err(...)` on connect/parse error.
     async fn run_ws_loop(&self) -> Result<(), String> {
-        use futures::StreamExt;
+        use futures::{SinkExt, StreamExt};
 
         let base = self.get_active_url().await?;
         let ws_url = http_to_ws_url(&base);
@@ -786,50 +786,85 @@ impl MonitorLink {
 
         info!("monitor_link: state → Connected (WebSocket)");
 
-        let (_write, mut read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split();
+
+        // Keepalive: send a Ping every 10 s; if no frame (any kind) arrives
+        // within 25 s from the last one, treat the connection as dead and
+        // return Err so the caller falls through to FallbackPoll/OverChain.
+        // This fixes "TCP REJECT doesn't kill an idle WS for 5 minutes" —
+        // without active pings the OS only realises the connection died on the
+        // next send attempt.
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
+        let idle_timeout = Duration::from_secs(25);
+        let mut last_seen = tokio::time::Instant::now();
 
         loop {
-            match read.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    match parse_ws_frame(&text) {
-                        Ok(TaggedServerFrame::Config(cfg)) => {
-                            debug!(
-                                version = cfg.version,
-                                chains = cfg.chains.len(),
-                                "monitor_link: WS config push received"
-                            );
-                            self.apply_config(cfg);
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            last_seen = tokio::time::Instant::now();
+                            match parse_ws_frame(&text) {
+                                Ok(TaggedServerFrame::Config(cfg)) => {
+                                    debug!(
+                                        version = cfg.version,
+                                        chains = cfg.chains.len(),
+                                        "monitor_link: WS config push received"
+                                    );
+                                    self.apply_config(cfg);
+                                }
+                                Ok(TaggedServerFrame::DebugTunnelOpen(payload)) => {
+                                    info!(
+                                        "monitor_link: DebugTunnelOpen received (host={}, port={}, ttl={}s)",
+                                        payload.monitor_ssh_host,
+                                        payload.reverse_port,
+                                        payload.ttl_secs,
+                                    );
+                                    let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelOpen(payload)));
+                                }
+                                Ok(TaggedServerFrame::DebugTunnelClose) => {
+                                    info!("monitor_link: DebugTunnelClose received");
+                                    let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelClose));
+                                }
+                                Err(e) => {
+                                    warn!("monitor_link: WS frame parse error: {e}");
+                                    // Don't break on parse error — monitor may send
+                                    // other frame types in the future.
+                                }
+                            }
                         }
-                        Ok(TaggedServerFrame::DebugTunnelOpen(payload)) => {
-                            info!(
-                                "monitor_link: DebugTunnelOpen received (host={}, port={}, ttl={}s)",
-                                payload.monitor_ssh_host,
-                                payload.reverse_port,
-                                payload.ttl_secs,
-                            );
-                            let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelOpen(payload)));
+                        Some(Ok(Message::Ping(_))) => {
+                            last_seen = tokio::time::Instant::now();
+                            // tungstenite auto-responds with pong, nothing to do.
                         }
-                        Ok(TaggedServerFrame::DebugTunnelClose) => {
-                            info!("monitor_link: DebugTunnelClose received");
-                            let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelClose));
+                        Some(Ok(Message::Pong(_))) => {
+                            last_seen = tokio::time::Instant::now();
                         }
-                        Err(e) => {
-                            warn!("monitor_link: WS frame parse error: {e}");
-                            // Don't break on parse error — monitor may send
-                            // other frame types in the future.
+                        Some(Ok(Message::Close(_))) | None => {
+                            info!("monitor_link: WebSocket closed by server");
+                            return Ok(());
+                        }
+                        Some(Ok(_)) => {
+                            last_seen = tokio::time::Instant::now();
+                        }
+                        Some(Err(e)) => {
+                            return Err(format!("WS stream error: {e}"));
                         }
                     }
                 }
-                Some(Ok(Message::Ping(_))) => {
-                    // tungstenite auto-responds with pong, nothing to do.
-                }
-                Some(Ok(Message::Close(_))) | None => {
-                    info!("monitor_link: WebSocket closed by server");
-                    return Ok(());
-                }
-                Some(Ok(_)) => {} // ignore binary / pong frames
-                Some(Err(e)) => {
-                    return Err(format!("WS stream error: {e}"));
+
+                _ = ping_interval.tick() => {
+                    // Check idle timeout before sending — if we're already past it,
+                    // the connection is considered dead.
+                    if last_seen.elapsed() > idle_timeout {
+                        return Err(format!(
+                            "WS idle timeout: no frame received for {:?}",
+                            last_seen.elapsed()
+                        ));
+                    }
+                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        return Err(format!("WS ping send failed: {e}"));
+                    }
                 }
             }
         }

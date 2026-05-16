@@ -12,16 +12,8 @@ mod tun_registry;
 mod worker_handle;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Context;
-use arc_swap::ArcSwap;
-use dashmap::DashMap;
-use mirage_client_core::{
-    ChainSet, HealthProbeConfig, PrewarmStrategy,
-    monitor_link::{MonitorLink, MonitorTransport},
-};
-use mirage_core::peer_table::PeerTable;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -191,92 +183,55 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── MonitorLink: peer_table broadcast ─────────────────────────────────────
-    // Supervisor owns a MonitorLink to receive peer_table snapshots.
-    // On each new snapshot, it serializes the peer_table and broadcasts
-    // PeerTableUpdate to all workers so they can resolve dynamic public keys.
-    //
-    // The shared ArcSwap is written by MonitorLink and read by the broadcast
-    // task below — supervisor does NOT share it with workers (workers get the
-    // JSON copy over IPC instead).
-    let peer_table_arc: Arc<ArcSwap<PeerTable>> =
-        Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+    // ── MonitorLink: delegate to the designated worker ────────────────────────
+    // The supervisor no longer owns a MonitorLink. Instead it finds the chain
+    // with `monitor_link_host = true` and sends `SetupMonitorLink` to that
+    // worker. The worker constructs MonitorLink using its own ChainSet so the
+    // OverChain transport can actually dial. Peer table snapshots flow back
+    // via `WorkerMsg::PeerTableSnapshot` and are broadcast to all other workers.
 
-    // Build a minimal empty ChainSet for MonitorLink (supervisor doesn't own
-    // pools; OverChain transport is not used at supervisor level).
-    let empty_chain_set: Arc<ChainSet> = Arc::new(ChainSet {
-        chains: Arc::new(DashMap::new()),
-        prewarm: PrewarmStrategy::default(),
-        peer_table: Arc::clone(&peer_table_arc),
-        peer_table_notify: Arc::new(tokio::sync::Notify::new()),
-        mesh_id: Vec::new(),
-        probe_config: HealthProbeConfig::default(),
-    });
-
-    // Convert MonitorTransportConfig entries from the supervisor TOML into
-    // the MonitorTransport variants that MonitorLink understands.
-    let monitor_transports: Vec<MonitorTransport> = config
-        .monitor_transports
-        .iter()
-        .map(|t| match t {
-            config::MonitorTransportConfig::DirectWs { url, sni } => MonitorTransport::DirectWs {
-                url: url.clone(),
-                sni: sni.clone(),
-            },
-            config::MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
-                MonitorTransport::OverChain {
-                    chain_id: mirage_client_core::chain_set::ChainId(chain_id.clone()),
-                    monitor_addr: *monitor_addr,
-                }
-            }
-        })
-        .collect();
-
-    let (monitor_link, mut monitor_cfg_rx) = MonitorLink::new(
-        vec![config.monitor_url.clone()],
-        config.monitor_api_key.clone(),
-        Arc::clone(&peer_table_arc),
-        empty_chain_set,
-        monitor_transports,
-    );
-    monitor_link.spawn();
-    info!("monitor_link spawned for peer_table tracking");
-
-    // Channel from monitor-watch-task to the main loop for peer_table updates.
+    // Channel: peer_table JSON forwarded from the MonitorLink host worker to
+    // the main loop for broadcast to all other workers.
     let (pt_tx, mut pt_rx) = mpsc::channel::<String>(8);
 
-    // Background task: watch MonitorLink config channel, extract peer_table,
-    // serialize and forward to main loop via pt_tx.
-    let pt_tx_bg = pt_tx.clone();
-    let _ml_watch = tokio::spawn(async move {
-        let mut last_generation: u64 = 0;
-        loop {
-            // Wait for a new config snapshot from MonitorLink.
-            if monitor_cfg_rx.changed().await.is_err() {
-                // Channel closed (MonitorLink dropped) — stop watching.
-                break;
-            }
-            // Read current peer_table generation from the ArcSwap.
-            let snapshot = peer_table_arc.load();
-            let generation = snapshot.generation;
-            if generation <= last_generation && last_generation != 0 {
-                // Not a new generation — skip broadcast.
-                continue;
-            }
-            last_generation = generation;
-            match serde_json::to_string(&**snapshot) {
-                Ok(json) => {
-                    debug!(generation, "supervisor: broadcasting PeerTableUpdate");
-                    if pt_tx_bg.send(json).await.is_err() {
-                        break; // main loop dropped receiver — exit
+    // Find the designated MonitorLink host chain (if any).
+    let ml_host_chain = config.chains.iter().find(|c| c.monitor_link_host);
+
+    match ml_host_chain {
+        None => {
+            warn!("supervisor: no chain has monitor_link_host = true — running without MonitorLink (peer_table will not update)");
+        }
+        Some(host_chain) => {
+            let host_chain_id = host_chain.id.clone();
+            if let Some(handle) = handles.get_mut(&host_chain_id) {
+                // Serialize the transports list so the worker can deserialize it
+                // using `mirage_chain_ipc::MonitorTransportSpec`.
+                // `MonitorTransportConfig` and `MonitorTransportSpec` share the
+                // same serde shape (same `kind` tag, same fields).
+                match serde_json::to_string(&config.monitor_transports) {
+                    Err(e) => {
+                        warn!("supervisor: failed to serialize monitor_transports: {e} — MonitorLink not delegated");
+                    }
+                    Ok(transports_json) => {
+                        if let Err(e) = handle.send_setup_monitor_link(
+                            vec![config.monitor_url.clone()],
+                            config.monitor_api_key.clone(),
+                            transports_json,
+                        ).await {
+                            warn!("supervisor: failed to send SetupMonitorLink to {host_chain_id}: {e}");
+                        } else {
+                            info!("supervisor: SetupMonitorLink sent to worker {host_chain_id}");
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!("supervisor: peer_table serialize error: {e}");
-                }
+            } else {
+                warn!(
+                    chain_id = %host_chain.id,
+                    "supervisor: monitor_link_host chain has no live handle — MonitorLink not delegated"
+                );
             }
         }
-    });
+    }
 
     // OTA poller channel.
     let (ota_tx, mut ota_rx) = mpsc::channel::<UpdateAvailable>(4);
@@ -296,8 +251,20 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         // Poll all worker rx channels for events (non-blocking pass).
-        for (chain_id, handle) in handles.iter_mut() {
+        // `PeerTableSnapshot` is also routed to `pt_tx` for broadcast;
+        // all messages flow through `apply_msg` + `log_worker_event` as before.
+        let chain_ids: Vec<String> = handles.keys().cloned().collect();
+        for chain_id in &chain_ids {
+            let Some(handle) = handles.get_mut(chain_id) else { continue };
             while let Ok(event) = handle.rx.try_recv() {
+                if let WorkerMsg::PeerTableSnapshot { generation, ref peer_table_json } = event.msg {
+                    debug!(
+                        source_chain = %chain_id,
+                        generation,
+                        "supervisor: PeerTableSnapshot from MonitorLink host worker — broadcasting"
+                    );
+                    let _ = pt_tx.try_send(peer_table_json.clone());
+                }
                 handle.apply_msg(&event.msg);
                 log_worker_event(chain_id, &event.msg);
             }
@@ -381,9 +348,17 @@ async fn main() -> anyhow::Result<()> {
 
             pt_json = pt_rx.recv() => {
                 if let Some(json) = pt_json {
-                    // Broadcast PeerTableUpdate to all live workers.
+                    // Broadcast PeerTableUpdate to all live workers EXCEPT the
+                    // MonitorLink host (it already has the data via its own ArcSwap).
+                    let host_id = config.chains.iter()
+                        .find(|c| c.monitor_link_host)
+                        .map(|c| c.id.as_str());
                     for (chain_id, handle) in handles.iter_mut() {
                         if handle.state == HandleState::Exited {
+                            continue;
+                        }
+                        if Some(chain_id.as_str()) == host_id {
+                            // Source worker — skip (it owns MonitorLink's ArcSwap).
                             continue;
                         }
                         if let Err(e) = handle.send_peer_table_update(json.clone()).await {
@@ -526,6 +501,10 @@ fn log_worker_event(chain_id: &str, msg: &WorkerMsg) {
         }
         WorkerMsg::Hello { pid, .. } => {
             info!(chain_id, pid, "worker Hello");
+        }
+        WorkerMsg::PeerTableSnapshot { generation, .. } => {
+            // Routed to pt_tx before reaching this function; logged there.
+            debug!(chain_id, generation, "worker PeerTableSnapshot");
         }
     }
 }
