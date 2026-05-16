@@ -47,9 +47,15 @@ const DEFAULT_ORPHAN_TIMEOUT_SECS: u64 = 3600;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_env("MIRAGE_LOG").add_directive(
-                "mirage_chain_worker=debug".parse().expect("valid directive"),
-            ),
+            tracing_subscriber::EnvFilter::from_env("MIRAGE_LOG")
+                .add_directive(
+                    "mirage_chain_worker=debug".parse().expect("valid directive"),
+                )
+                // MonitorLink state transitions only — same as supervisor.
+                // Worker hosts MonitorLink when monitor_link_host=true.
+                .add_directive(
+                    "mirage_client_core::monitor_link=info".parse().expect("valid directive"),
+                ),
         )
         .with_writer(std::io::stderr)
         .init();
