@@ -348,12 +348,29 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                         monitor_endpoint,
                         ..
                     } => {
-                        match monitor_endpoint.parse::<std::net::SocketAddr>() {
-                            Ok(addr) => Some(MonitorTransport::OverChain {
+                        // cli is monolithic — no separate worker process — so
+                        // worker_socks5 for option-b SOCKS5 fallback points at
+                        // our own SOCKS5 listener for this chain. Look it up
+                        // from config.chains.
+                        let socks5_bind = config
+                            .chains
+                            .iter()
+                            .find(|c| c.chain_id == *chain_id)
+                            .and_then(|c| c.socks5_bind.parse::<std::net::SocketAddr>().ok());
+                        let monitor_addr = monitor_endpoint.parse::<std::net::SocketAddr>();
+                        match (socks5_bind, monitor_addr) {
+                            (Some(ws), Ok(addr)) => Some(MonitorTransport::OverChain {
                                 chain_id: chain_id.clone().into(),
+                                worker_socks5: ws,
                                 monitor_addr: addr,
                             }),
-                            Err(e) => {
+                            (None, _) => {
+                                tracing::warn!(
+                                    "cli: over_chain references unknown chain_id={chain_id} or invalid socks5_bind"
+                                );
+                                None
+                            }
+                            (_, Err(e)) => {
                                 tracing::warn!(
                                     "cli: invalid monitor_endpoint '{}': {e}",
                                     monitor_endpoint
