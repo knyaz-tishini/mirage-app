@@ -108,6 +108,15 @@ pub trait MonitorChannel: Send {
         nonce: [u8; 8],
     ) -> impl std::future::Future<Output = Result<(), MonitorChannelError>> + Send;
 
+    /// Send a UTF-8 JSON text frame from client to server.
+    ///
+    /// For `DirectWs` this is a WS Text message; for `OverChain` this is a
+    /// `FRAME_MSG` carrying the JSON bytes.
+    fn send_text(
+        &mut self,
+        text: &str,
+    ) -> impl std::future::Future<Output = Result<(), MonitorChannelError>> + Send;
+
     /// Graceful close.
     fn close(
         self,
@@ -248,6 +257,14 @@ impl MonitorChannel for DirectWsChannel {
     async fn send_pong(&mut self, _nonce: [u8; 8]) -> Result<(), MonitorChannelError> {
         // WS ping/pong is handled by tungstenite automatically.
         Ok(())
+    }
+
+    async fn send_text(&mut self, text: &str) -> Result<(), MonitorChannelError> {
+        use futures::SinkExt;
+        self.stream
+            .send(Message::Text(text.to_owned().into()))
+            .await
+            .map_err(|e| MonitorChannelError::Ws(format!("WS send_text: {e}")))
     }
 
     async fn close(mut self) -> Result<(), MonitorChannelError> {
@@ -436,6 +453,10 @@ impl MonitorChannel for OverChainChannel {
 
     async fn send_pong(&mut self, nonce: [u8; 8]) -> Result<(), MonitorChannelError> {
         write_tunnel_frame(self.tunnel.as_mut(), FRAME_PONG, &nonce).await
+    }
+
+    async fn send_text(&mut self, text: &str) -> Result<(), MonitorChannelError> {
+        write_tunnel_frame(self.tunnel.as_mut(), FRAME_MSG, text.as_bytes()).await
     }
 
     async fn close(mut self) -> Result<(), MonitorChannelError> {
