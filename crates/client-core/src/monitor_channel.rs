@@ -418,11 +418,19 @@ impl MonitorChannel for DirectWsChannel {
 ///
 /// After construction via [`OverChainChannel::connect`] the channel is
 /// authenticated and ready to receive `FRAME_MSG` payloads.
+/// Inner transport for `OverChainChannel` — supports both raw TCP (via
+/// worker SOCKS5) and a directly-acquired Tunnel from the chain pool.
+enum OverChainTransport {
+    /// SOCKS5 to worker (option b) — used by supervisor or external callers.
+    Stream(tokio::net::TcpStream),
+    /// Tunnel acquired from the chain pool directly (option a') — used by
+    /// MonitorLink in the worker process that owns the pool. Eliminates
+    /// SOCKS5 inception when caller already has chain access.
+    Tunnel(Box<dyn Tunnel>),
+}
+
 pub struct OverChainChannel {
-    /// Raw TCP stream to the worker's SOCKS5 port. The worker tunnel-wraps
-    /// our bytes through the chain transparently. We speak our own binary
-    /// frame protocol on top — the chain just transports bytes.
-    stream: tokio::net::TcpStream,
+    inner: OverChainTransport,
 }
 
 impl OverChainChannel {
@@ -483,7 +491,30 @@ impl OverChainChannel {
 
         info!(%worker_socks5, %monitor_addr, "over_chain: AUTH_OK — channel ready");
 
-        Ok(Self { stream })
+        Ok(Self {
+            inner: OverChainTransport::Stream(stream),
+        })
+    }
+
+    /// Option (a') — directly attach an already-leased Tunnel from the chain
+    /// pool. Caller (MonitorLink in worker) has access to the pool, no need to
+    /// bounce through SOCKS5. The lease's target_addr send + Mirage handshake
+    /// must already be done by the caller; we run the auth handshake on top.
+    pub async fn connect_via_tunnel(
+        mut tunnel: Box<dyn Tunnel>,
+        bearer: &str,
+    ) -> Result<Self, MonitorChannelError> {
+        const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+        info!("over_chain: using directly-leased tunnel, starting auth handshake");
+        timeout(AUTH_TIMEOUT, Self::do_auth_handshake(tunnel.as_mut(), bearer))
+            .await
+            .map_err(|_| MonitorChannelError::Timeout)??;
+        info!("over_chain: AUTH_OK via tunnel — channel ready");
+
+        Ok(Self {
+            inner: OverChainTransport::Tunnel(tunnel),
+        })
     }
 
     /// Perform the AUTH_CHALLENGE / AUTH / AUTH_OK handshake over a raw stream.
@@ -529,8 +560,7 @@ impl OverChainChannel {
         }
     }
 
-    /// Old tunnel-based handshake — kept for backward-compat tests/unused.
-    #[allow(dead_code)]
+    /// Tunnel-based handshake — used by `connect_via_tunnel` (option a').
     async fn do_auth_handshake(
         tunnel: &mut dyn Tunnel,
         bearer: &str,
@@ -598,7 +628,11 @@ impl OverChainChannel {
 impl MonitorChannel for OverChainChannel {
     async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, MonitorChannelError> {
         loop {
-            let (tag, payload) = match read_stream_frame(&mut self.stream).await {
+            let read_res = match &mut self.inner {
+                OverChainTransport::Stream(s) => read_stream_frame(s).await,
+                OverChainTransport::Tunnel(t) => read_tunnel_frame(t.as_mut()).await,
+            };
+            let (tag, payload) = match read_res {
                 Ok(f) => f,
                 Err(MonitorChannelError::Closed) => return Ok(None),
                 Err(e) => return Err(e),
@@ -628,15 +662,25 @@ impl MonitorChannel for OverChainChannel {
     }
 
     async fn send_pong(&mut self, nonce: [u8; 8]) -> Result<(), MonitorChannelError> {
-        write_stream_frame(&mut self.stream, FRAME_PONG, &nonce).await
+        match &mut self.inner {
+            OverChainTransport::Stream(s) => write_stream_frame(s, FRAME_PONG, &nonce).await,
+            OverChainTransport::Tunnel(t) => write_tunnel_frame(t.as_mut(), FRAME_PONG, &nonce).await,
+        }
     }
 
     async fn send_text(&mut self, text: &str) -> Result<(), MonitorChannelError> {
-        write_stream_frame(&mut self.stream, FRAME_MSG, text.as_bytes()).await
+        let bytes = text.as_bytes();
+        match &mut self.inner {
+            OverChainTransport::Stream(s) => write_stream_frame(s, FRAME_MSG, bytes).await,
+            OverChainTransport::Tunnel(t) => write_tunnel_frame(t.as_mut(), FRAME_MSG, bytes).await,
+        }
     }
 
     async fn close(mut self) -> Result<(), MonitorChannelError> {
-        write_stream_frame(&mut self.stream, FRAME_CLOSE, &[]).await
+        match &mut self.inner {
+            OverChainTransport::Stream(s) => write_stream_frame(s, FRAME_CLOSE, &[]).await,
+            OverChainTransport::Tunnel(t) => write_tunnel_frame(t.as_mut(), FRAME_CLOSE, &[]).await,
+        }
     }
 }
 

@@ -38,8 +38,36 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, info, warn};
 
-use crate::chain_set::{ChainId, ChainSet};
-use crate::monitor_channel::{MonitorChannel, OverChainChannel};
+use crate::chain_set::{ChainHandle, ChainId, ChainSet};
+use crate::monitor_channel::{MonitorChannel, MonitorChannelError, OverChainChannel};
+use mirage_protocol::traits::Tunnel as _;
+
+/// Option (a') helper — acquire a tunnel from the chain pool directly, send
+/// the target address (same wire as SOCKS5 path), and hand off to
+/// `OverChainChannel::connect_via_tunnel` for the auth handshake.
+async fn try_lease_and_open(
+    handle: &Arc<ChainHandle>,
+    monitor_addr: SocketAddr,
+    bearer: &str,
+) -> Result<OverChainChannel, MonitorChannelError> {
+    let mut lease = handle
+        .pool
+        .lease()
+        .await
+        .map_err(MonitorChannelError::Lease)?;
+    // Send target string — single-hop direct exit reads this as the dest addr,
+    // but TunnelControl exit ignores its value and bridges to control_target.
+    let target_str = monitor_addr.to_string();
+    lease
+        .send(target_str.as_bytes())
+        .await
+        .map_err(MonitorChannelError::Lease)?;
+    lease.poison();
+    let inner = lease
+        .take_tunnel()
+        .ok_or_else(|| MonitorChannelError::Io("lease tunnel already taken".to_string()))?;
+    OverChainChannel::connect_via_tunnel(inner, bearer).await
+}
 
 // ── Timeouts ─────────────────────────────────────────────────────────────────
 
@@ -572,6 +600,37 @@ impl MonitorLink {
                 chain_id,
             } = transport
             {
+                // Option a' — same-process path: if the named chain lives in
+                // our local chain_set (MonitorLink hosted in the same worker
+                // that owns the pool), acquire a tunnel from the pool directly
+                // and run the auth handshake on it. Bypasses SOCKS5 inception.
+                if !chain_id.0.is_empty() {
+                    if let Some(handle) = self.chain_set.chains.get(chain_id).map(|e| Arc::clone(e.value())) {
+                        info!(chain_id = %chain_id, "monitor_link: OverChain via local pool.lease (option a')");
+                        match tokio::time::timeout(
+                            OVER_CHAIN_CONNECT_TIMEOUT,
+                            try_lease_and_open(&handle, *monitor_addr, bearer),
+                        )
+                        .await
+                        {
+                            Ok(Ok(ch)) => {
+                                info!(
+                                    chain_id = %chain_id,
+                                    addr = %monitor_addr,
+                                    "monitor_link: OverChain connected via tunnel"
+                                );
+                                return Some(ch);
+                            }
+                            Ok(Err(e)) => {
+                                warn!(chain_id = %chain_id, "monitor_link: OverChain tunnel path failed: {e} — trying SOCKS5 fallback");
+                            }
+                            Err(_) => {
+                                warn!(chain_id = %chain_id, "monitor_link: OverChain tunnel path timed out — trying SOCKS5 fallback");
+                            }
+                        }
+                    }
+                }
+                // Option (b) fallback — SOCKS5 to worker.
                 match tokio::time::timeout(
                     OVER_CHAIN_CONNECT_TIMEOUT,
                     OverChainChannel::connect(*worker_socks5, *monitor_addr, bearer),
@@ -583,7 +642,7 @@ impl MonitorLink {
                             chain_id = %chain_id,
                             worker_socks5 = %worker_socks5,
                             addr = %monitor_addr,
-                            "monitor_link: OverChain connected"
+                            "monitor_link: OverChain connected via SOCKS5"
                         );
                         return Some(ch);
                     }
@@ -591,14 +650,14 @@ impl MonitorLink {
                         warn!(
                             chain_id = %chain_id,
                             worker_socks5 = %worker_socks5,
-                            "monitor_link: OverChain connect failed: {e}"
+                            "monitor_link: OverChain SOCKS5 path failed: {e}"
                         );
                     }
                     Err(_) => {
                         warn!(
                             chain_id = %chain_id,
                             worker_socks5 = %worker_socks5,
-                            "monitor_link: OverChain connect timed out"
+                            "monitor_link: OverChain SOCKS5 path timed out"
                         );
                     }
                 }
