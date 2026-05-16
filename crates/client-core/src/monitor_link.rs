@@ -46,7 +46,7 @@ use crate::monitor_channel::{MonitorChannel, OverChainChannel};
 const OVER_CHAIN_BACKOFF_INIT: Duration = Duration::from_secs(5);
 const OVER_CHAIN_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const DIRECT_HEALTH_RECHECK: Duration = Duration::from_secs(30);
-const OVER_CHAIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const OVER_CHAIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── MonitorTransport ──────────────────────────────────────────────────────────
 
