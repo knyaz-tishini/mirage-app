@@ -216,6 +216,11 @@ async fn read_socks5_target(
     }
 }
 
+/// Worker handshake timeout — if the worker's upstream chain is dead, its
+/// SOCKS5 handshake stalls indefinitely while the worker retries reconnect.
+/// We bail fast and let the router try the next sibling.
+const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Forward the CONNECT to a worker's SOCKS5 port, then relay bidirectionally.
 ///
 /// This implements a second SOCKS5 handshake to the worker, then splices data
@@ -226,12 +231,17 @@ async fn forward_via_worker(
     target_host: &str,
     target_port: u16,
 ) -> std::io::Result<()> {
-    let mut worker = TcpStream::connect(worker_addr).await?;
-
-    // Greeting: [5, 1, 0] — one method: no-auth.
-    worker.write_all(&[VER, 1, AUTH_NONE]).await?;
-    let mut resp = [0u8; 2];
-    worker.read_exact(&mut resp).await?;
+    let handshake = async {
+        let mut worker = tokio::net::TcpStream::connect(worker_addr).await?;
+        worker.write_all(&[VER, 1, AUTH_NONE]).await?;
+        let mut resp = [0u8; 2];
+        worker.read_exact(&mut resp).await?;
+        Ok::<_, std::io::Error>((worker, resp))
+    };
+    let (mut worker, resp) =
+        tokio::time::timeout(WORKER_HANDSHAKE_TIMEOUT, handshake)
+            .await
+            .map_err(|_| std::io::Error::other("worker handshake timed out"))??;
     if resp[0] != VER || resp[1] != AUTH_NONE {
         return Err(std::io::Error::other("worker: auth negotiation failed"));
     }
@@ -247,9 +257,15 @@ async fn forward_via_worker(
     req.extend_from_slice(&target_port.to_be_bytes());
     worker.write_all(&req).await?;
 
-    // Read worker's SOCKS5 reply (10 bytes for IPv4 bind addr).
+    // Read worker's SOCKS5 reply (10 bytes for IPv4 bind addr) — bounded so
+    // a stalled worker chain doesn't pin the router on a dead sibling.
     let mut reply_hdr = [0u8; 4];
-    worker.read_exact(&mut reply_hdr).await?;
+    tokio::time::timeout(
+        WORKER_HANDSHAKE_TIMEOUT,
+        worker.read_exact(&mut reply_hdr),
+    )
+    .await
+    .map_err(|_| std::io::Error::other("worker CONNECT reply timed out"))??;
     if reply_hdr[0] != VER || reply_hdr[1] != REP_SUCCESS {
         return Err(std::io::Error::other(format!(
             "worker CONNECT failed: rep=0x{:02x}",
