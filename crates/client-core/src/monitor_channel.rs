@@ -25,7 +25,7 @@
 //! - `0x04` `FRAME_PONG`           — client → server; echoed 8-byte nonce
 //! - `0x05` `FRAME_CLOSE`          — either direction; graceful shutdown
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use futures::StreamExt;
 use mirage_core::error::MirageError;
@@ -38,7 +38,7 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, info, warn};
 
-use crate::chain_set::{ChainId, ChainSet};
+
 
 // ── Frame tag constants ───────────────────────────────────────────────────────
 

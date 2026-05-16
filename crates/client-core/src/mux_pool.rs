@@ -24,6 +24,14 @@ const CIRCUIT_CLOSED: u8 = 0;
 const CIRCUIT_OPEN: u8 = 1;
 const CIRCUIT_HALF_OPEN: u8 = 2;
 
+/// Returns current time as milliseconds since the Unix epoch (for CB wake-grace).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Per-pool circuit breaker.
 ///
 /// Transitions:
@@ -31,6 +39,10 @@ const CIRCUIT_HALF_OPEN: u8 = 2;
 /// - Open → Half-Open after `open_duration_secs` elapsed since last failure.
 /// - Half-Open → Closed on first success (resets counter).
 /// - Half-Open → Open on failure.
+///
+/// Wake-grace suppression: after dormant→reconnecting wake, `wake_grace_until_ms`
+/// is set 30s ahead. `is_open()` returns false during this window even if the
+/// failure counter is high — prevents stale failures from blocking recovery.
 struct CircuitBreaker {
     state: AtomicU8,
     consecutive_failures: AtomicU64,
@@ -38,6 +50,9 @@ struct CircuitBreaker {
     last_failure: Mutex<Option<Instant>>,
     open_duration_secs: u64,
     failure_threshold: u64,
+    /// ms-epoch deadline until which `is_open()` always returns false.
+    /// Set by `note_wake()` to suppress stale CB state after dormant→reconnecting.
+    wake_grace_until_ms: AtomicU64,
     /// Chain name for log messages.
     chain_label: String,
 }
@@ -50,6 +65,7 @@ impl CircuitBreaker {
             last_failure: Mutex::new(None),
             open_duration_secs,
             failure_threshold,
+            wake_grace_until_ms: AtomicU64::new(0),
             chain_label,
         }
     }
@@ -58,6 +74,13 @@ impl CircuitBreaker {
     ///
     /// Also drives the Open → Half-Open transition by time.
     fn is_open(&self) -> bool {
+        // Wake-grace suppression: if we just woke dormant slots, bypass CB check
+        // for 30s so stale failures don't block the recovery window.
+        let now = now_ms();
+        if now < self.wake_grace_until_ms.load(Ordering::Relaxed) {
+            return false;
+        }
+
         let state = self.state.load(Ordering::Acquire);
         match state {
             CIRCUIT_CLOSED => false,
@@ -85,6 +108,13 @@ impl CircuitBreaker {
             }
             _ => false,
         }
+    }
+
+    /// Call immediately after waking dormant slots to reconnecting.
+    /// Suppresses CB for 30s so recovery is not aborted by stale failure counter.
+    fn note_wake(&self) {
+        self.wake_grace_until_ms.store(now_ms() + 30_000, Ordering::Relaxed);
+        debug!(chain = %self.chain_label, "circuit breaker wake-grace set: 30s suppression");
     }
 
     /// Call after a successful connection attempt.
@@ -157,9 +187,6 @@ struct PoolInner {
     /// Live peer table shared with the monitor link (Phase 8.5).
     peer_table: Arc<ArcSwap<PeerTable>>,
 }
-
-/// Maximum number of open_stream attempts before giving up.
-const MAX_OPEN_ATTEMPTS: u32 = 5;
 
 /// Semaphore capacity for the post-recovery burst limiter.
 const RECONNECT_BURST_LIMIT: usize = 10;
@@ -269,8 +296,8 @@ impl MuxPool {
             reconnect_notify: Arc::new(tokio::sync::Notify::new()),
             circuit_breaker: Arc::new(CircuitBreaker::new(
                 chain_label,
-                5,  // open after 5 consecutive failures
-                5,  // stay open for 5 seconds
+                10, // open after 10 consecutive failures (was 5)
+                30, // stay open for 30 seconds (was 5)
             )),
             reconnect_limiter: Arc::new(Semaphore::new(RECONNECT_BURST_LIMIT)),
             peer_table_notify: Arc::new(tokio::sync::Notify::new()),
@@ -340,38 +367,47 @@ impl MuxPool {
             guard.slots.len()
         };
 
-        for attempt in 0u32..MAX_OPEN_ATTEMPTS {
+        // ── Phase 1: snapshot active sessions ────────────────────────────────
+        let initial_sessions: Vec<(usize, Arc<SessionHandle>)> = {
             let start = self.next_idx.fetch_add(1, Ordering::Relaxed) % pool_size;
+            let guard = self.inner.lock().await;
+            (0..pool_size)
+                .map(|i| (start + i) % pool_size)
+                .filter_map(|idx| match &guard.slots[idx] {
+                    SessionSlot::Active { session, .. } => Some((idx, Arc::clone(session))),
+                    SessionSlot::Reconnecting | SessionSlot::Dormant => None,
+                })
+                .collect()
+        };
 
-            let sessions: Vec<(usize, Arc<SessionHandle>)> = {
-                let guard = self.inner.lock().await;
-                (0..pool_size)
-                    .map(|i| (start + i) % pool_size)
-                    .filter_map(|idx| match &guard.slots[idx] {
-                        SessionSlot::Active { session, .. } => Some((idx, Arc::clone(session))),
-                        SessionSlot::Reconnecting | SessionSlot::Dormant => None,
-                    })
-                    .collect()
-            };
-
-            // If there are no active sessions, wake any dormant ones.
-            if sessions.is_empty() {
-                let mut guard = self.inner.lock().await;
-                let mut woke = false;
-                for slot in guard.slots.iter_mut() {
-                    if matches!(slot, SessionSlot::Dormant) {
-                        *slot = SessionSlot::Reconnecting;
-                        woke = true;
-                    }
-                }
-                if woke {
-                    debug!("open_stream: woke dormant mux sessions for reconnect");
-                    self.reconnect_notify.notify_one();
+        // ── Phase 2: wake dormant slots if pool is empty ──────────────────────
+        // Wake BEFORE the wait loop so the spawned reconnect task can populate
+        // sessions while we wait on stream_notify.
+        if initial_sessions.is_empty() {
+            let mut guard = self.inner.lock().await;
+            let mut woke = false;
+            for slot in guard.slots.iter_mut() {
+                if matches!(slot, SessionSlot::Dormant) {
+                    *slot = SessionSlot::Reconnecting;
+                    woke = true;
                 }
             }
+            if woke {
+                debug!("open_stream: woke dormant mux sessions for reconnect");
+                self.circuit_breaker.note_wake();
+                self.reconnect_notify.notify_one();
+            }
+        }
 
+        // ── Phase 3: try to open a stream on available sessions ───────────────
+        // If we had active sessions up front, try them now.
+        // If not (all dormant/reconnecting), skip to the 15s wait loop below.
+        let mut had_active_sessions = !initial_sessions.is_empty();
+
+        if had_active_sessions {
             let mut marked_reconnecting = false;
-            for (idx, session) in sessions {
+            for (idx, session) in &initial_sessions {
+                let idx = *idx;
                 if session.is_closed() {
                     let mut guard = self.inner.lock().await;
                     guard.slots[idx] = SessionSlot::Reconnecting;
@@ -383,7 +419,6 @@ impl MuxPool {
                 match session.open_stream().await {
                     Ok(stream) => {
                         debug!(slot = idx, "opened mux stream");
-                        // Bump last_open_stream_at so the reaper knows this slot is active.
                         {
                             let mut guard = self.inner.lock().await;
                             if let Some(SessionSlot::Active { last_open_stream_at, .. }) =
@@ -403,22 +438,87 @@ impl MuxPool {
                     }
                 }
             }
-
             if marked_reconnecting {
                 self.reconnect_notify.notify_one();
             }
+            // All active sessions were closed/busy — treat as empty for the wait below.
+            had_active_sessions = false;
+            let _ = had_active_sessions; // suppress lint; variable used for clarity
+        }
 
-            if attempt < MAX_OPEN_ATTEMPTS - 1 {
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    self.stream_notify.notified(),
-                )
-                .await
-                .ok();
+        // ── Phase 4: 15s wake-and-wait loop ─────────────────────────────────
+        // Onion mux cold-dial takes 2-5s; we wait up to 15s for stream_notify
+        // (fired by reconnect_mux_slot on success) before giving up.
+        let total_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            // Re-snapshot active sessions.
+            let start = self.next_idx.fetch_add(1, Ordering::Relaxed) % pool_size;
+            let sessions: Vec<(usize, Arc<SessionHandle>)> = {
+                let guard = self.inner.lock().await;
+                (0..pool_size)
+                    .map(|i| (start + i) % pool_size)
+                    .filter_map(|idx| match &guard.slots[idx] {
+                        SessionSlot::Active { session, .. } => Some((idx, Arc::clone(session))),
+                        SessionSlot::Reconnecting | SessionSlot::Dormant => None,
+                    })
+                    .collect()
+            };
+
+            if !sessions.is_empty() {
+                let mut marked_reconnecting = false;
+                for (idx, session) in sessions {
+                    if session.is_closed() {
+                        let mut guard = self.inner.lock().await;
+                        guard.slots[idx] = SessionSlot::Reconnecting;
+                        debug!(slot = idx, "mux session closed, marked reconnecting");
+                        marked_reconnecting = true;
+                        continue;
+                    }
+
+                    match session.open_stream().await {
+                        Ok(stream) => {
+                            debug!(slot = idx, "opened mux stream (after wake-wait)");
+                            {
+                                let mut guard = self.inner.lock().await;
+                                if let Some(SessionSlot::Active { last_open_stream_at, .. }) =
+                                    guard.slots.get_mut(idx)
+                                {
+                                    *last_open_stream_at = Instant::now();
+                                }
+                            }
+                            self.circuit_breaker.record_success();
+                            return Ok(TokioMuxStream(stream));
+                        }
+                        Err(MuxError::Closed) | Err(MuxError::TooManyStreams) => {
+                            debug!(slot = idx, "session not available for new stream, trying next");
+                        }
+                        Err(e) => {
+                            warn!(slot = idx, error = %e, "open_stream error, trying next");
+                        }
+                    }
+                }
+                if marked_reconnecting {
+                    self.reconnect_notify.notify_one();
+                }
+                // Sessions existed but all failed — fall through to wait again.
+            }
+
+            let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                _ = self.stream_notify.notified() => {
+                    debug!("open_stream: stream_notify woke wake-wait loop");
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    debug!("open_stream: wake-wait deadline reached (15s)");
+                    break;
+                }
             }
         }
 
-        warn!("mux pool exhausted after {} attempts", MAX_OPEN_ATTEMPTS);
+        warn!("mux pool exhausted after 15s wake-wait window");
         self.circuit_breaker.record_failure();
         Err(MirageError::PoolExhausted)
     }
