@@ -38,9 +38,17 @@ use worker_handle::{HandleState, WorkerHandle};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_env("MIRAGE_LOG").add_directive(
-                "mirage_chain_supervisor=debug".parse().expect("valid directive"),
-            ),
+            tracing_subscriber::EnvFilter::from_env("MIRAGE_LOG")
+                .add_directive(
+                    "mirage_chain_supervisor=debug".parse().expect("valid directive"),
+                )
+                // MonitorLink state transitions only (subscribe/WS error class/
+                // OverChain switch/DirectWs restore/peer-gen). No payload, no
+                // peer_table dumps, no frame bytes. Safe to keep on by default;
+                // operator can drop further via MIRAGE_LOG=warn for ZT lockdown.
+                .add_directive(
+                    "mirage_client_core::monitor_link=info".parse().expect("valid directive"),
+                ),
         )
         .init();
 
