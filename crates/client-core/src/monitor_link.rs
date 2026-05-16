@@ -434,11 +434,13 @@ impl MonitorLink {
             Err(e) => warn!("monitor_link: WebSocket failed ({e}), switching to FallbackPoll"),
         }
 
-        // Enter fallback-poll loop. Retry WS every 5 minutes.
+        // Enter fallback-poll loop. Retry WS every 20 s (was 5 min — too slow
+        // for the OverChain escalation path: WS retry deadline is the only
+        // place that calls run_over_chain_fallback after re-race fails).
         info!("monitor_link: state → {}", WsState::FallbackPoll);
         let poll_secs = self.poll_interval_secs.load(Ordering::Relaxed);
         let mut poll_interval = tokio::time::interval(Duration::from_secs(poll_secs));
-        let ws_retry_interval = Duration::from_secs(5 * 60);
+        let ws_retry_interval = Duration::from_secs(20);
         let mut ws_retry_deadline = tokio::time::Instant::now() + ws_retry_interval;
 
         loop {
@@ -776,18 +778,28 @@ impl MonitorLink {
             return Err("monitor_urls is empty".to_owned());
         }
 
-        // Single URL — skip the race overhead.
-        if urls.len() == 1 {
-            let url = urls[0].clone();
-            *self.active_url.lock().await = Some(url.clone());
-            return Ok(url);
-        }
-
         let race_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|e| format!("race client build: {e}"))?;
+
+        // Single URL — still health-check it so that re-race can correctly
+        // signal "all DirectWs down" and the OverChain fallback path triggers.
+        // Previous behaviour was to short-circuit Ok(url) which made re-race
+        // always succeed even when the URL was unreachable.
+        if urls.len() == 1 {
+            let url = urls[0].clone();
+            let health_url = format!("{url}/health");
+            match race_http.get(&health_url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    *self.active_url.lock().await = Some(url.clone());
+                    return Ok(url);
+                }
+                Ok(r) => return Err(format!("{url}/health -> HTTP {}", r.status())),
+                Err(e) => return Err(format!("{url}/health -> {e}")),
+            }
+        }
 
         let futures: Vec<_> = urls.iter().map(|base| {
             let client = race_http.clone();
