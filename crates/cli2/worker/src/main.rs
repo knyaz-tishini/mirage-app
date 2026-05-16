@@ -51,10 +51,13 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive(
                     "mirage_chain_worker=debug".parse().expect("valid directive"),
                 )
-                // MonitorLink state transitions only — same as supervisor.
-                // Worker hosts MonitorLink when monitor_link_host=true.
+                // MonitorLink + OverChainChannel state transitions only — same
+                // as supervisor. Worker hosts MonitorLink when monitor_link_host=true.
                 .add_directive(
                     "mirage_client_core::monitor_link=info".parse().expect("valid directive"),
+                )
+                .add_directive(
+                    "mirage_client_core::monitor_channel=info".parse().expect("valid directive"),
                 ),
         )
         .with_writer(std::io::stderr)
