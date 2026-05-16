@@ -307,8 +307,8 @@ impl OverChainChannel {
         monitor_addr: SocketAddr,
         bearer: &str,
     ) -> Result<Self, MonitorChannelError> {
-        const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-        const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+        const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
         // Resolve chain handle.
         let handle = chain_set
@@ -318,10 +318,18 @@ impl OverChainChannel {
             .ok_or_else(|| MonitorChannelError::ChainNotFound(chain_id.to_string()))?;
 
         // Lease a tunnel from the pool.
+        info!(chain_id = %chain_id, "over_chain: leasing tunnel from pool");
         let mut lease = timeout(CONNECT_TIMEOUT, handle.pool.lease())
             .await
-            .map_err(|_| MonitorChannelError::Timeout)?
-            .map_err(MonitorChannelError::Lease)?;
+            .map_err(|_| {
+                warn!(chain_id = %chain_id, "over_chain: pool lease TIMED OUT after {CONNECT_TIMEOUT:?}");
+                MonitorChannelError::Timeout
+            })?
+            .map_err(|e| {
+                warn!(chain_id = %chain_id, "over_chain: pool lease FAILED: {e}");
+                MonitorChannelError::Lease(e)
+            })?;
+        info!(chain_id = %chain_id, "over_chain: tunnel leased from pool");
 
         // Send target address to the relay entry node (same as SOCKS5 does).
         let target_str = monitor_addr.to_string();
