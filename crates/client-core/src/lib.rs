@@ -1,3 +1,4 @@
+pub mod chain_set;
 pub mod health_watcher;
 pub mod log_capture;
 pub mod monitor_link;
@@ -13,6 +14,12 @@ pub mod relay;
 pub mod runtime;
 pub mod socks5;
 pub mod transparent;
+
+pub use chain_set::{
+    ChainSet, ChainHandle, ChainId, ChainState, ChainMetrics,
+    PrewarmStrategy, HealthProbeConfig,
+    router::{Router, RouterImpl, RoutingPolicy, TargetKey, FlowKey, ProtocolHint, BypassMatcher},
+};
 
 /// Re-export dial primitives so existing call-sites
 /// (`mirage_client_core::tunnel::*`, `mirage_client_core::onion_tunnel::*`,

@@ -423,19 +423,6 @@ impl MuxPool {
         Err(MirageError::PoolExhausted)
     }
 
-    pub async fn switch_chain(&self, new_chain: ChainConfig) {
-        let mut guard = self.inner.lock().await;
-        guard.chain = new_chain;
-        for slot in guard.slots.iter_mut() {
-            if matches!(slot, SessionSlot::Active { .. } | SessionSlot::Dormant) {
-                *slot = SessionSlot::Reconnecting;
-            }
-        }
-        self.is_onion
-            .store(guard.chain.hops.len() > 1, Ordering::Release);
-        info!("mux pool chain switched: active and dormant sessions marked reconnecting");
-    }
-
     /// Signal that the shared peer_table has received a new generation.
     ///
     /// Wakes all sleeping mux reconnect tasks so they retry immediately with

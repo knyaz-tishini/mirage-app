@@ -84,30 +84,16 @@ pub async fn post_chain_switch(
         .active_chain_id
         .store(Arc::new(chain.chain_id.clone()));
 
-    // Update the pool's active chain under the mutex.
-    // When drain=true (or unset, defaulting to false), mark idle slots for
-    // reconnection so the next reconnect cycle uses the new chain.
+    // V7: switch_chain / switch_chain_lazy removed — ChainSet migration (Part D)
+    // will wire chain updates through ChainSet::upsert_chain. For now the
+    // active_chain_id swap above is sufficient to affect new leases through
+    // runtime.active_pool() dispatch.
     let drain = req.drain.unwrap_or(false);
-    let pool = runtime.active_pool();
-    if drain {
-        pool.switch_chain(chain).await;
-    } else {
-        pool.switch_chain_lazy(chain).await;
-    }
+    let _ = drain; // drain semantics handled by ChainSet in Part D
 
     let new_version = runtime.config_version.fetch_add(1, Ordering::SeqCst) + 1;
 
-    let message = if drain {
-        format!(
-            "switched to chain '{}' (drain: idle slots marked for reconnect)",
-            req.chain_id
-        )
-    } else {
-        format!(
-            "switched to chain '{}' (lazy: new leases use new chain, in-flight unaffected)",
-            req.chain_id
-        )
-    };
+    let message = format!("switched to chain '{}' (ChainSet-aware update pending Part D)", req.chain_id);
 
     Json(ReconfigResponse {
         status: "ok".to_owned(),

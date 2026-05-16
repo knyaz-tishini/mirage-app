@@ -375,36 +375,6 @@ impl TunnelPool {
         self.available.notify_one();
     }
 
-    /// Switch to a new chain and immediately mark all idle slots `Reconnecting`.
-    ///
-    /// Leased slots are unaffected — they finish on the old chain and are
-    /// replaced when they return.  The maintenance loop picks up `Reconnecting`
-    /// slots and reconnects them to the new chain.
-    pub async fn switch_chain(&self, new_chain: mirage_core::config::ChainConfig) {
-        let mut guard = self.inner.lock().await;
-        guard.chain = new_chain;
-        for slot in guard.slots.iter_mut() {
-            if matches!(slot, Slot::Idle { .. } | Slot::Dormant) {
-                *slot = Slot::Reconnecting;
-            }
-        }
-        self.is_onion.store(guard.chain.hops.len() > 1, Ordering::Release);
-        info!("chain switched (drain): idle and dormant slots marked for reconnect");
-        self.available.notify_waiters();
-    }
-
-    /// Switch to a new chain lazily.
-    ///
-    /// Updates the chain reference only.  Existing idle slots keep their
-    /// current tunnels until they expire via the idle-timeout mechanism.
-    /// Only new reconnections will use the new chain.
-    pub async fn switch_chain_lazy(&self, new_chain: mirage_core::config::ChainConfig) {
-        let mut guard = self.inner.lock().await;
-        guard.chain = new_chain;
-        self.is_onion.store(guard.chain.hops.len() > 1, Ordering::Release);
-        info!("chain switched (lazy): new reconnects will use new chain");
-    }
-
     /// Signal that the shared peer_table has received a new generation.
     ///
     /// Wakes all sleeping reconnect tasks so they retry immediately with fresh
