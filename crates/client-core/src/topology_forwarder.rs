@@ -341,9 +341,34 @@ impl TopologyForwarder {
 
     /// Return the SOCKS5 proxy URL for the given chain.
     ///
-    /// Wave 3 simplification: a single default SOCKS5 address covers all
-    /// chains.  Wave 4 will map each chain to its own per-port SOCKS5 listener.
-    fn socks_for_chain(&self, _chain_id: Option<&str>) -> String {
+    /// Looks up the chain's dedicated `socks5_bind` address from the active
+    /// `ChainSet`. Falls back to `default_socks_addr` when the chain has no
+    /// per-chain binding (single-chain configs, or chains without dedicated
+    /// SOCKS5 listeners).
+    ///
+    /// `chain_id = None` → bypass tier, always uses `default_socks_addr`.
+    fn socks_for_chain(&self, chain_id: Option<&str>) -> String {
+        let id = match chain_id {
+            Some(id) => id,
+            None => return self.default_socks_addr.clone(),
+        };
+
+        // Look up per-chain socks5_bind from ChainSet.
+        let key = crate::ChainId::from(id);
+        if let Some(handle) = self.chain_set.chains.get(&key) {
+            let cfg = handle.config.load();
+            if let Some(ref bind) = cfg.socks5_bind {
+                if !bind.is_empty() {
+                    // Wrap as a socks5h:// URL that reqwest understands.
+                    return if bind.starts_with("socks5") {
+                        bind.clone()
+                    } else {
+                        format!("socks5h://{bind}")
+                    };
+                }
+            }
+        }
+
         self.default_socks_addr.clone()
     }
 }
