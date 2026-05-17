@@ -120,6 +120,8 @@ pub struct TunnelPool {
     /// Sleeping reconnect tasks subscribe to this so they wake immediately
     /// and retry with fresh peer data instead of waiting out exponential backoff.
     peer_table_notify: Arc<Notify>,
+    /// Cached chain ID for zero-cost log fields (avoids locking inner mutex).
+    chain_id: Arc<str>,
 }
 
 impl TunnelPool {
@@ -144,6 +146,7 @@ impl TunnelPool {
         // any address < 256 chars) collides with the mux-detect byte
         // and the server routes the connection into `run_mux_session`.
         let is_onion = chain.hops.len() > 1;
+        let chain_id: Arc<str> = Arc::from(chain.chain_id.as_str());
         let pool_size = config.pool_size.max(1);
 
         // Spawn all tunnel establishes in parallel.
@@ -167,14 +170,14 @@ impl TunnelPool {
                 Ok((idx, Ok(tunnel))) => {
                     slots_partial.push((idx, Slot::Idle { tunnel, last_used: Instant::now() }));
                     ready_count += 1;
-                    info!(slot = idx, ready = ready_count, threshold, "pool slot established");
+                    info!(chain_id = %chain_id, slot = idx, ready = ready_count, threshold, "pool slot established");
                 }
                 Ok((idx, Err(e))) => {
-                    warn!(slot = idx, error = %e, "pool slot failed on startup");
+                    warn!(chain_id = %chain_id, slot = idx, error = %e, "pool slot failed on startup");
                     slots_partial.push((idx, Slot::Reconnecting));
                 }
                 Err(e) => {
-                    warn!(error = %e, "pool slot join error");
+                    warn!(chain_id = %chain_id, error = %e, "pool slot join error");
                 }
             }
             if ready_count >= threshold && !join_set.is_empty() {
@@ -194,6 +197,7 @@ impl TunnelPool {
         let slots: Vec<Slot> = slots_partial.into_iter().map(|(_, s)| s).collect();
 
         info!(
+            chain_id = %chain_id,
             ready = ready_count,
             total = pool_size,
             threshold,
@@ -215,6 +219,7 @@ impl TunnelPool {
             available: Arc::clone(&available),
             is_onion: AtomicBool::new(is_onion),
             peer_table_notify: Arc::new(Notify::new()),
+            chain_id: Arc::clone(&chain_id),
         });
 
         // Spawn the background maintenance task (reconnects Reconnecting slots).
@@ -233,6 +238,7 @@ impl TunnelPool {
         if !join_set.is_empty() {
             let inner_clone = Arc::clone(&inner);
             let available_clone = Arc::clone(&available);
+            let chain_id_warmup = Arc::clone(&chain_id);
             tokio::spawn(async move {
                 while let Some(result) = join_set.join_next().await {
                     match result {
@@ -241,15 +247,15 @@ impl TunnelPool {
                             if matches!(guard.slots.get(idx), Some(Slot::Reconnecting)) {
                                 guard.slots[idx] =
                                     Slot::Idle { tunnel, last_used: Instant::now() };
-                                info!(slot = idx, "background warmup: slot established");
+                                info!(chain_id = %chain_id_warmup, slot = idx, "background warmup: slot established");
                                 available_clone.notify_one();
                             }
                         }
                         Ok((idx, Err(e))) => {
-                            warn!(slot = idx, error = %e, "background warmup: slot failed");
+                            warn!(chain_id = %chain_id_warmup, slot = idx, error = %e, "background warmup: slot failed");
                         }
                         Err(e) => {
-                            warn!(error = %e, "background warmup: join error");
+                            warn!(chain_id = %chain_id_warmup, error = %e, "background warmup: join error");
                         }
                     }
                 }
@@ -283,6 +289,7 @@ impl TunnelPool {
                             // Tunnel has been idle too long — it is likely stale.
                             // Poison it so the maintenance loop reconnects it.
                             warn!(
+                                chain_id = %self.chain_id,
                                 slot = idx,
                                 idle_secs = last_used.elapsed().as_secs(),
                                 "lease: idle timeout exceeded, poisoning stale tunnel"
@@ -296,7 +303,7 @@ impl TunnelPool {
                             Slot::Idle { tunnel, .. } => tunnel,
                             _ => unreachable!(),
                         };
-                        debug!(slot = idx, "leased tunnel from pool");
+                        debug!(chain_id = %self.chain_id, slot = idx, "leased tunnel from pool");
                         return Ok(TunnelLease {
                             tunnel: Some(tunnel),
                             pool: Arc::clone(self),
@@ -318,7 +325,7 @@ impl TunnelPool {
                     }
                 }
                 if woke {
-                    debug!("lease: woke dormant slots for reconnect");
+                    debug!(chain_id = %self.chain_id, "lease: woke dormant slots for reconnect");
                     self.available.notify_one();
                 }
             }
@@ -339,7 +346,7 @@ impl TunnelPool {
             tunnel,
             last_used: Instant::now(),
         };
-        debug!(slot = slot_idx, "tunnel returned to pool");
+        debug!(chain_id = %self.chain_id, slot = slot_idx, "tunnel returned to pool");
         self.available.notify_one();
     }
 
@@ -370,7 +377,7 @@ impl TunnelPool {
     pub(crate) async fn poison_slot(&self, slot_idx: usize) {
         let mut guard = self.inner.lock().await;
         guard.slots[slot_idx] = Slot::Reconnecting;
-        debug!(slot = slot_idx, "tunnel poisoned, slot marked for reconnect");
+        debug!(chain_id = %self.chain_id, slot = slot_idx, "tunnel poisoned, slot marked for reconnect");
         // Notify to trigger the maintenance loop sooner.
         self.available.notify_one();
     }
@@ -467,6 +474,7 @@ impl Drop for TunnelLease {
                     // Lease silently dropped its tunnel without poisoning —
                     // slot is stuck. Log + poison anyway to recover.
                     tracing::warn!(
+                        chain_id = %pool.chain_id,
                         slot = slot_idx,
                         "TunnelLease dropped without poison and without tunnel — \
                          poisoning slot to force reconnect"
@@ -553,12 +561,13 @@ async fn reaper_loop(pool_weak: std::sync::Weak<TunnelPool>) {
         // Close each stale tunnel outside the lock (close is async).
         for (idx, mut tunnel) in stale_tunnels {
             info!(
+                chain_id = %pool.chain_id,
                 slot = idx,
                 idle_secs = TUNNEL_POOL_IDLE_KILL_TIMEOUT.as_secs(),
                 "reaper: closing long-idle tunnel (→ Dormant)"
             );
             if let Err(e) = tunnel.close().await {
-                debug!(slot = idx, error = %e, "reaper: tunnel close returned error (ignored)");
+                debug!(chain_id = %pool.chain_id, slot = idx, error = %e, "reaper: tunnel close returned error (ignored)");
             }
         }
     }
@@ -598,7 +607,7 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
             for (idx, slot) in guard.slots.iter_mut().enumerate() {
                 if let Slot::Idle { last_used, .. } = slot {
                     if last_used.elapsed() >= idle_timeout {
-                        debug!(slot = idx, "idle timeout expired, reconnecting");
+                        debug!(chain_id = %pool.chain_id, slot = idx, "idle timeout expired, reconnecting");
                         *slot = Slot::Reconnecting;
                         indices.push(idx);
                     }
@@ -973,6 +982,7 @@ mod pool_smoke_tests {
 }
 
 async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
+    let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
          peer_table_notify) = {
         let guard = pool.inner.lock().await;
@@ -990,7 +1000,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        debug!(slot = slot_idx, attempt, "reconnect attempt");
+        debug!(chain_id = %chain_id, slot = slot_idx, attempt, "reconnect attempt");
 
         // Load a fresh peer_table snapshot on each attempt so we pick up
         // any updates that arrived between retries (including the transition
@@ -1010,13 +1020,13 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                 // peer_table not populated yet — fall back to original chain and
                 // let the dial fail with the usual "not in peer_table" error so
                 // the retry/backoff logic handles it normally.
-                debug!(slot = slot_idx, error = %e, "freshen_chain_pubkeys: using original chain");
+                debug!(chain_id = %chain_id, slot = slot_idx, error = %e, "freshen_chain_pubkeys: using original chain");
                 chain.clone()
             }
         };
         match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id).await {
             Ok(tunnel) => {
-                info!(slot = slot_idx, attempt, "reconnect succeeded");
+                info!(chain_id = %chain_id, slot = slot_idx, attempt, "reconnect succeeded");
                 let mut guard = pool.inner.lock().await;
                 guard.slots[slot_idx] = Slot::Idle {
                     tunnel,
@@ -1029,6 +1039,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                 let limit_reached = max_attempts > 0 && attempt >= max_attempts;
                 if limit_reached {
                     error!(
+                        chain_id = %chain_id,
                         slot = slot_idx,
                         attempt,
                         error = %e,
@@ -1038,12 +1049,13 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                     // attempt counter.  This prevents permanent lockup when the
                     // peer_table was empty at dial time and arrives later.
                     peer_table_notify.notified().await;
-                    info!(slot = slot_idx, "peer_table changed — resetting attempt counter");
+                    info!(chain_id = %chain_id, slot = slot_idx, "peer_table changed — resetting attempt counter");
                     attempt = 0;
                     continue;
                 }
                 let delay_ms = base_ms.saturating_mul(1u64 << attempt.min(10));
                 warn!(
+                    chain_id = %chain_id,
                     slot = slot_idx,
                     attempt,
                     delay_ms,
@@ -1056,6 +1068,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
                     _ = peer_table_notify.notified() => {
                         info!(
+                            chain_id = %chain_id,
                             slot = slot_idx,
                             attempt,
                             "peer_table changed during backoff — retrying immediately"

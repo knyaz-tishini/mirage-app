@@ -206,6 +206,8 @@ pub struct MuxPool {
     /// Sleeping reconnect tasks subscribe to this so they wake immediately
     /// and retry with fresh peer data instead of waiting out exponential backoff.
     peer_table_notify: Arc<tokio::sync::Notify>,
+    /// Cached chain ID for zero-cost log fields (avoids locking inner mutex).
+    chain_id: Arc<str>,
 }
 
 impl MuxPool {
@@ -225,6 +227,7 @@ impl MuxPool {
         // as ASCII (>=0x30), not 0x00 (mux marker).
         let is_onion = chain.hops.len() > 1;
         let pool_size = config.pool_size.max(1).min(8);
+        let chain_id: Arc<str> = Arc::from(chain.chain_id.as_str());
 
         let chain_label = chain
             .hops
@@ -249,7 +252,7 @@ impl MuxPool {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok((idx, Ok(session))) => {
-                    info!(slot = idx, ready = ready_count + 1, threshold, "mux session established");
+                    info!(chain_id = %chain_id, slot = idx, ready = ready_count + 1, threshold, "mux session established");
                     slots.push((idx, SessionSlot::Active {
                         session: Arc::new(session),
                         last_open_stream_at: Instant::now(),
@@ -257,11 +260,11 @@ impl MuxPool {
                     ready_count += 1;
                 }
                 Ok((idx, Err(e))) => {
-                    warn!(slot = idx, error = %e, "mux session failed on startup, marking reconnecting");
+                    warn!(chain_id = %chain_id, slot = idx, error = %e, "mux session failed on startup, marking reconnecting");
                     slots.push((idx, SessionSlot::Reconnecting));
                 }
                 Err(e) => {
-                    warn!(error = %e, "mux session join error");
+                    warn!(chain_id = %chain_id, error = %e, "mux session join error");
                 }
             }
             if ready_count >= threshold && !join_set.is_empty() {
@@ -301,6 +304,7 @@ impl MuxPool {
             )),
             reconnect_limiter: Arc::new(Semaphore::new(RECONNECT_BURST_LIMIT)),
             peer_table_notify: Arc::new(tokio::sync::Notify::new()),
+            chain_id,
         });
 
         let pool_weak = Arc::downgrade(&pool);
@@ -318,6 +322,7 @@ impl MuxPool {
         if !join_set.is_empty() {
             let inner_clone = Arc::clone(&pool.inner);
             let notify_clone = Arc::clone(&pool.stream_notify);
+            let chain_id_warmup = Arc::clone(&pool.chain_id);
             tokio::spawn(async move {
                 while let Some(result) = join_set.join_next().await {
                     match result {
@@ -328,16 +333,16 @@ impl MuxPool {
                                     session: Arc::new(session),
                                     last_open_stream_at: Instant::now(),
                                 };
-                                info!(slot = idx, "mux background warmup: session established");
+                                info!(chain_id = %chain_id_warmup, slot = idx, "mux background warmup: session established");
                                 drop(guard);
                                 notify_clone.notify_waiters();
                             }
                         }
                         Ok((idx, Err(e))) => {
-                            warn!(slot = idx, error = %e, "mux background warmup: session failed");
+                            warn!(chain_id = %chain_id_warmup, slot = idx, error = %e, "mux background warmup: session failed");
                         }
                         Err(e) => {
-                            warn!(error = %e, "mux background warmup: join error");
+                            warn!(chain_id = %chain_id_warmup, error = %e, "mux background warmup: join error");
                         }
                     }
                 }
@@ -350,7 +355,7 @@ impl MuxPool {
     pub async fn open_stream(&self) -> Result<TokioMuxStream, MirageError> {
         // Fast-reject if circuit is open.
         if self.circuit_breaker.is_open() {
-            debug!("circuit breaker open: rejecting stream request immediately");
+            debug!(chain_id = %self.chain_id, "circuit breaker open: rejecting stream request immediately");
             return Err(MirageError::CircuitOpen);
         }
 
@@ -393,7 +398,7 @@ impl MuxPool {
                 }
             }
             if woke {
-                debug!("open_stream: woke dormant mux sessions for reconnect");
+                debug!(chain_id = %self.chain_id, "open_stream: woke dormant mux sessions for reconnect");
                 self.circuit_breaker.note_wake();
                 self.reconnect_notify.notify_one();
             }
@@ -411,14 +416,14 @@ impl MuxPool {
                 if session.is_closed() {
                     let mut guard = self.inner.lock().await;
                     guard.slots[idx] = SessionSlot::Reconnecting;
-                    debug!(slot = idx, "mux session closed, marked reconnecting");
+                    debug!(chain_id = %self.chain_id, slot = idx, "mux session closed, marked reconnecting");
                     marked_reconnecting = true;
                     continue;
                 }
 
                 match session.open_stream().await {
                     Ok(stream) => {
-                        debug!(slot = idx, "opened mux stream");
+                        debug!(chain_id = %self.chain_id, slot = idx, "opened mux stream");
                         {
                             let mut guard = self.inner.lock().await;
                             if let Some(SessionSlot::Active { last_open_stream_at, .. }) =
@@ -431,10 +436,10 @@ impl MuxPool {
                         return Ok(TokioMuxStream(stream));
                     }
                     Err(MuxError::Closed) | Err(MuxError::TooManyStreams) => {
-                        debug!(slot = idx, "session not available for new stream, trying next");
+                        debug!(chain_id = %self.chain_id, slot = idx, "session not available for new stream, trying next");
                     }
                     Err(e) => {
-                        warn!(slot = idx, error = %e, "open_stream error, trying next");
+                        warn!(chain_id = %self.chain_id, slot = idx, error = %e, "open_stream error, trying next");
                     }
                 }
             }
@@ -470,14 +475,14 @@ impl MuxPool {
                     if session.is_closed() {
                         let mut guard = self.inner.lock().await;
                         guard.slots[idx] = SessionSlot::Reconnecting;
-                        debug!(slot = idx, "mux session closed, marked reconnecting");
+                        debug!(chain_id = %self.chain_id, slot = idx, "mux session closed, marked reconnecting");
                         marked_reconnecting = true;
                         continue;
                     }
 
                     match session.open_stream().await {
                         Ok(stream) => {
-                            debug!(slot = idx, "opened mux stream (after wake-wait)");
+                            debug!(chain_id = %self.chain_id, slot = idx, "opened mux stream (after wake-wait)");
                             {
                                 let mut guard = self.inner.lock().await;
                                 if let Some(SessionSlot::Active { last_open_stream_at, .. }) =
@@ -490,10 +495,10 @@ impl MuxPool {
                             return Ok(TokioMuxStream(stream));
                         }
                         Err(MuxError::Closed) | Err(MuxError::TooManyStreams) => {
-                            debug!(slot = idx, "session not available for new stream, trying next");
+                            debug!(chain_id = %self.chain_id, slot = idx, "session not available for new stream, trying next");
                         }
                         Err(e) => {
-                            warn!(slot = idx, error = %e, "open_stream error, trying next");
+                            warn!(chain_id = %self.chain_id, slot = idx, error = %e, "open_stream error, trying next");
                         }
                     }
                 }
@@ -509,16 +514,16 @@ impl MuxPool {
             }
             tokio::select! {
                 _ = self.stream_notify.notified() => {
-                    debug!("open_stream: stream_notify woke wake-wait loop");
+                    debug!(chain_id = %self.chain_id, "open_stream: stream_notify woke wake-wait loop");
                 }
                 _ = tokio::time::sleep(remaining) => {
-                    debug!("open_stream: wake-wait deadline reached (15s)");
+                    debug!(chain_id = %self.chain_id, "open_stream: wake-wait deadline reached (15s)");
                     break;
                 }
             }
         }
 
-        warn!("mux pool exhausted after 15s wake-wait window");
+        warn!(chain_id = %self.chain_id, "mux pool exhausted after 15s wake-wait window");
         self.circuit_breaker.record_failure();
         Err(MirageError::PoolExhausted)
     }
@@ -585,6 +590,7 @@ async fn mux_reaper_loop(pool_weak: std::sync::Weak<MuxPool>) {
 
         for (idx, session) in stale_sessions {
             info!(
+                chain_id = %pool.chain_id,
                 slot = idx,
                 idle_secs = MUX_POOL_IDLE_KILL_TIMEOUT.as_secs(),
                 "mux reaper: closing long-idle session (→ Dormant)"
@@ -595,12 +601,12 @@ async fn mux_reaper_loop(pool_weak: std::sync::Weak<MuxPool>) {
             match Arc::try_unwrap(session) {
                 Ok(handle) => {
                     if let Err(e) = handle.close().await {
-                        debug!(slot = idx, error = %e, "mux reaper: session close error (ignored)");
+                        debug!(chain_id = %pool.chain_id, slot = idx, error = %e, "mux reaper: session close error (ignored)");
                     }
                 }
                 Err(_arc) => {
                     // Other owners exist — drop our reference, not forcibly closed.
-                    debug!(slot = idx, "mux reaper: session still referenced, releasing Arc");
+                    debug!(chain_id = %pool.chain_id, slot = idx, "mux reaper: session still referenced, releasing Arc");
                 }
             }
         }
@@ -634,7 +640,7 @@ async fn mux_maintenance_loop(
             for (idx, slot) in guard.slots.iter_mut().enumerate() {
                 if let SessionSlot::Active { session, .. } = slot {
                     if session.is_closed() {
-                        debug!(slot = idx, "maintenance: session closed, reconnecting");
+                        debug!(chain_id = %pool.chain_id, slot = idx, "maintenance: session closed, reconnecting");
                         *slot = SessionSlot::Reconnecting;
                         indices.push(idx);
                     }
@@ -1081,6 +1087,7 @@ mod tests {
 }
 
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
+    let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
          peer_table_notify) = {
         let guard = pool.inner.lock().await;
@@ -1098,7 +1105,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        debug!(slot = slot_idx, attempt, "mux reconnect attempt");
+        debug!(chain_id = %chain_id, slot = slot_idx, attempt, "mux reconnect attempt");
 
         // Load a fresh peer_table snapshot on each attempt so we pick up
         // any updates that arrived between retries (including the transition
@@ -1110,13 +1117,13 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         let fresh_chain = match freshen_chain_pubkeys(&chain, &peer_table_snap) {
             Ok(c) => c,
             Err(e) => {
-                debug!(slot = slot_idx, error = %e, "mux: freshen_chain_pubkeys: using original chain");
+                debug!(chain_id = %chain_id, slot = slot_idx, error = %e, "mux: freshen_chain_pubkeys: using original chain");
                 chain.clone()
             }
         };
         match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id).await {
             Ok(session) => {
-                info!(slot = slot_idx, attempt, "mux reconnect succeeded");
+                info!(chain_id = %chain_id, slot = slot_idx, attempt, "mux reconnect succeeded");
                 {
                     let mut guard = pool.inner.lock().await;
                     guard.slots[slot_idx] = SessionSlot::Active {
@@ -1133,6 +1140,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                 let limit_reached = max_attempts > 0 && attempt >= max_attempts;
                 if limit_reached {
                     error!(
+                        chain_id = %chain_id,
                         slot = slot_idx,
                         attempt,
                         error = %e,
@@ -1142,12 +1150,13 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                     // attempt counter.  This prevents permanent lockup when the
                     // peer_table was empty at dial time and arrives later.
                     peer_table_notify.notified().await;
-                    info!(slot = slot_idx, "mux: peer_table changed — resetting attempt counter");
+                    info!(chain_id = %chain_id, slot = slot_idx, "mux: peer_table changed — resetting attempt counter");
                     attempt = 0;
                     continue;
                 }
                 let delay_ms = base_ms.saturating_mul(1u64 << attempt.min(10));
                 warn!(
+                    chain_id = %chain_id,
                     slot = slot_idx,
                     attempt,
                     delay_ms,
@@ -1160,6 +1169,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
                     _ = peer_table_notify.notified() => {
                         info!(
+                            chain_id = %chain_id,
                             slot = slot_idx,
                             attempt,
                             "mux: peer_table changed during backoff — retrying immediately"
