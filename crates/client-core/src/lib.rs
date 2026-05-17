@@ -14,6 +14,7 @@ pub mod pool;
 pub mod relay;
 pub mod runtime;
 pub mod socks5;
+pub mod topology_forwarder;
 pub mod transparent;
 
 pub use chain_set::{
