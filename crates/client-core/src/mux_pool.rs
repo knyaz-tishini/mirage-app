@@ -1102,10 +1102,11 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         )
     };
 
+    let is_onion = chain.hops.len() > 1;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        debug!(chain_id = %chain_id, slot = slot_idx, attempt, "mux reconnect attempt");
+        debug!(chain_id = %chain_id, slot = slot_idx, attempt, is_onion, hops = chain.hops.len(), "mux reconnect attempt");
 
         // Load a fresh peer_table snapshot on each attempt so we pick up
         // any updates that arrived between retries (including the transition
@@ -1143,6 +1144,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                         chain_id = %chain_id,
                         slot = slot_idx,
                         attempt,
+                        is_onion,
                         error = %e,
                         "mux reconnect gave up after max attempts — waiting for peer_table change"
                     );
@@ -1159,6 +1161,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                     chain_id = %chain_id,
                     slot = slot_idx,
                     attempt,
+                    is_onion,
                     delay_ms,
                     error = %e,
                     "mux reconnect failed, retrying"

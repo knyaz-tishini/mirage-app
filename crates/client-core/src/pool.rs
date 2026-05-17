@@ -997,10 +997,11 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
         )
     };
 
+    let is_onion = chain.hops.len() > 1;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        debug!(chain_id = %chain_id, slot = slot_idx, attempt, "reconnect attempt");
+        debug!(chain_id = %chain_id, slot = slot_idx, attempt, is_onion, hops = chain.hops.len(), "reconnect attempt");
 
         // Load a fresh peer_table snapshot on each attempt so we pick up
         // any updates that arrived between retries (including the transition
@@ -1042,6 +1043,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                         chain_id = %chain_id,
                         slot = slot_idx,
                         attempt,
+                        is_onion,
                         error = %e,
                         "reconnect gave up after max attempts — waiting for peer_table change"
                     );
@@ -1058,6 +1060,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                     chain_id = %chain_id,
                     slot = slot_idx,
                     attempt,
+                    is_onion,
                     delay_ms,
                     error = %e,
                     "reconnect failed, retrying"
