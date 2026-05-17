@@ -390,6 +390,8 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             Arc::clone(&peer_table),
             ChainSet::empty(),
             transports,
+            config.mesh_id.clone(),
+            config.client_id.clone(),
         );
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");

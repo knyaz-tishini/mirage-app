@@ -393,6 +393,8 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         Arc::clone(&_sentinel_peer_table),
         ChainSet::empty(),
         direct_ws_transports,
+        String::new(),
+        client_id.clone(),
     );
     link.spawn();
 

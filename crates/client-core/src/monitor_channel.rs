@@ -449,12 +449,16 @@ impl OverChainChannel {
     ///   its own `control_target` (`127.0.0.1:19445`), but the SOCKS5
     ///   protocol still requires a target.
     /// * `bearer`        — Bearer token for FRAME_AUTH.
+    /// * `mesh_id`       — Cluster/mesh identifier (e.g. `"staging-v2"`).
+    /// * `client_id`     — Local node/sentry identifier.
     ///
     /// Times out after 15 s for SOCKS5 connect and 10 s for auth.
     pub async fn connect(
         worker_socks5: SocketAddr,
         monitor_addr: SocketAddr,
         bearer: &str,
+        mesh_id: &str,
+        client_id: &str,
     ) -> Result<Self, MonitorChannelError> {
         // Greeting reply is instant. CONNECT may block on chain handshake
         // (worker dials the entry hop on first use) — give it 30 s.
@@ -485,7 +489,7 @@ impl OverChainChannel {
         info!(%worker_socks5, %monitor_addr, "over_chain: SOCKS5 CONNECT established, starting auth handshake");
 
         // Auth handshake on the raw stream (with timeout).
-        timeout(AUTH_TIMEOUT, Self::do_auth_handshake_stream(&mut stream, bearer))
+        timeout(AUTH_TIMEOUT, Self::do_auth_handshake_stream(&mut stream, bearer, mesh_id, client_id))
             .await
             .map_err(|_| MonitorChannelError::Timeout)??;
 
@@ -503,11 +507,13 @@ impl OverChainChannel {
     pub async fn connect_via_tunnel(
         mut tunnel: Box<dyn Tunnel>,
         bearer: &str,
+        mesh_id: &str,
+        client_id: &str,
     ) -> Result<Self, MonitorChannelError> {
         const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
         info!("over_chain: using directly-leased tunnel, starting auth handshake");
-        timeout(AUTH_TIMEOUT, Self::do_auth_handshake(tunnel.as_mut(), bearer))
+        timeout(AUTH_TIMEOUT, Self::do_auth_handshake(tunnel.as_mut(), bearer, mesh_id, client_id))
             .await
             .map_err(|_| MonitorChannelError::Timeout)??;
         info!("over_chain: AUTH_OK via tunnel — channel ready");
@@ -521,6 +527,8 @@ impl OverChainChannel {
     async fn do_auth_handshake_stream(
         stream: &mut tokio::net::TcpStream,
         bearer: &str,
+        mesh_id: &str,
+        client_id: &str,
     ) -> Result<(), MonitorChannelError> {
         // Step 1: read FRAME_AUTH_CHALLENGE with 8-byte nonce.
         let (tag, payload) = read_stream_frame(stream).await?;
@@ -539,11 +547,21 @@ impl OverChainChannel {
 
         let bearer_bytes = bearer.as_bytes();
         let bearer_len = bearer_bytes.len() as u16;
-        let mut auth_payload = Vec::with_capacity(1 + 2 + bearer_bytes.len() + 8);
+        let mesh_bytes = mesh_id.as_bytes();
+        let mesh_len = mesh_bytes.len() as u16;
+        let cid_bytes = client_id.as_bytes();
+        let cid_len = cid_bytes.len() as u16;
+        let mut auth_payload = Vec::with_capacity(
+            1 + 2 + bearer_bytes.len() + 8 + 2 + mesh_bytes.len() + 2 + cid_bytes.len(),
+        );
         auth_payload.push(OVER_CHAIN_VERSION);
         auth_payload.extend_from_slice(&bearer_len.to_be_bytes());
         auth_payload.extend_from_slice(bearer_bytes);
         auth_payload.extend_from_slice(&nonce_echo);
+        auth_payload.extend_from_slice(&mesh_len.to_be_bytes());
+        auth_payload.extend_from_slice(mesh_bytes);
+        auth_payload.extend_from_slice(&cid_len.to_be_bytes());
+        auth_payload.extend_from_slice(cid_bytes);
 
         write_stream_frame(stream, FRAME_AUTH, &auth_payload).await?;
 
@@ -564,6 +582,8 @@ impl OverChainChannel {
     async fn do_auth_handshake(
         tunnel: &mut dyn Tunnel,
         bearer: &str,
+        mesh_id: &str,
+        client_id: &str,
     ) -> Result<(), MonitorChannelError> {
         // Step 1: read FRAME_AUTH_CHALLENGE with 8-byte nonce.
         let (tag, payload) = read_tunnel_frame(tunnel).await?;
@@ -583,11 +603,21 @@ impl OverChainChannel {
         // Step 2: build and send FRAME_AUTH.
         let bearer_bytes = bearer.as_bytes();
         let bearer_len = bearer_bytes.len() as u16;
-        let mut auth_payload = Vec::with_capacity(1 + 2 + bearer_bytes.len() + 8);
+        let mesh_bytes = mesh_id.as_bytes();
+        let mesh_len = mesh_bytes.len() as u16;
+        let cid_bytes = client_id.as_bytes();
+        let cid_len = cid_bytes.len() as u16;
+        let mut auth_payload = Vec::with_capacity(
+            1 + 2 + bearer_bytes.len() + 8 + 2 + mesh_bytes.len() + 2 + cid_bytes.len(),
+        );
         auth_payload.push(OVER_CHAIN_VERSION);
         auth_payload.extend_from_slice(&bearer_len.to_be_bytes());
         auth_payload.extend_from_slice(bearer_bytes);
         auth_payload.extend_from_slice(&nonce_echo);
+        auth_payload.extend_from_slice(&mesh_len.to_be_bytes());
+        auth_payload.extend_from_slice(mesh_bytes);
+        auth_payload.extend_from_slice(&cid_len.to_be_bytes());
+        auth_payload.extend_from_slice(cid_bytes);
 
         write_tunnel_frame(tunnel, FRAME_AUTH, &auth_payload).await?;
 
@@ -757,7 +787,7 @@ mod tests {
 
     /// Fake server: sends AUTH_CHALLENGE, reads AUTH, sends FRAME_MSG (AUTH_OK
     /// signal), then sends one config push.
-    async fn fake_server(mut server: MemTunnel, expected_bearer: &str) {
+    async fn fake_server(mut server: MemTunnel, expected_bearer: &str, expected_mesh_id: &str, expected_client_id: &str) {
         let srv: &mut dyn mirage_protocol::traits::Tunnel = &mut server;
 
         // Send AUTH_CHALLENGE with nonce = [1,2,3,4,5,6,7,8].
@@ -770,14 +800,32 @@ mod tests {
         let (tag, payload) = read_tunnel_frame(srv).await.unwrap();
         assert_eq!(tag, FRAME_AUTH, "expected FRAME_AUTH from client");
 
-        // Parse AUTH payload: [version(1)][bearer_len(2)][bearer][nonce_echo(8)]
+        // Parse AUTH payload:
+        // [version(1)][bearer_len(2)][bearer][nonce_echo(8)][mesh_id_len(2)][mesh_id][client_id_len(2)][client_id]
         assert!(payload.len() >= 3);
         let bearer_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
-        assert!(payload.len() >= 3 + bearer_len + 8, "AUTH payload too short");
-        let bearer_str = std::str::from_utf8(&payload[3..3 + bearer_len]).unwrap();
+        let base = 3 + bearer_len;
+        assert!(payload.len() >= base + 8, "AUTH payload too short (nonce)");
+        let bearer_str = std::str::from_utf8(&payload[3..base]).unwrap();
         assert_eq!(bearer_str, expected_bearer, "bearer mismatch");
-        let echoed_nonce = &payload[3 + bearer_len..3 + bearer_len + 8];
+        let echoed_nonce = &payload[base..base + 8];
         assert_eq!(echoed_nonce, &nonce, "nonce echo mismatch");
+
+        let after_nonce = base + 8;
+        assert!(payload.len() >= after_nonce + 2, "AUTH payload too short (mesh_id_len)");
+        let mesh_len = u16::from_be_bytes([payload[after_nonce], payload[after_nonce + 1]]) as usize;
+        let mesh_start = after_nonce + 2;
+        assert!(payload.len() >= mesh_start + mesh_len, "AUTH payload too short (mesh_id)");
+        let mesh_str = std::str::from_utf8(&payload[mesh_start..mesh_start + mesh_len]).unwrap();
+        assert_eq!(mesh_str, expected_mesh_id, "mesh_id mismatch");
+
+        let cid_len_offset = mesh_start + mesh_len;
+        assert!(payload.len() >= cid_len_offset + 2, "AUTH payload too short (client_id_len)");
+        let cid_len = u16::from_be_bytes([payload[cid_len_offset], payload[cid_len_offset + 1]]) as usize;
+        let cid_start = cid_len_offset + 2;
+        assert!(payload.len() >= cid_start + cid_len, "AUTH payload too short (client_id)");
+        let cid_str = std::str::from_utf8(&payload[cid_start..cid_start + cid_len]).unwrap();
+        assert_eq!(cid_str, expected_client_id, "client_id mismatch");
 
         // Send AUTH_OK as FRAME_MSG with a fake config payload.
         let config_json = br#"{"kind":"config","version":1,"chains":[]}"#;
@@ -789,17 +837,19 @@ mod tests {
     #[tokio::test]
     async fn over_chain_auth_handshake_roundtrip() {
         let bearer = "test-bearer-token";
+        let mesh_id = "staging-v2";
+        let client_id = "client-abc";
         let (client_tunnel, server_tunnel) = MemTunnel::pair();
 
         // Run fake server concurrently.
         let server_task = tokio::spawn(async move {
-            fake_server(server_tunnel, bearer).await;
+            fake_server(server_tunnel, bearer, mesh_id, client_id).await;
         });
 
         // Run client handshake.
         let mut client_tunnel = client_tunnel;
         let client_result =
-            OverChainChannel::do_auth_handshake(&mut client_tunnel, bearer).await;
+            OverChainChannel::do_auth_handshake(&mut client_tunnel, bearer, mesh_id, client_id).await;
 
         server_task.await.expect("fake server panicked");
         assert!(

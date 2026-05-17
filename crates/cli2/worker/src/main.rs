@@ -151,6 +151,10 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("chain '{}' not found in config", chain_id))?
         .clone();
 
+    // Capture mesh_id and client_id as strings for MonitorLink FRAME_AUTH.
+    let mesh_id_str = client_config.mesh_id.clone();
+    let client_id_str = client_config.client_id.clone();
+
     // Build protocol chain — single Mirage wire for the entry hop.
     let mesh_id = client_config.mesh_id.as_bytes().to_vec();
     use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
@@ -283,6 +287,8 @@ async fn main() -> anyhow::Result<()> {
         &mut listener,
         &chain_id,
         &chain,
+        &mesh_id_str,
+        &client_id_str,
         pid,
         started_at_unix,
         ipc,
@@ -316,6 +322,8 @@ async fn supervisor_loop(
     listener: &mut PipeListener,
     chain_id: &str,
     chain_cfg: &mirage_core::config::ChainConfig,
+    mesh_id: &str,
+    node_client_id: &str,
     pid: u32,
     started_at_unix: u64,
     initial_ipc: PipePair,
@@ -336,6 +344,8 @@ async fn supervisor_loop(
             &mut ipc,
             chain_id,
             chain_cfg,
+            mesh_id,
+            node_client_id,
             Arc::clone(&pool),
             mux_pool_opt.as_ref().map(Arc::clone),
             Arc::clone(&state),
@@ -437,6 +447,8 @@ async fn handle_session(
     ipc: &mut PipePair,
     chain_id: &str,
     chain_cfg: &mirage_core::config::ChainConfig,
+    mesh_id: &str,
+    node_client_id: &str,
     pool: Arc<TunnelPool>,
     mux_pool_opt: Option<Arc<MuxPool>>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
@@ -503,6 +515,8 @@ async fn handle_session(
                     monitor_urls,
                     monitor_api_key,
                     transports_json,
+                    mesh_id.to_string(),
+                    node_client_id.to_string(),
                     Arc::clone(&peer_table),
                     Arc::clone(&pool),
                     mux_pool_opt.as_ref().map(Arc::clone),
@@ -601,6 +615,8 @@ fn spawn_monitor_link_in_worker(
     monitor_urls: Vec<String>,
     monitor_api_key: Option<String>,
     transports_json: String,
+    mesh_id: String,
+    node_client_id: String,
     peer_table: Arc<ArcSwap<PeerTable>>,
     pool: Arc<TunnelPool>,
     mux_pool_opt: Option<Arc<MuxPool>>,
@@ -668,6 +684,8 @@ fn spawn_monitor_link_in_worker(
         Arc::clone(&peer_table),
         chain_set,
         transports,
+        mesh_id,
+        node_client_id,
     );
     monitor_link.spawn();
 

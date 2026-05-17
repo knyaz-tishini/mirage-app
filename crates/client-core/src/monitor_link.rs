@@ -49,6 +49,8 @@ async fn try_lease_and_open(
     handle: &Arc<ChainHandle>,
     monitor_addr: SocketAddr,
     bearer: &str,
+    mesh_id: &str,
+    client_id: &str,
 ) -> Result<OverChainChannel, MonitorChannelError> {
     let mut lease = handle
         .pool
@@ -66,7 +68,7 @@ async fn try_lease_and_open(
     let inner = lease
         .take_tunnel()
         .ok_or_else(|| MonitorChannelError::Io("lease tunnel already taken".to_string()))?;
-    OverChainChannel::connect_via_tunnel(inner, bearer).await
+    OverChainChannel::connect_via_tunnel(inner, bearer, mesh_id, client_id).await
 }
 
 // ── Timeouts ─────────────────────────────────────────────────────────────────
@@ -342,6 +344,10 @@ pub struct MonitorLink {
     /// Optional Bearer token forwarded in registration, heartbeat, and WS
     /// upgrade headers.
     monitor_api_key: Option<String>,
+    /// Cluster/mesh identifier sent in FRAME_AUTH (e.g. `"staging-v2"`).
+    mesh_id: String,
+    /// Local node/sentry identifier sent in FRAME_AUTH.
+    node_client_id: String,
     /// Currently winning URL after a race. None until first race completes.
     active_url: Mutex<Option<String>>,
     client_id: Mutex<Option<String>>,
@@ -386,12 +392,19 @@ impl MonitorLink {
     /// `transports` — optional list of [`MonitorTransport`]s from
     /// `ClientConfig.monitor_transports`.  If empty, `monitor_urls` is used
     /// (backward-compatible legacy path).
+    ///
+    /// `mesh_id` — cluster/mesh identifier sent in FRAME_AUTH for OverChain
+    /// connections (e.g. `"staging-v2"`).
+    ///
+    /// `node_client_id` — local node/sentry identifier sent in FRAME_AUTH.
     pub fn new(
         monitor_urls: Vec<String>,
         monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         chain_set: Arc<ChainSet>,
         transports: Vec<MonitorTransport>,
+        mesh_id: String,
+        node_client_id: String,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
         let (frame_tx, _frame_rx) = watch::channel(None);
@@ -405,6 +418,8 @@ impl MonitorLink {
         let link = Arc::new(Self {
             monitor_urls: Mutex::new(monitor_urls),
             monitor_api_key,
+            mesh_id,
+            node_client_id,
             active_url: Mutex::new(None),
             client_id: Mutex::new(None),
             http,
@@ -592,6 +607,8 @@ impl MonitorLink {
     /// channel, or `None` if all transports fail.
     async fn try_connect_over_chain(&self) -> Option<OverChainChannel> {
         let bearer = self.monitor_api_key.as_deref().unwrap_or("");
+        let mesh_id = self.mesh_id.as_str();
+        let client_id = self.node_client_id.as_str();
 
         for transport in &self.transports {
             if let MonitorTransport::OverChain {
@@ -609,7 +626,7 @@ impl MonitorLink {
                         info!(chain_id = %chain_id, "monitor_link: OverChain via local pool.lease (option a')");
                         match tokio::time::timeout(
                             OVER_CHAIN_CONNECT_TIMEOUT,
-                            try_lease_and_open(&handle, *monitor_addr, bearer),
+                            try_lease_and_open(&handle, *monitor_addr, bearer, mesh_id, client_id),
                         )
                         .await
                         {
@@ -633,7 +650,7 @@ impl MonitorLink {
                 // Option (b) fallback — SOCKS5 to worker.
                 match tokio::time::timeout(
                     OVER_CHAIN_CONNECT_TIMEOUT,
-                    OverChainChannel::connect(*worker_socks5, *monitor_addr, bearer),
+                    OverChainChannel::connect(*worker_socks5, *monitor_addr, bearer, mesh_id, client_id),
                 )
                 .await
                 {
