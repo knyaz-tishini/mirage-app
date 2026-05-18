@@ -77,7 +77,7 @@ pub enum SupervisorMsg {
     /// Sent on every config snapshot that contains a changed `peer_table`
     /// generation, and also when supervisor first receives the initial snapshot.
     PeerTableUpdate {
-        /// JSON-serialized `mirage_core::peer_table::PeerTable`.
+        /// JSON-serialized `mirage_core::mirage::mesh::PeerTable`.
         peer_table_json: String,
     },
     /// Sent by supervisor to the designated `monitor_link_host = true` worker
@@ -138,7 +138,7 @@ pub enum WorkerMsg {
     PeerTableSnapshot {
         /// Monotonically increasing generation counter from the monitor.
         generation: u64,
-        /// JSON-serialized `mirage_core::peer_table::PeerTable`.
+        /// JSON-serialized `mirage_core::mirage::mesh::PeerTable`.
         peer_table_json: String,
     },
 }

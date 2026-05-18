@@ -725,7 +725,7 @@ mod pool_smoke_tests {
     /// builder, not the actionable peer_table message.
     #[tokio::test]
     async fn pool_empty_peer_table_returns_specific_error() {
-        use mirage_core::peer_table::PeerTable;
+        use mirage_core::mirage::mesh::PeerTable;
         use crate::tunnel::establish_raw_tunnel;
 
         let chain = two_hop_chain("v2-entry", "v2-exit");

@@ -382,7 +382,7 @@ mod tests {
 
     fn make_chain_set(ids: &[&str]) -> Arc<ChainSet> {
         use arc_swap::ArcSwap;
-        use mirage_core::peer_table::PeerTable;
+        use mirage_core::mirage::mesh::PeerTable;
         use tokio::sync::Notify;
 
         let cs = ChainSet {

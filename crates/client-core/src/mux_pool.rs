@@ -925,7 +925,7 @@ mod tests {
     /// that existed before Phase 9.6 (commit d438661).
     #[tokio::test]
     async fn mux_pool_empty_peer_table_returns_specific_error() {
-        use mirage_core::peer_table::PeerTable;
+        use mirage_core::mirage::mesh::PeerTable;
 
         let chain = make_two_hop_chain("v2-entry", "v2-exit");
         let chain_protocols = make_chain_protocols();

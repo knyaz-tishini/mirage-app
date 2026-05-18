@@ -10,7 +10,7 @@ use mirage_client_core::{
     chain_set::ChainSet,
     monitor_link::{MonitorLink, MonitorTransport},
 };
-use mirage_core::peer_table::PeerTable;
+use mirage_core::mirage::mesh::PeerTable;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};

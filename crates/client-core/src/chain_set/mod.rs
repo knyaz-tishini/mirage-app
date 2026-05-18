@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use mirage_core::peer_table::PeerTable;
+use mirage_core::mirage::mesh::PeerTable;
 use tokio::sync::Notify;
 use tracing::info;
 

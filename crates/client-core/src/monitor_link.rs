@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use mirage_core::peer_table::PeerTable;
+use mirage_core::mirage::mesh::PeerTable;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::{
