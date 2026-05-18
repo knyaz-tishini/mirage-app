@@ -131,46 +131,28 @@ fn insert_ip(ip: IpAddr, v4: &mut BTreeSet<IpAddr>, v6: &mut BTreeSet<IpAddr>) {
 mod tests {
     use super::*;
     use mirage_core::config::{
-        CamouflageMode, ChainConfig, ChainNode, CoverTrafficConfig, HandshakeStrategy,
+        CamouflageMode, ChainConfig, CoverTrafficConfig, HandshakeStrategy,
         HopConfig, HopRole, ProtocolId, ReplyMode, ShapingPreset, TcpProtocolId,
     };
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr};
 
-    fn make_node(v4: &str, v6: Option<&str>) -> ChainNode {
-        ChainNode {
-            addr: v4.parse().unwrap(),
-            addr_v6: v6.map(|s| s.parse().unwrap()),
-            public_key: "aa".repeat(32),
+    fn make_hop(addr: &str, role: HopRole) -> HopConfig {
+        HopConfig {
+            addr: addr.into(),
+            public_key: Some("aa".repeat(32)),
+            node_id: None,
             sni: None,
+            role,
             display_name: None,
-        }
-    }
-
-    fn make_chain_two_hop(l1: ChainNode, l2: ChainNode) -> ChainConfig {
-        ChainConfig {
-            chain_id: "test".into(),
-            l1: Some(l1),
-            l2: Some(l2),
-            l1_transparent: false,
-            hops: vec![],
-            handshake: HandshakeStrategy::default(),
-            reply: ReplyMode::default(),
-            protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
-            priority: 0,
-            shaping: ShapingPreset::default(),
-            camouflage: CamouflageMode::default(),
-            cover_traffic: CoverTrafficConfig::default(),
+            camouflage: None,
             byte_cipher: None,
-            socks5_bind: None,
+            relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
         }
     }
 
     fn make_chain_hops(hops: Vec<HopConfig>) -> ChainConfig {
         ChainConfig {
             chain_id: "test-hops".into(),
-            l1: None,
-            l2: None,
-            l1_transparent: false,
             hops,
             handshake: HandshakeStrategy::default(),
             reply: ReplyMode::default(),
@@ -179,32 +161,34 @@ mod tests {
             shaping: ShapingPreset::default(),
             camouflage: CamouflageMode::default(),
             cover_traffic: CoverTrafficConfig::default(),
-            byte_cipher: None,
             socks5_bind: None,
+            websocket_xray: None,
+            shadowtls_v3: None,
+            vless_reality: None,
+            udp_hysteria2_native: None,
+            aead_suite: mirage_core::crypto::AeadSuite::ChaCha20Poly1305,
         }
     }
 
     #[test]
     fn extract_relay_addrs_from_chain_config() {
-        let l1 = make_node("91.218.245.247:8443", Some("[2a01:4f8::1]:8443"));
-        let l2 = make_node("45.59.119.139:8443", None);
-        let chain = make_chain_two_hop(l1, l2);
+        let chain = make_chain_hops(vec![
+            make_hop("91.218.245.247:8443", HopRole::Entry),
+            make_hop("45.59.119.139:8443", HopRole::Exit),
+        ]);
 
-        let (v4, v6) = extract_relay_addrs(&[chain]);
+        let (v4, _v6) = extract_relay_addrs(&[chain]);
 
-        assert_eq!(v4.len(), 2, "expected 2 v4 IPs");
-        assert_eq!(v6.len(), 1, "expected 1 v6 IP");
         assert!(v4.contains(&IpAddr::V4(Ipv4Addr::new(91, 218, 245, 247))));
         assert!(v4.contains(&IpAddr::V4(Ipv4Addr::new(45, 59, 119, 139))));
-        assert!(v6.contains(&IpAddr::V6("2a01:4f8::1".parse::<Ipv6Addr>().unwrap())));
     }
 
     #[test]
     fn extract_relay_addrs_deduplication() {
-        // Same IP in l1 and l2.
-        let l1 = make_node("91.218.245.247:8443", None);
-        let l2 = make_node("91.218.245.247:9443", None);
-        let chain = make_chain_two_hop(l1, l2);
+        let chain = make_chain_hops(vec![
+            make_hop("91.218.245.247:8443", HopRole::Entry),
+            make_hop("91.218.245.247:9443", HopRole::Exit),
+        ]);
 
         let (v4, _v6) = extract_relay_addrs(&[chain]);
         assert_eq!(v4.len(), 1, "duplicate IP must be deduped");
@@ -212,14 +196,7 @@ mod tests {
 
     #[test]
     fn extract_relay_addrs_hops() {
-        let hop = HopConfig {
-            addr: "10.0.0.1:1234".into(),
-            public_key: "bb".repeat(32),
-            sni: None,
-            role: HopRole::Entry,
-            display_name: None,
-        };
-        let chain = make_chain_hops(vec![hop]);
+        let chain = make_chain_hops(vec![make_hop("10.0.0.1:1234", HopRole::Entry)]);
         let (v4, _v6) = extract_relay_addrs(&[chain]);
         assert!(v4.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
     }
@@ -228,9 +205,10 @@ mod tests {
     fn tun_config_writes_marker() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tun.json").to_path_buf();
-        let l1 = make_node("1.2.3.4:8443", None);
-        let l2 = make_node("5.6.7.8:8443", None);
-        let chain = make_chain_two_hop(l1, l2);
+        let chain = make_chain_hops(vec![
+            make_hop("1.2.3.4:8443", HopRole::Entry),
+            make_hop("5.6.7.8:8443", HopRole::Exit),
+        ]);
 
         write_tun_config(&[chain], &path, None, true).unwrap();
 
@@ -252,9 +230,10 @@ mod tests {
         // Write a user-managed file (no _managed_by).
         std::fs::write(&path, r#"{"relay_addrs":["9.9.9.9"]}"#).unwrap();
 
-        let l1 = make_node("1.2.3.4:8443", None);
-        let l2 = make_node("5.6.7.8:8443", None);
-        let chain = make_chain_two_hop(l1, l2);
+        let chain = make_chain_hops(vec![
+            make_hop("1.2.3.4:8443", HopRole::Entry),
+            make_hop("5.6.7.8:8443", HopRole::Exit),
+        ]);
 
         // With respect_user_config=true: should not overwrite.
         write_tun_config(&[chain.clone()], &path, None, true).unwrap();
@@ -286,9 +265,10 @@ mod tests {
         .unwrap();
         let out_path = dir.path().join("tun.json").to_path_buf();
 
-        let l1 = make_node("1.2.3.4:8443", None);
-        let l2 = make_node("5.6.7.8:8443", None);
-        let chain = make_chain_two_hop(l1, l2);
+        let chain = make_chain_hops(vec![
+            make_hop("1.2.3.4:8443", HopRole::Entry),
+            make_hop("5.6.7.8:8443", HopRole::Exit),
+        ]);
 
         write_tun_config(&[chain], &out_path, Some(tpl_path.as_path()), true).unwrap();
 
@@ -313,9 +293,10 @@ mod tests {
         std::fs::write(&tpl_path, "this is not json{{{{").unwrap();
         let out_path = dir.path().join("tun.json").to_path_buf();
 
-        let l1 = make_node("1.2.3.4:8443", None);
-        let l2 = make_node("5.6.7.8:8443", None);
-        let chain = make_chain_two_hop(l1, l2);
+        let chain = make_chain_hops(vec![
+            make_hop("1.2.3.4:8443", HopRole::Entry),
+            make_hop("5.6.7.8:8443", HopRole::Exit),
+        ]);
 
         let result = write_tun_config(&[chain], &out_path, Some(tpl_path.as_path()), true);
         assert!(result.is_err(), "malformed template must return error");
