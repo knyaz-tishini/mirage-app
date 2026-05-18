@@ -29,7 +29,7 @@ use mirage_client_core::{
 };
 use mirage_core::{
     config::{ClientConfig, TcpProtocolId},
-    peer_table::PeerTable,
+    mirage::mesh::PeerTable,
     routing::RoutingTable,
 };
 use mirage_protocol::{

@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use mirage_core::{
     config::{ChainConfig, TunnelPoolConfig},
     error::MirageError,
-    peer_table::PeerTable,
+    mirage::mesh::PeerTable,
 };
 use mirage_mux::MuxError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
@@ -725,7 +725,7 @@ mod tests {
             config::{
                 ChainConfig, HandshakeStrategy, HopConfig, HopRole, ProtocolId, TcpProtocolId,
             },
-            peer_table::{PeerEntry, PeerTable},
+            mirage::mesh::peer_table::{PeerTable, PeerTableEntry},
         };
         use mirage_protocol::negotiation::ProtocolChain;
         use std::sync::Arc;
@@ -734,7 +734,7 @@ mod tests {
         let peer_table = Arc::new(ArcSwap::from_pointee(PeerTable {
             generation: 1,
             peers: vec![
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-entry".into(),
@@ -744,7 +744,7 @@ mod tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                 },
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-exit".into(),
@@ -951,7 +951,7 @@ mod tests {
     /// fix from Phase 9.6.
     #[tokio::test]
     async fn mux_pool_recovery_after_peer_table_arrives() {
-        use mirage_core::peer_table::{PeerEntry, PeerTable};
+        use mirage_core::mirage::mesh::peer_table::{PeerTable, PeerTableEntry};
 
         let chain = make_two_hop_chain("v2-entry", "v2-exit");
         let chain_protocols = make_chain_protocols();
@@ -970,7 +970,7 @@ mod tests {
         let pt_full = PeerTable {
             generation: 1,
             peers: vec![
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-entry".into(),
@@ -980,7 +980,7 @@ mod tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                 },
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-exit".into(),
@@ -1026,7 +1026,7 @@ mod tests {
     async fn mux_notify_peer_table_change_wakes_blocked_reconnect() {
         use super::MuxPool;
         use arc_swap::ArcSwap;
-        use mirage_core::{config::TunnelPoolConfig, peer_table::PeerTable};
+        use mirage_core::{config::TunnelPoolConfig, mirage::mesh::PeerTable};
         use std::sync::Arc;
 
         let chain = make_two_hop_chain("node-a", "node-b");
@@ -1068,7 +1068,7 @@ mod tests {
     async fn mux_notify_peer_table_change_no_subscribers_is_noop() {
         use super::MuxPool;
         use arc_swap::ArcSwap;
-        use mirage_core::{config::TunnelPoolConfig, peer_table::PeerTable};
+        use mirage_core::{config::TunnelPoolConfig, mirage::mesh::PeerTable};
         use std::sync::Arc;
 
         let chain = make_two_hop_chain("node-c", "node-d");

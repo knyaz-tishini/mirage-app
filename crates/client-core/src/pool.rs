@@ -33,7 +33,7 @@ use arc_swap::ArcSwap;
 use mirage_core::{
     config::{ChainConfig, TunnelPoolConfig},
     error::MirageError,
-    peer_table::PeerTable,
+    mirage::mesh::PeerTable,
 };
 use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::{Mutex, Notify};
@@ -756,14 +756,14 @@ mod pool_smoke_tests {
     /// that the "must be 64 hex chars" config error is gone for valid entries.
     #[tokio::test]
     async fn pool_peer_table_resolve_passes_pubkey_validation() {
-        use mirage_core::peer_table::{PeerEntry, PeerTable};
+        use mirage_core::mirage::mesh::peer_table::{PeerTable, PeerTableEntry};
         use crate::tunnel::establish_raw_tunnel;
 
         let pubkey = "d".repeat(64);
         let pt = PeerTable {
             generation: 1,
             peers: vec![
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-entry".into(),
@@ -773,7 +773,7 @@ mod pool_smoke_tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                 },
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-exit".into(),
@@ -824,7 +824,7 @@ mod pool_smoke_tests {
     /// `reconnect_slot` calls — to confirm the state machine recovery path.
     #[tokio::test]
     async fn pool_recovery_after_peer_table_arrives() {
-        use mirage_core::peer_table::{PeerEntry, PeerTable};
+        use mirage_core::mirage::mesh::peer_table::{PeerTable, PeerTableEntry};
         use crate::tunnel::establish_raw_tunnel;
 
         let chain = two_hop_chain("v2-entry", "v2-exit");
@@ -844,7 +844,7 @@ mod pool_smoke_tests {
         let pt_full = PeerTable {
             generation: 2,
             peers: vec![
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-entry".into(),
@@ -854,7 +854,7 @@ mod pool_smoke_tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                 },
-                PeerEntry {
+                PeerTableEntry {
                     mesh_id: "test".into(),
                     responsible_monitor_id: String::new(),
                     node_id: "v2-exit".into(),
@@ -901,7 +901,7 @@ mod pool_smoke_tests {
     async fn notify_peer_table_change_wakes_blocked_reconnect() {
         use super::TunnelPool;
         use arc_swap::ArcSwap;
-        use mirage_core::{config::TunnelPoolConfig, peer_table::PeerTable};
+        use mirage_core::{config::TunnelPoolConfig, mirage::mesh::PeerTable};
         use std::sync::Arc;
 
         // Build a pool with empty peer_table.  pool_size=1 so only one slot
@@ -959,7 +959,7 @@ mod pool_smoke_tests {
     async fn notify_peer_table_change_no_subscribers_is_noop() {
         use super::TunnelPool;
         use arc_swap::ArcSwap;
-        use mirage_core::{config::TunnelPoolConfig, peer_table::PeerTable};
+        use mirage_core::{config::TunnelPoolConfig, mirage::mesh::PeerTable};
         use std::sync::Arc;
 
         let chain = two_hop_chain("node-c", "node-d");

@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use mirage_core::{
     config::{AuthMode, ChainConfig, ClientConfig, MirageEndpointConfig, ProtocolId,
              TransportCamouflage, TransportKind},
-    peer_table::PeerTable,
+    mirage::mesh::PeerTable,
     routing::RoutingTable,
 };
 use mirage_protocol::{
