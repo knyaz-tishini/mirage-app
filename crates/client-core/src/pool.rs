@@ -686,6 +686,7 @@ mod pool_smoke_tests {
                     display_name: None,
                     camouflage: None,
                     byte_cipher: None,
+                    relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
                 },
                 HopConfig {
                     addr: "127.0.0.1:19972".into(),
@@ -696,6 +697,7 @@ mod pool_smoke_tests {
                     display_name: None,
                     camouflage: None,
                     byte_cipher: None,
+                    relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
                 },
             ],
             handshake: HandshakeStrategy::Ephemeral,
