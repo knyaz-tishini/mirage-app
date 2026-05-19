@@ -28,7 +28,7 @@ use mirage_client_core::{
     socks5::Socks5Server,
 };
 use mirage_core::{
-    config::{ClientConfig, TcpProtocolId},
+    config::{ClientConfig, ReplyMode, TcpProtocolId},
     mirage::mesh::PeerTable,
     routing::RoutingTable,
 };
@@ -202,7 +202,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(PeerTable::empty);
     let peer_table: Arc<ArcSwap<PeerTable>> = Arc::new(ArcSwap::from_pointee(initial_pt));
 
-    let mux_pool_opt: Option<Arc<MuxPool>> = if client_config.use_mux {
+    // MuxPool requires onion reply mode: the mux exit (run_mux_server_session_wrapped_v7)
+    // AEAD-wraps its replies, which OnionTunnel::recv unwraps per layer. Chains with
+    // reply=raw never receive AEAD-wrapped replies — their exit byte-pumps raw bytes.
+    // Creating a MuxPool for a reply=raw chain causes mux frame garbling → immediate EOF.
+    let chain_wants_mux = client_config.use_mux && chain.reply == ReplyMode::Onion;
+    let mux_pool_opt: Option<Arc<MuxPool>> = if chain_wants_mux {
         match MuxPool::new(
             chain.clone(),
             Arc::clone(&chain_protocols),

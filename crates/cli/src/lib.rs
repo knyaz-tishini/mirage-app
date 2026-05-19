@@ -10,7 +10,7 @@ use std::{
 use arc_swap::ArcSwap;
 use mirage_core::{
     config::{AuthMode, ChainConfig, ClientConfig, MirageEndpointConfig, ProtocolId,
-             TransportCamouflage, TransportKind},
+             ReplyMode, TransportCamouflage, TransportKind},
     mirage::mesh::PeerTable,
     routing::RoutingTable,
 };
@@ -205,12 +205,18 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         .cloned()
         .expect("default pool inserted above");
 
-    // ── Mux pools (one per chain when use_mux=true) ───────────────────────────
+    // ── Mux pools (one per chain when use_mux=true AND reply=onion) ──────────────
+    // MuxPool requires onion reply mode. Chains with reply=raw have exits that
+    // byte-pump raw data; a mux session on top causes frame garbling → EOF.
     let mut mux_pools: HashMap<String, Arc<MuxPool>> = HashMap::new();
     if use_mux {
-        info!(chains = all_chains.len(), "creating mux pools (all chains)");
+        info!(chains = all_chains.len(), "creating mux pools (onion-reply chains only)");
         let mut mux_tasks = tokio::task::JoinSet::new();
         for chain in &all_chains {
+            // Skip reply=raw chains — they never get AEAD-wrapped mux replies.
+            if chain.reply != ReplyMode::Onion {
+                continue;
+            }
             let chain_owned = (*chain).clone();
             let id = chain.chain_id.clone();
             let protocols = match build_chain_protocol_chain(&chain_owned, &mesh_id) {
