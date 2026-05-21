@@ -36,9 +36,6 @@ anyhow               = "1"
 rustls               = { version = "0.23", default-features = false, features = ["ring"] }
 mirage-runtime-guard = { workspace = true }
 uuid                 = { version = "1", features = ["v4"] }
-tokio-tungstenite    = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
-futures-util         = "0.3"
-sha2                 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

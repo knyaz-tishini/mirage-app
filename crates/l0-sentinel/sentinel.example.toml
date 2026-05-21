@@ -1,16 +1,21 @@
-# mirage-l0-sentinel — example configuration for Stage 3 declarative
-# chain provisioning. Drop this file into the working directory of the
-# sentinel binary and edit the bearer + axis as needed.
+# mirage-l0-sentinel — minimal client config.
+#
+# Sentinel is passive: on boot it generates a stable sentry_id, registers
+# with one of `monitor_urls`, and waits for the monitor to push chains
+# over the WebSocket subscription. The monitor decides which chains the
+# client gets based on policy. Operators/debug UIs can also call
+# `/relay/clients/{id}/chains/request` directly with an axis-spec — that
+# is NOT sentinel's job and there is no `[axis_request]` block here.
 
 # ─── Mesh + identity ──────────────────────────────────────────────────────────
 mesh_id   = "v3-staging"
-shortname = "tester1"
+shortname = "tester1"             # surfaces in /relay/clients
 role      = "sentry-client"
 
-# ─── Monitor endpoints ────────────────────────────────────────────────────────
-# Bootstrap fallback. Once the sentinel registers, the LM pushes the live
-# `peer_lm_urls` list which is persisted under `${state_dir}/monitor_urls.json`
-# and preferred on subsequent boots.
+# ─── Monitor endpoints + bearer ───────────────────────────────────────────────
+# Bootstrap fallback. Once registered, the monitor pushes the live
+# `peer_lm_urls` list via WS Config; sentinel persists it under
+# `${state_dir}/monitor_urls.json` and prefers it on subsequent boots.
 monitor_urls = [
   "https://lm-ru-1.zen-geldmaschine.net:19451",
   "https://lm-nl-1.zen-geldmaschine.net:19451",
@@ -19,10 +24,10 @@ monitor_urls = [
 monitor_api_key = "<paste Client-role bearer here>"
 
 # State directory — sentry-id.txt, client-id.txt, monitor_urls.json,
-# debug-tunnel.json. The directory will be created on first boot.
+# debug-tunnel.json. Created on first boot.
 state_dir = "C:/ProgramData/mirage/state"
 
-# ─── client-config materialisation ────────────────────────────────────────────
+# ─── client-config materialisation + spawning ─────────────────────────────────
 client_template    = "client-template.json"
 client_config_path = "client-config.json"
 client_binary      = "mirage-client-cli.exe"
@@ -31,25 +36,3 @@ respect_user_config = true
 
 # Set to "cli2" to spawn `mirage-chain-supervisor` instead of cli1.
 cli_variant = "cli1"
-
-# ─── Stage 3 — declarative chain bootstrap ────────────────────────────────────
-# When this section is present, sentinel POSTs the axis-spec to
-# `/relay/clients/{client_id}/chains/request` immediately after register.
-# The returned chain materialises into client-config.json on the next WS
-# Config push.
-[axis_request]
-transport   = "tcp"
-camouflage  = "tls_real"
-hops        = 2
-relay_mode  = "onion_peel"
-exit_mode   = "direct"
-aead_suite  = "cha_cha20_poly1305"
-byte_cipher = "none"
-# Optional anchor — pin entry/exit by region or node_id.
-# anchor      = { entry_region = "ru", exit_region = "ch" }
-# Optional TTL override (seconds). Defaults to monitor hard cap (7d).
-# ttl_secs    = 86400
-
-# How often (seconds) to POST `/chains/{id}/touch` so the chain's idle TTL
-# never trips the monitor reaper. Default 1800. Set to 0 to disable.
-touch_interval_secs = 1800

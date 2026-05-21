@@ -135,12 +135,13 @@ pub struct SentinelConfig {
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
 
-    // ── Stage 3 declarative chain provisioning ─────────────────────────────
+    // ── Stage 3 identity (sent on register; nothing axis-related here) ───
     //
-    // When `axis_request` is set, sentinel skips the legacy WS Config wait
-    // and instead, after register, POSTs the axis-spec to the monitor's
-    // /relay/clients/{client_id}/chains/request endpoint. The returned
-    // chain materialises into client-config.json the same way as before.
+    // Sentinel is passive: after register it just subscribes to WS and
+    // spawns cli. The monitor pushes chains on its own schedule. If the
+    // operator (or a debug UI on the client) wants to request a specific
+    // chain, they call /relay/clients/{id}/chains/request directly — that
+    // is NOT sentinel's job.
     /// Mesh id sent on register + carried in handshakes. Defaults to
     /// `"v3-staging"` to match the current staging mesh.
     #[serde(default = "default_mesh_id")]
@@ -153,16 +154,6 @@ pub struct SentinelConfig {
     /// Default `sentry-client` matches a desktop client.
     #[serde(default = "default_role")]
     pub role: String,
-    /// Optional axis-spec the sentinel POSTs after register. When absent,
-    /// the sentinel doesn't request any chain — operator must drive the
-    /// catalog via /relay/chains/upsert or /relay/chains/build.
-    #[serde(default)]
-    pub axis_request: Option<chain_request::AxisRequest>,
-    /// How often (seconds) to POST `/chains/{id}/touch` to refresh the
-    /// idle TTL. Default 1800 (30 min) — well under the server's 48h
-    /// idle expiry. Set to 0 to disable.
-    #[serde(default = "default_touch_interval")]
-    pub touch_interval_secs: u64,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -201,7 +192,6 @@ pub(crate) fn default_supervisor_args() -> Vec<String> {
 }
 pub(crate) fn default_mesh_id() -> String { "v3-staging".into() }
 pub(crate) fn default_role() -> String { "sentry-client".into() }
-pub(crate) fn default_touch_interval() -> u64 { 1800 }
 
 // ── Managed marker ────────────────────────────────────────────────────────────
 
@@ -433,59 +423,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         warn!(error = %e, "[sentinel] persist_client_id failed (non-fatal)");
     }
 
-    // Optional Stage 3 axis bootstrap — request a chain matching the
-    // operator-declared axis-spec. Outcome (chain_id) is captured for the
-    // touch loop below. Failure here is fatal: without a chain the cli
-    // would dial nothing.
-    let (bootstrap_chain_id, _bootstrap_expires_at): (Option<String>, Option<u64>) =
-        if let Some(axis) = cfg.axis_request.as_ref() {
-            let resp = chain_request::request_chain(
-                &http_client,
-                &active_monitor_url,
-                &client_id_resolved,
-                &bootstrap_bearer,
-                axis,
-            )
-            .await
-            .context("axis bootstrap POST /chains/request")?;
-            info!(
-                chain_id = %resp.chain_id,
-                cached = resp.cached,
-                "[sentinel] bootstrap chain provisioned"
-            );
-            (Some(resp.chain_id), Some(resp.expires_at_ms))
-        } else {
-            (None, None)
-        };
-
-    // Spawn TTL refresh loop when we own a bootstrap chain.
-    let (touch_cancel_tx, touch_cancel_rx) = tokio::sync::watch::channel(false);
-    if let Some(chain_id) = bootstrap_chain_id.as_ref() {
-        if cfg.touch_interval_secs > 0 {
-            chain_request::spawn_touch_loop(
-                http_client.clone(),
-                active_monitor_url.clone(),
-                client_id_resolved.clone(),
-                chain_id.clone(),
-                bootstrap_bearer.clone(),
-                std::time::Duration::from_secs(cfg.touch_interval_secs),
-                touch_cancel_rx.clone(),
-            );
-        }
-    }
-    // Hold the sender so the watch channel doesn't drop while sentinel runs.
-    // The loop receives `false` initially and exits only when we set `true`
-    // (currently no graceful shutdown path — sentinel exits on process kill).
-    let _touch_cancel_keepalive = touch_cancel_tx;
-
     info!(
-        "[sentinel] monitor_urls={:?} active={} client_id={} client_binary={:?} bootstrap_chain={:?}",
+        "[sentinel] monitor_urls={:?} active={} client_id={} client_binary={:?}",
         effective_urls,
         active_monitor_url,
         client_id_resolved,
         cfg.client_binary,
-        bootstrap_chain_id,
     );
+    drop(http_client);
+    drop(bootstrap_bearer);
 
     let config_exists = cfg.client_config_path.exists();
     let managed = config_exists && is_managed(&cfg.client_config_path);
