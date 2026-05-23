@@ -1,5 +1,5 @@
-//! Stable sentry_id flow — one UUID per physical box, persisted under
-//! `${state_dir}/sentry-id.txt`. Generated once on first boot; reused
+//! Stable sentinel_id flow — one UUID per physical box, persisted under
+//! `${state_dir}/sentinel-id.txt`. Generated once on first boot; reused
 //! verbatim on every subsequent register so the same box ends up with
 //! the SAME `client_id` across every LM it talks to.
 //!
@@ -10,14 +10,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-pub const FILE_NAME: &str = "sentry-id.txt";
+pub const FILE_NAME: &str = "sentinel-id.txt";
 
-/// Read or generate a persistent sentry_id under `state_dir`.
+/// Read or generate a persistent sentinel_id under `state_dir`.
 ///
-/// On first call: generates UUID v4, writes `<state_dir>/sentry-id.txt`
+/// On first call: generates UUID v4, writes `<state_dir>/sentinel-id.txt`
 /// atomically (tmp + rename). On every subsequent call: returns the same
 /// id from disk.
-pub fn ensure_sentry_id(state_dir: &Path) -> Result<String> {
+pub fn ensure_sentinel_id(state_dir: &Path) -> Result<String> {
     let path = state_dir.join(FILE_NAME);
     if let Ok(raw) = std::fs::read_to_string(&path) {
         let trimmed = raw.trim();

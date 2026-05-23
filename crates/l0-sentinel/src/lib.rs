@@ -23,7 +23,7 @@ pub mod log_upload;
 pub mod monitor_urls;
 pub mod onboarding;
 pub mod pid_file;
-pub mod sentry_id;
+pub mod sentinel_id;
 pub mod status_server;
 pub mod supervisor;
 pub mod telemetry;
@@ -349,7 +349,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
 
     // WaitingOnboard: block if URL list or bearer is empty. Unlike pre-Stage-3
-    // builds we DO NOT require a static `client_id` — the stable sentry_id
+    // builds we DO NOT require a static `client_id` — the stable sentinel_id
     // flow generates one on first boot under ${state_dir}.
     let creds_ready = effective_urls.iter().any(|u| !u.trim().is_empty())
         && cfg.monitor_api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
@@ -367,12 +367,12 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         std::process::exit(0);
     }
 
-    // Stage 3 stable sentry_id flow: persist UUID v4 under state_dir, then
+    // Stage 3 stable sentinel_id flow: persist UUID v4 under state_dir, then
     // register on every reachable LM so the same physical box ends up with
     // one identical client_id across the mesh.
-    let sentry = sentry_id::ensure_sentry_id(&state_dir)
-        .context("ensure_sentry_id failed")?;
-    info!(sentry_id = %sentry, "[sentinel] stable sentry_id resolved");
+    let sentinel = sentinel_id::ensure_sentinel_id(&state_dir)
+        .context("ensure_sentinel_id failed")?;
+    info!(sentinel_id = %sentinel, "[sentinel] stable sentinel_id resolved");
 
     // Build a plain reqwest client for the Stage 3 HTTP endpoints. We do NOT
     // pin certs here — sentinel runs on user boxes where the monitor's
@@ -389,9 +389,9 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let shortname_owned = cfg
         .shortname
         .clone()
-        .unwrap_or_else(|| sentry.clone());
+        .unwrap_or_else(|| sentinel.clone());
     let reg_body = chain_request::RegisterBody {
-        sentry_id: &sentry,
+        sentinel_id: &sentinel,
         role: &cfg.role,
         shortname: &shortname_owned,
         os: std::env::consts::OS,
@@ -412,9 +412,9 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             return Err(e);
         }
     };
-    if registered_client_id != sentry {
+    if registered_client_id != sentinel {
         warn!(
-            sent = %sentry, got = %registered_client_id,
+            sent = %sentinel, got = %registered_client_id,
             "[sentinel] monitor returned a different client_id; using monitor's value"
         );
     }

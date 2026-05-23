@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Body for `POST /relay/clients` (register).
 #[derive(Debug, Serialize)]
 pub struct RegisterBody<'a> {
-    pub sentry_id: &'a str,
+    pub sentinel_id: &'a str,
     pub role: &'a str,
     pub shortname: &'a str,
     pub os: &'a str,
@@ -31,7 +31,7 @@ pub struct RegisterResponse {
 
 /// Try every URL in `monitor_urls` in order, return the first one that
 /// accepts our registration. On every success the returned `client_id`
-/// should match `sentry_id` (post May-2026 monitor accepts caller id
+/// should match `sentinel_id` (post May-2026 monitor accepts caller id
 /// verbatim). On every failure we move on to the next URL.
 pub async fn register_with_failover(
     http: &Client,

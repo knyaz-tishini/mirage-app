@@ -1,6 +1,6 @@
 # mirage-l0-sentinel — minimal client config.
 #
-# Sentinel is passive: on boot it generates a stable sentry_id, registers
+# Sentinel is passive: on boot it generates a stable sentinel_id, registers
 # with one of `monitor_urls`, and waits for the monitor to push chains
 # over the WebSocket subscription. The monitor decides which chains the
 # client gets based on policy. Operators/debug UIs can also call
@@ -23,7 +23,7 @@ monitor_urls = [
 ]
 monitor_api_key = "<paste Client-role bearer here>"
 
-# State directory — sentry-id.txt, client-id.txt, monitor_urls.json,
+# State directory — sentinel-id.txt, client-id.txt, monitor_urls.json,
 # debug-tunnel.json. Created on first boot.
 state_dir = "C:/ProgramData/mirage/state"
 
