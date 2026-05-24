@@ -3,8 +3,7 @@
 //! verbatim on every subsequent register so the same box ends up with
 //! the SAME `client_id` across every LM it talks to.
 //!
-//! Pattern lifted from the deprecated `crates/_deprecated/sentry/` —
-//! kept lean: one read, one (optional) atomic write.
+//! Same pattern as monitor/node/mshd: UUID v4 minted once, file-based.
 
 use std::path::Path;
 

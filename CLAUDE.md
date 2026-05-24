@@ -71,85 +71,29 @@ Only chains with hardcoded `hop.public_key = Some(hex)` work; chains
 relying on dynamic resolution fail at first dial with `UnknownNode` /
 `BadPubkey`.
 
-## Universal `mirage-sentry` + stable cross-LM identity (May 2026)
+## Stable `sentinel_id` flow (l0-sentinel)
 
-One crate `crates/sentry/` ships as the **universal sentry binary** — same source deploys to every box (9 server-LMs + N client testers). Mode picked at build time via feature flags:
-
-| Feature | `SENTRY_ROLE` const | Where |
-|---|---|---|
-| `client-mode` (default) | `sentry-client` | tester1 Win, tester2 Mac, future end-user clients |
-| `server-lm-mode` | `sentry-server-lm` | each of the 9 LM boxes |
-| `server-node-mode` | `sentry-server-node` | reserved for relay/exit-only nodes |
-
-Build env:
-
-```bash
-SENTRY_SHORTNAME=tester1 cargo build --release -p mirage-sentry           # client (default)
-SENTRY_SHORTNAME=lm-nl-1 cargo build --release -p mirage-sentry \
-    --no-default-features --features server-lm-mode \
-    --target x86_64-unknown-linux-musl
-```
-
-`SENTRY_SHORTNAME` is **required at build** — `env!` macro panics at compile time if missing. Two reasons:
-- Becomes `SENTRY_SHORTNAME` const that sentry sends in register body so operator can identify the box at a glance.
-- Selects `env/local/slavyanka-<shortname>-ed25519` for slavyanka's `include_str!` embed (each binary embeds a *different* SSH private key, popping one tester loses only its own).
-
-Convenience scripts:
-- `scripts/build-musl-sentry.sh <shortname> [feature]` — Docker musl cross-compile per shortname into `nemo/target-build/sentry-<shortname>/`.
-- `scripts/mirage-sentry.service` — Linux systemd unit (root, restart=always).
-- `scripts/com.zengeld.mirage-sentry.plist` — macOS LaunchAgent (`dev` user, KeepAlive).
-
-### Stable `sentry_id` flow
-
-1. First boot: `ensure_sentry_id(state_dir)` reads `${state_dir}/sentry-id.txt`; if missing, generates UUID v4 and writes atomically (tmp + rename). On subsequent boots the same id is reused.
-2. Register on every reachable LM in parallel, sending `{sentry_id, role, shortname, os, version, supported_transports}`. Monitor (post May-2026 schema, see `mirage2monitor/CLAUDE.md`) accepts the caller-supplied `sentry_id` verbatim as `client_id` — so the same physical box ends up with one identical `client_id` across all 9 LMs instead of 9 random UUIDs.
-3. **Stale-state guard**: if persisted `sentry-state.json` was written by a pre-`sentry_id` build (per-LM `client_id` doesn't match `sentry-id.txt`), wipe and re-register so the converged stable id propagates. No manual cache clear on upgrade.
-4. State directory:
+1. First boot: `ensure_sentinel_id(state_dir)` reads `${state_dir}/sentinel-id.txt`; if missing, generates UUID v4 and writes atomically (tmp + rename). On subsequent boots the same id is reused.
+2. Register on every reachable LM in parallel, sending `{sentinel_id, role, shortname, os, version, supported_transports}` on `POST /relay/clients`. Monitor accepts the caller-supplied `sentinel_id` verbatim as `client_id` — same physical box ends up with the same `client_id` across all 9 LMs.
+3. State directory:
    - Linux/root: `/root/.local/share/mirage/`
    - macOS `dev`: `/Users/dev/.local/share/mirage/`
    - Windows: `%LOCALAPPDATA%/mirage/state/`
-5. Operator-side listing: `GET /relay/clients` on any LM returns rows with `role` + `shortname`; same `client_id` appearing on multiple LMs = same physical sentry, just multi-homed.
 
-### Slave-mode (slavyanka)
+The deprecated client-side `mirage-sentry` crate (in `crates/_deprecated/`) and its slavyanka reverse-SSH worker were removed 2026-05-24. Operator-side remote-shell access on client boxes now goes through `mirage-mshd` (operator-issued binary, separate per user — see `mirage2mshd/CLAUDE.md`).
 
-`crates/sentry/` spawns `mirage-slavyanka` as an in-process `tokio::task` (NOT a child binary) on `WsServerFrame::debug_tunnel_open { reverse_port }`. Slavyanka opens reverse SSH from the tester out to the dev-box and asks for a remote-port forward back to its own `127.0.0.1:31337` shell wrapper (`cmd.exe` on Windows / `/bin/sh -i` elsewhere). Operator on dev-box does `nc localhost <reverse_port>` and lands in a shell on the tester.
+## Naming (canonical)
 
-Each sentry embeds its own ed25519 SSH key (`env/local/slavyanka-<shortname>-ed25519`); matching `.pub` must live in dev-box's `~/.ssh/authorized_keys` with a per-shortname comment for auditability.
+In this workspace `sentinel` always means the client-side L0 agent (`mirage-l0-sentinel`). It is NOT the same as:
 
-### Operator triggers slave-mode
+- `sentry` — server-side system scanner in `mirage2monitor/crates/sentry/`. Never lives on client boxes.
+- `mshd` — operator-issued mesh-shell daemon (`mirage2mshd`). May land on a client box, but identity + bootstrap come from `POST /mshd/issue` on operator-box at issuance time — sentinel and mshd never share state or id.
 
-```bash
-. nemo/env/mirage2monitor/mirage2monitor.env
-SID=<sentry_id from /relay/clients>            # 32-byte UUID, same across all LMs
-RP=22500                                       # any unused port on dev-box
-curl -sk -X POST -H "Authorization: Bearer $LM_NL_OPERATOR_KEY" \
-  "https://lm-nl-1.zen-geldmaschine.net:19443/relay/clients/$SID/debug/enable" \
-  -H "Content-Type: application/json" -d "{\"reverse_port\":$RP}"
-# Then on dev-box:
-nc localhost $RP                                # shell drops in
-```
-
-`POST .../debug/disable` ends the session and SIGTERMs slavyanka.
-
-## Sentry / probe terminology (May 2026)
-
-**Sentry** = the always-on monitoring agent on the client; in this workspace that's `mirage-l0-sentinel`. The matching role on a relay/exit **node** is the `mirage2monitor-probe` agent (in the `mirage2monitor` crate) — same concept, two binaries because client and node deployment shapes differ. **Probe** (the noun, distinct from the node-side sentry whose binary happens to be named `mirage2monitor-probe`) = the on-demand SSH-debug worker the sentry spawns when an operator hits the debug API; today's `mirage-debug-shell` binary, conceptually being renamed to `mirage-probe`. From this workspace's perspective only the client-side path matters: monitor pushes `WsServerFrame::DebugTunnelOpen` over the existing WS subscription, sentinel writes `${state_dir}/debug-tunnel.json` and execs the SSH-debug worker. Nodes use a parallel HTTP-driven flow handled entirely on the LM ↔ probe (sentry) leg, documented in `mirage2monitor/CLAUDE.md`.
+Type `mirage_core::ids::SentinelId` covers (1) only. No `SentryId` type exists on the client side.
 
 ## Debug-shell + dynamic monitor URLs (Apr 2026)
 
 New crate `crates/debug-shell/` (`mirage-debug-shell`) — operator-triggered reverse-SSH tunnel. Sentinel reacts to two new WS frames from monitor (`monitor_link::WsServerFrame::DebugTunnelOpen { ssh_priv_key_pem, monitor_ssh_host, reverse_port, ttl_secs, ... }` and `DebugTunnelClose`); on Open it writes `${state_dir}/debug-tunnel.json` and spawns `mirage-debug-shell --config <path>`, on Close it SIGTERMs the child. `sentinel.toml` gains optional `debug_shell_binary` and `state_dir` fields. Same `WsServerFrame::Config` carries a new `peer_lm_urls: Vec<String>` field — sentinel persists it atomically to `${state_dir}/monitor_urls.json` and bootstraps from that file on next start (preferring it over static `monitor_urls`); on every change while running it calls `MonitorLink::reconfigure(...)` to swap the internal URL list. WS frames use the tagged enum `{kind: "config" | "debug_tunnel_open" | "debug_tunnel_close"}` — old monitors that emit untagged config still work via deserializer fallback. WS subscribe URL now carries `?client_id=<id>` query so monitor can route per-client pushes.
-
-## Sentry vs probe — quick reference
-
-In day-to-day usage this workspace deals only with the **client-side** sentry. The two-binary picture across both workspaces:
-
-| Term | Binary | Where it runs | Lifecycle |
-|------|--------|---------------|-----------|
-| Sentry (client) | `mirage-l0-sentinel` | every desktop/mobile client | always-on; subscribes to LM via WS |
-| Sentry (node) | `mirage2monitor-probe` | every relay/exit VPS | always-on; LM polls it over HTTP |
-| Probe (debug worker) | `mirage-debug-shell` (deployed as `/usr/local/bin/mirage-probe`) | spawned by either sentry on demand | short-lived; one process per active reverse-SSH tunnel |
-
-The debug-worker binary is **not** auto-started. Sentries spawn it on `POST /probe/spawn` (node side) or on a `WsServerFrame::DebugTunnelOpen` push (client side); they kill it on the matching disable/close.
 
 ## peer_lm_urls bootstrap order (sentinel)
 
