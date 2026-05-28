@@ -771,6 +771,7 @@ mod tests {
                     display_name: None,
                     camouflage: None,
                     byte_cipher: None,
+                    camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
                 },
                 HopConfig {
@@ -782,6 +783,7 @@ mod tests {
                     display_name: None,
                     camouflage: None,
                     byte_cipher: None,
+                    camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
                 },
             ],
@@ -869,6 +871,7 @@ mod tests {
                     display_name: None,
                     camouflage: None,
                     byte_cipher: None,
+                    camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
                 },
                 HopConfig {
@@ -880,6 +883,7 @@ mod tests {
                     display_name: None,
                     camouflage: None,
                     byte_cipher: None,
+                    camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
                 },
             ],
