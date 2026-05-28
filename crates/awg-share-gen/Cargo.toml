@@ -27,3 +27,4 @@ image        = { version = "0.25", default-features = false, features = ["png"] 
 anyhow       = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core    = { version = "0.6", features = ["std"] }
+mirage-standalone-templates = { workspace = true }

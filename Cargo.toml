@@ -46,3 +46,4 @@ mirage-control-plane = { path = "../mirage2web/crates/mirage-dial-core" }
 mirage-client-core  = { path = "crates/client-core" }
 tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roots"] }
 mirage-runtime-guard    = { path = "crates/runtime-guard" }
+mirage-standalone-templates = { path = "../mirage2web/crates/mirage-standalone-templates" }

@@ -20,6 +20,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Parser;
 use flate2::{write::ZlibEncoder, Compression};
 use image::{ImageBuffer, Luma};
+use mirage_standalone_templates::{AWG_H1, AWG_H2, AWG_H3, AWG_H4, AWG_JC, AWG_JMAX, AWG_JMIN, AWG_S1, AWG_S2};
 use qrcode::QrCode;
 use serde::Serialize;
 use std::{fs, io::Write, path::PathBuf};
@@ -63,16 +64,16 @@ struct Args {
     #[arg(long, default_value = "mirage-awg-test")]
     description: String,
 
-    // ── AmneziaWG obfuscation params — MUST match terminator config ────
-    #[arg(long, default_value_t = 4)]    jc: u32,
-    #[arg(long, default_value_t = 50)]   jmin: u32,
-    #[arg(long, default_value_t = 1000)] jmax: u32,
-    #[arg(long, default_value_t = 1)]    s1: u32,
-    #[arg(long, default_value_t = 2)]    s2: u32,
-    #[arg(long, default_value_t = 1247591134)] h1: u32,
-    #[arg(long, default_value_t = 1797685375)] h2: u32,
-    #[arg(long, default_value_t = 2635015212)] h3: u32,
-    #[arg(long, default_value_t = 3237568913)] h4: u32,
+    // ── AmneziaWG obfuscation params — canonical defaults from mirage-standalone-templates ────
+    #[arg(long, default_value_t = AWG_JC)]   jc: u32,
+    #[arg(long, default_value_t = AWG_JMIN)] jmin: u32,
+    #[arg(long, default_value_t = AWG_JMAX)] jmax: u32,
+    #[arg(long, default_value_t = AWG_S1)]   s1: u32,
+    #[arg(long, default_value_t = AWG_S2)]   s2: u32,
+    #[arg(long, default_value_t = AWG_H1)]   h1: u32,
+    #[arg(long, default_value_t = AWG_H2)]   h2: u32,
+    #[arg(long, default_value_t = AWG_H3)]   h3: u32,
+    #[arg(long, default_value_t = AWG_H4)]   h4: u32,
 
     /// Output directory. Files: phone.conf, vpn-uri.txt, phone-qr.png.
     #[arg(long, default_value = "./out")]
