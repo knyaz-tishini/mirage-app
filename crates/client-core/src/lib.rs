@@ -26,11 +26,12 @@ pub use chain_set::{
 /// Re-export dial primitives so existing call-sites
 /// (`mirage_client_core::tunnel::*`, `mirage_client_core::onion_tunnel::*`,
 /// ...) continue to compile after the dial-stack moved into
-/// [`mirage-dial-core`](https://crates.io/crates/mirage-dial-core) (in-tree
-/// at `mirage2web/crates/mirage-dial-core/`). Keeps cli / sentinel / tun
-/// import paths stable.
-pub use mirage_dial_core::cover_tunnel;
-pub use mirage_dial_core::onion_tunnel;
-pub use mirage_dial_core::shaped_tunnel;
-pub use mirage_dial_core::tunnel;
-pub use mirage_dial_core::udp_framing;
+/// `mirage-control-plane` (in-tree at
+/// `mirage2web/crates/mirage-dial-core/` — folder rename pending IDE
+/// lock release; crate name + lib name already migrated). Keeps cli /
+/// sentinel / tun import paths stable.
+pub use mirage_control_plane::cover_tunnel;
+pub use mirage_control_plane::onion_tunnel;
+pub use mirage_control_plane::shaped_tunnel;
+pub use mirage_control_plane::tunnel;
+pub use mirage_control_plane::udp_framing;
