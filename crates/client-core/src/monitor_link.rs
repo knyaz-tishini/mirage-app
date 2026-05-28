@@ -162,6 +162,29 @@ pub struct DebugTunnelOpen {
     pub ttl_secs: u64,
 }
 
+/// Phase 1.14 (memory wave): graceful chain migration push from a
+/// monitor. The named `chain_id` is now available at the `entry`
+/// host:port; if the sentinel was already using `replaces_chain_id`
+/// it should adopt the new one as secondary and drain the old.
+///
+/// Sentinel-side handling lands in 1.14b/c. For now this just lands
+/// the frame type so the monitor can start emitting without breaking
+/// older sentinels (they ignore unknown frames).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainAvailable {
+    pub chain_id: String,
+    pub entry: ChainAvailableEntry,
+    pub est_score: f64,
+    #[serde(default)]
+    pub replaces_chain_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainAvailableEntry {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Tagged server-to-client WebSocket frame.
 ///
 /// Wire format:
@@ -169,6 +192,7 @@ pub struct DebugTunnelOpen {
 /// { "kind": "config", ... }                    // ConfigResponse fields
 /// { "kind": "debug_tunnel_open", ... }
 /// { "kind": "debug_tunnel_close" }
+/// { "kind": "chain_available", ... }
 /// ```
 ///
 /// Old monitors send the bare `ConfigResponse` (no `kind`); the deserializer
@@ -181,6 +205,8 @@ pub enum WsServerFrame {
     DebugTunnelOpen(DebugTunnelOpen),
     /// Operator wants the active debug tunnel closed.
     DebugTunnelClose,
+    /// Phase 1.14 (memory wave): graceful chain migration hint.
+    ChainAvailable(ChainAvailable),
 }
 
 /// Traffic policy received from the monitor.
@@ -248,6 +274,8 @@ enum TaggedServerFrame {
     Config(ConfigResponse),
     DebugTunnelOpen(DebugTunnelOpen),
     DebugTunnelClose,
+    /// Phase 1.14 (memory wave): graceful chain migration hint.
+    ChainAvailable(ChainAvailable),
     /// App-level Pong echoing a client-sent Ping nonce.
     #[serde(rename = "pong")]
     Pong { nonce: u64 },
@@ -774,6 +802,16 @@ impl MonitorLink {
                                         .frame_tx
                                         .send(Some(WsServerFrame::DebugTunnelClose));
                                 }
+                                Ok(TaggedServerFrame::ChainAvailable(ca)) => {
+                                    info!(
+                                        chain_id = %ca.chain_id,
+                                        est_score = ca.est_score,
+                                        "monitor_link: OverChain ChainAvailable received"
+                                    );
+                                    let _ = self
+                                        .frame_tx
+                                        .send(Some(WsServerFrame::ChainAvailable(ca)));
+                                }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if outstanding_nonce == Some(nonce) {
                                         debug!(nonce, "monitor_link: OverChain app Pong received");
@@ -1022,6 +1060,16 @@ impl MonitorLink {
                                 Ok(TaggedServerFrame::DebugTunnelClose) => {
                                     info!("monitor_link: DebugTunnelClose received");
                                     let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelClose));
+                                }
+                                Ok(TaggedServerFrame::ChainAvailable(ca)) => {
+                                    info!(
+                                        chain_id = %ca.chain_id,
+                                        est_score = ca.est_score,
+                                        "monitor_link: ChainAvailable received"
+                                    );
+                                    let _ = self
+                                        .frame_tx
+                                        .send(Some(WsServerFrame::ChainAvailable(ca)));
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     // App-level Pong: clear outstanding ping if nonce matches.

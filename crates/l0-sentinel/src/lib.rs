@@ -988,6 +988,21 @@ fn spawn_frame_watcher(
                         mgr.close().await;
                     }
                 }
+                WsServerFrame::ChainAvailable(ca) => {
+                    // Phase 1.14a (memory wave): the monitor is telling us
+                    // a freshly built chain has a better score than what
+                    // we're using. Full pool migration / drain-and-swap
+                    // lands in 1.14b/c (cli2 supervisor work). For now
+                    // we just log so live runs surface the signal.
+                    info!(
+                        chain_id = %ca.chain_id,
+                        est_score = ca.est_score,
+                        replaces = ?ca.replaces_chain_id,
+                        entry_host = %ca.entry.host,
+                        entry_port = ca.entry.port,
+                        "[sentinel] ChainAvailable received (pool migration deferred to 1.14b/c)"
+                    );
+                }
             }
         }
     });
