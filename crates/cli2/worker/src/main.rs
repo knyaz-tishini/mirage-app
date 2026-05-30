@@ -28,7 +28,7 @@ use mirage_client_core::{
     socks5::Socks5Server,
 };
 use mirage_core::{
-    config::{ClientConfig, ReplyMode, TcpProtocolId},
+    config::{ClientConfig, ProtocolId, ReplyMode, TcpProtocolId},
     mirage::mesh::PeerTable,
     routing::RoutingTable,
 };
@@ -155,24 +155,48 @@ async fn main() -> anyhow::Result<()> {
     let mesh_id_str = client_config.mesh_id.clone();
     let client_id_str = client_config.client_id.clone();
 
-    // Build protocol chain — single Mirage wire for the entry hop.
+    // Build protocol chain for the entry hop.
+    //
+    // For TCP chains: build a real `ProtocolChain` with the entry-hop camouflage so
+    // `TunnelPool` can call `chain_protocols.connect(...)` on each slot.
+    //
+    // For UDP chains (`chain.protocol == ProtocolId::Udp(_)`): `establish_raw_tunnel`
+    // in mirage-dial-core branches on `chain.protocol` and calls
+    // `establish_udp_chain_tunnel` directly — it never touches `chain_protocols`.
+    // We still need to pass a valid (non-empty) `ProtocolChain` to `TunnelPool::new`
+    // because the API requires it, so we build a TCP placeholder; it is never used.
     let mesh_id = client_config.mesh_id.as_bytes().to_vec();
     use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
     let entry_camouflage = chain.hops.first()
         .and_then(|h| h.camouflage.clone())
         .unwrap_or(TransportCamouflage::None);
     let entry_byte_cipher = chain.hops.first().and_then(|h| h.byte_cipher.clone());
+
+    let is_udp_chain = matches!(chain.protocol, ProtocolId::Udp(_));
+
+    // For TCP chains build the real endpoint config with entry-hop camouflage.
+    // For UDP chains build a TCP placeholder — establish_raw_tunnel exits the
+    // UDP branch before ever calling chain_protocols.connect(), so this config
+    // is never executed for UDP chains.
     let ep_config = MirageEndpointConfig {
         transport: TransportKind::Tcp,
         auth: AuthMode::Blake3,
-        camouflage: entry_camouflage,
+        camouflage: if is_udp_chain { TransportCamouflage::None } else { entry_camouflage },
         byte_cipher: None,
-        byte_cipher_mode: entry_byte_cipher,
+        byte_cipher_mode: if is_udp_chain { None } else { entry_byte_cipher },
     };
     let proto: Box<dyn TcpProtocol> = Box::new(ProtocolEP::new(
         ep_config, TcpProtocolId::Mirage, mesh_id.clone(),
     ));
     let chain_protocols = Arc::new(ProtocolChain::new(vec![proto]));
+
+    if is_udp_chain {
+        info!(
+            chain_id = %chain_id,
+            protocol = %chain.protocol,
+            "UDP chain detected — TunnelPool will use establish_udp_chain_tunnel path"
+        );
+    }
 
     // Build tunnel pool.
     let mut pool_cfg = client_config.pool.clone();
@@ -206,7 +230,8 @@ async fn main() -> anyhow::Result<()> {
     // AEAD-wraps its replies, which OnionTunnel::recv unwraps per layer. Chains with
     // reply=raw never receive AEAD-wrapped replies — their exit byte-pumps raw bytes.
     // Creating a MuxPool for a reply=raw chain causes mux frame garbling → immediate EOF.
-    let chain_wants_mux = client_config.use_mux && chain.reply == ReplyMode::Onion;
+    // UDP chains never use mux — the mux protocol requires a reliable ordered stream.
+    let chain_wants_mux = client_config.use_mux && chain.reply == ReplyMode::Onion && !is_udp_chain;
     let mux_pool_opt: Option<Arc<MuxPool>> = if chain_wants_mux {
         match MuxPool::new(
             chain.clone(),
@@ -220,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(mp)
             }
             Err(e) => {
-                warn!(chain_id = %chain_id, "mux pool init failed, falling back to TCP-only: {e}");
+                warn!(chain_id = %chain_id, "mux pool init failed, falling back to tunnel-pool-only: {e}");
                 None
             }
         }
