@@ -160,8 +160,12 @@ impl TunnelPool {
             join_set.spawn(async move { (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid).await) });
         }
 
-        // Collect until 20% threshold is reached, then return early.
-        let threshold = (pool_size / 5).max(1);
+        // Wait for at least 2 warm slots before returning (or the whole pool if
+        // smaller). The old 20% threshold returned after a single slot, so the
+        // first request raced the background warm-up of the remaining slots and
+        // frequently hit a cold/empty pool (#59). Two warm slots give the first
+        // request a live tunnel plus a spare.
+        let threshold = pool_size.min(2).max(1);
         let mut slots_partial: Vec<(usize, Slot)> = Vec::with_capacity(pool_size);
         let mut ready_count = 0usize;
 
@@ -201,7 +205,7 @@ impl TunnelPool {
             ready = ready_count,
             total = pool_size,
             threshold,
-            "pool ready at threshold, remaining slots warming in background"
+            "pool ready (≥2-slot threshold), remaining slots warming in background"
         );
 
         let available = Arc::new(Notify::new());

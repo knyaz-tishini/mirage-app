@@ -245,7 +245,8 @@ impl MuxPool {
             join_set.spawn(async move { (idx, build_session(&cp, &ch, &pt, &mid).await) });
         }
 
-        let threshold = (pool_size / 5).max(1);
+        // Wait for at least 2 warm slots before returning (mirrors TunnelPool #59 fix).
+        let threshold = pool_size.min(2).max(1);
         let mut slots: Vec<(usize, SessionSlot)> = Vec::with_capacity(pool_size);
         let mut ready_count = 0usize;
 

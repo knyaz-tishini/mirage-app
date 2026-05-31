@@ -243,24 +243,8 @@ async fn handle_socks5_simple(
             let target_addr = dest.to_addr_string();
             debug!(target = %target_addr, "routing decision: chain (simple)");
 
-            let mut lease = pool.lease().await?;
-            let send_result = if lease.is_onion {
-                let target_bytes = target_addr.as_bytes();
-                let len_prefix = (target_bytes.len() as u16).to_be_bytes();
-                let mut framed = Vec::with_capacity(2 + target_bytes.len());
-                framed.extend_from_slice(&len_prefix);
-                framed.extend_from_slice(target_bytes);
-                lease.send(&framed).await
-            } else {
-                lease.send(target_addr.as_bytes()).await
-            };
-            if let Err(e) = send_result {
-                lease.poison();
-                return Err(e);
-            }
-
+            let mut lease = lease_and_send_target(&pool, &target_addr, LEASE_SEND_MAX_ATTEMPTS).await?;
             send_socks5_success(&mut stream).await?;
-
             lease.set_relay_active(true);
             let tunnel = lease.take_tunnel().ok_or(MirageError::TunnelClosed)?;
             let mut compat = TunnelCompat::wrap(tunnel);
@@ -281,6 +265,59 @@ async fn handle_socks5_simple(
             )))
         }
     }
+}
+
+/// How many times to retry the lease+send-target sequence before giving up.
+/// Retries are safe (pre-SOCKS5-success, idempotent) and absorb cold-pool /
+/// single-use-tunnel first-request flakiness.
+const LEASE_SEND_MAX_ATTEMPTS: u32 = 3;
+
+/// Lease a tunnel and send the target address, retrying the whole
+/// lease+send sequence on failure. This is safe to retry because it runs
+/// entirely BEFORE SOCKS5 success is sent to the client (no guest bytes
+/// have flowed yet). Returns a lease with the target address already sent,
+/// ready for the caller to send SOCKS5 success + enter the relay loop.
+/// De-flakes cold-pool / single-use-tunnel first-request failures (#59).
+async fn lease_and_send_target(
+    pool: &Arc<TunnelPool>,
+    target_addr: &str,
+    max_attempts: u32,
+) -> Result<crate::pool::TunnelLease, MirageError> {
+    let mut last_err = MirageError::PoolExhausted;
+    for attempt in 0..max_attempts {
+        let mut lease = match pool.lease().await {
+            Ok(l) => l,
+            Err(e) => {
+                last_err = e;
+                // brief backoff to let the pool warm a slot, then retry
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt as u64 + 1))).await;
+                continue;
+            }
+        };
+        let send_result = if lease.is_onion {
+            let target_bytes = target_addr.as_bytes();
+            let len_prefix = (target_bytes.len() as u16).to_be_bytes();
+            let mut framed = Vec::with_capacity(2 + target_bytes.len());
+            framed.extend_from_slice(&len_prefix);
+            framed.extend_from_slice(target_bytes);
+            lease.send(&framed).await
+        } else {
+            lease.send(target_addr.as_bytes()).await
+        };
+        match send_result {
+            Ok(()) => return Ok(lease),
+            Err(e) => {
+                // dead/stale tunnel — poison it so the pool rebuilds, retry
+                lease.poison();
+                drop(lease);
+                last_err = e;
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt as u64 + 1))).await;
+                continue;
+            }
+        }
+    }
+    warn!(target = %target_addr, attempts = max_attempts, error = %last_err, "lease_and_send_target: all attempts failed");
+    Err(last_err)
 }
 
 /// Lease a tunnel from the primary pool, falling over to other chains when
@@ -546,29 +583,45 @@ async fn route_direct(
 
 /// Lease a pre-warmed tunnel from the pool (with failover), send the target
 /// address, then relay.
+///
+/// Primary pool is tried with `LEASE_SEND_MAX_ATTEMPTS` retries (absorbs
+/// cold-pool / single-use-tunnel flakiness, #59). On exhaustion, each
+/// failover pool is tried once in priority order.
 async fn route_via_pool_with_failover(
     client: &mut TcpStream,
     pool: Arc<TunnelPool>,
     failover: &[(String, Arc<TunnelPool>)],
     target_addr: &str,
 ) -> Result<(), MirageError> {
-    let mut lease = lease_with_failover(&pool, failover).await?;
-
-    let send_result = if lease.is_onion {
-        let target_bytes = target_addr.as_bytes();
-        let len_prefix = (target_bytes.len() as u16).to_be_bytes();
-        let mut framed = Vec::with_capacity(2 + target_bytes.len());
-        framed.extend_from_slice(&len_prefix);
-        framed.extend_from_slice(target_bytes);
-        lease.send(&framed).await
-    } else {
-        lease.send(target_addr.as_bytes()).await
+    // Try the primary pool with bounded retry.
+    let lease_result = lease_and_send_target(&pool, target_addr, LEASE_SEND_MAX_ATTEMPTS).await;
+    let mut lease = match lease_result {
+        Ok(l) => l,
+        Err(primary_err) => {
+            warn!(error = %primary_err, "primary pool exhausted after retries, trying failover");
+            // Try each failover pool once (1 attempt each — multiple fallbacks give inherent retry).
+            let mut last_err = primary_err;
+            let mut found: Option<crate::pool::TunnelLease> = None;
+            for (chain_id, fo_pool) in failover {
+                warn!(chain = %chain_id, "failing over to chain");
+                match lease_and_send_target(fo_pool, target_addr, 1).await {
+                    Ok(l) => {
+                        info!(chain = %chain_id, "failover: using chain");
+                        found = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(chain = %chain_id, error = %e, "failover chain also failed");
+                        last_err = e;
+                    }
+                }
+            }
+            match found {
+                Some(l) => l,
+                None => return Err(last_err),
+            }
+        }
     };
-
-    if let Err(e) = send_result {
-        lease.poison();
-        return Err(e);
-    }
 
     send_socks5_success(client).await?;
 
