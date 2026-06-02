@@ -2573,6 +2573,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2 0.5.10",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
@@ -2581,6 +2582,7 @@ dependencies = [
  "windows-sys 0.59.0",
  "winreg 0.52.0",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -2711,6 +2713,7 @@ dependencies = [
  "futures-util",
  "h3",
  "h3-quinn",
+ "hex",
  "hkdf",
  "http",
  "md-5",
@@ -2725,12 +2728,14 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2 0.5.10",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

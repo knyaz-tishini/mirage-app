@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let proto: Box<dyn TcpProtocol> = Box::new(ProtocolEP::new(
         ep_config, TcpProtocolId::Mirage, mesh_id.clone(),
-    ));
+    ).with_wire_version(9));
     let chain_protocols = Arc::new(ProtocolChain::new(vec![proto]));
 
     if is_udp_chain {

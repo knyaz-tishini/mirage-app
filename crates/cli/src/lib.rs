@@ -700,6 +700,6 @@ fn build_chain_protocol_chain(
         endpoint,
         proto_id,
         mesh_id.to_vec(),
-    )));
+    ).with_wire_version(9)));
     Ok(ProtocolChain::new(protocols))
 }
