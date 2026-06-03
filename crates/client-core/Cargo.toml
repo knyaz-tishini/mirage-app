@@ -28,6 +28,8 @@ bytes                = { workspace = true }
 tokio-tungstenite    = { workspace = true }
 dashmap              = "5"
 ipnet                = "2"
+mirage-mesh-client   = { workspace = true }
+hex                  = "0.4"
 
 # Linux-only: transparent.rs uses libc::getsockopt for SO_ORIGINAL_DST.
 # Windows/macOS builds compile this module out via cfg(target_os="linux").

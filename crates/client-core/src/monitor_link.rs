@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::{
     connect_async_tls_with_config,
-    tungstenite::{client::IntoClientRequest, Message},
+    tungstenite::{client::IntoClientRequest, http::header, http::Request, Message},
 };
 use tracing::{debug, info, warn};
 
@@ -87,8 +87,8 @@ fn default_chain_id() -> ChainId {
 
 /// How to reach the monitor control plane.
 ///
-/// A [`MonitorLink`] accepts a list of transports; they are probed in order
-/// with DirectWs always preferred over OverChain.
+/// A [`MonitorLink`] accepts a list of transports; they are probed in order.
+/// Priority: `Wire` > `DirectWs` > `OverChain`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum MonitorTransport {
@@ -125,6 +125,36 @@ pub enum MonitorTransport {
         /// Kept for backward compat with logs / metrics. Not used for dial.
         #[serde(default = "default_chain_id")]
         chain_id: ChainId,
+    },
+    /// Direct Mirage-wire WebSocket — the sentinel dials the monitor's
+    /// wire endpoint (`:19444`) using an ephemeral X25519 client key,
+    /// performs the V9 Mirage AEAD handshake (anonymous, no
+    /// `DeclaredIdentity`), then upgrades to WebSocket over the resulting
+    /// tunnel.
+    ///
+    /// No `Authorization: Bearer` header is sent — the Mirage wire already
+    /// provides E2E encryption and mutual forward-secret auth. The
+    /// `/relay/clients/subscribe` endpoint is unauthenticated on the monitor
+    /// side (rate-limited only), so this works without any bearer token.
+    ///
+    /// `monitor_addr` — IP:port of the monitor's wire listener, e.g.
+    /// `"103.231.75.144:19444"`.
+    ///
+    /// `monitor_pubkey_hex` — 64-character hex of the monitor's static
+    /// X25519 public key (fetched from `GET /relay/me` on first boot or
+    /// set in `sentinel.toml`).
+    ///
+    /// `mesh_id` — cluster identifier baked into the V9 handshake confirm,
+    /// e.g. `"v3-staging"`.
+    ///
+    /// `host_hint` — optional hostname used as the HTTP `Host:` header on the
+    /// WS upgrade request (defaults to the IP portion of `monitor_addr`).
+    Wire {
+        monitor_addr: String,
+        monitor_pubkey_hex: String,
+        mesh_id: String,
+        #[serde(default)]
+        host_hint: Option<String>,
     },
 }
 
@@ -319,6 +349,47 @@ fn default_poll_interval() -> u64 {
     30
 }
 
+/// Decoded parameters for a [`MonitorTransport::Wire`] dial.
+///
+/// Cloned out of the transport list so it can be passed to async methods
+/// without holding a reference into `self.transports`.
+#[derive(Debug, Clone)]
+struct WireParams {
+    monitor_addr: String,
+    monitor_pubkey_hex: String,
+    mesh_id: String,
+    host_hint: Option<String>,
+}
+
+/// Generate a random base64-encoded 16-byte WebSocket `Sec-WebSocket-Key`.
+///
+/// Per RFC 6455 §4.1 the key must be 16 bytes of entropy base64-encoded.
+fn random_sec_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    base64_encode(&bytes)
+}
+
+/// Minimal base64 encoder (standard alphabet, with padding) for the 16-byte
+/// WS key. Avoids pulling in an extra `base64` dep — the calculation is
+/// trivial for a fixed 16-byte input.
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let combined = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((combined >> 18) & 0x3f) as usize]);
+        out.push(TABLE[((combined >> 12) & 0x3f) as usize]);
+        out.push(if chunk.len() > 1 { TABLE[((combined >> 6) & 0x3f) as usize] } else { b'=' });
+        out.push(if chunk.len() > 2 { TABLE[(combined & 0x3f) as usize] } else { b'=' });
+    }
+    String::from_utf8(out).expect("base64 output is always valid ASCII")
+}
+
 #[derive(Debug, Deserialize)]
 struct ChainEntry {
     #[serde(flatten)]
@@ -410,6 +481,12 @@ pub struct MonitorLink {
     transports: Vec<MonitorTransport>,
     /// Chain set used to open OverChain connections.
     chain_set: Arc<ChainSet>,
+    /// Ephemeral X25519 private key generated at construction.
+    ///
+    /// Used as the client-side static key for the Mirage V9 wire handshake
+    /// when connecting over a [`MonitorTransport::Wire`] transport. Ephemeral
+    /// per-process (not persisted) — clients are anonymous on the wire plane.
+    ephemeral_client_priv: [u8; 32],
 }
 
 impl MonitorLink {
@@ -485,6 +562,16 @@ impl MonitorLink {
             .build()
             .expect("reqwest::Client construction is infallible with these settings");
 
+        // Generate a fresh ephemeral X25519 private key for Wire transport dials.
+        // This key is used for the Mirage V9 client-static handshake slot.
+        // Clients are anonymous (no DeclaredIdentity) — the key is ephemeral per process.
+        let ephemeral_client_priv: [u8; 32] = {
+            use rand::RngCore;
+            let mut key = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut key);
+            key
+        };
+
         let link = Arc::new(Self {
             monitor_urls: Mutex::new(monitor_urls),
             monitor_api_key,
@@ -501,6 +588,7 @@ impl MonitorLink {
             credential_params,
             transports,
             chain_set,
+            ephemeral_client_priv,
         });
 
         (link, config_rx)
@@ -560,6 +648,16 @@ impl MonitorLink {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     async fn run(&self) {
+        // If a Wire transport is configured, try it first (preferred over DirectWs).
+        // Wire transport has no URL to "race" — it dials the monitor's wire addr directly.
+        if let Some(wire) = self.wire_transport() {
+            info!("monitor_link: Wire transport configured — attempting Mirage wire WS");
+            match self.run_wire_loop(&wire).await {
+                Ok(()) => info!("monitor_link: Wire WS closed cleanly, falling through to DirectWs"),
+                Err(e) => warn!("monitor_link: Wire WS failed ({e}), falling through to DirectWs"),
+            }
+        }
+
         // Race all URLs; register against winner.
         match self.race_urls().await {
             Ok(url) => info!("monitor_link: active_url={}", url),
@@ -590,6 +688,15 @@ impl MonitorLink {
                     self.send_heartbeat().await;
                 }
                 _ = tokio::time::sleep_until(ws_retry_deadline) => {
+                    // Try Wire transport first on every retry cycle (it's self-contained,
+                    // no URL-race needed).
+                    if let Some(wire) = self.wire_transport() {
+                        info!("monitor_link: retrying Wire transport");
+                        match self.run_wire_loop(&wire).await {
+                            Ok(()) => info!("monitor_link: Wire WS retry closed cleanly"),
+                            Err(e) => warn!("monitor_link: Wire WS retry failed ({e})"),
+                        }
+                    }
                     // Re-race before WS reconnect.
                     match self.race_urls().await {
                         Ok(url) => info!("monitor_link: re-race winner={}", url),
@@ -623,6 +730,273 @@ impl MonitorLink {
         self.transports
             .iter()
             .any(|t| matches!(t, MonitorTransport::OverChain { .. }))
+    }
+
+    /// Return the first `Wire` transport params, if any.
+    fn wire_transport(&self) -> Option<WireParams> {
+        for t in &self.transports {
+            if let MonitorTransport::Wire {
+                monitor_addr,
+                monitor_pubkey_hex,
+                mesh_id,
+                host_hint,
+            } = t
+            {
+                return Some(WireParams {
+                    monitor_addr: monitor_addr.clone(),
+                    monitor_pubkey_hex: monitor_pubkey_hex.clone(),
+                    mesh_id: mesh_id.clone(),
+                    host_hint: host_hint.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Drive a Mirage-wire WebSocket subscribe connection.
+    ///
+    /// Dials the monitor's V9 wire endpoint (`:19444`), wraps the resulting
+    /// Mirage tunnel as `AsyncRead+AsyncWrite` via [`tunnel_into_io`], then
+    /// upgrades to WebSocket over that IO with a `ws://` URI.
+    ///
+    /// No bearer token is sent — the monitor's `/relay/clients/subscribe`
+    /// is unauthenticated (rate-limited only). The Mirage wire already
+    /// provides E2E encryption and mutual forward-secret auth.
+    ///
+    /// The frame receive loop is identical to [`run_ws_loop`] — same
+    /// `TaggedServerFrame` dispatch, same keepalive strategy.
+    async fn run_wire_loop(&self, wire: &WireParams) -> Result<(), String> {
+        use futures::{SinkExt, StreamExt};
+        use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportKind};
+        use mirage_protocol::driver::run_client_tcp_v9;
+
+        // Decode the monitor's static public key.
+        let server_static_pub: [u8; 32] = hex::decode(&wire.monitor_pubkey_hex)
+            .map_err(|e| format!("Wire: decode monitor_pubkey_hex '{}': {e}", wire.monitor_pubkey_hex))?
+            .try_into()
+            .map_err(|_| format!("Wire: monitor_pubkey_hex must be 32 bytes: '{}'", wire.monitor_pubkey_hex))?;
+
+        let server_addr: SocketAddr = wire
+            .monitor_addr
+            .parse()
+            .map_err(|e| format!("Wire: parse monitor_addr '{}': {e}", wire.monitor_addr))?;
+
+        // SNI = host portion of monitor_addr (IP or hostname without port).
+        let sni = wire
+            .host_hint
+            .as_deref()
+            .or_else(|| wire.monitor_addr.rsplit_once(':').map(|(h, _)| h))
+            .unwrap_or(wire.monitor_addr.as_str())
+            .to_string();
+
+        // Dial V9 — anonymous ephemeral client, no DeclaredIdentity, no credential.
+        let config = MirageEndpointConfig {
+            transport: TransportKind::Tcp,
+            auth: AuthMode::Blake3,
+            camouflage: mirage_core::config::TransportCamouflage::None,
+            byte_cipher: None,
+            byte_cipher_mode: None,
+        };
+
+        info!(
+            addr = %wire.monitor_addr,
+            mesh_id = %wire.mesh_id,
+            "monitor_link: Wire — dialing monitor V9"
+        );
+
+        let tunnel = run_client_tcp_v9(
+            &config,
+            server_addr,
+            &server_static_pub,
+            &self.ephemeral_client_priv,
+            &sni,
+            wire.mesh_id.as_bytes(),
+            None, // anonymous client — no credential
+        )
+        .await
+        .map_err(|e| format!("Wire: V9 dial failed: {e}"))?;
+
+        info!("monitor_link: Wire — V9 dial succeeded, upgrading to WS");
+
+        let (io, _pump) = mirage_mesh_client::tunnel_into_io(tunnel);
+
+        // Determine client_id for the subscribe URL.
+        let cid = self.client_id.lock().await.clone();
+        let host = &sni;
+        let subscribe_path = match cid {
+            Some(ref id) => format!("/relay/clients/subscribe?client_id={id}"),
+            None => "/relay/clients/subscribe".to_string(),
+        };
+        // ws:// scheme — the Mirage tunnel already provides E2E encryption.
+        // TLS on top would be redundant double-encryption (same as node pattern).
+        let ws_uri = format!("ws://{host}{subscribe_path}");
+
+        // Build WS upgrade request — NO Authorization header (subscribe is unauthenticated).
+        let request = Request::builder()
+            .method("GET")
+            .uri(&ws_uri)
+            .header(header::HOST, host.as_str())
+            .header("upgrade", "websocket")
+            .header("connection", "upgrade")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", random_sec_key())
+            .body(())
+            .map_err(|e| format!("Wire: build WS request: {e}"))?;
+
+        let (ws_stream, _resp) = tokio_tungstenite::client_async(request, io)
+            .await
+            .map_err(|e| format!("Wire: WS upgrade failed: {e}"))?;
+
+        info!("monitor_link: state → Connected (Wire WebSocket)");
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Keepalive strategy mirrors run_ws_loop exactly.
+        let ping_interval_dur = Duration::from_secs(10);
+        let pong_timeout = Duration::from_secs(15);
+        let mut ping_ticker = tokio::time::interval(ping_interval_dur);
+        let mut app_ping_counter: u64 = 0;
+        let mut app_ping_nonce: Option<u64> = None;
+        let mut app_ping_sent_at: Option<tokio::time::Instant> = None;
+        let mut last_pong_at = tokio::time::Instant::now();
+        let mut last_ws_pong = tokio::time::Instant::now();
+        let mut ws_ping_outstanding_since: Option<tokio::time::Instant> = None;
+
+        loop {
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            match parse_ws_frame(&text) {
+                                Ok(TaggedServerFrame::Config(cfg)) => {
+                                    debug!(
+                                        version = cfg.version,
+                                        chains = cfg.chains.len(),
+                                        "monitor_link: Wire config push received"
+                                    );
+                                    self.apply_config(cfg);
+                                }
+                                Ok(TaggedServerFrame::DebugTunnelOpen(payload)) => {
+                                    info!(
+                                        "monitor_link: Wire DebugTunnelOpen (host={}, port={}, ttl={}s)",
+                                        payload.monitor_ssh_host,
+                                        payload.reverse_port,
+                                        payload.ttl_secs,
+                                    );
+                                    let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelOpen(payload)));
+                                }
+                                Ok(TaggedServerFrame::DebugTunnelClose) => {
+                                    info!("monitor_link: Wire DebugTunnelClose received");
+                                    let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelClose));
+                                }
+                                Ok(TaggedServerFrame::ChainAvailable(ca)) => {
+                                    info!(
+                                        chain_id = %ca.chain_id,
+                                        est_score = ca.est_score,
+                                        "monitor_link: Wire ChainAvailable received"
+                                    );
+                                    let _ = self.frame_tx.send(Some(WsServerFrame::ChainAvailable(ca)));
+                                }
+                                Ok(TaggedServerFrame::CredentialParams(params)) => {
+                                    let generation = params.generation;
+                                    self.credential_params.store(Arc::new(Some(params)));
+                                    debug!(generation, "monitor_link: Wire CredentialParams updated");
+                                }
+                                Ok(TaggedServerFrame::Pong { nonce }) => {
+                                    if app_ping_nonce == Some(nonce) {
+                                        debug!(nonce, "monitor_link: Wire app Pong received");
+                                        app_ping_nonce = None;
+                                        app_ping_sent_at = None;
+                                        last_pong_at = tokio::time::Instant::now();
+                                    } else {
+                                        debug!(nonce, "monitor_link: Wire stale/unexpected Pong nonce");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("monitor_link: Wire frame parse error: {e}");
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(_))) => {
+                            // tungstenite auto-responds with Pong.
+                        }
+                        Some(Ok(Message::Pong(_))) => {
+                            last_ws_pong = tokio::time::Instant::now();
+                            ws_ping_outstanding_since = None;
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            info!("monitor_link: Wire WebSocket closed by server");
+                            return Ok(());
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            return Err(format!("Wire WS stream error: {e}"));
+                        }
+                    }
+                }
+
+                _ = ping_ticker.tick() => {
+                    let now = tokio::time::Instant::now();
+
+                    if let Some(sent_at) = app_ping_sent_at {
+                        if now.duration_since(sent_at) > pong_timeout {
+                            return Err(format!(
+                                "monitor_link: Wire app pong timeout: no Pong for {:?}",
+                                now.duration_since(sent_at)
+                            ));
+                        }
+                    }
+                    if let Some(sent_at) = ws_ping_outstanding_since {
+                        if now.duration_since(sent_at) > pong_timeout {
+                            return Err(format!(
+                                "monitor_link: Wire WS pong timeout: no WS Pong for {:?}",
+                                now.duration_since(sent_at)
+                            ));
+                        }
+                    }
+                    if last_pong_at.elapsed() > ping_interval_dur + pong_timeout {
+                        return Err(format!(
+                            "monitor_link: Wire app pong idle: no Pong for {:?}",
+                            last_pong_at.elapsed()
+                        ));
+                    }
+                    if last_ws_pong.elapsed() > ping_interval_dur + pong_timeout {
+                        return Err(format!(
+                            "monitor_link: Wire WS pong idle: no WS Pong for {:?}",
+                            last_ws_pong.elapsed()
+                        ));
+                    }
+
+                    app_ping_counter += 1;
+                    let nonce = app_ping_counter;
+                    let ping_json = match serde_json::to_string(&TaggedClientFrame::Ping { nonce }) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return Err(format!("monitor_link: Wire failed to serialize Ping: {e}"));
+                        }
+                    };
+                    match write.send(Message::Text(ping_json.into())).await {
+                        Ok(()) => {
+                            app_ping_nonce = Some(nonce);
+                            app_ping_sent_at = Some(now);
+                        }
+                        Err(e) => {
+                            return Err(format!("monitor_link: Wire app Ping send failed: {e}"));
+                        }
+                    }
+                    match write.send(Message::Ping(vec![])).await {
+                        Ok(()) => {
+                            if ws_ping_outstanding_since.is_none() {
+                                ws_ping_outstanding_since = Some(now);
+                            }
+                        }
+                        Err(e) => {
+                            return Err(format!("monitor_link: Wire WS Ping send failed: {e}"));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Drive the OverChain fallback loop.

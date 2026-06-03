@@ -33,7 +33,7 @@ use crash_report::{report_crash, spawn_queue_drain};
 use status_server::{MonitorInfo, TunSpawnCfg, reboot_channel};
 use supervisor::{
     adopt_child, build_crash_report, cli_may_respawn, kill_tun, log_crash, record_cli_respawn,
-    resolve_supervisor_binary, spawn_child, spawn_child_with_flags, ChildState,
+    resolve_supervisor_binary, spawn_child, ChildState,
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
 };
 
@@ -146,6 +146,22 @@ pub struct SentinelConfig {
     /// `"v3-staging"` to match the current staging mesh.
     #[serde(default = "default_mesh_id")]
     pub mesh_id: String,
+    /// IP:port of the monitor's Mirage wire listener, e.g. `"103.231.75.144:19444"`.
+    ///
+    /// When both `monitor_wire_addr` and `monitor_wire_pubkey_hex` are set, the
+    /// sentinel builds a [`MonitorTransport::Wire`] entry and passes it to
+    /// `MonitorLink` alongside the regular `DirectWs` transports. `Wire` is
+    /// attempted first (preferred over HTTPS/WSS). `monitor_api_key` becomes
+    /// optional when wire is configured — the Mirage wire handshake provides
+    /// mutual authentication without a bearer token.
+    #[serde(default)]
+    pub monitor_wire_addr: Option<String>,
+    /// 64-character hex of the monitor's static X25519 public key.
+    ///
+    /// Obtain via `GET <monitor_url>/relay/me` → field `pubkey_hex`, or from
+    /// the operator-box inventory.  Required when `monitor_wire_addr` is set.
+    #[serde(default)]
+    pub monitor_wire_pubkey_hex: Option<String>,
     /// Human label that surfaces in /relay/clients responses
     /// (`sentry-XXX`). Hardcoded per build profile or set in toml.
     #[serde(default)]
@@ -467,21 +483,41 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let _sentinel_peer_table: Arc<ArcSwap<PeerTable>> =
         Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
     // Build DirectWs transports from the effective URL list.
-    let direct_ws_transports: Vec<MonitorTransport> = effective_urls
-        .iter()
-        .map(|url| MonitorTransport::DirectWs {
+    let mut transports: Vec<MonitorTransport> = Vec::new();
+
+    // Wire transport — preferred when both addr + pubkey are configured.
+    // No bearer needed: the Mirage V9 handshake provides mutual auth.
+    if let (Some(wire_addr), Some(wire_pubkey)) = (
+        cfg.monitor_wire_addr.clone(),
+        cfg.monitor_wire_pubkey_hex.clone(),
+    ) {
+        info!(
+            "[sentinel] Wire transport configured: addr={} (mesh_id={})",
+            wire_addr, cfg.mesh_id
+        );
+        transports.push(MonitorTransport::Wire {
+            monitor_addr: wire_addr,
+            monitor_pubkey_hex: wire_pubkey,
+            mesh_id: cfg.mesh_id.clone(),
+            host_hint: None,
+        });
+    }
+
+    // DirectWs transports (fallback, or primary when Wire is absent).
+    for url in &effective_urls {
+        transports.push(MonitorTransport::DirectWs {
             url: url.clone(),
             sni: None,
-        })
-        .collect();
+        });
+    }
 
     let (link, mut config_rx) = MonitorLink::new(
         effective_urls.clone(),
         Some(monitor_api_key.clone()),
         Arc::clone(&_sentinel_peer_table),
         ChainSet::empty(),
-        direct_ws_transports,
-        String::new(),
+        transports,
+        cfg.mesh_id.clone(),
         client_id.clone(),
     );
     link.spawn();

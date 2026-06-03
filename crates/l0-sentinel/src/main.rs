@@ -2,7 +2,6 @@
 //!
 //! Parses CLI args, reads sentinel TOML, delegates to [`mirage_l0_sentinel::run`].
 
-use std::error::Error as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};

@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::onboarding::{OnboardRequest, default_toml_path, log_onboard_result, patch_sentinel_toml};
 use crate::pid_file;
 use crate::supervisor::{
-    ChildHandle, ChildState, ChildStatus, kill_tun, resolve_tun_binary, spawn_child_with_flags,
+    ChildHandle, ChildState, ChildStatus, kill_tun, resolve_tun_binary,
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
 };
 use crate::SentinelPhase;
