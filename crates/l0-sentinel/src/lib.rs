@@ -1003,6 +1003,15 @@ fn spawn_frame_watcher(
                         "[sentinel] ChainAvailable received (pool migration deferred to 1.14b/c)"
                     );
                 }
+                WsServerFrame::CredentialParams(_) => {
+                    // Anon-credential epoch secrets are consumed inside MonitorLink
+                    // (stored in its credential_params ArcSwap, shared with the
+                    // cli's TunnelPool/MuxPool for per-dial token minting).
+                    // Sentinel itself does not dial, so nothing to do here.
+                    tracing::debug!(
+                        "[sentinel] CredentialParams frame observed (handled by MonitorLink)"
+                    );
+                }
             }
         }
     });
