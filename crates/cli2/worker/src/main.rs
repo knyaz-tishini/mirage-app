@@ -154,6 +154,9 @@ async fn main() -> anyhow::Result<()> {
     // Capture mesh_id and client_id as strings for MonitorLink FRAME_AUTH.
     let mesh_id_str = client_config.mesh_id.clone();
     let client_id_str = client_config.client_id.clone();
+    // Wire transport fields from ClientConfig (task #78).
+    let wire_addr_str = client_config.monitor_wire_addr.clone();
+    let wire_pubkey_str = client_config.monitor_wire_pubkey_hex.clone();
 
     // Build protocol chain for the entry hop.
     //
@@ -337,6 +340,8 @@ async fn main() -> anyhow::Result<()> {
         outgoing_tx,
         outgoing_rx,
         orphan_timeout_secs,
+        wire_addr_str,
+        wire_pubkey_str,
     )
     .await;
 
@@ -373,6 +378,8 @@ async fn supervisor_loop(
     outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
     mut outgoing_rx: mpsc::Receiver<WorkerMsg>,
     orphan_timeout_secs: u64,
+    wire_addr: Option<String>,
+    wire_pubkey: Option<String>,
 ) -> anyhow::Result<()> {
     let mut ipc = initial_ipc;
 
@@ -392,6 +399,8 @@ async fn supervisor_loop(
             Arc::clone(&outgoing_tx),
             &mut outgoing_rx,
             &stop_tx,
+            wire_addr.clone(),
+            wire_pubkey.clone(),
         )
         .await;
 
@@ -496,6 +505,8 @@ async fn handle_session(
     outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
     outgoing_rx: &mut mpsc::Receiver<WorkerMsg>,
     stop_tx: &watch::Sender<bool>,
+    wire_addr: Option<String>,
+    wire_pubkey: Option<String>,
 ) -> SessionEnd {
     loop {
         tokio::select! {
@@ -563,6 +574,8 @@ async fn handle_session(
                     mux_pool_opt.as_ref().map(Arc::clone),
                     chain_cfg.clone(),
                     Arc::clone(&outgoing_tx),
+                    wire_addr.clone(),
+                    wire_pubkey.clone(),
                 );
             }
             Ok(Some(SupervisorMsg::Drain { timeout_secs })) => {
@@ -664,6 +677,8 @@ fn spawn_monitor_link_in_worker(
     mux_pool_opt: Option<Arc<MuxPool>>,
     chain_cfg: mirage_core::config::ChainConfig,
     outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
+    wire_addr: Option<String>,
+    wire_pubkey: Option<String>,
 ) {
     // Parse transport specs from JSON.
     let transport_specs: Vec<MonitorTransportSpec> = match serde_json::from_str(&transports_json) {
@@ -704,21 +719,53 @@ fn spawn_monitor_link_in_worker(
     });
 
     // Convert MonitorTransportSpec → MonitorTransport.
-    let transports: Vec<MonitorTransport> = transport_specs
-        .into_iter()
-        .map(|spec| match spec {
+    // Wire transport from ClientConfig fields is prepended first (preferred).
+    let mut transports: Vec<MonitorTransport> = Vec::new();
+
+    // Prepend Wire from ClientConfig.monitor_wire_addr / monitor_wire_pubkey_hex
+    // when both are present. This is the primary Wire source for the cli2 worker
+    // path (mirrors the l0-sentinel construction in SentinelConfig).
+    if let (Some(ref wa), Some(ref wp)) = (&wire_addr, &wire_pubkey) {
+        info!(
+            chain_id,
+            addr = %wa,
+            "worker: Wire transport configured from ClientConfig — prepending to MonitorLink transports"
+        );
+        transports.push(MonitorTransport::Wire {
+            monitor_addr: wa.clone(),
+            monitor_pubkey_hex: wp.clone(),
+            mesh_id: mesh_id.clone(),
+            host_hint: None,
+        });
+    }
+
+    for spec in transport_specs {
+        match spec {
             MonitorTransportSpec::DirectWs { url, sni } => {
-                MonitorTransport::DirectWs { url, sni }
+                transports.push(MonitorTransport::DirectWs { url, sni });
             }
             MonitorTransportSpec::OverChain { worker_socks5, monitor_addr, chain_id: cid } => {
-                MonitorTransport::OverChain {
+                transports.push(MonitorTransport::OverChain {
                     worker_socks5,
                     monitor_addr,
                     chain_id: ChainId(cid),
+                });
+            }
+            MonitorTransportSpec::Wire { monitor_addr, monitor_pubkey_hex, mesh_id: mid } => {
+                // Wire from supervisor transports_json — only add if not already
+                // covered by the ClientConfig flat fields (avoid duplicate).
+                let already_prepended = wire_addr.is_some() && wire_pubkey.is_some();
+                if !already_prepended {
+                    transports.push(MonitorTransport::Wire {
+                        monitor_addr,
+                        monitor_pubkey_hex,
+                        mesh_id: mid,
+                        host_hint: None,
+                    });
                 }
             }
-        })
-        .collect();
+        }
+    }
 
     let (monitor_link, mut config_rx) = MonitorLink::new_with_credential_arc(
         monitor_urls,

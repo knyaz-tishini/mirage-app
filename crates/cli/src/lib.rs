@@ -344,22 +344,42 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         // enum used by MonitorLink.  Falls back to the legacy monitor_url when the
         // transports list is absent.
         use mirage_core::config::MonitorTransportConfig;
-        let transports: Vec<MonitorTransport> = if config.monitor_transports.is_empty() {
+        let mut transports: Vec<MonitorTransport> = Vec::new();
+
+        // Wire transport — prepended first (preferred over DirectWs/OverChain).
+        // Built from ClientConfig.monitor_wire_addr + monitor_wire_pubkey_hex
+        // when both are present (task #78 — mirrors l0-sentinel construction).
+        if let (Some(ref wire_addr), Some(ref wire_pubkey)) = (
+            &config.monitor_wire_addr,
+            &config.monitor_wire_pubkey_hex,
+        ) {
+            tracing::info!(
+                addr = %wire_addr,
+                "cli: Wire transport configured — prepending to MonitorLink transports"
+            );
+            transports.push(MonitorTransport::Wire {
+                monitor_addr: wire_addr.clone(),
+                monitor_pubkey_hex: wire_pubkey.clone(),
+                mesh_id: config.mesh_id.clone(),
+                host_hint: None,
+            });
+        }
+
+        // DirectWs / OverChain transports (fallback, or primary when Wire is absent).
+        if config.monitor_transports.is_empty() {
             // Legacy path: single DirectWs entry from monitor_url.
-            vec![MonitorTransport::DirectWs {
+            transports.push(MonitorTransport::DirectWs {
                 url: monitor_url.clone(),
                 sni: None,
-            }]
+            });
         } else {
-            config
-                .monitor_transports
-                .iter()
-                .filter_map(|t| match t {
+            for t in &config.monitor_transports {
+                match t {
                     MonitorTransportConfig::DirectWs { url, sni, .. } => {
-                        Some(MonitorTransport::DirectWs {
+                        transports.push(MonitorTransport::DirectWs {
                             url: url.clone(),
                             sni: sni.clone(),
-                        })
+                        });
                     }
                     MonitorTransportConfig::OverChain {
                         chain_id,
@@ -378,28 +398,28 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
                         let monitor_addr = monitor_endpoint.parse::<std::net::SocketAddr>();
                         match (socks5_bind, monitor_addr) {
-                            (Some(ws), Ok(addr)) => Some(MonitorTransport::OverChain {
-                                chain_id: chain_id.clone().into(),
-                                worker_socks5: ws,
-                                monitor_addr: addr,
-                            }),
+                            (Some(ws), Ok(addr)) => {
+                                transports.push(MonitorTransport::OverChain {
+                                    chain_id: chain_id.clone().into(),
+                                    worker_socks5: ws,
+                                    monitor_addr: addr,
+                                });
+                            }
                             (None, _) => {
                                 tracing::warn!(
                                     "cli: over_chain references unknown chain_id={chain_id} or invalid socks5_bind"
                                 );
-                                None
                             }
                             (_, Err(e)) => {
                                 tracing::warn!(
                                     "cli: invalid monitor_endpoint '{}': {e}",
                                     monitor_endpoint
                                 );
-                                None
                             }
                         }
                     }
-                })
-                .collect()
+                }
+            }
         };
 
         let (link, mut config_rx) = MonitorLink::new_with_credential_arc(

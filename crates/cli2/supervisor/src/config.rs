@@ -41,6 +41,19 @@ pub struct Config {
     /// URLs fail. Default: empty (DirectWs-only, current behaviour).
     #[serde(default)]
     pub monitor_transports: Vec<MonitorTransportConfig>,
+    /// IP:port of the monitor's Mirage wire listener, e.g. `"103.231.75.144:19444"`.
+    ///
+    /// When both `monitor_wire_addr` and `monitor_wire_pubkey_hex` are set, a
+    /// `Wire` transport spec is prepended to the list sent to the MonitorLink
+    /// host worker. The Mirage wire handshake provides mutual authentication;
+    /// no bearer token is required.
+    #[serde(default)]
+    pub monitor_wire_addr: Option<String>,
+    /// 64-character hex of the monitor's static X25519 public key.
+    ///
+    /// Required when `monitor_wire_addr` is set.
+    #[serde(default)]
+    pub monitor_wire_pubkey_hex: Option<String>,
     /// Optional router-level SOCKS5 listener and policy.
     ///
     /// When present, the supervisor binds an additional SOCKS5 listener at
@@ -123,6 +136,17 @@ pub enum MonitorTransportConfig {
         /// Defaults to `127.0.0.1:19445`.
         #[serde(default = "default_monitor_addr")]
         monitor_addr: SocketAddr,
+    },
+    /// Direct Mirage-wire WebSocket — dials the monitor's wire endpoint
+    /// (`:19444`) using an ephemeral X25519 client key. Preferred over
+    /// `DirectWs`; attempted first by `MonitorLink`.
+    Wire {
+        /// IP:port of the monitor's wire listener, e.g. `"103.231.75.144:19444"`.
+        monitor_addr: String,
+        /// 64-character hex of the monitor's static X25519 public key.
+        monitor_pubkey_hex: String,
+        /// Cluster/mesh identifier baked into the V9 handshake confirm.
+        mesh_id: String,
     },
 }
 

@@ -37,6 +37,20 @@ pub enum MonitorTransportSpec {
         #[serde(default)]
         chain_id: String,
     },
+    /// Direct Mirage-wire WebSocket — dials the monitor's wire endpoint
+    /// (`:19444`) using an ephemeral X25519 client key, performs the V9
+    /// Mirage AEAD handshake (anonymous, no `DeclaredIdentity`), then
+    /// upgrades to WebSocket over the resulting tunnel.
+    ///
+    /// Preferred over `DirectWs` — attempted first by `MonitorLink`.
+    Wire {
+        /// IP:port of the monitor's wire listener, e.g. `"103.231.75.144:19444"`.
+        monitor_addr: String,
+        /// 64-character hex of the monitor's static X25519 public key.
+        monitor_pubkey_hex: String,
+        /// Cluster/mesh identifier baked into the V9 handshake confirm.
+        mesh_id: String,
+    },
 }
 
 fn default_monitor_addr() -> SocketAddr {

@@ -269,6 +269,32 @@ async fn main() -> anyhow::Result<()> {
                 use config::MonitorTransportConfig;
                 let mut ipc_specs: Vec<MonitorTransportSpec> = Vec::new();
                 let mut conv_err: Option<String> = None;
+
+                // Wire transport — prepended first (preferred over DirectWs).
+                // Can be specified either via the flat supervisor.toml fields
+                // or as a `[[monitor_transports]]` entry with kind = "wire".
+                // The flat fields are checked here; the tagged entry is handled
+                // in the loop below.
+                if let (Some(wire_addr), Some(wire_pubkey)) = (
+                    config.monitor_wire_addr.clone(),
+                    config.monitor_wire_pubkey_hex.clone(),
+                ) {
+                    ipc_specs.push(MonitorTransportSpec::Wire {
+                        monitor_addr: wire_addr,
+                        monitor_pubkey_hex: wire_pubkey,
+                        mesh_id: config.monitor_transports
+                            .iter()
+                            .find_map(|t| {
+                                if let MonitorTransportConfig::Wire { mesh_id, .. } = t {
+                                    Some(mesh_id.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| "v3-staging".to_string()),
+                    });
+                }
+
                 for t in &config.monitor_transports {
                     match t {
                         MonitorTransportConfig::DirectWs { url, sni } => {
@@ -301,6 +327,18 @@ async fn main() -> anyhow::Result<()> {
                                 monitor_addr: *monitor_addr,
                                 chain_id: chain_id.clone(),
                             });
+                        }
+                        MonitorTransportConfig::Wire { monitor_addr, monitor_pubkey_hex, mesh_id } => {
+                            // Skip if already inserted from flat fields to avoid duplicate.
+                            let already_inserted = config.monitor_wire_addr.is_some()
+                                && config.monitor_wire_pubkey_hex.is_some();
+                            if !already_inserted {
+                                ipc_specs.push(MonitorTransportSpec::Wire {
+                                    monitor_addr: monitor_addr.clone(),
+                                    monitor_pubkey_hex: monitor_pubkey_hex.clone(),
+                                    mesh_id: mesh_id.clone(),
+                                });
+                            }
                         }
                     }
                 }
