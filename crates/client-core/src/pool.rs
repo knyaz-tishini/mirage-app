@@ -32,6 +32,7 @@ use std::{
 use arc_swap::ArcSwap;
 use mirage_core::{
     config::{ChainConfig, TunnelPoolConfig},
+    crypto::credential::CredentialParams,
     error::MirageError,
     mirage::mesh::PeerTable,
 };
@@ -81,6 +82,10 @@ struct PoolInner {
     /// Live peer table shared with the monitor link.  Each dial loads a
     /// snapshot via `ArcSwap::load()` and passes it to `establish_raw_tunnel`.
     peer_table: Arc<ArcSwap<PeerTable>>,
+    /// Operator-issued credential params pushed by MonitorLink.
+    /// Shared via Arc::clone — pool snapshots it on each dial and mints a fresh
+    /// per-dial token.  None = credential feature inactive (tolerant mode).
+    credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
 }
 
 // ── Pool statistics ───────────────────────────────────────────────────────────
@@ -138,6 +143,7 @@ impl TunnelPool {
         config: TunnelPoolConfig,
         mesh_id: Vec<u8>,
         peer_table: Arc<ArcSwap<PeerTable>>,
+        credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // (hops[0].role == Exit) reaches `handle_exit` server-side as a
@@ -157,7 +163,12 @@ impl TunnelPool {
             let mid = mesh_id.clone();
             // Load a peer_table snapshot for the initial dial (Phase 8.5).
             let pt = peer_table.load_full();
-            join_set.spawn(async move { (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid).await) });
+            // Snapshot credential_params for this dial attempt.
+            let cred_snap = credential_params.load_full();
+            join_set.spawn(async move {
+                let cred_ref = cred_snap.as_ref().as_ref();
+                (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid, cred_ref).await)
+            });
         }
 
         // Wait for at least 2 warm slots before returning (or the whole pool if
@@ -216,6 +227,7 @@ impl TunnelPool {
             config,
             mesh_id,
             peer_table,
+            credential_params,
         }));
 
         let pool = Arc::new(Self {
@@ -652,10 +664,12 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
 
 #[cfg(test)]
 mod pool_smoke_tests {
+    use arc_swap::ArcSwap;
     use mirage_core::config::{
         AuthMode, ChainConfig, HandshakeStrategy, HopConfig, HopRole, MirageEndpointConfig,
         ProtocolId, TcpProtocolId, TransportCamouflage, TransportKind,
     };
+    use mirage_core::crypto::credential::CredentialParams;
     use mirage_protocol::{endpoint_protocol::EndpointProtocol, negotiation::ProtocolChain};
     use std::sync::Arc;
 
@@ -738,7 +752,7 @@ mod pool_smoke_tests {
         let pt = PeerTable::empty();
         let chain_protocols = minimal_chain_protocols();
 
-        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[]).await;
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[], None).await;
 
         assert!(result.is_err(), "must fail when peer_table is empty");
         let e = result.err().expect("just checked is_err");
@@ -795,7 +809,7 @@ mod pool_smoke_tests {
         let chain = two_hop_chain("v2-entry", "v2-exit");
         let chain_protocols = minimal_chain_protocols();
 
-        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[]).await;
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[], None).await;
 
         match result {
             Ok(_) => panic!("expected network-level error (no server on :19971/:19972)"),
@@ -838,7 +852,7 @@ mod pool_smoke_tests {
 
         // Step 1: empty peer_table — expect config error (simulates failed startup).
         let pt_empty = PeerTable::empty();
-        let err = establish_raw_tunnel(&chain_protocols, &chain, &pt_empty, &[]).await;
+        let err = establish_raw_tunnel(&chain_protocols, &chain, &pt_empty, &[], None).await;
         assert!(err.is_err());
         let msg_empty = format!("{:?}", err.err().expect("just checked is_err"));
         assert!(
@@ -874,7 +888,7 @@ mod pool_smoke_tests {
         };
 
         // Step 3: retry with filled peer_table — must reach network, not config error.
-        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt_full, &[]).await;
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt_full, &[], None).await;
         match result {
             Ok(_) => panic!("expected network error, no server running on test ports"),
             Err(e) => {
@@ -932,6 +946,7 @@ mod pool_smoke_tests {
             config,
             vec![],
             Arc::clone(&peer_table),
+            Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
         )
         .await
         .expect("TunnelPool::new must not fail during construction");
@@ -978,9 +993,16 @@ mod pool_smoke_tests {
             idle_timeout_secs: 300,
         };
 
-        let pool = TunnelPool::new(chain, chain_protocols, config, vec![], peer_table)
-            .await
-            .expect("TunnelPool::new must not fail during construction");
+        let pool = TunnelPool::new(
+            chain,
+            chain_protocols,
+            config,
+            vec![],
+            peer_table,
+            Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+        )
+        .await
+        .expect("TunnelPool::new must not fail during construction");
 
         // Must not panic or block.
         pool.notify_peer_table_change();
@@ -992,7 +1014,7 @@ mod pool_smoke_tests {
 async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
-         peer_table_notify) = {
+         peer_table_notify, credential_params_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1002,6 +1024,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             guard.mesh_id.clone(),
             Arc::clone(&guard.peer_table),
             Arc::clone(&pool.peer_table_notify),
+            Arc::clone(&guard.credential_params),
         )
     };
 
@@ -1033,7 +1056,9 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                 chain.clone()
             }
         };
-        match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id).await {
+        let cred_snap = credential_params_shared.load_full();
+        let cred_ref = cred_snap.as_ref().as_ref();
+        match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, cred_ref).await {
             Ok(tunnel) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "reconnect succeeded");
                 let mut guard = pool.inner.lock().await;

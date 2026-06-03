@@ -7,6 +7,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use mirage_core::{
     config::{ChainConfig, TunnelPoolConfig},
+    crypto::credential::CredentialParams,
     error::MirageError,
     mirage::mesh::PeerTable,
 };
@@ -186,6 +187,10 @@ struct PoolInner {
     mesh_id: Vec<u8>,
     /// Live peer table shared with the monitor link (Phase 8.5).
     peer_table: Arc<ArcSwap<PeerTable>>,
+    /// Operator-issued credential params pushed by MonitorLink.
+    /// Shared via Arc::clone — pool snapshots it on each dial and mints a fresh
+    /// per-dial token.  None = credential feature inactive (tolerant mode).
+    credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
 }
 
 /// Semaphore capacity for the post-recovery burst limiter.
@@ -220,6 +225,7 @@ impl MuxPool {
         config: TunnelPoolConfig,
         mesh_id: Vec<u8>,
         peer_table: Arc<ArcSwap<PeerTable>>,
+        credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // sends the address bytes raw (no length-prefix) so the
@@ -242,7 +248,12 @@ impl MuxPool {
             let mid = mesh_id.clone();
             // Load a peer_table snapshot for the initial dial (Phase 8.5).
             let pt = peer_table.load_full();
-            join_set.spawn(async move { (idx, build_session(&cp, &ch, &pt, &mid).await) });
+            // Snapshot credential_params for this dial attempt.
+            let cred_snap = credential_params.load_full();
+            join_set.spawn(async move {
+                let cred_ref = cred_snap.as_ref().as_ref();
+                (idx, build_session(&cp, &ch, &pt, &mid, cred_ref).await)
+            });
         }
 
         // Wait for at least 2 warm slots before returning (mirrors TunnelPool #59 fix).
@@ -290,6 +301,7 @@ impl MuxPool {
             config,
             mesh_id,
             peer_table,
+            credential_params,
         }));
 
         let pool = Arc::new(Self {
@@ -548,11 +560,12 @@ async fn build_session(
     chain: &ChainConfig,
     peer_table: &PeerTable,
     mesh_id: &[u8],
+    credential_params: Option<&CredentialParams>,
 ) -> Result<SessionHandle, MirageError> {
     // Onion chains send MUX\0 magic so the exit upgrades to a mux server.
     // Direct chains use the raw tunnel path (no magic needed — they connect
     // directly to a relay that already runs a mux server).
-    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, peer_table, mesh_id).await?;
+    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, peer_table, mesh_id, credential_params).await?;
     let compat = TunnelCompat::wrap(tunnel);
     Ok(SessionHandle::client(compat))
 }
@@ -828,6 +841,7 @@ mod tests {
             &chain,
             &pt_snap,
             &[],
+            None,
         )
         .await;
 
@@ -936,7 +950,7 @@ mod tests {
         let chain_protocols = make_chain_protocols();
         let pt = PeerTable::empty();
 
-        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt, &[]).await;
+        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt, &[], None).await;
 
         assert!(result.is_err(), "must fail when peer_table is empty");
         let msg = format!("{:?}", result.err().expect("just checked is_err"));
@@ -963,7 +977,7 @@ mod tests {
 
         // Phase 1: empty peer_table → config error (simulated startup failure).
         let pt_empty = PeerTable::empty();
-        let err = establish_mux_tunnel(&chain_protocols, &chain, &pt_empty, &[]).await;
+        let err = establish_mux_tunnel(&chain_protocols, &chain, &pt_empty, &[], None).await;
         assert!(err.is_err());
         let startup_msg = format!("{:?}", err.err().expect("just checked is_err"));
         assert!(
@@ -999,7 +1013,7 @@ mod tests {
         };
 
         // Phase 3: retry — pubkey resolve succeeds, fails at network (no server).
-        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt_full, &[]).await;
+        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt_full, &[], None).await;
         match result {
             Ok(_) => panic!("expected network error; no server on :19981/:19982"),
             Err(e) => {
@@ -1098,7 +1112,7 @@ mod tests {
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
-         peer_table_notify) = {
+         peer_table_notify, credential_params_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1108,6 +1122,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             guard.mesh_id.clone(),
             Arc::clone(&guard.peer_table),
             Arc::clone(&pool.peer_table_notify),
+            Arc::clone(&guard.credential_params),
         )
     };
 
@@ -1131,7 +1146,9 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                 chain.clone()
             }
         };
-        match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id).await {
+        let cred_snap = credential_params_shared.load_full();
+        let cred_ref = cred_snap.as_ref().as_ref();
+        match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, cred_ref).await {
             Ok(session) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "mux reconnect succeeded");
                 {

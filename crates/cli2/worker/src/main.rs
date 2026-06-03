@@ -226,6 +226,11 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(PeerTable::empty);
     let peer_table: Arc<ArcSwap<PeerTable>> = Arc::new(ArcSwap::from_pointee(initial_pt));
 
+    // Shared credential params arc — updated by MonitorLink on CredentialParams WS frames.
+    // Pools snapshot this on each dial to mint a fresh per-dial EpochHmac token.
+    let credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+
     // MuxPool requires onion reply mode: the mux exit (run_mux_server_session_wrapped_v7)
     // AEAD-wraps its replies, which OnionTunnel::recv unwraps per layer. Chains with
     // reply=raw never receive AEAD-wrapped replies — their exit byte-pumps raw bytes.
@@ -239,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
             pool_cfg.clone(),
             mesh_id.clone(),
             Arc::clone(&peer_table),
+            Arc::clone(&credential_params),
         ).await {
             Ok(mp) => {
                 info!(chain_id = %chain_id, "mux pool ready");
@@ -253,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table))
+    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params))
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 
@@ -326,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
         mux_pool_for_loop,
         Arc::clone(&current_state),
         Arc::clone(&peer_table),
+        Arc::clone(&credential_params),
         stop_tx,
         outgoing_tx,
         outgoing_rx,
@@ -361,6 +368,7 @@ async fn supervisor_loop(
     mux_pool_opt: Option<Arc<MuxPool>>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
     peer_table: Arc<ArcSwap<PeerTable>>,
+    credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
     stop_tx: watch::Sender<bool>,
     outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
     mut outgoing_rx: mpsc::Receiver<WorkerMsg>,
@@ -380,6 +388,7 @@ async fn supervisor_loop(
             mux_pool_opt.as_ref().map(Arc::clone),
             Arc::clone(&state),
             Arc::clone(&peer_table),
+            Arc::clone(&credential_params),
             Arc::clone(&outgoing_tx),
             &mut outgoing_rx,
             &stop_tx,
@@ -483,6 +492,7 @@ async fn handle_session(
     mux_pool_opt: Option<Arc<MuxPool>>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
     peer_table: Arc<ArcSwap<PeerTable>>,
+    credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
     outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
     outgoing_rx: &mut mpsc::Receiver<WorkerMsg>,
     stop_tx: &watch::Sender<bool>,
@@ -548,6 +558,7 @@ async fn handle_session(
                     mesh_id.to_string(),
                     node_client_id.to_string(),
                     Arc::clone(&peer_table),
+                    Arc::clone(&credential_params),
                     Arc::clone(&pool),
                     mux_pool_opt.as_ref().map(Arc::clone),
                     chain_cfg.clone(),
@@ -648,6 +659,7 @@ fn spawn_monitor_link_in_worker(
     mesh_id: String,
     node_client_id: String,
     peer_table: Arc<ArcSwap<PeerTable>>,
+    credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
     pool: Arc<TunnelPool>,
     mux_pool_opt: Option<Arc<MuxPool>>,
     chain_cfg: mirage_core::config::ChainConfig,
@@ -708,10 +720,11 @@ fn spawn_monitor_link_in_worker(
         })
         .collect();
 
-    let (monitor_link, mut config_rx) = MonitorLink::new(
+    let (monitor_link, mut config_rx) = MonitorLink::new_with_credential_arc(
         monitor_urls,
         monitor_api_key,
         Arc::clone(&peer_table),
+        Arc::clone(&credential_params),
         chain_set,
         transports,
         mesh_id,

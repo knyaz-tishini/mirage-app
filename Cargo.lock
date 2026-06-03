@@ -2552,6 +2552,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -2566,6 +2568,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hkdf",
+ "hmac",
  "libc",
  "mirage-ids",
  "rand 0.8.6",

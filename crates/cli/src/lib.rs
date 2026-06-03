@@ -122,6 +122,16 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
     let peer_table: Arc<ArcSwap<PeerTable>> =
         Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
 
+    // ── Shared credential params arc (ZT dial authz) ──────────────────────────
+    //
+    // Created upfront as None and shared with all TunnelPool / MuxPool instances.
+    // MonitorLink writes into this ArcSwap on every `CredentialParams` WS frame
+    // from the monitor, so pools transparently pick up new epoch secrets without
+    // any extra plumbing.  The same arc is passed to MonitorLink::new_with_credential_arc
+    // below so that ONE ArcSwap is shared between pools and the link.
+    let credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+
     // ── Build tunnel pools (one per chain) ────────────────────────────────────
     let all_chains = select_all_chains(&config);
     if all_chains.is_empty() {
@@ -177,9 +187,10 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         };
         let mid = mesh_id.clone();
         let pt = Arc::clone(&peer_table);
+        let cred = Arc::clone(&credential_params);
         pool_tasks.spawn(async move {
             let id = chain_owned.chain_id.clone();
-            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt).await {
+            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt, cred).await {
                 Ok(pool) => Some((id, pool)),
                 Err(e) => {
                     tracing::warn!(chain = %id, "pool init failed, skipping: {e}");
@@ -229,8 +240,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             let cfg = pool_cfg_base.clone();
             let mid = mesh_id.clone();
             let pt = Arc::clone(&peer_table);
+            let cred = Arc::clone(&credential_params);
             mux_tasks.spawn(async move {
-                match MuxPool::new(chain_owned, protocols, cfg, mid, pt).await {
+                match MuxPool::new(chain_owned, protocols, cfg, mid, pt, cred).await {
                     Ok(mux) => Some((id, mux)),
                     Err(e) => {
                         tracing::warn!(
@@ -390,10 +402,11 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                 .collect()
         };
 
-        let (link, mut config_rx) = MonitorLink::new(
+        let (link, mut config_rx) = MonitorLink::new_with_credential_arc(
             vec![monitor_url.clone()],
             None,
             Arc::clone(&peer_table),
+            Arc::clone(&credential_params),
             ChainSet::empty(),
             transports,
             config.mesh_id.clone(),
@@ -424,6 +437,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         let pool_cfg_for_watcher = pool_cfg_base.clone();
         let use_mux_for_watcher = use_mux;
         let peer_table_for_watcher = Arc::clone(&peer_table);
+        let credential_params_for_watcher = Arc::clone(&credential_params);
 
         tokio::spawn(async move {
             loop {
@@ -480,6 +494,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             pool_cfg,
                             mesh_id_for_watcher.clone(),
                             Arc::clone(&peer_table_for_watcher),
+                            Arc::clone(&credential_params_for_watcher),
                         )
                         .await
                         {

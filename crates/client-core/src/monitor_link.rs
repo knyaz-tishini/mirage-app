@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use mirage_core::crypto::credential::CredentialParams;
 use mirage_core::mirage::mesh::PeerTable;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
@@ -207,6 +208,12 @@ pub enum WsServerFrame {
     DebugTunnelClose,
     /// Phase 1.14 (memory wave): graceful chain migration hint.
     ChainAvailable(ChainAvailable),
+    /// Operator-declared epoch secrets for per-dial anonymous credential minting.
+    ///
+    /// Contains the full `CredentialParams` (live epochs + `require` policy flag).
+    /// MonitorLink stores this in `credential_params` ArcSwap; pools snapshot it
+    /// on each dial and call `mint_epoch_hmac_credential` for a fresh token.
+    CredentialParams(CredentialParams),
 }
 
 /// Traffic policy received from the monitor.
@@ -276,6 +283,9 @@ enum TaggedServerFrame {
     DebugTunnelClose,
     /// Phase 1.14 (memory wave): graceful chain migration hint.
     ChainAvailable(ChainAvailable),
+    /// Operator pushes epoch secrets for per-dial anonymous credential minting.
+    /// Wire JSON: `{"kind":"credential_params","generation":N,"scheme":1,"epochs":[...],"require":false}`.
+    CredentialParams(CredentialParams),
     /// App-level Pong echoing a client-sent Ping nonce.
     #[serde(rename = "pong")]
     Pong { nonce: u64 },
@@ -391,6 +401,10 @@ pub struct MonitorLink {
     /// carries a non-`None` `peer_table` field.
     /// Shared with `TunnelPool` / `MuxPool` via `Arc::clone`.
     pub peer_table: Arc<ArcSwap<PeerTable>>,
+    /// Operator-declared anonymous credential params pushed over WS.
+    /// Initialised as `None`; updated on every `CredentialParams` frame.
+    /// Shared with `TunnelPool` / `MuxPool` via `Arc::clone` (same pattern as peer_table).
+    pub credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
     /// Additional transport options (DirectWs + OverChain).
     /// If empty, `monitor_urls` is used for DirectWs (legacy path).
     transports: Vec<MonitorTransport>,
@@ -434,6 +448,34 @@ impl MonitorLink {
         mesh_id: String,
         node_client_id: String,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
+        Self::new_with_credential_arc(
+            monitor_urls,
+            monitor_api_key,
+            peer_table,
+            Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+            chain_set,
+            transports,
+            mesh_id,
+            node_client_id,
+        )
+    }
+
+    /// Like [`new`] but accepts a pre-created `credential_params` arc so that
+    /// the arc can be shared with `TunnelPool` / `MuxPool` instances created
+    /// before the `MonitorLink` is constructed.
+    ///
+    /// Use `link.credential_params()` to retrieve an `Arc::clone` from a link
+    /// built with the ordinary [`new`] constructor.
+    pub fn new_with_credential_arc(
+        monitor_urls: Vec<String>,
+        monitor_api_key: Option<String>,
+        peer_table: Arc<ArcSwap<PeerTable>>,
+        credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
+        chain_set: Arc<ChainSet>,
+        transports: Vec<MonitorTransport>,
+        mesh_id: String,
+        node_client_id: String,
+    ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
         let (frame_tx, _frame_rx) = watch::channel(None);
 
@@ -456,6 +498,7 @@ impl MonitorLink {
             config_tx,
             frame_tx,
             peer_table,
+            credential_params,
             transports,
             chain_set,
         });
@@ -467,6 +510,16 @@ impl MonitorLink {
     /// channel.
     pub fn subscribe(&self) -> watch::Receiver<Option<MonitorConfig>> {
         self.config_tx.subscribe()
+    }
+
+    /// Return a shared arc to the credential params ArcSwap.
+    ///
+    /// Pass the returned arc to `TunnelPool::new` / `MuxPool::new` so pools
+    /// always dial with the latest operator-issued epoch secrets without extra
+    /// plumbing.  The ArcSwap is updated by the WS receive loop on every
+    /// `CredentialParams` frame from the monitor.
+    pub fn credential_params(&self) -> Arc<ArcSwap<Option<CredentialParams>>> {
+        Arc::clone(&self.credential_params)
     }
 
     /// Subscribe to raw server-pushed WebSocket frames (config snapshots and
@@ -812,6 +865,11 @@ impl MonitorLink {
                                         .frame_tx
                                         .send(Some(WsServerFrame::ChainAvailable(ca)));
                                 }
+                                Ok(TaggedServerFrame::CredentialParams(params)) => {
+                                    let generation = params.generation;
+                                    self.credential_params.store(Arc::new(Some(params)));
+                                    debug!(generation, "monitor_link: OverChain CredentialParams updated");
+                                }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if outstanding_nonce == Some(nonce) {
                                         debug!(nonce, "monitor_link: OverChain app Pong received");
@@ -1070,6 +1128,11 @@ impl MonitorLink {
                                     let _ = self
                                         .frame_tx
                                         .send(Some(WsServerFrame::ChainAvailable(ca)));
+                                }
+                                Ok(TaggedServerFrame::CredentialParams(params)) => {
+                                    let generation = params.generation;
+                                    self.credential_params.store(Arc::new(Some(params)));
+                                    debug!(generation, "monitor_link: CredentialParams updated");
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     // App-level Pong: clear outstanding ping if nonce matches.
