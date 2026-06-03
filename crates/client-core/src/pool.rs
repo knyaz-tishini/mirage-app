@@ -167,7 +167,7 @@ impl TunnelPool {
             let cred_snap = credential_params.load_full();
             join_set.spawn(async move {
                 let cred_ref = cred_snap.as_ref().as_ref();
-                (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid, cred_ref).await)
+                (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid, None, cred_ref).await)
             });
         }
 
@@ -752,7 +752,7 @@ mod pool_smoke_tests {
         let pt = PeerTable::empty();
         let chain_protocols = minimal_chain_protocols();
 
-        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[], None).await;
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[], None, None).await;
 
         assert!(result.is_err(), "must fail when peer_table is empty");
         let e = result.err().expect("just checked is_err");
@@ -809,7 +809,7 @@ mod pool_smoke_tests {
         let chain = two_hop_chain("v2-entry", "v2-exit");
         let chain_protocols = minimal_chain_protocols();
 
-        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[], None).await;
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt, &[], None, None).await;
 
         match result {
             Ok(_) => panic!("expected network-level error (no server on :19971/:19972)"),
@@ -852,7 +852,7 @@ mod pool_smoke_tests {
 
         // Step 1: empty peer_table — expect config error (simulates failed startup).
         let pt_empty = PeerTable::empty();
-        let err = establish_raw_tunnel(&chain_protocols, &chain, &pt_empty, &[], None).await;
+        let err = establish_raw_tunnel(&chain_protocols, &chain, &pt_empty, &[], None, None).await;
         assert!(err.is_err());
         let msg_empty = format!("{:?}", err.err().expect("just checked is_err"));
         assert!(
@@ -888,7 +888,7 @@ mod pool_smoke_tests {
         };
 
         // Step 3: retry with filled peer_table — must reach network, not config error.
-        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt_full, &[], None).await;
+        let result = establish_raw_tunnel(&chain_protocols, &chain, &pt_full, &[], None, None).await;
         match result {
             Ok(_) => panic!("expected network error, no server running on test ports"),
             Err(e) => {
@@ -1058,7 +1058,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
         };
         let cred_snap = credential_params_shared.load_full();
         let cred_ref = cred_snap.as_ref().as_ref();
-        match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, cred_ref).await {
+        match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, None, cred_ref).await {
             Ok(tunnel) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "reconnect succeeded");
                 let mut guard = pool.inner.lock().await;

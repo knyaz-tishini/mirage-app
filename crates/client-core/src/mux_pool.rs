@@ -565,7 +565,7 @@ async fn build_session(
     // Onion chains send MUX\0 magic so the exit upgrades to a mux server.
     // Direct chains use the raw tunnel path (no magic needed — they connect
     // directly to a relay that already runs a mux server).
-    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, peer_table, mesh_id, credential_params).await?;
+    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, peer_table, mesh_id, None, credential_params).await?;
     let compat = TunnelCompat::wrap(tunnel);
     Ok(SessionHandle::client(compat))
 }
@@ -842,6 +842,7 @@ mod tests {
             &pt_snap,
             &[],
             None,
+            None,
         )
         .await;
 
@@ -950,7 +951,7 @@ mod tests {
         let chain_protocols = make_chain_protocols();
         let pt = PeerTable::empty();
 
-        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt, &[], None).await;
+        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt, &[], None, None).await;
 
         assert!(result.is_err(), "must fail when peer_table is empty");
         let msg = format!("{:?}", result.err().expect("just checked is_err"));
@@ -977,7 +978,7 @@ mod tests {
 
         // Phase 1: empty peer_table → config error (simulated startup failure).
         let pt_empty = PeerTable::empty();
-        let err = establish_mux_tunnel(&chain_protocols, &chain, &pt_empty, &[], None).await;
+        let err = establish_mux_tunnel(&chain_protocols, &chain, &pt_empty, &[], None, None).await;
         assert!(err.is_err());
         let startup_msg = format!("{:?}", err.err().expect("just checked is_err"));
         assert!(
@@ -1013,7 +1014,7 @@ mod tests {
         };
 
         // Phase 3: retry — pubkey resolve succeeds, fails at network (no server).
-        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt_full, &[], None).await;
+        let result = establish_mux_tunnel(&chain_protocols, &chain, &pt_full, &[], None, None).await;
         match result {
             Ok(_) => panic!("expected network error; no server on :19981/:19982"),
             Err(e) => {
