@@ -14,13 +14,14 @@ use mirage_core::mirage::mesh::PeerTable;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub mod chain_request;
 pub mod crash_report;
 pub mod debug_shell;
 pub mod log_upload;
 pub mod monitor_urls;
+pub mod monitor_wire;
 pub mod onboarding;
 pub mod pid_file;
 pub mod sentinel_id;
@@ -414,20 +415,21 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         supported_transports: vec!["tcp", "udp"],
     };
-    let (active_monitor_url, registered_client_id) = match chain_request::register_with_failover(
-        &http_client,
-        &effective_urls,
-        &bootstrap_bearer,
-        &reg_body,
-    )
-    .await
-    {
-        Ok(out) => out,
-        Err(e) => {
-            error!(error = %e, "[sentinel] register failed across all monitor URLs");
-            return Err(e);
-        }
-    };
+    let (active_monitor_url, registered_client_id, registered_client_token) =
+        match chain_request::register_with_failover(
+            &http_client,
+            &effective_urls,
+            &bootstrap_bearer,
+            &reg_body,
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                error!(error = %e, "[sentinel] register failed across all monitor URLs");
+                return Err(e);
+            }
+        };
     if registered_client_id != sentinel {
         warn!(
             sent = %sentinel, got = %registered_client_id,
@@ -437,6 +439,13 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let client_id_resolved = registered_client_id.clone();
     if let Err(e) = chain_request::persist_client_id(&state_dir, &client_id_resolved) {
         warn!(error = %e, "[sentinel] persist_client_id failed (non-fatal)");
+    }
+    // Phase 2: persist client_token when the monitor issues one.
+    if let Some(ref tok) = registered_client_token {
+        if let Err(e) = chain_request::persist_client_token(&state_dir, tok) {
+            warn!(error = %e, "[sentinel] persist_client_token failed (non-fatal)");
+        }
+        info!("[sentinel] client_token received and persisted");
     }
 
     info!(
@@ -485,20 +494,33 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     // Build DirectWs transports from the effective URL list.
     let mut transports: Vec<MonitorTransport> = Vec::new();
 
-    // Wire transport — preferred when both addr + pubkey are configured.
-    // No bearer needed: the Mirage V9 handshake provides mutual auth.
-    if let (Some(wire_addr), Some(wire_pubkey)) = (
-        cfg.monitor_wire_addr.clone(),
-        cfg.monitor_wire_pubkey_hex.clone(),
-    ) {
+    // Wire transport — preferred when addr + pubkey are configured.
+    // Priority order:
+    //   1. sentinel.toml explicit fields (operator-set, highest trust)
+    //   2. Persisted monitor_wire.json (auto-seeded from peer_table on previous run)
+    //   3. Absent → Wire not activated; falls through to DirectWs
+    let wire_coords: Option<monitor_wire::WireCoords> =
+        if cfg.monitor_wire_addr.is_some() && cfg.monitor_wire_pubkey_hex.is_some() {
+            // Explicit toml config overrides everything.
+            Some(monitor_wire::WireCoords {
+                monitor_addr: cfg.monitor_wire_addr.clone().unwrap(),
+                monitor_pubkey_hex: cfg.monitor_wire_pubkey_hex.clone().unwrap(),
+                mesh_id: cfg.mesh_id.clone(),
+            })
+        } else {
+            // Fall back to last-run persisted coords (auto-seeded from peer_table).
+            monitor_wire::load(&state_dir)
+        };
+
+    if let Some(ref wc) = wire_coords {
         info!(
-            "[sentinel] Wire transport configured: addr={} (mesh_id={})",
-            wire_addr, cfg.mesh_id
+            "[sentinel] Wire transport activated: addr={} (mesh_id={})",
+            wc.monitor_addr, wc.mesh_id
         );
         transports.push(MonitorTransport::Wire {
-            monitor_addr: wire_addr,
-            monitor_pubkey_hex: wire_pubkey,
-            mesh_id: cfg.mesh_id.clone(),
+            monitor_addr: wc.monitor_addr.clone(),
+            monitor_pubkey_hex: wc.monitor_pubkey_hex.clone(),
+            mesh_id: wc.mesh_id.clone(),
             host_hint: None,
         });
     }
@@ -520,6 +542,18 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         cfg.mesh_id.clone(),
         client_id.clone(),
     );
+
+    // Phase 2: seed the per-client token into MonitorLink so subscribe/poll
+    // calls carry ?client_id=&client_token= when the monitor requires it.
+    // Use freshly-registered token first; fall back to persisted from last run.
+    let effective_token = registered_client_token
+        .clone()
+        .or_else(|| chain_request::load_client_token(&state_dir));
+    if effective_token.is_some() {
+        link.set_client_token(effective_token.clone()).await;
+        debug!("[sentinel] client_token loaded into MonitorLink");
+    }
+
     link.spawn();
 
     // Spawn debug-shell + dynamic-monitor-urls watcher.
@@ -532,6 +566,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         debug_mgr.clone(),
         state_dir.clone(),
         active_urls.clone(),
+        cfg.mesh_id.clone(),
     );
 
     // Disk-first: if a managed config from a prior session is on disk, run cli
@@ -968,6 +1003,9 @@ fn unix_now_u64() -> u64 {
 /// [`MonitorLink`]:
 /// - `Config` → diff `peer_lm_urls` vs `current_active`; on change, rewrite
 ///   `monitor_urls.json` (atomic) and call `link.reconfigure(...)`.
+///   Also extracts the monitor wire entry from `peer_table` (Phase 3 auto-seed):
+///   on first appearance (or change), persists to `monitor_wire.json` and
+///   calls `link.seed_wire_transport(...)`.
 /// - `DebugTunnelOpen` → write `<state_dir>/debug-tunnel.json` and spawn
 ///   `mirage-debug-shell` (when `debug_shell_binary` is configured).
 /// - `DebugTunnelClose` → SIGTERM the child.
@@ -976,12 +1014,15 @@ fn spawn_frame_watcher(
     debug_mgr: Option<Arc<debug_shell::DebugShellManager>>,
     state_dir: PathBuf,
     initial_urls: Vec<String>,
+    mesh_id: String,
 ) {
     use mirage_client_core::monitor_link::WsServerFrame;
 
     tokio::spawn(async move {
         let mut frames = link.subscribe_frames();
         let mut current_urls = initial_urls;
+        // Track last-seen wire addr to avoid redundant persist + seed calls.
+        let mut last_wire_addr: Option<String> = None;
         loop {
             if frames.changed().await.is_err() {
                 tracing::info!("[sentinel] frame watcher: link closed");
@@ -991,6 +1032,41 @@ fn spawn_frame_watcher(
             let Some(frame) = frame else { continue; };
             match frame {
                 WsServerFrame::Config(cfg) => {
+                    // ── Phase 3: auto-seed Wire transport from peer_table ──────
+                    // The config snapshot carries a peer_table that includes the
+                    // co-located monitor's wire entry (labels=["monitor"],
+                    // addr=<ip>:19444).  Extract it, persist to monitor_wire.json,
+                    // and call seed_wire_transport so the next retry cycle uses
+                    // the native wire.
+                    //
+                    // We check `last_wire_addr` to avoid redundant persists on
+                    // every heartbeat-driven config push.
+                    {
+                        // Access the link's peer_table (updated by apply_config
+                        // inside MonitorLink before the frame is pushed here).
+                        let pt = link.peer_table.load();
+                        if let Some(wc) = monitor_wire::extract_from_peer_table(&pt, &mesh_id) {
+                            if last_wire_addr.as_deref() != Some(&wc.monitor_addr) {
+                                info!(
+                                    "[sentinel] monitor wire entry found in peer_table: \
+                                     addr={} pubkey={}...",
+                                    wc.monitor_addr,
+                                    &wc.monitor_pubkey_hex[..8.min(wc.monitor_pubkey_hex.len())]
+                                );
+                                if let Err(e) = monitor_wire::save(&state_dir, &wc) {
+                                    warn!("[sentinel] monitor_wire.json save failed: {}", e);
+                                }
+                                link.seed_wire_transport(
+                                    wc.monitor_addr.clone(),
+                                    wc.monitor_pubkey_hex.clone(),
+                                    wc.mesh_id.clone(),
+                                ).await;
+                                last_wire_addr = Some(wc.monitor_addr);
+                            }
+                        }
+                    }
+                    // ─────────────────────────────────────────────────────────
+
                     if cfg.peer_lm_urls.is_empty() {
                         continue;
                     }

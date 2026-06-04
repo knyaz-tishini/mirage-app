@@ -416,6 +416,10 @@ struct RegisterResponse {
     client_id: String,
     #[serde(default = "default_poll_interval")]
     monitor_poll_interval_secs: u64,
+    /// Phase 2: per-client token returned once at registration.
+    /// Old monitors omit this field — treated as `None`.
+    #[serde(default)]
+    client_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -460,6 +464,10 @@ pub struct MonitorLink {
     /// Currently winning URL after a race. None until first race completes.
     active_url: Mutex<Option<String>>,
     client_id: Mutex<Option<String>>,
+    /// Per-client token issued by the monitor on registration (Phase 2).
+    /// Appended as `?client_id=X&client_token=Y` on subscribe, config-poll,
+    /// and heartbeat when present. `None` on older monitors — omitted silently.
+    client_token: Mutex<Option<String>>,
     http: reqwest::Client,
     config_version: AtomicU64,
     poll_interval_secs: AtomicU64,
@@ -487,6 +495,14 @@ pub struct MonitorLink {
     /// when connecting over a [`MonitorTransport::Wire`] transport. Ephemeral
     /// per-process (not persisted) — clients are anonymous on the wire plane.
     ephemeral_client_priv: [u8; 32],
+    /// Runtime-seeded wire coordinates (addr + pubkey_hex + mesh_id).
+    ///
+    /// Set by [`Self::seed_wire_transport`] after the sentinel receives its
+    /// first config snapshot containing a monitor peer_table entry.  Takes
+    /// precedence over any `Wire` entry already in `transports` (or adds one
+    /// when `transports` has none).  `None` means no runtime override — the
+    /// static `transports` list is used as-is.
+    wire_override: Mutex<Option<WireParams>>,
 }
 
 impl MonitorLink {
@@ -579,6 +595,7 @@ impl MonitorLink {
             node_client_id,
             active_url: Mutex::new(None),
             client_id: Mutex::new(None),
+            client_token: Mutex::new(None),
             http,
             config_version: AtomicU64::new(0),
             poll_interval_secs: AtomicU64::new(30),
@@ -589,6 +606,7 @@ impl MonitorLink {
             transports,
             chain_set,
             ephemeral_client_priv,
+            wire_override: Mutex::new(None),
         });
 
         (link, config_rx)
@@ -631,6 +649,16 @@ impl MonitorLink {
         *guard = new_urls;
     }
 
+    /// Store the per-client token issued by the monitor on registration.
+    ///
+    /// Called by the sentinel after `register_with_failover` returns a token.
+    /// The token is appended as `?client_id=X&client_token=Y` on subscribe,
+    /// config-poll, and heartbeat calls.  `None` clears any existing token
+    /// (safe to call with `None` — no-op for backward compat).
+    pub async fn set_client_token(&self, token: Option<String>) {
+        *self.client_token.lock().await = token;
+    }
+
     /// Snapshot the current URL list (used internally by the run loop and by
     /// callers that want to log what's active).
     pub async fn current_urls(&self) -> Vec<String> {
@@ -650,7 +678,7 @@ impl MonitorLink {
     async fn run(&self) {
         // If a Wire transport is configured, try it first (preferred over DirectWs).
         // Wire transport has no URL to "race" — it dials the monitor's wire addr directly.
-        if let Some(wire) = self.wire_transport() {
+        if let Some(wire) = self.wire_transport().await {
             info!("monitor_link: Wire transport configured — attempting Mirage wire WS");
             match self.run_wire_loop(&wire).await {
                 Ok(()) => info!("monitor_link: Wire WS closed cleanly, falling through to DirectWs"),
@@ -690,7 +718,7 @@ impl MonitorLink {
                 _ = tokio::time::sleep_until(ws_retry_deadline) => {
                     // Try Wire transport first on every retry cycle (it's self-contained,
                     // no URL-race needed).
-                    if let Some(wire) = self.wire_transport() {
+                    if let Some(wire) = self.wire_transport().await {
                         info!("monitor_link: retrying Wire transport");
                         match self.run_wire_loop(&wire).await {
                             Ok(()) => info!("monitor_link: Wire WS retry closed cleanly"),
@@ -732,8 +760,15 @@ impl MonitorLink {
             .any(|t| matches!(t, MonitorTransport::OverChain { .. }))
     }
 
-    /// Return the first `Wire` transport params, if any.
-    fn wire_transport(&self) -> Option<WireParams> {
+    /// Return the active Wire transport params, if any.
+    ///
+    /// Checks `wire_override` first (runtime-seeded from peer_table); falls
+    /// back to the first `Wire` entry in the static `transports` list.
+    async fn wire_transport(&self) -> Option<WireParams> {
+        // Runtime override takes precedence (auto-seeded from peer_table).
+        if let Some(ref wp) = *self.wire_override.lock().await {
+            return Some(wp.clone());
+        }
         for t in &self.transports {
             if let MonitorTransport::Wire {
                 monitor_addr,
@@ -751,6 +786,33 @@ impl MonitorLink {
             }
         }
         None
+    }
+
+    /// Inject wire transport coordinates at runtime (Phase 3 auto-seed).
+    ///
+    /// Called by the sentinel after it extracts the monitor's wire entry from
+    /// the first config's `peer_table`. The override is tried on every Wire
+    /// retry cycle from this point forward.
+    ///
+    /// Setting `None` removes any previous runtime override (falls back to the
+    /// static `transports` list or no-Wire if that is also absent).
+    pub async fn seed_wire_transport(
+        &self,
+        monitor_addr: String,
+        monitor_pubkey_hex: String,
+        mesh_id: String,
+    ) {
+        info!(
+            addr = %monitor_addr,
+            mesh_id = %mesh_id,
+            "monitor_link: wire transport seeded from peer_table"
+        );
+        *self.wire_override.lock().await = Some(WireParams {
+            monitor_addr,
+            monitor_pubkey_hex,
+            mesh_id,
+            host_hint: None,
+        });
     }
 
     /// Drive a Mirage-wire WebSocket subscribe connection.
@@ -820,16 +882,14 @@ impl MonitorLink {
 
         let (io, _pump) = mirage_mesh_client::tunnel_into_io(tunnel);
 
-        // Determine client_id for the subscribe URL.
+        // Determine client_id + token for the subscribe URL.
         let cid = self.client_id.lock().await.clone();
+        let tok = self.client_token.lock().await.clone();
         let host = &sni;
-        let subscribe_path = match cid {
-            Some(ref id) => format!("/relay/clients/subscribe?client_id={id}"),
-            None => "/relay/clients/subscribe".to_string(),
-        };
         // ws:// scheme — the Mirage tunnel already provides E2E encryption.
         // TLS on top would be redundant double-encryption (same as node pattern).
-        let ws_uri = format!("ws://{host}{subscribe_path}");
+        let ws_base = format!("ws://{host}");
+        let ws_uri = build_subscribe_url(&ws_base, cid.as_deref(), tok.as_deref());
 
         // Build WS upgrade request — NO Authorization header (subscribe is unauthenticated).
         let request = Request::builder()
@@ -1417,10 +1477,8 @@ impl MonitorLink {
         // Include client_id when known so the monitor can route per-client
         // pushes (e.g. debug tunnel open/close) back to this exact connection.
         let cid = self.client_id.lock().await.clone();
-        let subscribe_url = match cid {
-            Some(id) => format!("{ws_url}/relay/clients/subscribe?client_id={id}"),
-            None => format!("{ws_url}/relay/clients/subscribe"),
-        };
+        let tok = self.client_token.lock().await.clone();
+        let subscribe_url = build_subscribe_url(&ws_url, cid.as_deref(), tok.as_deref());
 
         let mut req = subscribe_url
             .into_client_request()
@@ -1687,6 +1745,11 @@ impl MonitorLink {
                         self.poll_interval_secs
                             .store(reg.monitor_poll_interval_secs, Ordering::Relaxed);
                         *self.client_id.lock().await = Some(reg.client_id);
+                        // Phase 2: store token when monitor issues one.
+                        // Old monitors return None — silently kept as None.
+                        if reg.client_token.is_some() {
+                            *self.client_token.lock().await = reg.client_token;
+                        }
                         // Fetch initial config via HTTP right after registration
                         // (WS will also send a snapshot on connect, but this
                         // ensures the client has config even before WS is up).
@@ -1711,8 +1774,15 @@ impl MonitorLink {
                 return;
             }
         };
-        let url = format!("{base}/relay/clients/config");
         let current_version = self.config_version.load(Ordering::Relaxed);
+        // Phase 2: append client_id + client_token when both are present.
+        let cid = self.client_id.lock().await.clone();
+        let tok = self.client_token.lock().await.clone();
+        let url = append_client_params(
+            &format!("{base}/relay/clients/config"),
+            cid.as_deref(),
+            tok.as_deref(),
+        );
 
         let mut req = self
             .http
@@ -1756,10 +1826,11 @@ impl MonitorLink {
     }
 
     async fn send_heartbeat(&self) {
-        let client_id = {
-            let guard = self.client_id.lock().await;
-            match guard.as_deref() {
-                Some(id) => id.to_owned(),
+        let (client_id, tok) = {
+            let cid_guard = self.client_id.lock().await;
+            let tok_guard = self.client_token.lock().await;
+            match cid_guard.as_deref() {
+                Some(id) => (id.to_owned(), tok_guard.clone()),
                 None => return,
             }
         };
@@ -1771,7 +1842,12 @@ impl MonitorLink {
                 return;
             }
         };
-        let url = format!("{base}/relay/clients/{client_id}/heartbeat");
+        // Phase 2: append client_token as query param when present.
+        let url = append_client_params(
+            &format!("{base}/relay/clients/{client_id}/heartbeat"),
+            Some(&client_id),
+            tok.as_deref(),
+        );
         let active_chains = self
             .config_version
             .load(Ordering::Relaxed)
@@ -1803,6 +1879,51 @@ fn http_to_ws_url(url: &str) -> String {
         format!("ws://{}", &url["http://".len()..])
     } else {
         url.to_owned()
+    }
+}
+
+/// Build the WebSocket subscribe URL, appending `?client_id=X` and
+/// `?client_token=Y` when present.
+///
+/// `ws_base` — the base WS URL including the scheme, e.g. `wss://host:port`
+/// or `ws://host`.  The path `/relay/clients/subscribe` is always appended.
+///
+/// Backward-compat: if `client_id` is `None`, the raw path is returned with
+/// no query params (older behaviour, old monitors).  If `client_token` is
+/// `None`, only `?client_id=X` is appended.
+fn build_subscribe_url(ws_base: &str, client_id: Option<&str>, client_token: Option<&str>) -> String {
+    match (client_id, client_token) {
+        (Some(id), Some(tok)) => {
+            format!("{ws_base}/relay/clients/subscribe?client_id={id}&client_token={tok}")
+        }
+        (Some(id), None) => {
+            format!("{ws_base}/relay/clients/subscribe?client_id={id}")
+        }
+        (None, _) => {
+            format!("{ws_base}/relay/clients/subscribe")
+        }
+    }
+}
+
+/// Append `?client_id=X&client_token=Y` (or just `?client_token=Y`) to a URL
+/// that already has the path component set.  Used for config-poll and heartbeat.
+///
+/// If both params are absent, returns `base_url` unchanged.
+/// If only `client_id` is present (no token), nothing is appended — the
+/// heartbeat URL already carries the id in the path.
+fn append_client_params(base_url: &str, client_id: Option<&str>, client_token: Option<&str>) -> String {
+    // Only append token when present — client_id for heartbeat is in the path,
+    // but for config-poll we add both as query params (required by Phase 2 gate).
+    match (client_id, client_token) {
+        (Some(id), Some(tok)) => {
+            let sep = if base_url.contains('?') { '&' } else { '?' };
+            format!("{base_url}{sep}client_id={id}&client_token={tok}")
+        }
+        (_, Some(tok)) => {
+            let sep = if base_url.contains('?') { '&' } else { '?' };
+            format!("{base_url}{sep}client_token={tok}")
+        }
+        _ => base_url.to_owned(),
     }
 }
 
