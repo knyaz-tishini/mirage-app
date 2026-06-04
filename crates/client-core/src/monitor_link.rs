@@ -1486,6 +1486,104 @@ async fn register_over_wire(
         .map_err(|e| format!("register_wire: parse response JSON: {e}"))
 }
 
+/// Issue an arbitrary `POST <path>` over the Mirage wire.
+///
+/// Dials the monitor using an anonymous ephemeral V9 tunnel, writes a
+/// hand-framed HTTP/1.0 POST with the supplied `bearer` token in the
+/// `Authorization` header, and returns `(status_code, response_body_bytes)`.
+///
+/// The bearer token travels inside the V9-encrypted wire — it is never
+/// exposed on the network in plaintext.
+///
+/// Returns `Err(String)` if the dial or the HTTP framing fails (non-2xx is
+/// returned as `Ok((status, body))` so callers can decide how to handle it).
+pub async fn wire_post(
+    monitor_addr: &str,
+    monitor_pubkey_hex: &str,
+    mesh_id: &str,
+    path: &str,
+    bearer: &str,
+    body_json: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ephemeral: [u8; 32] = {
+        use rand::RngCore;
+        let mut k = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut k);
+        k
+    };
+    let wire = WireParams {
+        monitor_addr: monitor_addr.to_owned(),
+        monitor_pubkey_hex: monitor_pubkey_hex.to_owned(),
+        mesh_id: mesh_id.to_owned(),
+        host_hint: None,
+    };
+
+    let host = wire
+        .monitor_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_owned())
+        .unwrap_or_else(|| wire.monitor_addr.clone());
+
+    let (mut io, _pump) = dial_monitor_wire_io(&wire, &ephemeral).await?;
+
+    let auth_header = format!("Authorization: Bearer {bearer}\r\n");
+    let head = format!(
+        "POST {path} HTTP/1.0\r\n\
+         Host: {host}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         {auth_header}\
+         Connection: close\r\n\
+         \r\n",
+        body_json.len()
+    );
+
+    io.write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("wire_post: send head: {e}"))?;
+    io.write_all(body_json)
+        .await
+        .map_err(|e| format!("wire_post: send body: {e}"))?;
+
+    let mut response = Vec::new();
+    io.read_to_end(&mut response)
+        .await
+        .map_err(|e| format!("wire_post: read response: {e}"))?;
+
+    if response.is_empty() {
+        return Err("wire_post: empty response from monitor".to_string());
+    }
+
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(response.len());
+
+    let status_line = response[..header_end.min(response.len())]
+        .split(|&b| b == b'\n')
+        .next()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .unwrap_or_default();
+
+    if !status_line.starts_with("HTTP/1.") {
+        return Err(format!(
+            "wire_post: unexpected response prefix: {:?}",
+            &status_line[..status_line.len().min(40)]
+        ));
+    }
+
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let body_bytes = response[(header_end + 4).min(response.len())..].to_vec();
+    Ok((status_code, body_bytes))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build the Wire WebSocket subscribe URL, appending `?client_id=X` and

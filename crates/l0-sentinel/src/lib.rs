@@ -200,8 +200,8 @@ impl SentinelConfig {
         self.tun_args.clone()
     }
 }
-pub(crate) fn default_telemetry_interval() -> u64 { 30 }
-pub(crate) fn default_logs_upload_interval() -> u64 { 60 }
+pub(crate) fn default_telemetry_interval() -> u64 { 0 }
+pub(crate) fn default_logs_upload_interval() -> u64 { 0 }
 pub(crate) fn default_cli_variant() -> String { "cli1".into() }
 pub(crate) fn default_supervisor_args() -> Vec<String> {
     vec!["{client_config_path}".to_owned()]
@@ -498,14 +498,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let monitor_api_key = cfg.monitor_api_key.clone().unwrap_or_default();
     let client_id = client_id_resolved.clone();
 
-    // Task 2
-    spawn_queue_drain(
-        monitor_reachable_rx.clone(),
-        monitor_url.clone(),
-        monitor_api_key.clone(),
-        client_id.clone(),
-    );
-
     info!("[sentinel] spawning MonitorLink -> {:?}", effective_urls);
     publisher.set(SentinelPhase::FetchingConfig { monitor_url: monitor_url.clone() });
     // Sentinel does not plumb peer_table into pools — it only materialises
@@ -533,6 +525,22 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             // Fall back to last-run persisted coords (auto-seeded from peer_table).
             monitor_wire::load(&state_dir)
         };
+
+    // Wire-coords watch: telemetry, log_upload, crash_report, and queue_drain
+    // read from this receiver.  The sender lives in spawn_frame_watcher and
+    // pushes an updated value whenever the peer_table delivers new wire coords.
+    // Initial value is whatever we loaded from disk/config above.
+    let (wire_coords_tx, wire_coords_rx) =
+        tokio::sync::watch::channel(wire_coords.clone());
+
+    // Task 2: drain any queued crash reports to the monitor as soon as the wire
+    // becomes reachable.
+    spawn_queue_drain(
+        monitor_reachable_rx.clone(),
+        wire_coords_rx.clone(),
+        monitor_api_key.clone(),
+        client_id.clone(),
+    );
 
     if let Some(ref wc) = wire_coords {
         info!(
@@ -588,6 +596,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         state_dir.clone(),
         active_urls.clone(),
         cfg.mesh_id.clone(),
+        wire_coords_tx,
     );
 
     // Disk-first: if a managed config from a prior session is on disk, run cli
@@ -743,18 +752,18 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         }
     }
 
-    // Task 5
+    // Task 5: telemetry push over the native wire (0 = disabled by default)
     telemetry::spawn(
-        monitor_url.clone(),
+        wire_coords_rx.clone(),
         monitor_api_key.clone(),
         client_id.clone(),
         cfg.telemetry_interval_secs,
         tun_alive_rx.clone(),
     );
 
-    // Periodic log-tail upload (best-effort, 0 = disabled)
+    // Periodic log-tail upload over the native wire (0 = disabled by default)
     log_upload::spawn(
-        monitor_url.clone(),
+        wire_coords_rx.clone(),
         monitor_api_key.clone(),
         client_id.clone(),
         cfg.logs_upload_interval_secs,
@@ -803,11 +812,11 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                 let kind_str = format!("{:?}", report.kind);
                 let exit_code = report.exit_code.unwrap_or(-1);
 
-                // Task 1
+                // Task 1: send crash report over the native wire (disk fallback
+                // when wire coords are not yet available).
                 report_crash(
                     &report,
-                    Some(&monitor_url),
-                    Some(&monitor_api_key),
+                    wire_coords_rx.borrow().as_ref(),
                     Some(&client_id),
                 ).await;
 
@@ -1036,6 +1045,7 @@ fn spawn_frame_watcher(
     state_dir: PathBuf,
     initial_urls: Vec<String>,
     mesh_id: String,
+    wire_coords_tx: tokio::sync::watch::Sender<Option<monitor_wire::WireCoords>>,
 ) {
     use mirage_client_core::monitor_link::WsServerFrame;
 
@@ -1082,6 +1092,10 @@ fn spawn_frame_watcher(
                                     wc.monitor_pubkey_hex.clone(),
                                     wc.mesh_id.clone(),
                                 ).await;
+                                // Broadcast updated coords to telemetry / log_upload /
+                                // crash_report so they can switch to the new wire address
+                                // without a restart.
+                                let _ = wire_coords_tx.send(Some(wc.clone()));
                                 last_wire_addr = Some(wc.monitor_addr);
                             }
                         }

@@ -2,13 +2,18 @@
 //!
 //! Pulls metrics from TUN (`GET http://127.0.0.1:19485/metrics` and
 //! `/connections`) every `interval_secs` seconds and POSTs the aggregated
-//! [`TelemetryPush`] to `{monitor_url}/relay/clients/{client_id}/telemetry`.
+//! [`TelemetryPush`] to `/relay/clients/{client_id}/telemetry` over the
+//! native Mirage wire (V9 encrypted tunnel — no plain HTTPS).
+//!
+//! Skips ticks when wire coords are not yet available (early boot).
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
+
+use crate::monitor_wire::WireCoords;
 
 // ── TUN port ──────────────────────────────────────────────────────────────────
 
@@ -72,9 +77,10 @@ struct TunConnection {
 
 /// Spawn the telemetry push task.
 ///
-/// Exits quietly if `interval_secs == 0` or credentials are missing.
+/// Exits quietly if `interval_secs == 0` (disabled by default).
+/// Skips each tick when `wire_coords_rx` carries `None` (wire not yet known).
 pub fn spawn(
-    monitor_url: String,
+    wire_coords_rx: watch::Receiver<Option<WireCoords>>,
     monitor_api_key: String,
     client_id: String,
     interval_secs: u64,
@@ -84,7 +90,7 @@ pub fn spawn(
         return;
     }
     tokio::spawn(telemetry_task(
-        monitor_url,
+        wire_coords_rx,
         monitor_api_key,
         client_id,
         interval_secs,
@@ -93,12 +99,14 @@ pub fn spawn(
 }
 
 async fn telemetry_task(
-    monitor_url: String,
+    wire_coords_rx: watch::Receiver<Option<WireCoords>>,
     api_key: String,
     client_id: String,
     interval_secs: u64,
     tun_alive_rx: watch::Receiver<bool>,
 ) {
+    // Local reqwest client — used only to query the TUN sidecar on localhost.
+    // No outbound monitor traffic uses this client.
     let http = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -121,12 +129,18 @@ async fn telemetry_task(
             continue;
         }
 
+        // Skip if wire coords not yet known
+        let coords = wire_coords_rx.borrow().clone();
+        let Some(coords) = coords else {
+            continue;
+        };
+
         let push = match collect_telemetry(&http).await {
             Some(p) => p,
             None => continue,
         };
 
-        post_telemetry(&http, &monitor_url, &api_key, &client_id, &push).await;
+        post_telemetry_wire(&coords, &api_key, &client_id, &push).await;
     }
 }
 
@@ -191,41 +205,38 @@ async fn collect_telemetry(http: &reqwest::Client) -> Option<TelemetryPush> {
     Some(TelemetryPush { ts_ms, chains, destinations_top })
 }
 
-async fn post_telemetry(
-    http: &reqwest::Client,
-    monitor_url: &str,
+async fn post_telemetry_wire(
+    coords: &WireCoords,
     api_key: &str,
     client_id: &str,
     push: &TelemetryPush,
 ) {
-    let url = format!(
-        "{}/relay/clients/{}/telemetry",
-        monitor_url.trim_end_matches('/'),
-        client_id
-    );
-    let body = match serde_json::to_string(push) {
+    let path = format!("/relay/clients/{}/telemetry", client_id);
+    let body = match serde_json::to_vec(push) {
         Ok(b) => b,
         Err(e) => {
             warn!("[telemetry] serialise error: {}", e);
             return;
         }
     };
-    match http
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .body(body)
-        .send()
-        .await
+    match mirage_client_core::monitor_link::wire_post(
+        &coords.monitor_addr,
+        &coords.monitor_pubkey_hex,
+        &coords.mesh_id,
+        &path,
+        api_key,
+        &body,
+    )
+    .await
     {
-        Ok(r) if r.status().is_success() => {
-            info!("[telemetry] pushed to monitor (chains={})", push.chains.len());
+        Ok((status, _)) if (200..300).contains(&(status as usize)) => {
+            info!("[telemetry] pushed to monitor via wire (chains={})", push.chains.len());
         }
-        Ok(r) => {
-            warn!("[telemetry] monitor returned {}", r.status());
+        Ok((status, _)) => {
+            warn!("[telemetry] monitor returned {} via wire", status);
         }
         Err(e) => {
-            warn!("[telemetry] POST failed: {}", e);
+            warn!("[telemetry] wire POST failed: {}", e);
         }
     }
 }

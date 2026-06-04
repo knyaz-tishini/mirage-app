@@ -2,14 +2,18 @@
 //!
 //! Every `interval_secs` seconds, reads the last 32 KB of cli and tun stderr
 //! ring buffers and POSTs each non-empty tail to
-//! `{monitor_url}/relay/clients/{client_id}/logs`.
+//! `/relay/clients/{client_id}/logs` over the native Mirage wire (V9
+//! encrypted tunnel — no plain HTTPS).
+//!
+//! Skips ticks when wire coords are not yet available (early boot).
 
 use std::sync::Arc;
 
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::warn;
 
+use crate::monitor_wire::WireCoords;
 use crate::supervisor::{ChildState, RingBuffer};
 
 // ── Upload size limit ─────────────────────────────────────────────────────────
@@ -30,9 +34,10 @@ struct LogUploadBody<'a> {
 
 /// Spawn the log-upload task.
 ///
-/// Exits quietly if `interval_secs == 0` (disabled).
+/// Exits quietly if `interval_secs == 0` (disabled by default).
+/// Skips each tick when `wire_coords_rx` carries `None` (wire not yet known).
 pub fn spawn(
-    monitor_url: String,
+    wire_coords_rx: watch::Receiver<Option<WireCoords>>,
     monitor_api_key: String,
     client_id: String,
     interval_secs: u64,
@@ -42,7 +47,7 @@ pub fn spawn(
         return;
     }
     tokio::spawn(log_upload_task(
-        monitor_url,
+        wire_coords_rx,
         monitor_api_key,
         client_id,
         interval_secs,
@@ -51,29 +56,24 @@ pub fn spawn(
 }
 
 async fn log_upload_task(
-    monitor_url: String,
+    wire_coords_rx: watch::Receiver<Option<WireCoords>>,
     api_key: String,
     client_id: String,
     interval_secs: u64,
     children: Arc<Mutex<ChildState>>,
 ) {
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("[log_upload] failed to build http client: {}", e);
-            return;
-        }
-    };
-
     let mut ticker =
         tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;
+
+        // Skip if wire coords not yet known
+        let coords = wire_coords_rx.borrow().clone();
+        let Some(coords) = coords else {
+            continue;
+        };
 
         // Snapshot stderr tails while holding the lock briefly.
         let (cli_tail, tun_tail) = {
@@ -91,13 +91,13 @@ async fn log_upload_task(
 
         if let Some(tail) = cli_tail {
             if !tail.is_empty() {
-                post_log(&http, &monitor_url, &api_key, &client_id, "cli", tail).await;
+                post_log_wire(&coords, &api_key, &client_id, "cli", tail).await;
             }
         }
 
         if let Some(tail) = tun_tail {
             if !tail.is_empty() {
-                post_log(&http, &monitor_url, &api_key, &client_id, "tun", tail).await;
+                post_log_wire(&coords, &api_key, &client_id, "tun", tail).await;
             }
         }
     }
@@ -107,9 +107,8 @@ async fn read_tail(buf: &tokio::sync::Mutex<RingBuffer>) -> String {
     buf.lock().await.tail_utf8(TAIL_BYTES)
 }
 
-async fn post_log(
-    http: &reqwest::Client,
-    monitor_url: &str,
+async fn post_log_wire(
+    coords: &WireCoords,
     api_key: &str,
     client_id: &str,
     process: &str,
@@ -127,7 +126,7 @@ async fn post_log(
         stdout_tail: "",
     };
 
-    let body_str = match serde_json::to_string(&body) {
+    let body_bytes = match serde_json::to_vec(&body) {
         Ok(s) => s,
         Err(e) => {
             warn!("[log_upload] serialise error: {}", e);
@@ -135,28 +134,29 @@ async fn post_log(
         }
     };
 
-    let url = format!(
-        "{}/relay/clients/{}/logs",
-        monitor_url.trim_end_matches('/'),
-        client_id
-    );
+    let path = format!("/relay/clients/{}/logs", client_id);
 
-    match http
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .body(body_str)
-        .send()
-        .await
+    match mirage_client_core::monitor_link::wire_post(
+        &coords.monitor_addr,
+        &coords.monitor_pubkey_hex,
+        &coords.mesh_id,
+        &path,
+        api_key,
+        &body_bytes,
+    )
+    .await
     {
-        Ok(r) if r.status().is_success() => {
+        Ok((status, _)) if (200..300).contains(&(status as usize)) => {
             // best-effort, no noise on success
         }
-        Ok(r) => {
-            warn!("[log_upload] monitor returned {} for process={}", r.status(), process);
+        Ok((status, _)) => {
+            warn!(
+                "[log_upload] monitor returned {} via wire for process={}",
+                status, process
+            );
         }
         Err(e) => {
-            warn!("[log_upload] POST failed for process={}: {}", process, e);
+            warn!("[log_upload] wire POST failed for process={}: {}", process, e);
         }
     }
 }

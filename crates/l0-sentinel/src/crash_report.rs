@@ -1,11 +1,17 @@
 //! Crash report struct + persistence/relay logic.
+//!
+//! Sends crash reports over the native Mirage wire (V9 encrypted tunnel).
+//! Falls back to disk persistence when wire coords are not yet known or when
+//! the wire dial fails.  The disk queue is drained to the wire when
+//! `monitor_reachable_rx` flips to `true`.
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use serde::Serialize;
 use tokio::sync::watch;
 use tracing::{info, warn};
+
+use crate::monitor_wire::WireCoords;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -33,53 +39,51 @@ pub struct CrashReport {
 
 // ── Persist / relay ───────────────────────────────────────────────────────────
 
-/// Try to POST crash report to monitor; on failure (or no monitor) write to disk.
-/// If POST succeeds (2xx), disk file is NOT written (no fallback needed).
-/// If POST fails, write to disk so the queue drain can retry later.
+/// Try to POST crash report to monitor over the wire; on failure (or no wire
+/// coords yet), write to disk.  If the wire POST succeeds (2xx), no disk file
+/// is written.
 pub async fn report_crash(
     report: &CrashReport,
-    monitor_url: Option<&str>,
-    monitor_api_key: Option<&str>,
+    wire_coords: Option<&WireCoords>,
     client_id: Option<&str>,
 ) {
-    if let (Some(url), Some(key), Some(id)) = (monitor_url, monitor_api_key, client_id) {
-        match try_post_crash(report, url, key, id).await {
-            Ok(()) => return, // posted — no disk needed
+    if let (Some(coords), Some(id)) = (wire_coords, client_id) {
+        match try_post_crash_wire(report, coords, id).await {
+            Ok(()) => return, // posted over wire — no disk needed
             Err(e) => {
-                warn!("[crash] POST to monitor failed ({}), saving to disk", e);
+                warn!("[crash] wire POST to monitor failed ({}), saving to disk", e);
             }
         }
     }
     save_crash_to_disk(report);
 }
 
-async fn try_post_crash(
+async fn try_post_crash_wire(
     report: &CrashReport,
-    monitor_url: &str,
-    api_key: &str,
+    coords: &WireCoords,
     client_id: &str,
-) -> Result<()> {
-    let url = format!(
-        "{}/relay/clients/{}/crash",
-        monitor_url.trim_end_matches('/'),
-        client_id
-    );
-    let body = serde_json::to_string(report)?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .body(body)
-        .send()
-        .await?;
-    if resp.status().is_success() {
-        info!("[crash] posted crash report for '{}' to monitor", report.process);
+) -> Result<(), String> {
+    let path = format!("/relay/clients/{}/crash", client_id);
+    let body = serde_json::to_vec(report)
+        .map_err(|e| format!("serialize crash report: {e}"))?;
+    // We use an empty bearer here: crash reports are identified by client_id
+    // in the path; the monitor_api_key is carried by the queue drain when
+    // available.  Pass empty string so the header is present but harmless for
+    // monitors that don't require it on this endpoint.
+    let (status, _) = mirage_client_core::monitor_link::wire_post(
+        &coords.monitor_addr,
+        &coords.monitor_pubkey_hex,
+        &coords.mesh_id,
+        &path,
+        "",
+        &body,
+    )
+    .await?;
+    if (200..300).contains(&(status as usize)) {
+        info!("[crash] posted crash report for '{}' to monitor via wire", report.process);
         Ok(())
     } else {
-        anyhow::bail!("monitor returned {}", resp.status());
+        Err(format!("monitor returned {status}"))
     }
 }
 
@@ -130,16 +134,17 @@ fn save_crash_to_disk(report: &CrashReport) {
 /// Spawn a background task that drains `<exe_dir>/crashes/*.json` whenever
 /// `monitor_reachable_rx` flips to `true`.
 ///
-/// Each queued file is POSTed to the monitor; on success the file is deleted.
+/// Each queued file is POSTed to the monitor over the wire; on success the
+/// file is deleted.
 pub fn spawn_queue_drain(
     monitor_reachable_rx: watch::Receiver<bool>,
-    monitor_url: String,
+    wire_coords_rx: watch::Receiver<Option<WireCoords>>,
     monitor_api_key: String,
     client_id: String,
 ) {
     tokio::spawn(queue_drain_task(
         monitor_reachable_rx,
-        monitor_url,
+        wire_coords_rx,
         monitor_api_key,
         client_id,
     ));
@@ -147,7 +152,7 @@ pub fn spawn_queue_drain(
 
 async fn queue_drain_task(
     mut reachable_rx: watch::Receiver<bool>,
-    monitor_url: String,
+    wire_coords_rx: watch::Receiver<Option<WireCoords>>,
     api_key: String,
     client_id: String,
 ) {
@@ -160,11 +165,17 @@ async fn queue_drain_task(
             continue;
         }
 
-        drain_disk_queue(&monitor_url, &api_key, &client_id).await;
+        // Only drain when we actually have wire coords
+        let coords = wire_coords_rx.borrow().clone();
+        let Some(coords) = coords else {
+            continue;
+        };
+
+        drain_disk_queue(&coords, &api_key, &client_id).await;
     }
 }
 
-async fn drain_disk_queue(monitor_url: &str, api_key: &str, client_id: &str) {
+async fn drain_disk_queue(coords: &WireCoords, api_key: &str, client_id: &str) {
     let exe_dir = match std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from))
@@ -201,7 +212,7 @@ async fn drain_disk_queue(monitor_url: &str, api_key: &str, client_id: &str) {
                 continue;
             }
         };
-        if try_post_raw_crash(&raw, monitor_url, api_key, client_id).await.is_ok() {
+        if try_post_raw_crash_wire(&raw, coords, api_key, client_id).await.is_ok() {
             if let Err(e) = std::fs::remove_file(&path) {
                 warn!("[crash] delete queued file {:?}: {}", path, e);
             } else {
@@ -217,30 +228,25 @@ async fn drain_disk_queue(monitor_url: &str, api_key: &str, client_id: &str) {
     }
 }
 
-async fn try_post_raw_crash(
+async fn try_post_raw_crash_wire(
     body: &str,
-    monitor_url: &str,
+    coords: &WireCoords,
     api_key: &str,
     client_id: &str,
-) -> Result<()> {
-    let url = format!(
-        "{}/relay/clients/{}/crash",
-        monitor_url.trim_end_matches('/'),
-        client_id
-    );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .body(body.to_owned())
-        .send()
-        .await?;
-    if resp.status().is_success() {
+) -> Result<(), String> {
+    let path = format!("/relay/clients/{}/crash", client_id);
+    let (status, _) = mirage_client_core::monitor_link::wire_post(
+        &coords.monitor_addr,
+        &coords.monitor_pubkey_hex,
+        &coords.mesh_id,
+        &path,
+        api_key,
+        body.as_bytes(),
+    )
+    .await?;
+    if (200..300).contains(&(status as usize)) {
         Ok(())
     } else {
-        anyhow::bail!("monitor returned {}", resp.status());
+        Err(format!("monitor returned {status}"))
     }
 }
