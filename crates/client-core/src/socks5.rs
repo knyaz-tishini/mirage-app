@@ -3,17 +3,33 @@
 //! Supports CONNECT (0x01) and UDP ASSOCIATE (0x03) with no authentication.
 //! Handles both IPv4 (0x01), domain (0x03), and IPv6 (0x04) addresses.
 //!
-//! ## Multi-chain failover
+//! ## Multi-chain failover + kill-switch (Wave 2a)
 //!
 //! Each [`Socks5Server`] is bound to one chain's [`TunnelPool`] as its
 //! primary pool.  An optional `failover_pools` list (sorted by priority)
-//! allows the handler to try other chains when the primary pool is
-//! exhausted.  This is the cross-chain failover mechanism described in the
-//! multi-chain design.
+//! allows the handler to try other chains when the primary pool is exhausted.
+//!
+//! Kill-switch invariants enforced here:
+//!
+//! 1. **Bypass is sacred** — `RouteDecision::Direct` flows are always allowed
+//!    through `route_direct` (native TCP).  The kill-switch NEVER blocks a
+//!    flow that the routing table designated as Direct/Bypass.
+//!
+//! 2. **No native internet for wire flows** — `RouteDecision::Chain` flows
+//!    MUST NOT fall through to `route_direct` on pool exhaustion.  On failure
+//!    they receive a SOCKS5 error reply and are closed.
+//!
+//! 3. **Per-wire class** —
+//!    - `SocksFailurePolicy::FailClosed` (Strict): on primary pool failure → SOCKS5
+//!      error, no reroute, no native.
+//!    - `SocksFailurePolicy::Failover { group }` (General): try only pools whose
+//!      chain belongs to the same group; if all fail → SOCKS5 error, no native.
+//!    - `SocksFailurePolicy::Default` (no kill-switch configured): legacy behavior,
+//!      try all failover pools in order.
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use mirage_core::{config::ClientConfig, error::MirageError, routing::RouteDecision, routing::RoutingTable};
+use mirage_core::{config::{ClientConfig, KillSwitchMode}, error::MirageError, routing::RouteDecision, routing::RoutingTable};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -27,6 +43,52 @@ use mirage_protocol::traits::Tunnel as _;
 use crate::{mux_pool::MuxPool, pool::TunnelPool, relay::{relay_loop, TunnelCompat}};
 use crate::udp_framing::{write_udp_frame, read_udp_frame};
 use crate::chain_set::{ChainId, Router, TargetKey, FlowKey, ProtocolHint};
+use crate::wire_health::WireHealthMap;
+
+// ── Kill-switch policy for the SOCKS5 path ───────────────────────────────────
+
+/// Per-chain failure policy for the SOCKS5 routing path.
+///
+/// Maps from [`KillSwitchMode`] + `group` in [`ChainConfig`]:
+/// - `None` → `Default` (legacy: try all failover pools unconditionally)
+/// - `Strict` → `FailClosed`
+/// - `General` + group → `Failover { group }`
+///
+/// [`KillSwitchMode`]: mirage_core::config::KillSwitchMode
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocksFailurePolicy {
+    /// No kill-switch configured for this chain — legacy failover semantics.
+    Default,
+    /// INVARIANT 3 / STRICT: flow pinned to its exact wire.
+    ///
+    /// On primary pool failure → send SOCKS5 error, DO NOT try other pools,
+    /// DO NOT call `route_direct`.
+    FailClosed,
+    /// INVARIANT 3 / GENERAL: flow may use any healthy wire in the same group.
+    ///
+    /// On primary failure → try only pools whose chain is in `group`.
+    /// If all group members fail → SOCKS5 error, DO NOT call `route_direct`.
+    Failover { group: String },
+}
+
+impl SocksFailurePolicy {
+    /// Derive a `SocksFailurePolicy` from a chain's kill-switch config fields.
+    pub fn from_chain_config(
+        kill_switch: Option<&KillSwitchMode>,
+        group: Option<&str>,
+        chain_id: &str,
+    ) -> Self {
+        match kill_switch {
+            None => SocksFailurePolicy::Default,
+            Some(KillSwitchMode::Strict) => SocksFailurePolicy::FailClosed,
+            Some(KillSwitchMode::General) => {
+                // Use explicit group name, fall back to chain_id as group sentinel.
+                let g = group.unwrap_or(chain_id).to_owned();
+                SocksFailurePolicy::Failover { group: g }
+            }
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 use crate::transparent::{get_original_dst, peek_connection_kind, ConnectionKind};
@@ -40,6 +102,9 @@ const SOCKS5_ATYP_IPV4: u8 = 0x01;
 const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
 const SOCKS5_REP_SUCCESS: u8 = 0x00;
+/// RFC 1928 §6 reply code: general SOCKS server failure.
+/// Used for kill-switch fail-closed: wire flow → no wire available → refuse.
+const SOCKS5_REP_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS5_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
@@ -71,6 +136,16 @@ impl Destination {
 /// which is used to look up pools in `all_pools`. If a chain_id is not found
 /// in `all_pools`, it is silently skipped. When `chain_router` is `None`,
 /// the legacy `failover_pools` path is used unchanged (cli1 backward compat).
+///
+/// ## Kill-switch
+///
+/// `chain_policies` maps each chain_id (including the primary) to its
+/// [`SocksFailurePolicy`].  When populated, the failover logic in
+/// `route_via_pool_with_failover` enforces per-wire Strict/General semantics.
+/// Chains absent from the map default to `SocksFailurePolicy::Default`.
+///
+/// `wire_health` tracks per-wire liveness so dead wires fail closed
+/// immediately instead of waiting for the pool-lease timeout (300–600 s).
 pub struct Socks5Server {
     bind_addr: SocketAddr,
     /// `(chain_id, pool)` pairs used for failover, highest-priority first.
@@ -80,6 +155,15 @@ pub struct Socks5Server {
     chain_router: Option<Arc<dyn Router>>,
     /// All pool handles keyed by chain_id — used when `chain_router` is set.
     all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
+    /// Per-chain kill-switch failure policies (chain_id → policy).
+    /// Absent entry → `SocksFailurePolicy::Default` (legacy behavior).
+    chain_policies: Arc<HashMap<String, SocksFailurePolicy>>,
+    /// Per-wire liveness map.  Shared across all connection handlers spawned
+    /// by this server so a dead wire is detected instantly without waiting for
+    /// pool-lease timeouts.
+    wire_health: Arc<WireHealthMap>,
+    /// `chain_id` this server instance is the primary for.
+    primary_chain_id: String,
 }
 
 impl Socks5Server {
@@ -90,6 +174,9 @@ impl Socks5Server {
             failover_pools: Vec::new(),
             chain_router: None,
             all_pools: Arc::new(HashMap::new()),
+            chain_policies: Arc::new(HashMap::new()),
+            wire_health: WireHealthMap::new(),
+            primary_chain_id: String::new(),
         }
     }
 
@@ -104,7 +191,34 @@ impl Socks5Server {
             failover_pools,
             chain_router: None,
             all_pools: Arc::new(HashMap::new()),
+            chain_policies: Arc::new(HashMap::new()),
+            wire_health: WireHealthMap::new(),
+            primary_chain_id: String::new(),
         }
+    }
+
+    /// Attach kill-switch policies to an existing server.
+    ///
+    /// `policies` maps every chain_id (including the primary) to its
+    /// [`SocksFailurePolicy`].  Chains absent from the map retain
+    /// `SocksFailurePolicy::Default`.  `primary_chain_id` identifies which
+    /// chain is the primary for this server instance so the handler can look
+    /// up its own policy without ambiguity.
+    pub fn with_kill_switch(
+        mut self,
+        primary_chain_id: String,
+        policies: HashMap<String, SocksFailurePolicy>,
+    ) -> Self {
+        self.primary_chain_id = primary_chain_id;
+        self.chain_policies = Arc::new(policies);
+        self
+    }
+
+    /// Attach a shared wire-health map (for fleets of servers sharing the same
+    /// underlying wire set).  When not called, a fresh per-server map is used.
+    pub fn with_shared_wire_health(mut self, wire_health: Arc<WireHealthMap>) -> Self {
+        self.wire_health = wire_health;
+        self
     }
 
     /// Create a server with a dynamic `Router` driving chain selection.
@@ -122,6 +236,9 @@ impl Socks5Server {
             failover_pools: Vec::new(),
             chain_router: Some(chain_router),
             all_pools: Arc::new(all_pools),
+            chain_policies: Arc::new(HashMap::new()),
+            wire_health: WireHealthMap::new(),
+            primary_chain_id: String::new(),
         }
     }
 
@@ -139,6 +256,9 @@ impl Socks5Server {
         let failover = Arc::new(self.failover_pools.clone());
         let chain_router = self.chain_router.clone();
         let all_pools = Arc::clone(&self.all_pools);
+        let chain_policies = Arc::clone(&self.chain_policies);
+        let wire_health = Arc::clone(&self.wire_health);
+        let primary_chain_id = Arc::new(self.primary_chain_id.clone());
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -150,6 +270,9 @@ impl Socks5Server {
             let failover = Arc::clone(&failover);
             let chain_router = chain_router.clone();
             let all_pools = Arc::clone(&all_pools);
+            let chain_policies = Arc::clone(&chain_policies);
+            let wire_health = Arc::clone(&wire_health);
+            let primary_chain_id = Arc::clone(&primary_chain_id);
 
             tokio::spawn(async move {
                 #[cfg(target_os = "linux")]
@@ -163,16 +286,16 @@ impl Socks5Server {
                     };
                     match kind {
                         ConnectionKind::Socks5 => {
-                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools).await
+                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await
                         }
                         ConnectionKind::Transparent => {
-                            handle_transparent_connection(stream, pool, mux_pool, router, failover, chain_router, all_pools).await
+                            handle_transparent_connection(stream, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await
                         }
                     }
                 };
 
                 #[cfg(not(target_os = "linux"))]
-                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools).await;
+                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await;
 
                 if let Err(e) = result {
                     error!(%peer, "connection error: {e}");
@@ -322,6 +445,10 @@ async fn lease_and_send_target(
 
 /// Lease a tunnel from the primary pool, falling over to other chains when
 /// the primary is exhausted.
+///
+/// Legacy path used by the UDP session task and other callers that predate
+/// kill-switch.  Does NOT enforce `SocksFailurePolicy`.  For the transparent
+/// proxy path with kill-switch, use [`lease_with_failover_policy`] instead.
 async fn lease_with_failover(
     primary: &Arc<TunnelPool>,
     failover: &[(String, Arc<TunnelPool>)],
@@ -348,6 +475,100 @@ async fn lease_with_failover(
     }
 
     Err(MirageError::PoolExhausted)
+}
+
+/// Policy-aware lease for the transparent proxy path.
+///
+/// Same kill-switch semantics as [`route_via_pool_with_failover`] but does not
+/// send SOCKS5 error replies (the transparent path has no SOCKS5 framing).
+/// On any failure returns `Err` — the caller RSTs the connection.
+///
+/// INVARIANT 2: never falls through to native TCP on exhaustion.
+#[cfg(target_os = "linux")]
+async fn lease_with_failover_policy(
+    primary: &Arc<TunnelPool>,
+    primary_chain_id: &str,
+    failover: &[(String, Arc<TunnelPool>)],
+    policy: &SocksFailurePolicy,
+    wire_health: &Arc<WireHealthMap>,
+    chain_policies: &HashMap<String, SocksFailurePolicy>,
+) -> Result<crate::pool::TunnelLease, MirageError> {
+    match primary.lease().await {
+        Ok(lease) => {
+            wire_health.record_success(primary_chain_id);
+            return Ok(lease);
+        }
+        Err(primary_err) => {
+            wire_health.record_failure(primary_chain_id);
+            match policy {
+                // INVARIANT 3 / STRICT: no failover.
+                SocksFailurePolicy::FailClosed => {
+                    warn!(
+                        chain = %primary_chain_id,
+                        error = %primary_err,
+                        "transparent kill-switch FailClosed: refusing flow"
+                    );
+                    return Err(primary_err);
+                }
+                // INVARIANT 3 / GENERAL: group-only.
+                SocksFailurePolicy::Failover { group } => {
+                    warn!(
+                        chain = %primary_chain_id,
+                        error = %primary_err,
+                        group = %group,
+                        "transparent kill-switch Failover: trying group members"
+                    );
+                    let mut last_err = primary_err;
+                    for (chain_id, fo_pool) in failover {
+                        let in_group = match chain_policies.get(chain_id) {
+                            Some(SocksFailurePolicy::Failover { group: g }) => g == group,
+                            _ => false,
+                        };
+                        if !in_group {
+                            continue;
+                        }
+                        if !wire_health.is_healthy(chain_id) {
+                            warn!(chain = %chain_id, "wire-health: transparent group member unhealthy");
+                            continue;
+                        }
+                        match fo_pool.lease().await {
+                            Ok(l) => {
+                                wire_health.record_success(chain_id);
+                                return Ok(l);
+                            }
+                            Err(e) => {
+                                wire_health.record_failure(chain_id);
+                                last_err = e;
+                            }
+                        }
+                    }
+                    // INVARIANT 3+2: group exhausted — RST, no native TCP.
+                    return Err(last_err);
+                }
+                // Default: legacy, try all (still no native TCP on exhaustion).
+                SocksFailurePolicy::Default => {
+                    let mut last_err = primary_err;
+                    for (chain_id, fo_pool) in failover {
+                        if !wire_health.is_healthy(chain_id) {
+                            continue;
+                        }
+                        match fo_pool.lease().await {
+                            Ok(l) => {
+                                wire_health.record_success(chain_id);
+                                return Ok(l);
+                            }
+                            Err(e) => {
+                                wire_health.record_failure(chain_id);
+                                last_err = e;
+                            }
+                        }
+                    }
+                    // INVARIANT 2: no native TCP on exhaustion.
+                    return Err(last_err);
+                }
+            }
+        }
+    }
 }
 
 /// Read and discard a SOCKS5 address field (atyp + addr bytes + port).
@@ -388,6 +609,9 @@ async fn handle_socks5_connection(
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
     chain_router: Option<Arc<dyn Router>>,
     all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
+    chain_policies: Arc<HashMap<String, SocksFailurePolicy>>,
+    wire_health: Arc<WireHealthMap>,
+    primary_chain_id: Arc<String>,
 ) -> Result<(), MirageError> {
     // ── 1. SOCKS5 greeting ────────────────────────────────────────────────
     // Client: [0x05, n_methods, method1, ...]
@@ -449,8 +673,22 @@ async fn handle_socks5_connection(
             debug!(target = %target_addr, decision = decision_label, "routing decision");
 
             match decision {
+                // ── INVARIANT 1: Bypass is sacred ────────────────────────────
+                // RouteDecision::Direct means the routing table EXPLICITLY
+                // designated this flow as bypass (clearnet is allowed).
+                // This is the ONLY code path that may call route_direct.
                 RouteDecision::Direct => route_direct(&mut stream, &target_addr).await,
+
+                // ── INVARIANT 2 + 3: Wire flows must NOT reach native TCP ────
+                // All RouteDecision::Chain flows are wire-designated.  On any
+                // failure they receive a SOCKS5 error — never route_direct.
                 RouteDecision::Chain => {
+                    // Derive the failure policy for the primary chain of this server.
+                    let policy = chain_policies
+                        .get(primary_chain_id.as_str())
+                        .cloned()
+                        .unwrap_or(SocksFailurePolicy::Default);
+
                     if let Some(cr) = &chain_router {
                         // Router-driven path: pick ordered chain list, try each pool.
                         let target_key = TargetKey {
@@ -470,7 +708,9 @@ async fn handle_socks5_connection(
                         };
                         let chain_ids = cr.pick(&target_key, &flow);
                         if chain_ids.is_empty() {
-                            warn!(target = %target_addr, "router returned empty chain list — pool exhausted");
+                            warn!(target = %target_addr, "router returned empty chain list — fail-closed");
+                            // INVARIANT 2: pool exhausted on wire path → SOCKS5 error, NOT direct.
+                            send_socks5_error(&mut stream, SOCKS5_REP_GENERAL_FAILURE).await;
                             return Err(MirageError::PoolExhausted);
                         }
                         route_via_router_pools(&mut stream, &chain_ids, &all_pools, &target_addr).await
@@ -482,15 +722,42 @@ async fn handle_socks5_connection(
                                 Ok(()) => Ok(()),
                                 Err(e) if matches!(&e, MirageError::CircuitOpen) => {
                                     tracing::warn!(target = %target_addr, "mux circuit open — falling back to TunnelPool");
-                                    route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                                    route_via_pool_with_failover(
+                                        &mut stream,
+                                        pool,
+                                        &primary_chain_id,
+                                        &failover,
+                                        &target_addr,
+                                        &policy,
+                                        &wire_health,
+                                        &chain_policies,
+                                    ).await
                                 }
                                 Err(e) => {
                                     tracing::warn!(target = %target_addr, error = %e, "mux open_stream failed — falling back to TunnelPool");
-                                    route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                                    route_via_pool_with_failover(
+                                        &mut stream,
+                                        pool,
+                                        &primary_chain_id,
+                                        &failover,
+                                        &target_addr,
+                                        &policy,
+                                        &wire_health,
+                                        &chain_policies,
+                                    ).await
                                 }
                             }
                         } else {
-                            route_via_pool_with_failover(&mut stream, pool, &failover, &target_addr).await
+                            route_via_pool_with_failover(
+                                &mut stream,
+                                pool,
+                                &primary_chain_id,
+                                &failover,
+                                &target_addr,
+                                &policy,
+                                &wire_health,
+                                &chain_policies,
+                            ).await
                         }
                     }
                 }
@@ -581,44 +848,186 @@ async fn route_direct(
     Ok(())
 }
 
-/// Lease a pre-warmed tunnel from the pool (with failover), send the target
-/// address, then relay.
+/// Lease a pre-warmed tunnel from the pool (with kill-switch-aware failover),
+/// send the target address, then relay.
 ///
 /// Primary pool is tried with `LEASE_SEND_MAX_ATTEMPTS` retries (absorbs
-/// cold-pool / single-use-tunnel flakiness, #59). On exhaustion, each
-/// failover pool is tried once in priority order.
+/// cold-pool / single-use-tunnel flakiness, #59).
+///
+/// On exhaustion the kill-switch policy governs what happens next:
+///
+/// - `FailClosed` (Strict): **no** failover — send SOCKS5 `0x01 General Failure`
+///   reply to the client and return.  The flow goes NOWHERE.  Native TCP is
+///   NEVER tried.  INVARIANT 3 (Strict).
+///
+/// - `Failover { group }` (General): try only failover pools whose `chain_id`
+///   appears in `chain_policies` with a matching group name.  If all group
+///   members fail → SOCKS5 error, **no** native TCP.  INVARIANT 3 (General).
+///
+/// - `Default` (no kill-switch): legacy behavior, try all failover pools in
+///   priority order.  Still never calls `route_direct` — that is the
+///   caller's responsibility (only `RouteDecision::Direct` may do that).
+///   INVARIANT 2 preserved.
+///
+/// Wire health is consulted before attempting each pool: a chain marked
+/// unhealthy (≥2 consecutive failures) is skipped without a lease attempt so
+/// dead wires fail closed immediately instead of waiting 300–600 s for the
+/// pool-lease timeout.
 async fn route_via_pool_with_failover(
     client: &mut TcpStream,
     pool: Arc<TunnelPool>,
+    primary_chain_id: &str,
     failover: &[(String, Arc<TunnelPool>)],
     target_addr: &str,
+    policy: &SocksFailurePolicy,
+    wire_health: &Arc<WireHealthMap>,
+    chain_policies: &HashMap<String, SocksFailurePolicy>,
 ) -> Result<(), MirageError> {
-    // Try the primary pool with bounded retry.
+    // ── S3: consult wire health before attempting primary ─────────────────────
+    if !wire_health.is_healthy(primary_chain_id) {
+        warn!(
+            chain = %primary_chain_id,
+            target = %target_addr,
+            // INVARIANT 3: wire is known-dead — fail immediately without lease attempt.
+            "wire-health: primary chain unhealthy, fail-closed without lease"
+        );
+        send_socks5_error(client, SOCKS5_REP_GENERAL_FAILURE).await;
+        return Err(MirageError::PoolExhausted);
+    }
+
+    // ── Try the primary pool with bounded retry ───────────────────────────────
     let lease_result = lease_and_send_target(&pool, target_addr, LEASE_SEND_MAX_ATTEMPTS).await;
     let mut lease = match lease_result {
-        Ok(l) => l,
+        Ok(l) => {
+            // S3: record success — resets fail streak for this wire.
+            wire_health.record_success(primary_chain_id);
+            l
+        }
         Err(primary_err) => {
-            warn!(error = %primary_err, "primary pool exhausted after retries, trying failover");
-            // Try each failover pool once (1 attempt each — multiple fallbacks give inherent retry).
-            let mut last_err = primary_err;
-            let mut found: Option<crate::pool::TunnelLease> = None;
-            for (chain_id, fo_pool) in failover {
-                warn!(chain = %chain_id, "failing over to chain");
-                match lease_and_send_target(fo_pool, target_addr, 1).await {
-                    Ok(l) => {
-                        info!(chain = %chain_id, "failover: using chain");
-                        found = Some(l);
-                        break;
+            // S3: record failure — may mark wire unhealthy after threshold.
+            wire_health.record_failure(primary_chain_id);
+
+            match policy {
+                // ── INVARIANT 3 / STRICT: fail-closed, no reroute ────────────
+                SocksFailurePolicy::FailClosed => {
+                    warn!(
+                        chain = %primary_chain_id,
+                        error = %primary_err,
+                        // INVARIANT 3: Strict mode — no failover, no native TCP.
+                        "kill-switch FailClosed: primary failed, refusing flow"
+                    );
+                    send_socks5_error(client, SOCKS5_REP_GENERAL_FAILURE).await;
+                    return Err(primary_err);
+                }
+
+                // ── INVARIANT 3 / GENERAL: group-only failover ───────────────
+                SocksFailurePolicy::Failover { group } => {
+                    warn!(
+                        chain = %primary_chain_id,
+                        error = %primary_err,
+                        group = %group,
+                        "kill-switch Failover: primary failed, trying group members"
+                    );
+                    let mut last_err = primary_err;
+                    let mut found: Option<crate::pool::TunnelLease> = None;
+
+                    for (chain_id, fo_pool) in failover {
+                        // Only try chains that are members of the same group.
+                        let chain_policy = chain_policies
+                            .get(chain_id)
+                            .cloned()
+                            .unwrap_or(SocksFailurePolicy::Default);
+                        let in_group = matches!(
+                            &chain_policy,
+                            SocksFailurePolicy::Failover { group: g } if g == group
+                        );
+                        if !in_group {
+                            debug!(
+                                chain = %chain_id,
+                                group = %group,
+                                // INVARIANT 3: chain not in this group — skip.
+                                "kill-switch Failover: skipping chain not in group"
+                            );
+                            continue;
+                        }
+                        // S3: skip wire-health-unhealthy group members.
+                        if !wire_health.is_healthy(chain_id) {
+                            warn!(
+                                chain = %chain_id,
+                                // S3: wire-health says dead — instant skip.
+                                "wire-health: failover group member unhealthy, skipping"
+                            );
+                            continue;
+                        }
+                        warn!(chain = %chain_id, "kill-switch Failover: trying group member");
+                        match lease_and_send_target(fo_pool, target_addr, 1).await {
+                            Ok(l) => {
+                                wire_health.record_success(chain_id);
+                                info!(chain = %chain_id, "kill-switch Failover: using group member");
+                                found = Some(l);
+                                break;
+                            }
+                            Err(e) => {
+                                wire_health.record_failure(chain_id);
+                                warn!(chain = %chain_id, error = %e, "kill-switch Failover: group member failed");
+                                last_err = e;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(chain = %chain_id, error = %e, "failover chain also failed");
-                        last_err = e;
+
+                    match found {
+                        Some(l) => l,
+                        None => {
+                            // INVARIANT 3: all group members exhausted → fail-closed.
+                            // INVARIANT 2: never route_direct here.
+                            warn!(
+                                group = %group,
+                                "kill-switch Failover: all group members exhausted, fail-closed"
+                            );
+                            send_socks5_error(client, SOCKS5_REP_GENERAL_FAILURE).await;
+                            return Err(last_err);
+                        }
                     }
                 }
-            }
-            match found {
-                Some(l) => l,
-                None => return Err(last_err),
+
+                // ── Default: legacy failover (no kill-switch configured) ─────
+                // INVARIANT 2: even in legacy mode we NEVER call route_direct —
+                // this function is only called from RouteDecision::Chain.
+                SocksFailurePolicy::Default => {
+                    warn!(error = %primary_err, "primary pool exhausted after retries, trying failover (default policy)");
+                    let mut last_err = primary_err;
+                    let mut found: Option<crate::pool::TunnelLease> = None;
+
+                    for (chain_id, fo_pool) in failover {
+                        // S3: skip unhealthy chains even in default mode.
+                        if !wire_health.is_healthy(chain_id) {
+                            warn!(
+                                chain = %chain_id,
+                                "wire-health: failover chain unhealthy, skipping"
+                            );
+                            continue;
+                        }
+                        warn!(chain = %chain_id, "failing over to chain (default policy)");
+                        match lease_and_send_target(fo_pool, target_addr, 1).await {
+                            Ok(l) => {
+                                wire_health.record_success(chain_id);
+                                info!(chain = %chain_id, "failover: using chain");
+                                found = Some(l);
+                                break;
+                            }
+                            Err(e) => {
+                                wire_health.record_failure(chain_id);
+                                warn!(chain = %chain_id, error = %e, "failover chain also failed");
+                                last_err = e;
+                            }
+                        }
+                    }
+                    // INVARIANT 2: on exhaustion return error — do NOT route_direct.
+                    match found {
+                        Some(l) => l,
+                        None => return Err(last_err),
+                    }
+                }
             }
         }
     };
@@ -699,6 +1108,9 @@ async fn handle_transparent_connection(
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
     chain_router: Option<Arc<dyn Router>>,
     all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
+    chain_policies: Arc<HashMap<String, SocksFailurePolicy>>,
+    wire_health: Arc<WireHealthMap>,
+    primary_chain_id: Arc<String>,
 ) -> Result<(), MirageError> {
     let orig_dst = get_original_dst(&stream)?;
 
@@ -711,6 +1123,9 @@ async fn handle_transparent_connection(
     debug!(target = %target_addr, decision = decision_label, "transparent routing decision");
 
     match decision {
+        // ── INVARIANT 1: Bypass sacred — transparent direct connect ──────────
+        // RouteDecision::Direct = routing table designated this as bypass.
+        // Only this arm may connect via native TCP.
         RouteDecision::Direct => {
             let mut target = TcpStream::connect(&target_addr).await.map_err(|e| {
                 MirageError::NodeUnreachable(format!(
@@ -721,6 +1136,8 @@ async fn handle_transparent_connection(
                 .await
                 .map_err(MirageError::Io)?;
         }
+
+        // ── INVARIANT 2 + 3: Wire flows must NOT reach native TCP ────────────
         RouteDecision::Chain => {
             if let Some(cr) = &chain_router {
                 // Router-driven transparent path.
@@ -739,13 +1156,45 @@ async fn handle_transparent_connection(
                 };
                 let chain_ids = cr.pick(&target_key, &flow);
                 if chain_ids.is_empty() {
+                    // INVARIANT 2: router exhausted — RST the connection, no native TCP.
                     return Err(MirageError::PoolExhausted);
                 }
                 route_via_router_pools_transparent(&mut stream, &chain_ids, &all_pools, &target_addr).await?;
             } else if let Some(mp) = mux_pool {
                 route_via_mux_pool(&mut stream, mp, &target_addr).await?;
             } else {
-                let mut lease = lease_with_failover(&pool, &failover).await?;
+                // Derive policy for transparent path (same as SOCKS5 path).
+                let policy = chain_policies
+                    .get(primary_chain_id.as_str())
+                    .cloned()
+                    .unwrap_or(SocksFailurePolicy::Default);
+
+                // S3: consult wire health before attempting primary.
+                if !wire_health.is_healthy(primary_chain_id.as_str()) {
+                    warn!(
+                        chain = %primary_chain_id,
+                        // INVARIANT 3: wire known-dead — RST, no native TCP.
+                        "wire-health: primary chain unhealthy, transparent fail-closed"
+                    );
+                    return Err(MirageError::PoolExhausted);
+                }
+
+                let lease_result = lease_with_failover_policy(
+                    &pool,
+                    &primary_chain_id,
+                    &failover,
+                    &policy,
+                    &wire_health,
+                    &chain_policies,
+                ).await;
+                let mut lease = match lease_result {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // INVARIANT 2: exhausted — RST, no native TCP.
+                        return Err(e);
+                    }
+                };
+
                 let send_result = if lease.is_onion {
                     let target_bytes = target_addr.as_bytes();
                     let len_prefix = (target_bytes.len() as u16).to_be_bytes();

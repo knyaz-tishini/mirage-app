@@ -16,6 +16,7 @@ pub mod runtime;
 pub mod socks5;
 pub mod topology_forwarder;
 pub mod transparent;
+pub mod wire_health;
 
 pub use chain_set::{
     ChainSet, ChainHandle, ChainId, ChainState, ChainMetrics,

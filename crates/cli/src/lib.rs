@@ -28,8 +28,9 @@ use mirage_client_core::{
     mux_pool::MuxPool,
     pool::TunnelPool,
     runtime::ClientRuntime,
-    socks5::Socks5Server,
+    socks5::{Socks5Server, SocksFailurePolicy},
     tun_bridge::TunBridge,
+    wire_health::WireHealthMap,
 };
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use tokio_util::sync::CancellationToken;
@@ -603,8 +604,31 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         tracing::debug!("management_key not set — management server disabled");
     }
 
+    // Shared wire-health map — single instance shared across all SOCKS5 servers
+    // so a dead wire is detected immediately regardless of which server port
+    // the next flow arrives on.
+    let shared_wire_health = WireHealthMap::new();
+
     // ── Per-chain SOCKS5 listeners ────────────────────────────────────────────
     let chains_sorted = select_all_chains(&config);
+
+    // ── Build per-chain kill-switch policy map ────────────────────────────────
+    //
+    // Maps chain_id → SocksFailurePolicy derived from ChainConfig.kill_switch
+    // + ChainConfig.group.  Used by Socks5Server to enforce per-wire Strict /
+    // General / Default semantics without any further config reads at runtime.
+    // Built from chains_sorted (Arc<ClientConfig>-borrowed) after Arc wrapping.
+    let all_chain_policies: HashMap<String, SocksFailurePolicy> = chains_sorted
+        .iter()
+        .map(|c| {
+            let policy = SocksFailurePolicy::from_chain_config(
+                c.kill_switch.as_ref(),
+                c.group.as_deref(),
+                &c.chain_id,
+            );
+            (c.chain_id.clone(), policy)
+        })
+        .collect();
     let chain_pools_sorted: Vec<(String, Arc<TunnelPool>)> = chains_sorted
         .iter()
         .filter_map(|c| {
@@ -636,7 +660,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             .cloned()
             .collect();
 
-        let server = Socks5Server::new_with_failover(chain_bind_addr, failover);
+        let server = Socks5Server::new_with_failover(chain_bind_addr, failover)
+            .with_kill_switch(chain.chain_id.clone(), all_chain_policies.clone())
+            .with_shared_wire_health(Arc::clone(&shared_wire_health));
         let router2 = Arc::clone(&router);
         let cfg2 = Arc::clone(&config);
         let chain_id = chain.chain_id.clone();
@@ -661,7 +687,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         .cloned()
         .collect();
 
-    let server = Socks5Server::new_with_failover(bind_addr, default_failover);
+    let server = Socks5Server::new_with_failover(bind_addr, default_failover)
+        .with_kill_switch(default_chain_id.clone(), all_chain_policies)
+        .with_shared_wire_health(Arc::clone(&shared_wire_health));
 
     tokio::select! {
         res = server.run(default_pool, mux_pool, config, router) => {
