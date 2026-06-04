@@ -733,6 +733,8 @@ mod pool_smoke_tests {
             vless_reality: None,
             udp_hysteria2_native: None,
             aead_suite: mirage_core::crypto::AeadSuite::ChaCha20Poly1305,
+            kill_switch: None,
+            group: None,
         }
     }
 

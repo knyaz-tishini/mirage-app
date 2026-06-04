@@ -11,6 +11,7 @@ use reqwest::Client;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use mirage_core::config::KillSwitchMode;
 use crate::monitor_link::{MonitorConfig, MonitorChain};
 
 /// Forwards monitor config updates to the TUN chain registry HTTP API.
@@ -92,9 +93,41 @@ fn chain_to_json(c: &MonitorChain) -> serde_json::Value {
         .clone()
         .or_else(|| c.chain.hops.first().map(|h| h.addr.clone()))
         .unwrap_or_default();
-    serde_json::json!({
-        "name":        c.chain.chain_id,
-        "socks5_addr": socks5_addr,
-        "protocol":    format!("{:?}", c.chain.protocol),
-    })
+
+    // Propagate failover group: General mode uses the chain's group (or its
+    // chain_id as fallback); Strict/None emit no group field so the TUN/SOCKS5
+    // layer defaults to fail-closed with no group membership.
+    let group: Option<&str> = match c.chain.kill_switch {
+        Some(KillSwitchMode::General) => c
+            .chain
+            .group
+            .as_deref()
+            .or(Some(c.chain.chain_id.as_str())),
+        _ => None,
+    };
+
+    // Map KillSwitchMode → FailurePolicy tag understood by mirage-tun-core.
+    // None / Strict → "fail_closed" (fail-closed, no substitution).
+    // General       → "failover" with the group name.
+    // This is informational for Wave 1 (schema + plumbing only).
+    // Enforcement in macOS TUN already reads FailurePolicy from PolicyRule;
+    // later waves will wire these per-chain values into PolicyRule construction.
+    let failure_policy: serde_json::Value = match c.chain.kill_switch {
+        Some(KillSwitchMode::General) => serde_json::json!({
+            "mode": "failover",
+            "group": group.unwrap_or(c.chain.chain_id.as_str()),
+        }),
+        _ => serde_json::json!({ "mode": "fail_closed" }),
+    };
+
+    let mut obj = serde_json::json!({
+        "name":           c.chain.chain_id,
+        "socks5_addr":    socks5_addr,
+        "protocol":       format!("{:?}", c.chain.protocol),
+        "failure_policy": failure_policy,
+    });
+    if let Some(g) = group {
+        obj["group"] = serde_json::Value::String(g.to_owned());
+    }
+    obj
 }
