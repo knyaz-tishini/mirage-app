@@ -151,9 +151,8 @@ pub struct SentinelConfig {
     ///
     /// When both `monitor_wire_addr` and `monitor_wire_pubkey_hex` are set, the
     /// sentinel builds a [`MonitorTransport::Wire`] entry and passes it to
-    /// `MonitorLink` alongside the regular `DirectWs` transports. `Wire` is
-    /// attempted first (preferred over HTTPS/WSS). `monitor_api_key` becomes
-    /// optional when wire is configured — the Mirage wire handshake provides
+    /// `MonitorLink` as the Wire transport. Wire is the primary transport;
+    /// `monitor_api_key` is not needed — the Mirage wire handshake provides
     /// mutual authentication without a bearer token.
     #[serde(default)]
     pub monitor_wire_addr: Option<String>,
@@ -513,14 +512,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     // ClientConfig files for cli. An empty table is sufficient here.
     let _sentinel_peer_table: Arc<ArcSwap<PeerTable>> =
         Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
-    // Build DirectWs transports from the effective URL list.
+    // Build transport list: Wire is primary; OverChain can be added if configured.
+    // DirectWs has been removed — all client→monitor traffic uses Mirage-native transports.
     let mut transports: Vec<MonitorTransport> = Vec::new();
 
     // Wire transport — preferred when addr + pubkey are configured.
     // Priority order:
     //   1. sentinel.toml explicit fields (operator-set, highest trust)
     //   2. Persisted monitor_wire.json (auto-seeded from peer_table on previous run)
-    //   3. Absent → Wire not activated; falls through to DirectWs
+    //   3. Absent → MonitorLink waits until seed_wire_transport is called
     let wire_coords: Option<monitor_wire::WireCoords> =
         if cfg.monitor_wire_addr.is_some() && cfg.monitor_wire_pubkey_hex.is_some() {
             // Explicit toml config overrides everything.
@@ -547,14 +547,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         });
     }
 
-    // DirectWs transports (fallback, or primary when Wire is absent).
-    for url in &effective_urls {
-        transports.push(MonitorTransport::DirectWs {
-            url: url.clone(),
-            sni: None,
-        });
-    }
-
     let (link, mut config_rx) = MonitorLink::new(
         effective_urls.clone(),
         Some(monitor_api_key.clone()),
@@ -565,15 +557,22 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         client_id.clone(),
     );
 
-    // Phase 2: seed the per-client token into MonitorLink so subscribe/poll
-    // calls carry ?client_id=&client_token= when the monitor requires it.
-    // Use freshly-registered token first; fall back to persisted from last run.
+    // Token-race fix: seed client_id + client_token into MonitorLink BEFORE
+    // spawn() so that the very first wire subscribe attempt uses the correct
+    // credentials.  Without this, MonitorLink would see client_id=None on the
+    // first connect and either subscribe without params (→ 401) or re-register
+    // with a new token that diverges from the one already seeded here.
+    link.set_client_id(client_id.clone()).await;
+    debug!("[sentinel] client_id seeded into MonitorLink");
+
+    // Phase 2: seed the per-client token.  Use freshly-registered token first;
+    // fall back to persisted from last run.
     let effective_token = registered_client_token
         .clone()
         .or_else(|| chain_request::load_client_token(&state_dir));
     if effective_token.is_some() {
         link.set_client_token(effective_token.clone()).await;
-        debug!("[sentinel] client_token loaded into MonitorLink");
+        debug!("[sentinel] client_token seeded into MonitorLink");
     }
 
     link.spawn();

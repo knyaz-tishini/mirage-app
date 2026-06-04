@@ -365,62 +365,52 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             });
         }
 
-        // DirectWs / OverChain transports (fallback, or primary when Wire is absent).
-        if config.monitor_transports.is_empty() {
-            // Legacy path: single DirectWs entry from monitor_url.
-            transports.push(MonitorTransport::DirectWs {
-                url: monitor_url.clone(),
-                sni: None,
-            });
-        } else {
-            for t in &config.monitor_transports {
-                match t {
-                    MonitorTransportConfig::DirectWs { url, sni, .. } => {
-                        transports.push(MonitorTransport::DirectWs {
-                            url: url.clone(),
-                            sni: sni.clone(),
-                        });
-                    }
-                    MonitorTransportConfig::OverChain {
-                        chain_id,
-                        monitor_endpoint,
-                        ..
-                    } => {
-                        // cli is monolithic — no separate worker process — so
-                        // worker_socks5 for option-b SOCKS5 fallback points at
-                        // our own SOCKS5 listener for this chain. Look it up
-                        // from config.chains.
-                        let socks5_bind = config
-                            .chains
-                            .iter()
-                            .find(|c| c.chain_id == *chain_id)
-                            .and_then(|c| c.socks5_bind.as_ref())
-                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
-                        let monitor_addr = monitor_endpoint.parse::<std::net::SocketAddr>();
-                        match (socks5_bind, monitor_addr) {
-                            (Some(ws), Ok(addr)) => {
-                                transports.push(MonitorTransport::OverChain {
-                                    chain_id: chain_id.clone().into(),
-                                    worker_socks5: ws,
-                                    monitor_addr: addr,
-                                });
-                            }
-                            (None, _) => {
-                                tracing::warn!(
-                                    "cli: over_chain references unknown chain_id={chain_id} or invalid socks5_bind"
-                                );
-                            }
-                            (_, Err(e)) => {
-                                tracing::warn!(
-                                    "cli: invalid monitor_endpoint '{}': {e}",
-                                    monitor_endpoint
-                                );
-                            }
+        // OverChain transports only (DirectWs removed — Wire is primary,
+        // OverChain is the censored-network fallback).
+        for t in &config.monitor_transports {
+            match t {
+                MonitorTransportConfig::DirectWs { .. } => {
+                    // DirectWs has been removed — skip silently.
+                    tracing::debug!("cli: DirectWs transport config ignored (removed)");
+                }
+                MonitorTransportConfig::OverChain {
+                    chain_id,
+                    monitor_endpoint,
+                    ..
+                } => {
+                    // cli is monolithic — no separate worker process — so
+                    // worker_socks5 for option-b SOCKS5 fallback points at
+                    // our own SOCKS5 listener for this chain.
+                    let socks5_bind = config
+                        .chains
+                        .iter()
+                        .find(|c| c.chain_id == *chain_id)
+                        .and_then(|c| c.socks5_bind.as_ref())
+                        .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+                    let monitor_addr = monitor_endpoint.parse::<std::net::SocketAddr>();
+                    match (socks5_bind, monitor_addr) {
+                        (Some(ws), Ok(addr)) => {
+                            transports.push(MonitorTransport::OverChain {
+                                chain_id: chain_id.clone().into(),
+                                worker_socks5: ws,
+                                monitor_addr: addr,
+                            });
+                        }
+                        (None, _) => {
+                            tracing::warn!(
+                                "cli: over_chain references unknown chain_id={chain_id} or invalid socks5_bind"
+                            );
+                        }
+                        (_, Err(e)) => {
+                            tracing::warn!(
+                                "cli: invalid monitor_endpoint '{}': {e}",
+                                monitor_endpoint
+                            );
                         }
                     }
                 }
             }
-        };
+        }
 
         let (link, mut config_rx) = MonitorLink::new_with_credential_arc(
             vec![monitor_url.clone()],

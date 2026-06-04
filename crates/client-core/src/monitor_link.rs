@@ -1,25 +1,27 @@
-//! Background link to mirage2monitor — config push via WebSocket with HTTP poll fallback,
-//! plus an optional `OverChain` fallback when all direct WebSocket URLs are unreachable.
+//! Background link to mirage2monitor — config push via WebSocket with OverChain fallback.
 //!
-//! [`MonitorLink`] races all configured URLs on startup (GET /health, 5s timeout).
-//! First to respond 2xx wins → set as `active_url`.  All subsequent calls go to
-//! `active_url` only (sticky).  On any error against the active URL → re-race
-//! immediately → re-register against the new winner.
+//! [`MonitorLink`] uses Mirage-native transports only:
 //!
-//! When all DirectWs transports fail, [`MonitorLink`] falls back to any configured
-//! `OverChain` transports (see [`MonitorTransport`]).  A background health-recheck
-//! task runs every 30 s while OverChain is active; on the first 2xx from any DirectWs
-//! URL the client promotes back to DirectWs automatically.
+//! 1. **Wire** (`MonitorTransport::Wire`) — direct dial to the monitor's `:19444`
+//!    V9 wire endpoint.  Anonymous ephemeral X25519 client key; no bearer token.
+//!    Primary transport; attempted on every connection cycle.
+//!
+//! 2. **OverChain** (`MonitorTransport::OverChain`) — MonitorLink frames over a
+//!    Mirage chain (via a worker SOCKS5 port or the local chain pool).  Fallback
+//!    for censored networks where direct `:19444` is DPI-blocked.
+//!
+//! No HTTPS, no `Authorization: Bearer` — all communication is authenticated by
+//! the Mirage V9 wire handshake or the OverChain Mirage tunnel.
 //!
 //! State machine:
 //! ```text
-//! Connecting ──► Connected (DirectWs)
-//!     ▲               │ error/close
-//!     │               ▼
-//!     │     FallbackPoll (5-min WS retry)
-//!     │               │ all DirectWs fail + OverChain configured
-//!     │               ▼
-//!     └── OverChain (health-recheck → promote back to DirectWs on 2xx)
+//! Wire (primary) ──► Connected (Wire WebSocket)
+//!     │ error/close
+//!     ▼
+//! OverChain (fallback when Wire fails + OverChain configured)
+//!     │ Wire recovers (next retry cycle succeeds)
+//!     ▼
+//! Wire (promoted back)
 //! ```
 
 use std::collections::HashMap;
@@ -33,10 +35,7 @@ use mirage_core::crypto::credential::CredentialParams;
 use mirage_core::mirage::mesh::PeerTable;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
-use tokio_tungstenite::{
-    connect_async_tls_with_config,
-    tungstenite::{client::IntoClientRequest, http::header, http::Request, Message},
-};
+use tokio_tungstenite::tungstenite::{http::header, http::Request, Message};
 use tracing::{debug, info, warn};
 
 use crate::chain_set::{ChainHandle, ChainId, ChainSet};
@@ -75,8 +74,6 @@ async fn try_lease_and_open(
 // ── Timeouts ─────────────────────────────────────────────────────────────────
 
 const OVER_CHAIN_BACKOFF_INIT: Duration = Duration::from_secs(5);
-const OVER_CHAIN_BACKOFF_MAX: Duration = Duration::from_secs(60);
-const DIRECT_HEALTH_RECHECK: Duration = Duration::from_secs(30);
 const OVER_CHAIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn default_chain_id() -> ChainId {
@@ -88,19 +85,13 @@ fn default_chain_id() -> ChainId {
 /// How to reach the monitor control plane.
 ///
 /// A [`MonitorLink`] accepts a list of transports; they are probed in order.
-/// Priority: `Wire` > `DirectWs` > `OverChain`.
+/// Priority: `Wire` (primary) > `OverChain` (censored-network fallback).
+///
+/// `DirectWs` (HTTPS/WSS + bearer) has been removed — all client→monitor
+/// communication must go over Mirage-native transports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum MonitorTransport {
-    /// Standard WebSocket subscribe (`wss://` or `ws://`).
-    DirectWs {
-        /// WebSocket URL for the monitor subscribe endpoint.
-        url: String,
-        /// Optional SNI override (unused by current WS impl, reserved for
-        /// future TLS pinning).
-        #[serde(default)]
-        sni: Option<String>,
-    },
     /// Binary frame protocol over a Mirage tunnel (`OverChain`).
     ///
     /// The client connects to the monitor's over-chain listener through the
@@ -133,9 +124,7 @@ pub enum MonitorTransport {
     /// tunnel.
     ///
     /// No `Authorization: Bearer` header is sent — the Mirage wire already
-    /// provides E2E encryption and mutual forward-secret auth. The
-    /// `/relay/clients/subscribe` endpoint is unauthenticated on the monitor
-    /// side (rate-limited only), so this works without any bearer token.
+    /// provides E2E encryption and mutual forward-secret auth.
     ///
     /// `monitor_addr` — IP:port of the monitor's wire listener, e.g.
     /// `"103.231.75.144:19444"`.
@@ -422,53 +411,30 @@ struct RegisterResponse {
     client_token: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct HeartbeatBody {
-    active_chains: u32,
-}
-
-// ── Internal WS state ─────────────────────────────────────────────────────────
-
-/// WebSocket connection state for logging / tracing transitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WsState {
-    /// Actively attempting (or connected to) a WebSocket.
-    Active,
-    /// WS failed; falling back to HTTP poll with a retry timer.
-    FallbackPoll,
-}
-
-impl std::fmt::Display for WsState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WsState::Active => f.write_str("Active"),
-            WsState::FallbackPoll => f.write_str("FallbackPoll"),
-        }
-    }
-}
 
 // ── MonitorLink ───────────────────────────────────────────────────────────────
 
 /// Background task that keeps the client in sync with mirage2monitor.
+///
+/// Uses Mirage-native transports only: Wire (primary) and OverChain (fallback).
+/// No HTTPS, no bearer tokens.
 pub struct MonitorLink {
-    /// Mutable so [`Self::reconfigure`] can swap in a new URL list pushed by
-    /// the monitor (`peer_lm_urls`).
+    /// Retained for backward compat: callers may call `reconfigure` / `current_urls`
+    /// after a `peer_lm_urls` push from the monitor.  Not used for dialing —
+    /// all transport is via Wire or OverChain.
     monitor_urls: Mutex<Vec<String>>,
-    /// Optional Bearer token forwarded in registration, heartbeat, and WS
-    /// upgrade headers.
-    monitor_api_key: Option<String>,
     /// Cluster/mesh identifier sent in FRAME_AUTH (e.g. `"staging-v2"`).
     mesh_id: String,
     /// Local node/sentry identifier sent in FRAME_AUTH.
     node_client_id: String,
-    /// Currently winning URL after a race. None until first race completes.
-    active_url: Mutex<Option<String>>,
+    /// Registered client_id returned by the monitor on registration.
+    /// Set externally via [`Self::set_client_id`] (sentinel R1 path) or
+    /// internally by the wire connect sequence before subscribe.
     client_id: Mutex<Option<String>>,
     /// Per-client token issued by the monitor on registration (Phase 2).
-    /// Appended as `?client_id=X&client_token=Y` on subscribe, config-poll,
-    /// and heartbeat when present. `None` on older monitors — omitted silently.
+    /// Appended as `?client_id=X&client_token=Y` on subscribe when present.
+    /// `None` on older monitors — omitted silently.
     client_token: Mutex<Option<String>>,
-    http: reqwest::Client,
     config_version: AtomicU64,
     poll_interval_secs: AtomicU64,
     config_tx: watch::Sender<Option<MonitorConfig>>,
@@ -484,8 +450,7 @@ pub struct MonitorLink {
     /// Initialised as `None`; updated on every `CredentialParams` frame.
     /// Shared with `TunnelPool` / `MuxPool` via `Arc::clone` (same pattern as peer_table).
     pub credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
-    /// Additional transport options (DirectWs + OverChain).
-    /// If empty, `monitor_urls` is used for DirectWs (legacy path).
+    /// Transport list (Wire + OverChain only — DirectWs removed).
     transports: Vec<MonitorTransport>,
     /// Chain set used to open OverChain connections.
     chain_set: Arc<ChainSet>,
@@ -510,26 +475,21 @@ impl MonitorLink {
     ///
     /// The link does not start until [`MonitorLink::spawn`] is called.
     ///
-    /// `monitor_urls` — list of monitor base URLs to race on startup and re-race
-    /// on error.  Used as the fallback when `transports` is empty.
+    /// `monitor_urls` — retained for `reconfigure` / `current_urls` callers;
+    /// not used for dialing (Wire/OverChain only).
     ///
-    /// `monitor_api_key` — if set, sent as `Authorization: Bearer <key>` on
-    /// every request including the WebSocket upgrade handshake.
+    /// `monitor_api_key` — **ignored**; kept in the signature for backward
+    /// compat with call sites.  No bearer token is ever sent — authentication
+    /// is provided by the Mirage V9 wire handshake.
     ///
     /// `peer_table` — shared [`ArcSwap`] that the link writes to on every config
-    /// frame containing a `peer_table` snapshot (Phase 8.5). Pass a freshly
-    /// created `Arc::new(ArcSwap::from_pointee(PeerTable::empty()))` and share
-    /// that same arc with `TunnelPool::new` / `MuxPool::new` so pools always see
-    /// the latest peer table without extra plumbing.
+    /// frame containing a `peer_table` snapshot (Phase 8.5).
     ///
     /// `chain_set` — registry of chains, used for OverChain transport.
     ///
-    /// `transports` — optional list of [`MonitorTransport`]s from
-    /// `ClientConfig.monitor_transports`.  If empty, `monitor_urls` is used
-    /// (backward-compatible legacy path).
+    /// `transports` — list of [`MonitorTransport`]s (Wire + OverChain).
     ///
-    /// `mesh_id` — cluster/mesh identifier sent in FRAME_AUTH for OverChain
-    /// connections (e.g. `"staging-v2"`).
+    /// `mesh_id` — cluster/mesh identifier sent in FRAME_AUTH.
     ///
     /// `node_client_id` — local node/sentry identifier sent in FRAME_AUTH.
     pub fn new(
@@ -561,7 +521,7 @@ impl MonitorLink {
     /// built with the ordinary [`new`] constructor.
     pub fn new_with_credential_arc(
         monitor_urls: Vec<String>,
-        monitor_api_key: Option<String>,
+        _monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         chain_set: Arc<ChainSet>,
@@ -571,12 +531,6 @@ impl MonitorLink {
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
         let (frame_tx, _frame_rx) = watch::channel(None);
-
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("reqwest::Client construction is infallible with these settings");
 
         // Generate a fresh ephemeral X25519 private key for Wire transport dials.
         // This key is used for the Mirage V9 client-static handshake slot.
@@ -590,13 +544,10 @@ impl MonitorLink {
 
         let link = Arc::new(Self {
             monitor_urls: Mutex::new(monitor_urls),
-            monitor_api_key,
             mesh_id,
             node_client_id,
-            active_url: Mutex::new(None),
             client_id: Mutex::new(None),
             client_token: Mutex::new(None),
-            http,
             config_version: AtomicU64::new(0),
             poll_interval_secs: AtomicU64::new(30),
             config_tx,
@@ -649,12 +600,23 @@ impl MonitorLink {
         *guard = new_urls;
     }
 
+    /// Seed the registered client_id from outside (sentinel R1 path).
+    ///
+    /// Must be called **before** `spawn()` so that `run_wire_loop` sees the
+    /// correct client_id on the very first subscribe attempt.  When both
+    /// `client_id` and `client_token` are set before spawn, no internal
+    /// re-register is needed on first connect and the subscribe URL carries
+    /// the correct credentials immediately (no 401 → no 20 s backoff gap).
+    pub async fn set_client_id(&self, client_id: String) {
+        *self.client_id.lock().await = Some(client_id);
+    }
+
     /// Store the per-client token issued by the monitor on registration.
     ///
     /// Called by the sentinel after `register_with_failover` returns a token.
-    /// The token is appended as `?client_id=X&client_token=Y` on subscribe,
-    /// config-poll, and heartbeat calls.  `None` clears any existing token
-    /// (safe to call with `None` — no-op for backward compat).
+    /// The token is appended as `?client_id=X&client_token=Y` on subscribe
+    /// calls.  `None` clears any existing token (safe to call with `None` —
+    /// no-op for backward compat).
     pub async fn set_client_token(&self, token: Option<String>) {
         *self.client_token.lock().await = token;
     }
@@ -676,79 +638,29 @@ impl MonitorLink {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     async fn run(&self) {
-        // If a Wire transport is configured, try it first (preferred over DirectWs).
-        // Wire transport has no URL to "race" — it dials the monitor's wire addr directly.
-        if let Some(wire) = self.wire_transport().await {
-            info!("monitor_link: Wire transport configured — attempting Mirage wire WS");
-            match self.run_wire_loop(&wire).await {
-                Ok(()) => info!("monitor_link: Wire WS closed cleanly, falling through to DirectWs"),
-                Err(e) => warn!("monitor_link: Wire WS failed ({e}), falling through to DirectWs"),
-            }
-        }
-
-        // Race all URLs; register against winner.
-        match self.race_urls().await {
-            Ok(url) => info!("monitor_link: active_url={}", url),
-            Err(e) => warn!("monitor_link: initial race failed ({e}); will retry in poll loop"),
-        }
-        self.register().await;
-
-        // Try WebSocket first.
-        info!("monitor_link: state → {} (initial WebSocket attempt)", WsState::Active);
-        match self.run_ws_loop().await {
-            Ok(()) => info!("monitor_link: WebSocket closed cleanly, switching to FallbackPoll"),
-            Err(e) => warn!("monitor_link: WebSocket failed ({e}), switching to FallbackPoll"),
-        }
-
-        // Enter fallback-poll loop. Retry WS every 20 s (was 5 min — too slow
-        // for the OverChain escalation path: WS retry deadline is the only
-        // place that calls run_over_chain_fallback after re-race fails).
-        info!("monitor_link: state → {}", WsState::FallbackPoll);
-        let poll_secs = self.poll_interval_secs.load(Ordering::Relaxed);
-        let mut poll_interval = tokio::time::interval(Duration::from_secs(poll_secs));
-        let ws_retry_interval = Duration::from_secs(20);
-        let mut ws_retry_deadline = tokio::time::Instant::now() + ws_retry_interval;
+        // Wire transport is primary.  Retry every 20 s on failure.
+        // On every failed Wire attempt, escalate to OverChain if configured.
+        let wire_retry_interval = Duration::from_secs(20);
 
         loop {
-            tokio::select! {
-                _ = poll_interval.tick() => {
-                    self.poll_config().await;
-                    self.send_heartbeat().await;
+            if let Some(wire) = self.wire_transport().await {
+                info!("monitor_link: Wire transport configured — attempting Mirage wire WS");
+                match self.run_wire_loop(&wire).await {
+                    Ok(()) => info!("monitor_link: Wire WS closed cleanly"),
+                    Err(e) => warn!("monitor_link: Wire WS failed ({e})"),
                 }
-                _ = tokio::time::sleep_until(ws_retry_deadline) => {
-                    // Try Wire transport first on every retry cycle (it's self-contained,
-                    // no URL-race needed).
-                    if let Some(wire) = self.wire_transport().await {
-                        info!("monitor_link: retrying Wire transport");
-                        match self.run_wire_loop(&wire).await {
-                            Ok(()) => info!("monitor_link: Wire WS retry closed cleanly"),
-                            Err(e) => warn!("monitor_link: Wire WS retry failed ({e})"),
-                        }
-                    }
-                    // Re-race before WS reconnect.
-                    match self.race_urls().await {
-                        Ok(url) => info!("monitor_link: re-race winner={}", url),
-                        Err(e) => {
-                            warn!("monitor_link: re-race failed ({e})");
-                            // If OverChain transports are configured, escalate.
-                            if self.has_over_chain_transports() {
-                                info!("monitor_link: escalating to OverChain fallback");
-                                self.run_over_chain_fallback().await;
-                                info!("monitor_link: promoted back to DirectWs");
-                            }
-                            ws_retry_deadline = tokio::time::Instant::now() + ws_retry_interval;
-                            continue;
-                        }
-                    }
-                    self.register().await;
-                    info!("monitor_link: state → {} (retry WebSocket)", WsState::Active);
-                    match self.run_ws_loop().await {
-                        Ok(()) => info!("monitor_link: WebSocket closed, back to FallbackPoll"),
-                        Err(e) => warn!("monitor_link: WebSocket retry failed ({e}), staying in FallbackPoll"),
-                    }
-                    info!("monitor_link: state → {}", WsState::FallbackPoll);
-                    ws_retry_deadline = tokio::time::Instant::now() + ws_retry_interval;
-                }
+            } else {
+                warn!("monitor_link: no Wire transport configured — waiting before retry");
+            }
+
+            // Wire failed or absent — escalate to OverChain when available.
+            if self.has_over_chain_transports() {
+                info!("monitor_link: escalating to OverChain fallback");
+                self.run_over_chain_fallback().await;
+                info!("monitor_link: OverChain fallback exited — retrying Wire");
+            } else {
+                // No fallback available: back off before retrying Wire.
+                tokio::time::sleep(wire_retry_interval).await;
             }
         }
     }
@@ -882,7 +794,55 @@ impl MonitorLink {
 
         let (io, _pump) = mirage_mesh_client::tunnel_into_io(tunnel);
 
-        // Determine client_id + token for the subscribe URL.
+        // ── Token-race fix ────────────────────────────────────────────────────
+        // Register over the wire connection BEFORE building the subscribe URL.
+        // If a client_id was already seeded externally (sentinel R1 path via
+        // `set_client_id` + `set_client_token` before `spawn()`), reuse it —
+        // no re-register needed, and the token is already correct.
+        // If client_id is absent (cold start without prior R1, or a retry after
+        // `recover()` cleared it), register now on THIS wire connection so that
+        // the token we store is the one the monitor just bound to this client_id.
+        // This guarantees the subscribe URL uses the SAME token the monitor
+        // stored for this client_id — no mismatch, no 401 on first attempt.
+        {
+            let needs_register = self.client_id.lock().await.is_none();
+            if needs_register {
+                debug!("monitor_link: Wire — client_id absent, registering before subscribe");
+                let body = RegisterBody {
+                    os: std::env::consts::OS,
+                    version: env!("CARGO_PKG_VERSION"),
+                    supported_transports: vec!["tcp", "websocket"],
+                };
+                match serde_json::to_vec(&body) {
+                    Ok(body_json) => {
+                        match register_over_wire(wire, &self.ephemeral_client_priv, &body_json).await {
+                            Ok(reg) => {
+                                debug!(
+                                    client_id = %reg.client_id,
+                                    "monitor_link: Wire pre-subscribe register (R2-wire)"
+                                );
+                                self.poll_interval_secs
+                                    .store(reg.monitor_poll_interval_secs, Ordering::Relaxed);
+                                *self.client_id.lock().await = Some(reg.client_id);
+                                if reg.client_token.is_some() {
+                                    *self.client_token.lock().await = reg.client_token;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("monitor_link: Wire pre-subscribe register failed ({e}) — subscribing without token");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("monitor_link: Wire pre-subscribe register: serialize body failed ({e})");
+                    }
+                }
+            }
+        }
+        // ── End token-race fix ────────────────────────────────────────────────
+
+        // Read client_id + token AFTER the conditional register above so we
+        // always use the freshest values bound to THIS registration session.
         let cid = self.client_id.lock().await.clone();
         let tok = self.client_token.lock().await.clone();
         let host = &sni;
@@ -1061,59 +1021,31 @@ impl MonitorLink {
 
     /// Drive the OverChain fallback loop.
     ///
-    /// Tries all configured `OverChain` transports in parallel.  While active,
-    /// a background task rechecks DirectWs every 30 s.  Returns when:
-    /// - A DirectWs health check succeeds (promote back), or
-    /// - An OverChain connection succeeds, runs, and then all OverChain transports
-    ///   fail (caller retries DirectWs).
+    /// Tries all configured `OverChain` transports in sequence.  Returns when:
+    /// - Wire transport recovers (caller re-attempts Wire on return), or
+    /// - An OverChain connection closes and no replacement is available.
+    ///
+    /// Caller (`run()`) retries Wire after this function returns — OverChain
+    /// is a temporary fallback for censored networks where direct `:19444` is
+    /// DPI-blocked, not a permanent transport.
     async fn run_over_chain_fallback(&self) {
-        let mut backoff = OVER_CHAIN_BACKOFF_INIT;
+        let channel = self.try_connect_over_chain().await;
 
-        loop {
-            // First, try to open an OverChain connection.
-            let channel = self.try_connect_over_chain().await;
-
-            match channel {
-                None => {
-                    // All OverChain transports failed — back off and check DirectWs.
-                    info!(
-                        "monitor_link: all OverChain transports failed, backoff={:?}",
-                        backoff
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(OVER_CHAIN_BACKOFF_MAX);
-
-                    // Check if DirectWs is back before retrying OverChain.
-                    if self.check_direct_ws_health().await {
-                        info!("monitor_link: DirectWs health check passed — promoting");
-                        return;
-                    }
-                }
-                Some(mut ch) => {
-                    info!("monitor_link: OverChain connected — entering receive loop");
-                    backoff = OVER_CHAIN_BACKOFF_INIT; // reset on success
-
-                    // Drive the OverChain loop; health-recheck DirectWs in parallel.
-                    let result = self
-                        .run_over_chain_loop_with_health_check(&mut ch)
-                        .await;
-
-                    match result {
-                        OverChainLoopResult::DirectWsRestored => {
-                            info!(
-                                "monitor_link: DirectWs restored while on OverChain — promoting"
-                            );
-                            let _ = ch.close().await;
-                            return;
-                        }
-                        OverChainLoopResult::ChannelClosed => {
-                            warn!(
-                                "monitor_link: OverChain channel closed — will retry"
-                            );
-                            let _ = ch.close().await;
-                        }
-                    }
-                }
+        match channel {
+            None => {
+                // All OverChain transports failed — back off then return so
+                // the caller can retry Wire.
+                info!(
+                    "monitor_link: all OverChain transports failed, backoff={:?}",
+                    OVER_CHAIN_BACKOFF_INIT
+                );
+                tokio::time::sleep(OVER_CHAIN_BACKOFF_INIT).await;
+            }
+            Some(mut ch) => {
+                info!("monitor_link: OverChain connected — entering receive loop");
+                self.run_over_chain_loop(&mut ch).await;
+                let _ = ch.close().await;
+                warn!("monitor_link: OverChain channel closed — returning to Wire retry");
             }
         }
     }
@@ -1121,7 +1053,8 @@ impl MonitorLink {
     /// Try to open one OverChain connection.  Returns the first successful
     /// channel, or `None` if all transports fail.
     async fn try_connect_over_chain(&self) -> Option<OverChainChannel> {
-        let bearer = self.monitor_api_key.as_deref().unwrap_or("");
+        // No bearer token — OverChain auth is provided by the Mirage tunnel.
+        let bearer = "";
         let mesh_id = self.mesh_id.as_str();
         let client_id = self.node_client_id.as_str();
 
@@ -1198,54 +1131,12 @@ impl MonitorLink {
         None
     }
 
-    /// Check if any DirectWs URL responds with 2xx on GET /health.
-    async fn check_direct_ws_health(&self) -> bool {
-        let urls = self.monitor_urls.lock().await.clone();
-        // Also include DirectWs URLs from the transports list.
-        let mut all_urls: Vec<String> = urls;
-        for t in &self.transports {
-            if let MonitorTransport::DirectWs { url, .. } = t {
-                all_urls.push(url.clone());
-            }
-        }
-
-        let client = reqwest::Client::builder()
-            .connect_timeout(OVER_CHAIN_CONNECT_TIMEOUT)
-            .timeout(OVER_CHAIN_CONNECT_TIMEOUT)
-            .build()
-            .ok();
-        let Some(client) = client else {
-            return false;
-        };
-
-        for base in &all_urls {
-            let health_url = format!("{base}/health");
-            if let Ok(Ok(r)) = tokio::time::timeout(
-                OVER_CHAIN_CONNECT_TIMEOUT,
-                client.get(&health_url).send(),
-            )
-            .await
-            {
-                if r.status().is_success() {
-                    info!("monitor_link: DirectWs health OK at {base}");
-                    *self.active_url.lock().await = Some(base.clone());
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Result of [`MonitorLink::run_over_chain_loop_with_health_check`].
-    async fn run_over_chain_loop_with_health_check(
-        &self,
-        channel: &mut OverChainChannel,
-    ) -> OverChainLoopResult {
+    /// Drive the OverChain receive loop until the channel closes or errors.
+    async fn run_over_chain_loop(&self, channel: &mut OverChainChannel) {
         use crate::monitor_channel::MonitorChannel;
 
         let ping_interval_dur = Duration::from_secs(10);
         let pong_timeout = Duration::from_secs(15);
-        let recheck_interval = DIRECT_HEALTH_RECHECK;
 
         let mut ping_ticker = tokio::time::interval(ping_interval_dur);
         let mut ping_counter: u64 = 0;
@@ -1320,11 +1211,11 @@ impl MonitorLink {
                             }
                         }
                         Ok(None) => {
-                            return OverChainLoopResult::ChannelClosed;
+                            return;
                         }
                         Err(e) => {
                             warn!("monitor_link: OverChain recv error: {e}");
-                            return OverChainLoopResult::ChannelClosed;
+                            return;
                         }
                     }
                 }
@@ -1340,7 +1231,7 @@ impl MonitorLink {
                                 "monitor_link: OverChain app pong timeout ({:?}) — channel dead",
                                 now.duration_since(sent_at)
                             );
-                            return OverChainLoopResult::ChannelClosed;
+                            return;
                         }
                     }
 
@@ -1350,7 +1241,7 @@ impl MonitorLink {
                             "monitor_link: OverChain app pong idle ({:?}) — channel dead",
                             last_pong_at.elapsed()
                         );
-                        return OverChainLoopResult::ChannelClosed;
+                        return;
                     }
 
                     // Send app-level Ping.
@@ -1370,305 +1261,7 @@ impl MonitorLink {
                         }
                         Err(e) => {
                             warn!("monitor_link: OverChain Ping send failed: {e}");
-                            return OverChainLoopResult::ChannelClosed;
-                        }
-                    }
-                }
-
-                // Background health recheck — promote back to DirectWs when possible.
-                _ = tokio::time::sleep(recheck_interval) => {
-                    if self.check_direct_ws_health().await {
-                        return OverChainLoopResult::DirectWsRestored;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Result returned by the OverChain receive loop.
-enum OverChainLoopResult {
-    /// A DirectWs URL responded 2xx — time to promote back.
-    DirectWsRestored,
-    /// The OverChain channel was closed or errored — need reconnect.
-    ChannelClosed,
-}
-
-impl MonitorLink {
-    /// Race all configured URLs with a 5s timeout each.
-    /// First to return 2xx on GET /health wins → stored in `active_url`.
-    async fn race_urls(&self) -> Result<String, String> {
-        let urls = self.monitor_urls.lock().await.clone();
-        if urls.is_empty() {
-            return Err("monitor_urls is empty".to_owned());
-        }
-
-        let race_http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("race client build: {e}"))?;
-
-        // Single URL — still health-check it so that re-race can correctly
-        // signal "all DirectWs down" and the OverChain fallback path triggers.
-        // Previous behaviour was to short-circuit Ok(url) which made re-race
-        // always succeed even when the URL was unreachable.
-        if urls.len() == 1 {
-            let url = urls[0].clone();
-            let health_url = format!("{url}/health");
-            match race_http.get(&health_url).send().await {
-                Ok(r) if r.status().is_success() => {
-                    *self.active_url.lock().await = Some(url.clone());
-                    return Ok(url);
-                }
-                Ok(r) => return Err(format!("{url}/health -> HTTP {}", r.status())),
-                Err(e) => return Err(format!("{url}/health -> {e}")),
-            }
-        }
-
-        let futures: Vec<_> = urls.iter().map(|base| {
-            let client = race_http.clone();
-            let health_url = format!("{base}/health");
-            let base = base.clone();
-            Box::pin(async move {
-                match client.get(&health_url).send().await {
-                    Ok(r) if r.status().is_success() => Ok(base),
-                    Ok(r) => Err(format!("{base}/health -> HTTP {}", r.status())),
-                    Err(e) => Err(format!("{base}/health -> {e}")),
-                }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
-        }).collect();
-
-        // select_ok: first Ok wins, remaining futures are dropped.
-        match futures::future::select_ok(futures).await {
-            Ok((winner, _)) => {
-                info!("monitor_link: race winner={}", winner);
-                *self.active_url.lock().await = Some(winner.clone());
-                Ok(winner)
-            }
-            Err(_) => Err("all monitor URLs failed health check".to_owned()),
-        }
-    }
-
-    /// Return the current active URL, or error if none set.
-    async fn get_active_url(&self) -> Result<String, String> {
-        self.active_url
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| "no active monitor URL".to_owned())
-    }
-
-    /// On error: re-race and clear client_id so next register uses new URL.
-    async fn recover(&self) -> Result<String, String> {
-        warn!("monitor_link: error on active_url — re-racing");
-        let url = self.race_urls().await?;
-        *self.client_id.lock().await = None;
-        Ok(url)
-    }
-
-    /// Drive the WebSocket subscribe connection until it closes or errors.
-    /// Returns `Ok(())` on clean close, `Err(...)` on connect/parse error.
-    async fn run_ws_loop(&self) -> Result<(), String> {
-        use futures::{SinkExt, StreamExt};
-
-        let base = self.get_active_url().await?;
-        let ws_url = http_to_ws_url(&base);
-        // Include client_id when known so the monitor can route per-client
-        // pushes (e.g. debug tunnel open/close) back to this exact connection.
-        let cid = self.client_id.lock().await.clone();
-        let tok = self.client_token.lock().await.clone();
-        let subscribe_url = build_subscribe_url(&ws_url, cid.as_deref(), tok.as_deref());
-
-        let mut req = subscribe_url
-            .into_client_request()
-            .map_err(|e| format!("build WS request: {e}"))?;
-
-        if let Some(key) = &self.monitor_api_key {
-            let header_val = format!("Bearer {key}")
-                .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-                .map_err(|e| format!("invalid auth header: {e}"))?;
-            req.headers_mut().insert(
-                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-                header_val,
-            );
-        }
-
-        let (ws_stream, _) = connect_async_tls_with_config(req, None, false, None)
-            .await
-            .map_err(|e| format!("WS upgrade failed: {e}"))?;
-
-        info!("monitor_link: state → Connected (WebSocket)");
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // Keepalive strategy (transport-agnostic app-level Ping/Pong):
-        //   - Every 10 s send `TaggedClientFrame::Ping { nonce }` as a JSON
-        //     text frame.  The monitor echoes `TaggedServerFrame::Pong { nonce }`.
-        //   - Track `app_ping_nonce` + `app_ping_sent_at`.
-        //   - On matching Pong → clear outstanding; record `last_pong_at`.
-        //   - Dead-detection: if 15 s have elapsed since the last Ping without
-        //     a matching Pong → return Err (triggers reconnect).
-        //
-        // We also keep the tungstenite WS-Ping for protocol-level housekeeping
-        // (routers/proxies expect WS-level keepalives).  WS-Pong from the server
-        // is still tracked via `last_ws_pong` as a secondary liveness signal.
-        let ping_interval_dur = Duration::from_secs(10);
-        let pong_timeout = Duration::from_secs(15);
-        let mut ping_ticker = tokio::time::interval(ping_interval_dur);
-        let mut app_ping_counter: u64 = 0;
-        let mut app_ping_nonce: Option<u64> = None;
-        let mut app_ping_sent_at: Option<tokio::time::Instant> = None;
-        let mut last_pong_at = tokio::time::Instant::now();
-        // tungstenite WS-level Ping/Pong tracking (secondary signal).
-        let mut last_ws_pong = tokio::time::Instant::now();
-        let mut ws_ping_outstanding_since: Option<tokio::time::Instant> = None;
-
-        loop {
-            tokio::select! {
-                msg = read.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            match parse_ws_frame(&text) {
-                                Ok(TaggedServerFrame::Config(cfg)) => {
-                                    debug!(
-                                        version = cfg.version,
-                                        chains = cfg.chains.len(),
-                                        "monitor_link: WS config push received"
-                                    );
-                                    self.apply_config(cfg);
-                                }
-                                Ok(TaggedServerFrame::DebugTunnelOpen(payload)) => {
-                                    info!(
-                                        "monitor_link: DebugTunnelOpen received (host={}, port={}, ttl={}s)",
-                                        payload.monitor_ssh_host,
-                                        payload.reverse_port,
-                                        payload.ttl_secs,
-                                    );
-                                    let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelOpen(payload)));
-                                }
-                                Ok(TaggedServerFrame::DebugTunnelClose) => {
-                                    info!("monitor_link: DebugTunnelClose received");
-                                    let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelClose));
-                                }
-                                Ok(TaggedServerFrame::ChainAvailable(ca)) => {
-                                    info!(
-                                        chain_id = %ca.chain_id,
-                                        est_score = ca.est_score,
-                                        "monitor_link: ChainAvailable received"
-                                    );
-                                    let _ = self
-                                        .frame_tx
-                                        .send(Some(WsServerFrame::ChainAvailable(ca)));
-                                }
-                                Ok(TaggedServerFrame::CredentialParams(params)) => {
-                                    let generation = params.generation;
-                                    self.credential_params.store(Arc::new(Some(params)));
-                                    debug!(generation, "monitor_link: CredentialParams updated");
-                                }
-                                Ok(TaggedServerFrame::Pong { nonce }) => {
-                                    // App-level Pong: clear outstanding ping if nonce matches.
-                                    if app_ping_nonce == Some(nonce) {
-                                        debug!(nonce, "monitor_link: app Pong received");
-                                        app_ping_nonce = None;
-                                        app_ping_sent_at = None;
-                                        last_pong_at = tokio::time::Instant::now();
-                                    } else {
-                                        debug!(nonce, "monitor_link: stale/unexpected Pong nonce");
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("monitor_link: WS frame parse error: {e}");
-                                    // Don't break on parse error — monitor may send
-                                    // other frame types in the future.
-                                }
-                            }
-                        }
-                        Some(Ok(Message::Ping(_))) => {
-                            // tungstenite auto-responds with Pong, nothing to do.
-                        }
-                        Some(Ok(Message::Pong(_))) => {
-                            let now = tokio::time::Instant::now();
-                            last_ws_pong = now;
-                            ws_ping_outstanding_since = None;
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            info!("monitor_link: WebSocket closed by server");
-                            return Ok(());
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => {
-                            return Err(format!("WS stream error: {e}"));
-                        }
-                    }
-                }
-
-                _ = ping_ticker.tick() => {
-                    let now = tokio::time::Instant::now();
-
-                    // Dead-detection: app-level Pong not received within pong_timeout.
-                    if let Some(sent_at) = app_ping_sent_at {
-                        if now.duration_since(sent_at) > pong_timeout {
-                            return Err(format!(
-                                "monitor_link: app pong timeout: no Pong for {:?}",
-                                now.duration_since(sent_at)
-                            ));
-                        }
-                    }
-
-                    // Secondary: WS-level Pong not received within pong_timeout.
-                    if let Some(sent_at) = ws_ping_outstanding_since {
-                        if now.duration_since(sent_at) > pong_timeout {
-                            return Err(format!(
-                                "monitor_link: WS pong timeout: no WS Pong for {:?}",
-                                now.duration_since(sent_at)
-                            ));
-                        }
-                    }
-
-                    // Idle fallback: if app-level Pong idle too long (covers the case
-                    // where we never had a pending Ping but Pongs stopped arriving).
-                    if last_pong_at.elapsed() > ping_interval_dur + pong_timeout {
-                        return Err(format!(
-                            "monitor_link: app pong idle: no Pong for {:?}",
-                            last_pong_at.elapsed()
-                        ));
-                    }
-                    if last_ws_pong.elapsed() > ping_interval_dur + pong_timeout {
-                        return Err(format!(
-                            "monitor_link: WS pong idle: no WS Pong for {:?}",
-                            last_ws_pong.elapsed()
-                        ));
-                    }
-
-                    // Send app-level Ping (JSON text frame).
-                    app_ping_counter += 1;
-                    let nonce = app_ping_counter;
-                    let ping_json = match serde_json::to_string(&TaggedClientFrame::Ping { nonce }) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            return Err(format!("monitor_link: failed to serialize Ping: {e}"));
-                        }
-                    };
-                    match write.send(Message::Text(ping_json.into())).await {
-                        Ok(()) => {
-                            app_ping_nonce = Some(nonce);
-                            app_ping_sent_at = Some(now);
-                        }
-                        Err(e) => {
-                            return Err(format!("monitor_link: app Ping send failed: {e}"));
-                        }
-                    }
-
-                    // Also send tungstenite WS-level Ping for protocol housekeeping.
-                    match write.send(Message::Ping(vec![])).await {
-                        Ok(()) => {
-                            if ws_ping_outstanding_since.is_none() {
-                                ws_ping_outstanding_since = Some(now);
-                            }
-                        }
-                        Err(e) => {
-                            return Err(format!("monitor_link: WS Ping send failed: {e}"));
+                            return;
                         }
                     }
                 }
@@ -1710,202 +1303,6 @@ impl MonitorLink {
         };
         let _ = self.config_tx.send(Some(monitor_cfg.clone()));
         let _ = self.frame_tx.send(Some(WsServerFrame::Config(monitor_cfg)));
-    }
-
-    async fn register(&self) {
-        // R2: Try wire-first when coords are available.  The monitor's full axum
-        // router is served over :19444, so POST /relay/clients is reachable
-        // without a bearer token.  On any wire error fall back to HTTPS.
-        if let Some(wire) = self.wire_transport().await {
-            let body = RegisterBody {
-                os: std::env::consts::OS,
-                version: env!("CARGO_PKG_VERSION"),
-                supported_transports: vec!["tcp", "websocket"],
-            };
-            let body_json = match serde_json::to_vec(&body) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("monitor_link: register: serialize body: {e}");
-                    // Fall through to HTTPS below.
-                    vec![]
-                }
-            };
-            if !body_json.is_empty() {
-                match register_over_wire(&wire, &self.ephemeral_client_priv, &body_json).await {
-                    Ok(reg) => {
-                        debug!(
-                            client_id = %reg.client_id,
-                            "monitor_link: registered over wire (R2)"
-                        );
-                        self.poll_interval_secs
-                            .store(reg.monitor_poll_interval_secs, Ordering::Relaxed);
-                        *self.client_id.lock().await = Some(reg.client_id);
-                        if reg.client_token.is_some() {
-                            *self.client_token.lock().await = reg.client_token;
-                        }
-                        self.poll_config().await;
-                        return;
-                    }
-                    Err(e) => {
-                        warn!("monitor_link: register: wire failed ({e}) — falling back to HTTPS");
-                    }
-                }
-            }
-        }
-
-        // HTTPS fallback (original path, unchanged).
-        let base = match self.get_active_url().await {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("monitor_link: register: {e}");
-                return;
-            }
-        };
-        let url = format!("{base}/relay/clients");
-        let body = RegisterBody {
-            os: std::env::consts::OS,
-            version: env!("CARGO_PKG_VERSION"),
-            supported_transports: vec!["tcp", "websocket"],
-        };
-
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(key) = &self.monitor_api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    warn!(status = %status, "monitor_link: register: non-2xx");
-                    return;
-                }
-                match resp.json::<RegisterResponse>().await {
-                    Ok(reg) => {
-                        debug!(client_id = %reg.client_id, "monitor_link: registered");
-                        self.poll_interval_secs
-                            .store(reg.monitor_poll_interval_secs, Ordering::Relaxed);
-                        *self.client_id.lock().await = Some(reg.client_id);
-                        // Phase 2: store token when monitor issues one.
-                        // Old monitors return None — silently kept as None.
-                        if reg.client_token.is_some() {
-                            *self.client_token.lock().await = reg.client_token;
-                        }
-                        // Fetch initial config via HTTP right after registration
-                        // (WS will also send a snapshot on connect, but this
-                        // ensures the client has config even before WS is up).
-                        self.poll_config().await;
-                    }
-                    Err(e) => {
-                        warn!(status = %status, "monitor_link: register: failed to parse response: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("monitor_link: register: request failed: {e}");
-            }
-        }
-    }
-
-    async fn poll_config(&self) {
-        let base = match self.get_active_url().await {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("monitor_link: poll_config: {e}");
-                return;
-            }
-        };
-        let current_version = self.config_version.load(Ordering::Relaxed);
-        // Phase 2: append client_id + client_token when both are present.
-        let cid = self.client_id.lock().await.clone();
-        let tok = self.client_token.lock().await.clone();
-        let url = append_client_params(
-            &format!("{base}/relay/clients/config"),
-            cid.as_deref(),
-            tok.as_deref(),
-        );
-
-        let mut req = self
-            .http
-            .get(&url)
-            .header("If-None-Match", current_version.to_string());
-        if let Some(key) = &self.monitor_api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status == reqwest::StatusCode::NOT_MODIFIED {
-                    debug!(version = current_version, "monitor_link: config unchanged (304)");
-                    return;
-                }
-                if !status.is_success() {
-                    warn!(status = %status, "monitor_link: config poll: unexpected status — re-racing");
-                    let _ = self.recover().await;
-                    return;
-                }
-                match resp.json::<ConfigResponse>().await {
-                    Ok(cfg) => {
-                        debug!(
-                            version = cfg.version,
-                            chains = cfg.chains.len(),
-                            "monitor_link: config updated (HTTP poll)"
-                        );
-                        self.apply_config(cfg);
-                    }
-                    Err(e) => {
-                        warn!("monitor_link: config poll: failed to parse response: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("monitor_link: config poll: request failed: {e}");
-                let _ = self.recover().await;
-            }
-        }
-    }
-
-    async fn send_heartbeat(&self) {
-        let (client_id, tok) = {
-            let cid_guard = self.client_id.lock().await;
-            let tok_guard = self.client_token.lock().await;
-            match cid_guard.as_deref() {
-                Some(id) => (id.to_owned(), tok_guard.clone()),
-                None => return,
-            }
-        };
-
-        let base = match self.get_active_url().await {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("monitor_link: send_heartbeat: {e}");
-                return;
-            }
-        };
-        // Phase 2: append client_token as query param when present.
-        let url = append_client_params(
-            &format!("{base}/relay/clients/{client_id}/heartbeat"),
-            Some(&client_id),
-            tok.as_deref(),
-        );
-        let active_chains = self
-            .config_version
-            .load(Ordering::Relaxed)
-            .min(u32::MAX as u64) as u32;
-        let body = HeartbeatBody { active_chains };
-
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(key) = &self.monitor_api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-
-        if let Err(e) = req.send().await {
-            warn!("monitor_link: heartbeat: request failed: {e}");
-            if self.recover().await.is_ok() {
-                self.register().await;
-            }
-        }
     }
 }
 
@@ -2091,27 +1488,15 @@ async fn register_over_wire(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Convert `http://` → `ws://` and `https://` → `wss://`.
-/// Passes through existing `ws://` / `wss://` URLs unchanged.
-fn http_to_ws_url(url: &str) -> String {
-    if url.starts_with("https://") {
-        format!("wss://{}", &url["https://".len()..])
-    } else if url.starts_with("http://") {
-        format!("ws://{}", &url["http://".len()..])
-    } else {
-        url.to_owned()
-    }
-}
-
-/// Build the WebSocket subscribe URL, appending `?client_id=X` and
+/// Build the Wire WebSocket subscribe URL, appending `?client_id=X` and
 /// `?client_token=Y` when present.
 ///
-/// `ws_base` — the base WS URL including the scheme, e.g. `wss://host:port`
-/// or `ws://host`.  The path `/relay/clients/subscribe` is always appended.
+/// `ws_base` — the base WS URL including the scheme, e.g. `ws://host`.
+/// The path `/relay/clients/subscribe` is always appended.
 ///
 /// Backward-compat: if `client_id` is `None`, the raw path is returned with
-/// no query params (older behaviour, old monitors).  If `client_token` is
-/// `None`, only `?client_id=X` is appended.
+/// no query params (older monitors).  If `client_token` is `None`, only
+/// `?client_id=X` is appended.
 fn build_subscribe_url(ws_base: &str, client_id: Option<&str>, client_token: Option<&str>) -> String {
     match (client_id, client_token) {
         (Some(id), Some(tok)) => {
@@ -2123,28 +1508,6 @@ fn build_subscribe_url(ws_base: &str, client_id: Option<&str>, client_token: Opt
         (None, _) => {
             format!("{ws_base}/relay/clients/subscribe")
         }
-    }
-}
-
-/// Append `?client_id=X&client_token=Y` (or just `?client_token=Y`) to a URL
-/// that already has the path component set.  Used for config-poll and heartbeat.
-///
-/// If both params are absent, returns `base_url` unchanged.
-/// If only `client_id` is present (no token), nothing is appended — the
-/// heartbeat URL already carries the id in the path.
-fn append_client_params(base_url: &str, client_id: Option<&str>, client_token: Option<&str>) -> String {
-    // Only append token when present — client_id for heartbeat is in the path,
-    // but for config-poll we add both as query params (required by Phase 2 gate).
-    match (client_id, client_token) {
-        (Some(id), Some(tok)) => {
-            let sep = if base_url.contains('?') { '&' } else { '?' };
-            format!("{base_url}{sep}client_id={id}&client_token={tok}")
-        }
-        (_, Some(tok)) => {
-            let sep = if base_url.contains('?') { '&' } else { '?' };
-            format!("{base_url}{sep}client_token={tok}")
-        }
-        _ => base_url.to_owned(),
     }
 }
 

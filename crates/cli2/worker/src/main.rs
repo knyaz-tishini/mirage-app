@@ -741,8 +741,9 @@ fn spawn_monitor_link_in_worker(
 
     for spec in transport_specs {
         match spec {
-            MonitorTransportSpec::DirectWs { url, sni } => {
-                transports.push(MonitorTransport::DirectWs { url, sni });
+            MonitorTransportSpec::DirectWs { .. } => {
+                // DirectWs has been removed from MonitorTransport — skip.
+                debug!(chain_id, "worker: DirectWs transport spec ignored (removed)");
             }
             MonitorTransportSpec::OverChain { worker_socks5, monitor_addr, chain_id: cid } => {
                 transports.push(MonitorTransport::OverChain {

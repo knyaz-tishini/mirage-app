@@ -297,11 +297,9 @@ async fn main() -> anyhow::Result<()> {
 
                 for t in &config.monitor_transports {
                     match t {
-                        MonitorTransportConfig::DirectWs { url, sni } => {
-                            ipc_specs.push(MonitorTransportSpec::DirectWs {
-                                url: url.clone(),
-                                sni: sni.clone(),
-                            });
+                        MonitorTransportConfig::DirectWs { .. } => {
+                            // DirectWs has been removed — skip silently.
+                            tracing::debug!("supervisor: DirectWs transport config ignored (removed)");
                         }
                         MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
                             let chain_cfg = match config.chains.iter().find(|c| &c.id == chain_id) {
