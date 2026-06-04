@@ -45,6 +45,14 @@ pub struct KillSwitch {
     /// interface are explicitly accepted in both ip4tables and ip6tables so
     /// tunnelled traffic is never accidentally dropped.
     tun_iface: Option<String>,
+    /// Bypass CIDRs (invariant 1: bypass is sacred).  Traffic destined for
+    /// these CIDRs is explicitly ACCEPT-ed before the DROP floor so that
+    /// route-rule-designated direct flows are never killed by the kill-switch.
+    ///
+    /// Both IPv4 (e.g. `"10.0.0.0/8"`) and IPv6 (e.g. `"2001:db8::/32"`)
+    /// prefixes are accepted.  IPv4 CIDRs go into the ip4tables chain; IPv6
+    /// CIDRs go into the ip6tables chain.
+    bypass_cidrs: Vec<String>,
     /// Whether the rules are currently installed.
     active: bool,
 }
@@ -56,8 +64,21 @@ impl KillSwitch {
         Self {
             relay_addrs,
             tun_iface: None,
+            bypass_cidrs: Vec::new(),
             active: false,
         }
+    }
+
+    /// Attach bypass CIDRs (invariant 1 — bypass is sacred).
+    ///
+    /// Each CIDR in `cidrs` generates an ACCEPT rule in the `MIRAGE_KS` chain
+    /// *before* the DROP floor, so traffic explicitly designated as direct by
+    /// the routing table is never blocked.  IPv4 CIDRs go into the ip4tables
+    /// chain; IPv6 CIDRs go into the ip6tables chain.  Invalid or empty strings
+    /// are silently skipped at activation time.
+    pub fn with_bypass_cidrs(mut self, cidrs: Vec<String>) -> Self {
+        self.bypass_cidrs = cidrs;
+        self
     }
 
     /// Attach a TUN interface name so traffic on that interface is always
@@ -87,20 +108,38 @@ impl KillSwitch {
             .copied()
             .collect();
 
+        // Partition bypass CIDRs into IPv4 and IPv6.
+        let bypass_v4: Vec<&str> = self
+            .bypass_cidrs
+            .iter()
+            .filter(|c| !c.contains(':'))
+            .map(String::as_str)
+            .collect();
+        let bypass_v6: Vec<&str> = self
+            .bypass_cidrs
+            .iter()
+            .filter(|c| c.contains(':'))
+            .map(String::as_str)
+            .collect();
+
         info!(
             v4_count = v4_addrs.len(),
             v6_count = v6_addrs.len(),
+            bypass_v4_count = bypass_v4.len(),
+            bypass_v6_count = bypass_v6.len(),
             "kill switch: activating (chain {CHAIN_NAME})",
         );
 
-        install_ip4_chain(&v4_addrs, self.tun_iface.as_deref())?;
-        install_ip6_chain(&v6_addrs, self.tun_iface.as_deref());
+        install_ip4_chain(&v4_addrs, self.tun_iface.as_deref(), &bypass_v4)?;
+        install_ip6_chain(&v6_addrs, self.tun_iface.as_deref(), &bypass_v6);
 
         self.active = true;
         info!(
             relay_count = self.relay_addrs.len(),
-            "kill switch: active — all traffic except {} relay(s) is blocked",
+            bypass_cidr_count = self.bypass_cidrs.len(),
+            "kill switch: active — all traffic except {} relay(s) and {} bypass CIDR(s) is blocked",
             self.relay_addrs.len(),
+            self.bypass_cidrs.len(),
         );
         Ok(())
     }
@@ -190,9 +229,12 @@ fn run_iptables_tolerant(args: &[&str]) -> Result<(), KillSwitchError> {
 /// Install the IPv4 `MIRAGE_KS` iptables chain.
 ///
 /// `relay_addrs` must contain only IPv4 addresses.
+/// `bypass_cidrs` are IPv4 CIDR strings that must be ACCEPT-ed before the
+/// DROP floor (invariant 1 — bypass is sacred).
 fn install_ip4_chain(
     relay_addrs: &[SocketAddr],
     tun_iface: Option<&str>,
+    bypass_cidrs: &[&str],
 ) -> Result<(), KillSwitchError> {
     // 1. Create the custom chain.  If it already exists iptables exits with
     //    status 1 and the message "Chain already exists." — that is fine.
@@ -258,10 +300,19 @@ fn install_ip4_chain(
         "ACCEPT",
     ])?;
 
-    // 7. Drop everything else.
+    // 7. Bypass CIDRs — invariant 1 (bypass is sacred).
+    //    These ACCEPTs sit between relay-IP rules and the DROP floor so that
+    //    any destination explicitly designated as direct by the routing table
+    //    is never blocked.
+    for cidr in bypass_cidrs {
+        info!(cidr = *cidr, "kill switch: adding bypass CIDR ACCEPT rule");
+        run_iptables(&["-A", CHAIN_NAME, "-d", cidr, "-j", "ACCEPT"])?;
+    }
+
+    // 8. Drop everything else (invariant 2 — no-native floor).
     run_iptables(&["-A", CHAIN_NAME, "-j", "DROP"])?;
 
-    // 8. Insert jump at the front of OUTPUT.
+    // 9. Insert jump at the front of OUTPUT.
     run_iptables(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME])?;
 
     Ok(())
@@ -281,12 +332,14 @@ fn remove_ip4_chain() {
 }
 
 /// Install an `ip6tables` MIRAGE_KS chain that permits loopback, DHCPv6
-/// client traffic, ICMPv6 neighbor-discovery/RA messages, and any IPv6
-/// relay addresses, then drops the rest.
+/// client traffic, ICMPv6 neighbor-discovery/RA messages, any IPv6 relay
+/// addresses, and any IPv6 bypass CIDRs, then drops the rest.
 ///
 /// `relay_addrs` must contain only IPv6 addresses (caller responsibility).
+/// `bypass_cidrs` are IPv6 CIDR strings that must be ACCEPT-ed before the
+/// DROP floor (invariant 1 — bypass is sacred).
 /// All operations are tolerant — ip6tables may not exist on the host.
-fn install_ip6_chain(relay_addrs: &[SocketAddr], tun_iface: Option<&str>) {
+fn install_ip6_chain(relay_addrs: &[SocketAddr], tun_iface: Option<&str>, bypass_cidrs: &[&str]) {
     // Create chain (ignore "already exists").
     run_ip6tables_tolerant(&["-N", CHAIN_NAME]);
 
@@ -365,7 +418,13 @@ fn install_ip6_chain(relay_addrs: &[SocketAddr], tun_iface: Option<&str>) {
         ]);
     }
 
-    // Drop everything else.
+    // Bypass CIDRs — invariant 1 (bypass is sacred).
+    for cidr in bypass_cidrs {
+        info!(cidr = *cidr, "kill switch: adding ip6tables bypass CIDR ACCEPT rule");
+        run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-d", cidr, "-j", "ACCEPT"]);
+    }
+
+    // Drop everything else (invariant 2 — no-native floor).
     run_ip6tables_tolerant(&["-A", CHAIN_NAME, "-j", "DROP"]);
 
     // Insert jump at front of OUTPUT.
@@ -410,13 +469,15 @@ fn run_ip6tables_tolerant(args: &[&str]) {
 type RuleArgs = Vec<&'static str>;
 
 /// Build the ordered list of ip6tables rule-arg slices that
-/// `install_ip6_chain` would issue for the given relay addrs and tun iface.
+/// `install_ip6_chain` would issue for the given relay addrs, tun iface, and
+/// bypass CIDRs.
 ///
 /// Used in structural unit tests — no actual `ip6tables` binary is invoked.
 #[cfg(test)]
 fn expected_ip6_rules(
     relay_addrs: &[SocketAddr],
     tun_iface: Option<&'static str>,
+    bypass_cidrs: &[&'static str],
 ) -> Vec<RuleArgs> {
     let mut rules: Vec<RuleArgs> = Vec::new();
 
@@ -451,6 +512,10 @@ fn expected_ip6_rules(
     rules.push(vec!["-A", CHAIN_NAME, "-p", "udp", "--dport", "547", "-j", "ACCEPT"]);
     for t in ["133", "134", "135", "136", "143"] {
         rules.push(vec!["-A", CHAIN_NAME, "-p", "ipv6-icmp", "--icmpv6-type", t, "-j", "ACCEPT"]);
+    }
+    // bypass CIDRs sit just before the DROP floor
+    for cidr in bypass_cidrs {
+        rules.push(vec!["-A", CHAIN_NAME, "-d", cidr, "-j", "ACCEPT"]);
     }
     rules.push(vec!["-A", CHAIN_NAME, "-j", "DROP"]);
     rules.push(vec!["-I", "OUTPUT", "1", "-j", CHAIN_NAME]);
@@ -506,7 +571,7 @@ mod tests {
             "10.0.0.1:4431".parse().unwrap(), // v4 — filtered out by caller
         ];
         let v6_only: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
-        install_ip6_chain(&v6_only, None);
+        install_ip6_chain(&v6_only, None, &[]);
         remove_ip6_chain();
     }
 
@@ -548,14 +613,14 @@ mod tests {
         let v6: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
         assert!(v6.is_empty());
         // install_ip6_chain with empty slice must not panic
-        install_ip6_chain(&v6, None);
+        install_ip6_chain(&v6, None, &[]);
         remove_ip6_chain();
     }
 
     /// Structural: ip6tables rule list contains all required rule families.
     #[test]
     fn ip6_rule_list_structure() {
-        let rules = expected_ip6_rules(&[], None);
+        let rules = expected_ip6_rules(&[], None, &[]);
 
         // Must begin with chain creation.
         assert_eq!(rules[0], vec!["-N", CHAIN_NAME]);
@@ -584,7 +649,7 @@ mod tests {
     /// Structural: with tun_iface set, the rule list contains a tun ACCEPT rule.
     #[test]
     fn ip6_rule_list_with_tun_iface() {
-        let rules = expected_ip6_rules(&[], Some("tun0"));
+        let rules = expected_ip6_rules(&[], Some("tun0"), &[]);
         assert!(
             rules.iter().any(|r| r.contains(&"-o") && r.contains(&"tun0")),
             "missing tun iface ACCEPT rule"
@@ -594,7 +659,7 @@ mod tests {
     /// Structural: without tun_iface, no tun ACCEPT rule is present.
     #[test]
     fn ip6_rule_list_without_tun_iface() {
-        let rules = expected_ip6_rules(&[], None);
+        let rules = expected_ip6_rules(&[], None, &[]);
         // "lo" is expected, but no other interface rule should appear
         let non_lo_iface_rules: Vec<_> = rules
             .iter()
@@ -606,7 +671,7 @@ mod tests {
     /// Structural: conntrack ESTABLISHED,RELATED rule is present.
     #[test]
     fn ip6_rule_list_has_conntrack() {
-        let rules = expected_ip6_rules(&[], None);
+        let rules = expected_ip6_rules(&[], None, &[]);
         assert!(
             rules.iter().any(|r| r.contains(&"ESTABLISHED,RELATED")),
             "missing conntrack rule"

@@ -280,7 +280,12 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let mut ks = killswitch::KillSwitch::new(relay_addrs);
+        // Invariant 1: bypass is sacred — source bypass CIDRs from the
+        // routing config's `direct_cidrs` list (the same list that drives
+        // RouteDecision::Direct in the SOCKS5/HTTP proxy path).
+        let bypass_cidrs = config.routing.direct_cidrs.clone();
+        let mut ks = killswitch::KillSwitch::new(relay_addrs)
+            .with_bypass_cidrs(bypass_cidrs);
         ks.activate()
             .map_err(|e| format!("kill switch activate failed: {e}"))?;
         Some(ks)
