@@ -11,6 +11,17 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+/// Wire coordinates for register-over-wire (R1).
+///
+/// Supplied by the sentinel at startup when `monitor_wire_addr` and
+/// `monitor_wire_pubkey_hex` are present in config or `monitor_wire.json`
+/// was persisted from a previous run.
+pub struct WireRegisterCoords<'a> {
+    pub monitor_addr: &'a str,
+    pub monitor_pubkey_hex: &'a str,
+    pub mesh_id: &'a str,
+}
+
 /// Body for `POST /relay/clients` (register).
 #[derive(Debug, Serialize)]
 pub struct RegisterBody<'a> {
@@ -42,12 +53,58 @@ pub struct RegisterResponse {
 /// Returns `(active_url, client_id, client_token)`. `client_token` is
 /// `None` on older monitors that do not issue tokens yet — callers must
 /// treat absence as backward-compat (no token in subscribe params).
+///
+/// When `wire_coords` is `Some`, the function tries `POST /relay/clients`
+/// over the Mirage native wire (`:19444`, V9, no bearer) **first** (R1).
+/// On wire success the HTTPS URL loop is skipped entirely.  On wire
+/// failure the code falls through to the HTTPS URL loop unchanged —
+/// backward-compatible cold-bootstrap path.
 pub async fn register_with_failover(
     http: &Client,
     monitor_urls: &[String],
     bearer: &str,
     body: &RegisterBody<'_>,
+    wire_coords: Option<&WireRegisterCoords<'_>>,
 ) -> Result<(String, String, Option<String>)> {
+    // R1: Wire-preferred register.
+    if let Some(wc) = wire_coords {
+        let body_json = match serde_json::to_vec(body) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("[sentinel] register: serialize body for wire: {e}");
+                vec![]
+            }
+        };
+        if !body_json.is_empty() {
+            match mirage_client_core::monitor_link::register_post_over_wire(
+                wc.monitor_addr,
+                wc.monitor_pubkey_hex,
+                wc.mesh_id,
+                &body_json,
+            )
+            .await
+            {
+                Ok((client_id, _poll_secs, client_token)) => {
+                    tracing::info!(
+                        "[sentinel] registered over wire (R1): client_id={client_id}"
+                    );
+                    // Use the wire addr as the active "URL" so callers have a
+                    // non-empty string.  The actual HTTPS URL is irrelevant once
+                    // MonitorLink uses Wire transport for all subsequent calls.
+                    let wire_url =
+                        format!("wire://{}", wc.monitor_addr);
+                    return Ok((wire_url, client_id, client_token));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[sentinel] register wire failed ({e}) — falling back to HTTPS"
+                    );
+                }
+            }
+        }
+    }
+
+    // HTTPS failover (unchanged original path).
     let mut last_err: Option<anyhow::Error> = None;
     for url in monitor_urls {
         let endpoint = format!("{}/relay/clients", url.trim_end_matches('/'));

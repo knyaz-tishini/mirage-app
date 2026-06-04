@@ -1713,6 +1713,47 @@ impl MonitorLink {
     }
 
     async fn register(&self) {
+        // R2: Try wire-first when coords are available.  The monitor's full axum
+        // router is served over :19444, so POST /relay/clients is reachable
+        // without a bearer token.  On any wire error fall back to HTTPS.
+        if let Some(wire) = self.wire_transport().await {
+            let body = RegisterBody {
+                os: std::env::consts::OS,
+                version: env!("CARGO_PKG_VERSION"),
+                supported_transports: vec!["tcp", "websocket"],
+            };
+            let body_json = match serde_json::to_vec(&body) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("monitor_link: register: serialize body: {e}");
+                    // Fall through to HTTPS below.
+                    vec![]
+                }
+            };
+            if !body_json.is_empty() {
+                match register_over_wire(&wire, &self.ephemeral_client_priv, &body_json).await {
+                    Ok(reg) => {
+                        debug!(
+                            client_id = %reg.client_id,
+                            "monitor_link: registered over wire (R2)"
+                        );
+                        self.poll_interval_secs
+                            .store(reg.monitor_poll_interval_secs, Ordering::Relaxed);
+                        *self.client_id.lock().await = Some(reg.client_id);
+                        if reg.client_token.is_some() {
+                            *self.client_token.lock().await = reg.client_token;
+                        }
+                        self.poll_config().await;
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("monitor_link: register: wire failed ({e}) — falling back to HTTPS");
+                    }
+                }
+            }
+        }
+
+        // HTTPS fallback (original path, unchanged).
         let base = match self.get_active_url().await {
             Ok(u) => u,
             Err(e) => {
@@ -1866,6 +1907,186 @@ impl MonitorLink {
             }
         }
     }
+}
+
+// ── Wire HTTP helpers ─────────────────────────────────────────────────────────
+
+/// Issue `POST /relay/clients` over the Mirage wire using raw wire coordinate
+/// strings (no `WireParams` struct required — public API for callers outside
+/// this module such as `l0-sentinel::chain_request`).
+///
+/// Generates a fresh ephemeral X25519 client key per call (anonymous client,
+/// no `DeclaredIdentity`).
+///
+/// Returns `(client_id, poll_interval_secs, client_token)` matching the
+/// shape of `chain_request::register_with_failover`.
+pub async fn register_post_over_wire(
+    monitor_addr: &str,
+    monitor_pubkey_hex: &str,
+    mesh_id: &str,
+    body_json: &[u8],
+) -> Result<(String, u64, Option<String>), String> {
+    let ephemeral: [u8; 32] = {
+        use rand::RngCore;
+        let mut k = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut k);
+        k
+    };
+    let wire = WireParams {
+        monitor_addr: monitor_addr.to_owned(),
+        monitor_pubkey_hex: monitor_pubkey_hex.to_owned(),
+        mesh_id: mesh_id.to_owned(),
+        host_hint: None,
+    };
+    let reg = register_over_wire(&wire, &ephemeral, body_json).await?;
+    Ok((reg.client_id, reg.monitor_poll_interval_secs, reg.client_token))
+}
+
+/// Dial the monitor's V9 wire endpoint and return it wrapped as duplex IO.
+///
+/// Mirrors the first part of [`run_wire_loop`] — same V9 anonymous-ephemeral
+/// dial, same `tunnel_into_io` wrapping — factored out so any caller that needs
+/// raw IO (e.g. `register_over_wire`) can reuse it without touching the WS
+/// upgrade path.
+///
+/// Returns the `DuplexStream` (hand to hyper / manual HTTP writes) plus the
+/// background pump handle (drop to close, or ignore for fire-and-forget).
+async fn dial_monitor_wire_io(
+    wire: &WireParams,
+    ephemeral_client_priv: &[u8; 32],
+) -> Result<(tokio::io::DuplexStream, tokio::task::JoinHandle<()>), String> {
+    use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportKind};
+    use mirage_protocol::driver::run_client_tcp_v9;
+
+    let server_static_pub: [u8; 32] = hex::decode(&wire.monitor_pubkey_hex)
+        .map_err(|e| format!("wire_io: decode pubkey_hex '{}': {e}", wire.monitor_pubkey_hex))?
+        .try_into()
+        .map_err(|_| format!("wire_io: pubkey_hex must be 32 bytes: '{}'", wire.monitor_pubkey_hex))?;
+
+    let server_addr: std::net::SocketAddr = wire
+        .monitor_addr
+        .parse()
+        .map_err(|e| format!("wire_io: parse monitor_addr '{}': {e}", wire.monitor_addr))?;
+
+    let config = MirageEndpointConfig {
+        transport: TransportKind::Tcp,
+        auth: AuthMode::Blake3,
+        camouflage: mirage_core::config::TransportCamouflage::None,
+        byte_cipher: None,
+        byte_cipher_mode: None,
+    };
+
+    let tunnel = run_client_tcp_v9(
+        &config,
+        server_addr,
+        &server_static_pub,
+        ephemeral_client_priv,
+        wire.host_hint
+            .as_deref()
+            .or_else(|| wire.monitor_addr.rsplit_once(':').map(|(h, _)| h))
+            .unwrap_or(wire.monitor_addr.as_str()),
+        wire.mesh_id.as_bytes(),
+        None, // anonymous client
+    )
+    .await
+    .map_err(|e| format!("wire_io: V9 dial failed: {e}"))?;
+
+    Ok(mirage_mesh_client::tunnel_into_io(tunnel))
+}
+
+/// Issue `POST /relay/clients` over the Mirage wire (HTTP/1.0, no bearer).
+///
+/// The monitor's full axum router is already served over `:19444`
+/// (first-byte HTTP dispatch → hyper `serve_connection`), so the register
+/// endpoint is reachable through the tunnel without any new server code.
+///
+/// Mirrors the hand-written HTTP pattern from `mirage2operator`'s
+/// `wire_http::wire_request` but adapted to the client's anonymous-
+/// ephemeral tunnel type — no SenderProof headers (client has no
+/// `DeclaredIdentity`).
+///
+/// On success returns `(client_id, poll_interval_secs, client_token)`.
+async fn register_over_wire(
+    wire: &WireParams,
+    ephemeral_client_priv: &[u8; 32],
+    body_json: &[u8],
+) -> Result<RegisterResponse, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = wire
+        .host_hint
+        .as_deref()
+        .or_else(|| wire.monitor_addr.rsplit_once(':').map(|(h, _)| h))
+        .unwrap_or(wire.monitor_addr.as_str())
+        .to_string();
+
+    let (mut io, _pump) = dial_monitor_wire_io(wire, ephemeral_client_priv).await?;
+
+    // Build minimal HTTP/1.0 POST (Connection: close — read until EOF).
+    let head = format!(
+        "POST /relay/clients HTTP/1.0\r\n\
+         Host: {host}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_json.len()
+    );
+
+    io.write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("register_wire: send head: {e}"))?;
+    io.write_all(body_json)
+        .await
+        .map_err(|e| format!("register_wire: send body: {e}"))?;
+
+    // Read full response (HTTP/1.0 — server closes after reply).
+    let mut response = Vec::new();
+    io.read_to_end(&mut response)
+        .await
+        .map_err(|e| format!("register_wire: read response: {e}"))?;
+
+    if response.is_empty() {
+        return Err("register_wire: empty response from monitor".to_string());
+    }
+
+    // Split headers / body at \r\n\r\n.
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(response.len());
+
+    let status_line = response[..header_end.min(response.len())]
+        .split(|&b| b == b'\n')
+        .next()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .unwrap_or_default();
+
+    if !status_line.starts_with("HTTP/1.") {
+        return Err(format!(
+            "register_wire: unexpected response prefix: {:?}",
+            &status_line[..status_line.len().min(40)]
+        ));
+    }
+
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if !(200..300).contains(&status_code) {
+        let body_preview = String::from_utf8_lossy(
+            &response[(header_end + 4).min(response.len())..],
+        );
+        return Err(format!(
+            "register_wire: HTTP {status_code}: {body_preview}"
+        ));
+    }
+
+    let body_bytes = &response[(header_end + 4).min(response.len())..];
+    serde_json::from_slice::<RegisterResponse>(body_bytes)
+        .map_err(|e| format!("register_wire: parse response JSON: {e}"))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

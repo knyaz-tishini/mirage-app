@@ -415,12 +415,34 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         supported_transports: vec!["tcp", "udp"],
     };
+    // Build wire coords for R1 wire-preferred register (if available).
+    // Same precedence as the MonitorTransport::Wire activation below:
+    // explicit toml fields first, then persisted monitor_wire.json.
+    let wire_register_coords_owned: Option<monitor_wire::WireCoords> =
+        if cfg.monitor_wire_addr.is_some() && cfg.monitor_wire_pubkey_hex.is_some() {
+            Some(monitor_wire::WireCoords {
+                monitor_addr: cfg.monitor_wire_addr.clone().unwrap(),
+                monitor_pubkey_hex: cfg.monitor_wire_pubkey_hex.clone().unwrap(),
+                mesh_id: cfg.mesh_id.clone(),
+            })
+        } else {
+            monitor_wire::load(&state_dir)
+        };
+    // Borrow the owned strings into the short-lived reference struct.
+    let wire_reg_coords_ref: Option<chain_request::WireRegisterCoords<'_>> =
+        wire_register_coords_owned.as_ref().map(|wc| chain_request::WireRegisterCoords {
+            monitor_addr: wc.monitor_addr.as_str(),
+            monitor_pubkey_hex: wc.monitor_pubkey_hex.as_str(),
+            mesh_id: wc.mesh_id.as_str(),
+        });
+
     let (active_monitor_url, registered_client_id, registered_client_token) =
         match chain_request::register_with_failover(
             &http_client,
             &effective_urls,
             &bootstrap_bearer,
             &reg_body,
+            wire_reg_coords_ref.as_ref(),
         )
         .await
         {
@@ -1062,6 +1084,33 @@ fn spawn_frame_watcher(
                                     wc.mesh_id.clone(),
                                 ).await;
                                 last_wire_addr = Some(wc.monitor_addr);
+                            }
+                        }
+
+                        // R6: Persist peer_table JSON for cli2 supervisor cold-start.
+                        // The supervisor reads `last-peer-table.json` from its
+                        // `state_dir` before falling back to HTTP.  When
+                        // supervisor.toml `state_dir` equals sentinel's
+                        // `state_dir`, this file seeds the cold-start bootstrap.
+                        let pt_for_persist = link.peer_table.load();
+                        if !pt_for_persist.peers.is_empty() {
+                            match serde_json::to_string(&**pt_for_persist) {
+                                Ok(pt_json) => {
+                                    let pt_path = state_dir.join("last-peer-table.json");
+                                    let tmp = pt_path.with_extension("json.tmp");
+                                    if let Err(e) = std::fs::write(&tmp, &pt_json)
+                                        .and_then(|_| std::fs::rename(&tmp, &pt_path))
+                                    {
+                                        tracing::debug!(
+                                            "[sentinel] last-peer-table.json write failed: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "[sentinel] peer_table serialize failed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
