@@ -171,15 +171,31 @@ pub struct MonitorConfig {
 ///
 /// Sentinel writes this verbatim to `${state_dir}/debug-tunnel.json` and
 /// spawns `mirage-debug-shell --config <path>` to act on it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DebugTunnelOpen {
     pub monitor_ssh_host: String,
     pub monitor_ssh_port: u16,
     pub monitor_ssh_user: String,
+    /// SSH private key in PEM form — redacted in Debug output to prevent
+    /// accidental key exposure in logs.
     pub ssh_priv_key_pem: String,
     pub reverse_port: u16,
     pub local_ssh_port: u16,
     pub ttl_secs: u64,
+}
+
+impl std::fmt::Debug for DebugTunnelOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebugTunnelOpen")
+            .field("monitor_ssh_host", &self.monitor_ssh_host)
+            .field("monitor_ssh_port", &self.monitor_ssh_port)
+            .field("monitor_ssh_user", &self.monitor_ssh_user)
+            .field("ssh_priv_key_pem", &"<redacted>")
+            .field("reverse_port", &self.reverse_port)
+            .field("local_ssh_port", &self.local_ssh_port)
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
 }
 
 /// Phase 1.14 (memory wave): graceful chain migration push from a
