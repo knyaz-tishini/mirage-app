@@ -2521,6 +2521,7 @@ dependencies = [
  "axum",
  "bytes",
  "dashmap",
+ "ed25519-dalek",
  "futures",
  "hex",
  "ipnet",
@@ -2653,6 +2654,8 @@ dependencies = [
  "arc-swap",
  "axum",
  "clap",
+ "ed25519-dalek",
+ "hex",
  "libc",
  "mirage-client-core",
  "mirage-core",
@@ -2731,6 +2734,7 @@ name = "mirage-protocol"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "async-trait",
  "blake3",
  "bytes",

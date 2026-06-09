@@ -468,6 +468,21 @@ pub struct MonitorLink {
     /// when `transports` has none).  `None` means no runtime override — the
     /// static `transports` list is used as-is.
     wire_override: Mutex<Option<WireParams>>,
+    /// Static operator Ed25519 verifying key pinned in sentinel.toml.
+    ///
+    /// When `Some`, every incoming `CredentialParams` frame is verified against
+    /// this key before being applied.  Frames that fail verification are
+    /// discarded (the previously held params remain active) and a `warn!` is
+    /// emitted.  When `None`, params are applied without operator-signature
+    /// verification and a one-time transition-state `warn!` fires.
+    operator_pub: Option<ed25519_dalek::VerifyingKey>,
+    /// Monotonic generation watermark.
+    ///
+    /// Tracks the highest `generation` value from any `CredentialParams` that
+    /// was successfully verified (or accepted in the no-pin path) and stored.
+    /// Incoming params with `generation <= last_credential_generation` are
+    /// treated as stale/replayed and discarded with a `warn!`.
+    last_credential_generation: std::sync::atomic::AtomicU64,
 }
 
 impl MonitorLink {
@@ -501,6 +516,35 @@ impl MonitorLink {
         mesh_id: String,
         node_client_id: String,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
+        Self::new_with_operator_pub(
+            monitor_urls,
+            monitor_api_key,
+            peer_table,
+            chain_set,
+            transports,
+            mesh_id,
+            node_client_id,
+            None,
+        )
+    }
+
+    /// Like [`new`] but also accepts a pinned operator [`ed25519_dalek::VerifyingKey`]
+    /// for verifying incoming `CredentialParams` frames before applying them.
+    ///
+    /// When `operator_pub` is `Some`, every `CredentialParams` frame is verified
+    /// against the key.  Frames that fail verification are discarded; the previously
+    /// held params remain active.  When `None`, params are applied without
+    /// operator-signature verification (transition state).
+    pub fn new_with_operator_pub(
+        monitor_urls: Vec<String>,
+        monitor_api_key: Option<String>,
+        peer_table: Arc<ArcSwap<PeerTable>>,
+        chain_set: Arc<ChainSet>,
+        transports: Vec<MonitorTransport>,
+        mesh_id: String,
+        node_client_id: String,
+        operator_pub: Option<ed25519_dalek::VerifyingKey>,
+    ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         Self::new_with_credential_arc(
             monitor_urls,
             monitor_api_key,
@@ -510,6 +554,7 @@ impl MonitorLink {
             transports,
             mesh_id,
             node_client_id,
+            operator_pub,
         )
     }
 
@@ -528,6 +573,7 @@ impl MonitorLink {
         transports: Vec<MonitorTransport>,
         mesh_id: String,
         node_client_id: String,
+        operator_pub: Option<ed25519_dalek::VerifyingKey>,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         let (config_tx, config_rx) = watch::channel(None);
         let (frame_tx, _frame_rx) = watch::channel(None);
@@ -558,6 +604,8 @@ impl MonitorLink {
             chain_set,
             ephemeral_client_priv,
             wire_override: Mutex::new(None),
+            operator_pub,
+            last_credential_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         (link, config_rx)
@@ -584,6 +632,70 @@ impl MonitorLink {
     /// channel slot.
     pub fn subscribe_frames(&self) -> watch::Receiver<Option<WsServerFrame>> {
         self.frame_tx.subscribe()
+    }
+
+    /// Validate and apply a `CredentialParams` frame received from the monitor.
+    ///
+    /// Steps (in order):
+    /// 1. If `operator_pub` is set, verify `params.operator_sig` against it.
+    ///    On failure: log a `warn!`, keep existing params, return.
+    /// 2. If `operator_pub` is absent: emit a one-time `warn!` (logged on first
+    ///    call only via the `WARNED_NO_PIN` flag) and continue.
+    /// 3. Monotonic generation check: if `params.generation <=
+    ///    last_credential_generation`, the frame is stale or replayed — log a
+    ///    `warn!`, keep existing params, return.
+    /// 4. Store the params and advance `last_credential_generation`.
+    fn apply_credential_params(&self, params: CredentialParams, transport_label: &str) {
+        let generation = params.generation;
+
+        // Step 1 / 2: operator-signature check.
+        match &self.operator_pub {
+            Some(pub_key) => {
+                if let Err(e) = params.verify(pub_key) {
+                    warn!(
+                        generation,
+                        transport = transport_label,
+                        error = %e,
+                        "monitor_link: CredentialParams operator-signature check failed — discarding"
+                    );
+                    return;
+                }
+            }
+            None => {
+                // One-time transition-state warning.  Use a static AtomicBool so
+                // the warn fires at most once per process, not on every frame.
+                use std::sync::atomic::AtomicBool;
+                static WARNED_NO_PIN: AtomicBool = AtomicBool::new(false);
+                if !WARNED_NO_PIN.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "monitor_link: operator_pub not configured — \
+                         CredentialParams applied without operator-signature verification \
+                         (set operator_pub_hex in sentinel.toml to enable)"
+                    );
+                }
+            }
+        }
+
+        // Step 3: monotonic generation guard.
+        let last = self.last_credential_generation.load(Ordering::Acquire);
+        if generation <= last {
+            warn!(
+                generation,
+                last_accepted = last,
+                transport = transport_label,
+                "monitor_link: CredentialParams stale generation — discarding"
+            );
+            return;
+        }
+
+        // Step 4: accept.
+        self.credential_params.store(Arc::new(Some(params)));
+        self.last_credential_generation.store(generation, Ordering::Release);
+        debug!(
+            generation,
+            transport = transport_label,
+            "monitor_link: CredentialParams updated"
+        );
     }
 
     /// Snapshot the registered client_id (set after first successful
@@ -918,9 +1030,7 @@ impl MonitorLink {
                                     let _ = self.frame_tx.send(Some(WsServerFrame::ChainAvailable(ca)));
                                 }
                                 Ok(TaggedServerFrame::CredentialParams(params)) => {
-                                    let generation = params.generation;
-                                    self.credential_params.store(Arc::new(Some(params)));
-                                    debug!(generation, "monitor_link: Wire CredentialParams updated");
+                                    self.apply_credential_params(params, "wire");
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if app_ping_nonce == Some(nonce) {
@@ -1191,9 +1301,7 @@ impl MonitorLink {
                                         .send(Some(WsServerFrame::ChainAvailable(ca)));
                                 }
                                 Ok(TaggedServerFrame::CredentialParams(params)) => {
-                                    let generation = params.generation;
-                                    self.credential_params.store(Arc::new(Some(params)));
-                                    debug!(generation, "monitor_link: OverChain CredentialParams updated");
+                                    self.apply_credential_params(params, "over_chain");
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if outstanding_nonce == Some(nonce) {

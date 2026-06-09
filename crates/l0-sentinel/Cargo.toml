@@ -32,6 +32,8 @@ clap               = { workspace = true }
 axum               = { workspace = true }
 reqwest            = { workspace = true }
 toml                 = "0.8"
+ed25519-dalek        = { workspace = true }
+hex                  = "0.4"
 anyhow               = "1"
 rustls               = { version = "0.23", default-features = false, features = ["ring"] }
 mirage-runtime-guard = { workspace = true }

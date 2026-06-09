@@ -170,6 +170,22 @@ pub struct SentinelConfig {
     /// Default `sentry-client` matches a desktop client.
     #[serde(default = "default_role")]
     pub role: String,
+    /// Operator Ed25519 verifying key as a 64-character lowercase hex string.
+    ///
+    /// When set, `MonitorLink` will verify every incoming `CredentialParams`
+    /// frame against this key before applying it.  Params that fail verification
+    /// or whose `generation` is not strictly greater than the last-accepted
+    /// generation are silently discarded (a `warn!` is emitted).
+    ///
+    /// Obtain the value from the operator-box: it is the public half of the
+    /// Ed25519 keypair used when the operator calls `CredentialParams::sign`.
+    /// This value is static operator identity — it must NOT be fetched from
+    /// the monitor (the monitor is the entity being verified).
+    ///
+    /// When absent (default), params are applied without operator-signature
+    /// verification; a one-time `warn!` is emitted as a reminder.
+    #[serde(default)]
+    pub operator_pub_hex: Option<String>,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -555,7 +571,35 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         });
     }
 
-    let (link, mut config_rx) = MonitorLink::new(
+    // Decode the operator verifying key once here, before constructing the link.
+    // Any decode error is fatal — a mis-configured key is worse than no key.
+    let operator_pub: Option<ed25519_dalek::VerifyingKey> = if let Some(ref hex_str) = cfg.operator_pub_hex {
+        match hex::decode(hex_str) {
+            Ok(bytes) => {
+                let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "operator_pub_hex must be exactly 32 bytes (64 hex chars), got wrong length"
+                    )
+                })?;
+                match ed25519_dalek::VerifyingKey::from_bytes(&arr) {
+                    Ok(k) => {
+                        info!("[sentinel] operator_pub_hex decoded — CredentialParams will be verified");
+                        Some(k)
+                    }
+                    Err(e) => {
+                        anyhow::bail!("operator_pub_hex is not a valid Ed25519 key: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                anyhow::bail!("operator_pub_hex is not valid hex: {e}");
+            }
+        }
+    } else {
+        None
+    };
+
+    let (link, mut config_rx) = MonitorLink::new_with_operator_pub(
         effective_urls.clone(),
         Some(monitor_api_key.clone()),
         Arc::clone(&_sentinel_peer_table),
@@ -563,6 +607,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         transports,
         cfg.mesh_id.clone(),
         client_id.clone(),
+        operator_pub,
     );
 
     // Token-race fix: seed client_id + client_token into MonitorLink BEFORE

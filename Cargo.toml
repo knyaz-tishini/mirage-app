@@ -48,3 +48,4 @@ tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roo
 mirage-runtime-guard    = { path = "crates/runtime-guard" }
 mirage-standalone-templates = { path = "../mirage2web/crates/mirage-standalone-templates" }
 mirage-mesh-client  = { path = "../mirage2web/crates/mirage-mesh-client" }
+ed25519-dalek       = { version = "2", features = ["rand_core"] }

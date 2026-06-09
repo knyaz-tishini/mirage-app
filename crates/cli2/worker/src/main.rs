@@ -777,6 +777,7 @@ fn spawn_monitor_link_in_worker(
         transports,
         mesh_id,
         node_client_id,
+        None,
     );
     monitor_link.spawn();
 

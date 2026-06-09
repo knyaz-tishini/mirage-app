@@ -427,6 +427,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             transports,
             config.mesh_id.clone(),
             config.client_id.clone(),
+            None,
         );
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");
