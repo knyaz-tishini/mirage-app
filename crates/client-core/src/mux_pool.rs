@@ -1063,7 +1063,8 @@ mod tests {
             idle_timeout_secs: 300,
         };
 
-        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table)
+        let credential_params = Arc::new(arc_swap::ArcSwap::from_pointee(None::<mirage_core::crypto::credential::CredentialParams>));
+        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table, credential_params)
             .await
             .expect("MuxPool::new must not fail during construction");
 
@@ -1105,7 +1106,8 @@ mod tests {
             idle_timeout_secs: 300,
         };
 
-        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table)
+        let credential_params = Arc::new(arc_swap::ArcSwap::from_pointee(None::<mirage_core::crypto::credential::CredentialParams>));
+        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table, credential_params)
             .await
             .expect("MuxPool::new must not fail during construction");
 

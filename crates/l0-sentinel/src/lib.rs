@@ -186,6 +186,15 @@ pub struct SentinelConfig {
     /// verification; a one-time `warn!` is emitted as a reminder.
     #[serde(default)]
     pub operator_pub_hex: Option<String>,
+    /// Enrolment token used for blind-RSA batch credential requests.
+    ///
+    /// When set, `MonitorLink` will request a batch of blind tokens from the
+    /// monitor whenever the local token pool falls below 16 tokens and the
+    /// monitor has pushed `CredentialParams` with a `BlindRsaBatch` authority.
+    /// When absent (default), no batch requests are made and existing behavior
+    /// is preserved (pool stays empty, spending returns an error).
+    #[serde(default)]
+    pub enrol_token: Option<String>,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -609,6 +618,11 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         client_id.clone(),
         operator_pub,
     );
+
+    // Seed enrol_token for blind-token batch requests (Phase 3).
+    // When absent in config, set_enrol_token(None) is a no-op (current behavior preserved).
+    link.set_enrol_token(cfg.enrol_token.clone());
+    debug!("[sentinel] enrol_token seeded into MonitorLink (present={})", cfg.enrol_token.is_some());
 
     // Token-race fix: seed client_id + client_token into MonitorLink BEFORE
     // spawn() so that the very first wire subscribe attempt uses the correct

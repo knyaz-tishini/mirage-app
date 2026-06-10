@@ -664,7 +664,6 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
 
 #[cfg(test)]
 mod pool_smoke_tests {
-    use arc_swap::ArcSwap;
     use mirage_core::config::{
         AuthMode, ChainConfig, HandshakeStrategy, HopConfig, HopRole, MirageEndpointConfig,
         ProtocolId, TcpProtocolId, TransportCamouflage, TransportKind,

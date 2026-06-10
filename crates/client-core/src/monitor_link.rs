@@ -26,13 +26,16 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use mirage_core::crypto::credential::CredentialParams;
+use mirage_core::crypto::credential::{CredentialParams, EpochEntry};
+use rand::RngCore as _;
 use mirage_core::mirage::mesh::PeerTable;
+use mirage_core::mirage_blindtoken as bt;
+use mirage_core::mirage::wire::CredentialScheme;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::tungstenite::{http::header, http::Request, Message};
@@ -40,6 +43,7 @@ use tracing::{debug, info, warn};
 
 use crate::chain_set::{ChainHandle, ChainId, ChainSet};
 use crate::monitor_channel::{MonitorChannel, MonitorChannelError, OverChainChannel};
+use crate::token_pool::{absorb_issue_result, TokenPool};
 use mirage_protocol::traits::Tunnel as _;
 
 /// Option (a') helper — acquire a tunnel from the chain pool directly, send
@@ -324,16 +328,35 @@ enum TaggedServerFrame {
     /// App-level Pong echoing a client-sent Ping nonce.
     #[serde(rename = "pong")]
     Pong { nonce: u64 },
+    /// Monitor returns signed blind tokens (success path).
+    CredentialIssueResult {
+        request_id: u64,
+        epoch_id: u32,
+        blind_sigs_hex: Vec<String>,
+    },
+    /// Monitor returns an error for a batch request.
+    CredentialIssueError {
+        request_id: u64,
+        error: String,
+    },
 }
 
 /// Tagged client→server frame sent over the same JSON channel.
-/// Used for app-level ping-pong that works over both DirectWs and OverChain.
+/// Used for app-level ping-pong and blind-token batch requests.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum TaggedClientFrame {
     /// App-level ping — server must reply with `Pong { nonce }`.
     #[serde(rename = "ping")]
     Ping { nonce: u64 },
+    /// Blind-token batch request — monitor signs and returns `CredentialIssueResult`.
+    ///
+    /// Wire: `{"kind":"credential_request","request_id":<u64>,"enrol_token":"<str>","blinded_hex":["<hex>",...]}`
+    CredentialRequest {
+        request_id: u64,
+        enrol_token: String,
+        blinded_hex: Vec<String>,
+    },
 }
 
 /// Parse a server WebSocket text frame, accepting both the tagged
@@ -352,6 +375,33 @@ fn parse_ws_frame(text: &str) -> Result<TaggedServerFrame, serde_json::Error> {
 
 fn default_poll_interval() -> u64 {
     30
+}
+
+/// Return the first live `EpochEntry` from the first `BlindRsaBatch` authority
+/// in `params` that has non-empty `verify_material`.
+///
+/// Returns `None` when no suitable authority/epoch exists.
+fn find_blind_rsa_epoch(params: &CredentialParams) -> Option<EpochEntry> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    for authority in &params.authorities {
+        if authority.scheme != CredentialScheme::BlindRsaBatch {
+            continue;
+        }
+        for epoch in &authority.epochs {
+            if epoch.verify_material.is_empty() {
+                continue;
+            }
+            if now_ms > epoch.not_after_ms {
+                continue; // expired
+            }
+            return Some(epoch.clone());
+        }
+    }
+    None
 }
 
 /// Decoded parameters for a [`MonitorTransport::Wire`] dial.
@@ -428,6 +478,17 @@ struct RegisterResponse {
 }
 
 
+// ── InflightBatch ─────────────────────────────────────────────────────────────
+
+/// In-flight state for one outstanding batch request.
+struct InflightBatch {
+    /// The issuer public key parsed at request time; stashed so the result
+    /// handler can call `bt::unblind` without re-parsing `credential_params`.
+    pk: bt::IssuerPublicKey,
+    /// `(msg, ClientBlind)` pairs in the same order as the `blinded_hex` vec.
+    retained: Vec<([u8; bt::MSG_LEN], bt::ClientBlind)>,
+}
+
 // ── MonitorLink ───────────────────────────────────────────────────────────────
 
 /// Background task that keeps the client in sync with mirage2monitor.
@@ -499,6 +560,32 @@ pub struct MonitorLink {
     /// Incoming params with `generation <= last_credential_generation` are
     /// treated as stale/replayed and discarded with a `warn!`.
     last_credential_generation: std::sync::atomic::AtomicU64,
+
+    // ── Blind-token batch fields (Phase 3) ────────────────────────────────────
+
+    /// Enrolment token passed in batch requests; plumbed from `sentinel.toml`.
+    ///
+    /// When `None`, no batch requests are sent (current behavior preserved).
+    /// Wrapped in `std::sync::Mutex` so it can be set after construction
+    /// (via `set_enrol_token`) without needing `&mut self`.
+    enrol_token: std::sync::Mutex<Option<String>>,
+    /// Pool of unspent blind-RSA tokens ready for presentation.
+    ///
+    /// Filled by the batch-request path; consumed by Phase 4 spend wiring.
+    pub token_pool: Arc<ArcSwap<TokenPool>>,
+    /// In-flight blind state keyed by `request_id`.
+    ///
+    /// Each entry holds the `(msg, ClientBlind)` pairs retained between sending
+    /// `CredentialRequest` and receiving `CredentialIssueResult`.  Uses
+    /// `std::sync::Mutex` — the critical sections are short and never hold
+    /// the lock across an await point.
+    inflight: std::sync::Mutex<HashMap<u64, InflightBatch>>,
+    /// Monotonic request-id counter.
+    next_request_id: AtomicU64,
+    /// True while a batch request is outstanding.
+    ///
+    /// Limits outstanding requests to one at a time; cleared on result/error.
+    request_in_flight: AtomicBool,
 }
 
 impl MonitorLink {
@@ -622,9 +709,30 @@ impl MonitorLink {
             wire_override: Mutex::new(None),
             operator_pub,
             last_credential_generation: std::sync::atomic::AtomicU64::new(0),
+            enrol_token: std::sync::Mutex::new(None),
+            token_pool: Arc::new(ArcSwap::from_pointee(TokenPool::default())),
+            inflight: std::sync::Mutex::new(HashMap::new()),
+            next_request_id: AtomicU64::new(0),
+            request_in_flight: AtomicBool::new(false),
         });
 
         (link, config_rx)
+    }
+
+    /// Set (or clear) the enrolment token used for blind-token batch requests.
+    ///
+    /// Call before [`MonitorLink::spawn`] so the first recv loop iteration can
+    /// trigger a batch request.  Can also be called at runtime to update the
+    /// token (e.g. after a re-registration).  Thread-safe.
+    pub fn set_enrol_token(&self, token: Option<String>) {
+        if let Ok(mut guard) = self.enrol_token.lock() {
+            *guard = token;
+        }
+    }
+
+    /// Return the token pool ArcSwap so Phase 4 spend wiring can read and drain it.
+    pub fn token_pool(&self) -> Arc<ArcSwap<TokenPool>> {
+        Arc::clone(&self.token_pool)
     }
 
     /// Create an additional [`watch::Receiver`] subscribed to the same config
@@ -712,6 +820,257 @@ impl MonitorLink {
             transport = transport_label,
             "monitor_link: CredentialParams updated"
         );
+    }
+
+    /// Fire a blind-token batch request if conditions are met.
+    ///
+    /// Conditions (all must hold):
+    /// - `enrol_token` is `Some`,
+    /// - the current `CredentialParams` has a `BlindRsaBatch` authority with a
+    ///   live epoch carrying non-empty `verify_material`,
+    /// - `token_pool.len() < 16` (low-water mark),
+    /// - no request is currently in flight.
+    ///
+    /// Sends `TaggedClientFrame::CredentialRequest` over the provided write sink.
+    /// On any error (parse, blind, serialise, send) logs a `warn!` and returns
+    /// without crashing the loop.
+    ///
+    /// # Sink type
+    ///
+    /// The sink is a `futures::SinkExt<Message>` abstraction — same concrete type
+    /// (`SplitSink`) used by both `run_wire_loop` and `run_over_chain_loop`.
+    async fn maybe_request_batch_ws<S>(&self, write: &mut S)
+    where
+        S: futures::SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        // Gate: enrol_token must be set.
+        let enrol_token = match self.enrol_token.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        let enrol_token = match enrol_token {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Gate: no outstanding request.
+        if self.request_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Gate: low-water mark.
+        if self.token_pool.load().len() >= 16 {
+            return;
+        }
+
+        // Gate: find a live BlindRsaBatch authority + epoch with verify_material.
+        let pk = {
+            let params_arc = self.credential_params.load();
+            let params = match params_arc.as_ref().as_ref() {
+                Some(p) => p.clone(),
+                None => return,
+            };
+            match find_blind_rsa_epoch(&params) {
+                Some(ep) => {
+                    match bt::IssuerPublicKey::from_der(&ep.verify_material) {
+                        Ok(pk) => pk,
+                        Err(e) => {
+                            warn!("monitor_link: batch request: bad issuer pubkey in params: {e}");
+                            return;
+                        }
+                    }
+                }
+                None => return,
+            }
+        };
+
+        // Blind 64 random messages.
+        const BATCH_SIZE: usize = 64;
+        let mut blinded_hex = Vec::with_capacity(BATCH_SIZE);
+        let mut retained: Vec<([u8; bt::MSG_LEN], bt::ClientBlind)> = Vec::with_capacity(BATCH_SIZE);
+
+        for _ in 0..BATCH_SIZE {
+            let mut msg = [0u8; bt::MSG_LEN];
+            rand::rngs::OsRng.fill_bytes(&mut msg);
+            match bt::blind(&pk, &msg) {
+                Ok((blinded_bytes, client_blind)) => {
+                    blinded_hex.push(hex::encode(&blinded_bytes));
+                    retained.push((msg, client_blind));
+                }
+                Err(e) => {
+                    warn!("monitor_link: batch request: blind failed: {e}");
+                    // Partial batch — clear in_flight flag and abort.
+                    return;
+                }
+            }
+        }
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+
+        // Stash retained state BEFORE sending (no race — in_flight guards re-entry).
+        {
+            let batch = InflightBatch { pk, retained };
+            match self.inflight.lock() {
+                Ok(mut map) => { map.insert(request_id, batch); }
+                Err(_) => return,
+            }
+        }
+        self.request_in_flight.store(true, Ordering::Release);
+
+        // Serialise and send.
+        let frame = TaggedClientFrame::CredentialRequest {
+            request_id,
+            enrol_token,
+            blinded_hex,
+        };
+        match serde_json::to_string(&frame) {
+            Ok(json) => {
+                if let Err(e) = write.send(Message::Text(json.into())).await {
+                    warn!("monitor_link: batch request: send failed: {e}");
+                    // Clean up — remove inflight entry and clear flag.
+                    if let Ok(mut map) = self.inflight.lock() {
+                        map.remove(&request_id);
+                    }
+                    self.request_in_flight.store(false, Ordering::Release);
+                } else {
+                    info!(request_id, n = BATCH_SIZE, "monitor_link: requested credential batch");
+                }
+            }
+            Err(e) => {
+                warn!("monitor_link: batch request: serialise failed: {e}");
+                if let Ok(mut map) = self.inflight.lock() {
+                    map.remove(&request_id);
+                }
+                self.request_in_flight.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Same as `maybe_request_batch_ws` but for the OverChain text-frame path.
+    ///
+    /// OverChain uses a different sink type (`OverChainChannel::send_text`),
+    /// so we factor the send differently while keeping the batch-prep logic shared.
+    async fn maybe_request_batch_oc(&self, channel: &mut crate::monitor_channel::OverChainChannel) {
+        // Gate: enrol_token must be set.
+        let enrol_token = match self.enrol_token.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        let enrol_token = match enrol_token {
+            Some(t) => t,
+            None => return,
+        };
+
+        if self.request_in_flight.load(Ordering::Acquire) { return; }
+        if self.token_pool.load().len() >= 16 { return; }
+
+        let pk = {
+            let params_arc = self.credential_params.load();
+            let params = match params_arc.as_ref().as_ref() {
+                Some(p) => p.clone(),
+                None => return,
+            };
+            match find_blind_rsa_epoch(&params) {
+                Some(ep) => match bt::IssuerPublicKey::from_der(&ep.verify_material) {
+                    Ok(pk) => pk,
+                    Err(e) => { warn!("monitor_link: OC batch request: bad pubkey: {e}"); return; }
+                },
+                None => return,
+            }
+        };
+
+        const BATCH_SIZE: usize = 64;
+        let mut blinded_hex = Vec::with_capacity(BATCH_SIZE);
+        let mut retained: Vec<([u8; bt::MSG_LEN], bt::ClientBlind)> = Vec::with_capacity(BATCH_SIZE);
+
+        for _ in 0..BATCH_SIZE {
+            let mut msg = [0u8; bt::MSG_LEN];
+            rand::rngs::OsRng.fill_bytes(&mut msg);
+            match bt::blind(&pk, &msg) {
+                Ok((blinded_bytes, client_blind)) => {
+                    blinded_hex.push(hex::encode(&blinded_bytes));
+                    retained.push((msg, client_blind));
+                }
+                Err(e) => { warn!("monitor_link: OC batch request: blind failed: {e}"); return; }
+            }
+        }
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let batch = InflightBatch { pk, retained };
+            match self.inflight.lock() {
+                Ok(mut map) => { map.insert(request_id, batch); }
+                Err(_) => return,
+            }
+        }
+        self.request_in_flight.store(true, Ordering::Release);
+
+        let frame = TaggedClientFrame::CredentialRequest {
+            request_id,
+            enrol_token,
+            blinded_hex,
+        };
+        match serde_json::to_string(&frame) {
+            Ok(json) => {
+                if let Err(e) = channel.send_text(&json).await {
+                    warn!("monitor_link: OC batch request: send failed: {e}");
+                    if let Ok(mut map) = self.inflight.lock() { map.remove(&request_id); }
+                    self.request_in_flight.store(false, Ordering::Release);
+                } else {
+                    info!(request_id, n = BATCH_SIZE, "monitor_link: OC requested credential batch");
+                }
+            }
+            Err(e) => {
+                warn!("monitor_link: OC batch request: serialise failed: {e}");
+                if let Ok(mut map) = self.inflight.lock() { map.remove(&request_id); }
+                self.request_in_flight.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Handle a `CredentialIssueResult` frame from the monitor.
+    ///
+    /// Looks up + removes the in-flight entry for `request_id`, unblind-fills
+    /// the returned signatures into [`StoredToken`]s, and appends them to the
+    /// pool via ArcSwap RCU.  Clears `request_in_flight`.
+    fn handle_issue_result(&self, request_id: u64, epoch_id: u32, blind_sigs_hex: Vec<String>) {
+        let batch = match self.inflight.lock() {
+            Ok(mut map) => map.remove(&request_id),
+            Err(_) => None,
+        };
+        let batch = match batch {
+            Some(b) => b,
+            None => {
+                warn!(request_id, "monitor_link: CredentialIssueResult for unknown request_id — ignoring");
+                self.request_in_flight.store(false, Ordering::Release);
+                return;
+            }
+        };
+        self.request_in_flight.store(false, Ordering::Release);
+
+        let new_tokens = absorb_issue_result(&batch.pk, batch.retained, &blind_sigs_hex, epoch_id);
+        let n = new_tokens.len();
+
+        self.token_pool.rcu(|cur| {
+            let mut next = (**cur).clone();
+            next.extend(new_tokens.iter().cloned());
+            next
+        });
+
+        info!(request_id, epoch_id, added = n, pool = self.token_pool.load().len(),
+              "monitor_link: credential batch absorbed");
+    }
+
+    /// Handle a `CredentialIssueError` frame from the monitor.
+    ///
+    /// Removes the in-flight entry and clears `request_in_flight` so the next
+    /// low-water trigger can retry.
+    fn handle_issue_error(&self, request_id: u64, error: String) {
+        if let Ok(mut map) = self.inflight.lock() {
+            map.remove(&request_id);
+        }
+        self.request_in_flight.store(false, Ordering::Release);
+        warn!(request_id, error = %error, "monitor_link: credential batch request failed by monitor");
     }
 
     /// Snapshot the registered client_id (set after first successful
@@ -1047,6 +1406,7 @@ impl MonitorLink {
                                 }
                                 Ok(TaggedServerFrame::CredentialParams(params)) => {
                                     self.apply_credential_params(params, "wire");
+                                    self.maybe_request_batch_ws(&mut write).await;
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if app_ping_nonce == Some(nonce) {
@@ -1057,6 +1417,12 @@ impl MonitorLink {
                                     } else {
                                         debug!(nonce, "monitor_link: Wire stale/unexpected Pong nonce");
                                     }
+                                }
+                                Ok(TaggedServerFrame::CredentialIssueResult { request_id, epoch_id, blind_sigs_hex }) => {
+                                    self.handle_issue_result(request_id, epoch_id, blind_sigs_hex);
+                                }
+                                Ok(TaggedServerFrame::CredentialIssueError { request_id, error }) => {
+                                    self.handle_issue_error(request_id, error);
                                 }
                                 Err(e) => {
                                     warn!("monitor_link: Wire frame parse error: {e}");
@@ -1271,6 +1637,10 @@ impl MonitorLink {
         let mut last_pong_at = tokio::time::Instant::now();
 
         loop {
+            // `channel` must not be borrowed across the select! boundary when we
+            // call maybe_request_batch_oc after the block, so we use a flag.
+            let mut request_batch_after = false;
+
             tokio::select! {
                 // Drive OverChain receive.
                 frame = channel.recv_frame() => {
@@ -1318,6 +1688,7 @@ impl MonitorLink {
                                 }
                                 Ok(TaggedServerFrame::CredentialParams(params)) => {
                                     self.apply_credential_params(params, "over_chain");
+                                    request_batch_after = true;
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if outstanding_nonce == Some(nonce) {
@@ -1328,6 +1699,12 @@ impl MonitorLink {
                                     } else {
                                         debug!(nonce, "monitor_link: OverChain stale Pong nonce");
                                     }
+                                }
+                                Ok(TaggedServerFrame::CredentialIssueResult { request_id, epoch_id, blind_sigs_hex }) => {
+                                    self.handle_issue_result(request_id, epoch_id, blind_sigs_hex);
+                                }
+                                Ok(TaggedServerFrame::CredentialIssueError { request_id, error }) => {
+                                    self.handle_issue_error(request_id, error);
                                 }
                                 Err(e) => {
                                     warn!("monitor_link: OverChain frame parse error: {e}");
@@ -1389,6 +1766,11 @@ impl MonitorLink {
                         }
                     }
                 }
+            }
+
+            // Fire batch request outside the select! to avoid double-borrow of channel.
+            if request_batch_after {
+                self.maybe_request_batch_oc(channel).await;
             }
         }
     }
@@ -1904,5 +2286,51 @@ mod tests {
             elapsed > pong_timeout,
             "expected dead detection: elapsed={elapsed:?} pong_timeout={pong_timeout:?}"
         );
+    }
+
+    // ── Phase 3: new frame serde round-trip tests ─────────────────────────────
+
+    /// `TaggedClientFrame::CredentialRequest` serialises with `"kind":"credential_request"`.
+    #[test]
+    fn credential_request_frame_serialized() {
+        let frame = TaggedClientFrame::CredentialRequest {
+            request_id: 42,
+            enrol_token: "tok-abc".to_string(),
+            blinded_hex: vec!["deadbeef".to_string(), "cafebabe".to_string()],
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"kind\":\"credential_request\""), "kind field missing: {json}");
+        assert!(json.contains("\"request_id\":42"), "request_id missing: {json}");
+        assert!(json.contains("\"enrol_token\":\"tok-abc\""), "enrol_token missing: {json}");
+        assert!(json.contains("\"deadbeef\""), "blinded_hex[0] missing: {json}");
+    }
+
+    /// `TaggedServerFrame::CredentialIssueResult` deserialises from contract JSON.
+    #[test]
+    fn credential_issue_result_deserialized() {
+        let json = r#"{"kind":"credential_issue_result","request_id":7,"epoch_id":3,"blind_sigs_hex":["aabbcc","ddeeff"]}"#;
+        let frame = parse_ws_frame(json).expect("must parse");
+        match frame {
+            TaggedServerFrame::CredentialIssueResult { request_id, epoch_id, blind_sigs_hex } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(epoch_id, 3);
+                assert_eq!(blind_sigs_hex, vec!["aabbcc", "ddeeff"]);
+            }
+            other => panic!("unexpected frame variant: {other:?}"),
+        }
+    }
+
+    /// `TaggedServerFrame::CredentialIssueError` deserialises from contract JSON.
+    #[test]
+    fn credential_issue_error_deserialized() {
+        let json = r#"{"kind":"credential_issue_error","request_id":99,"error":"rate limited"}"#;
+        let frame = parse_ws_frame(json).expect("must parse");
+        match frame {
+            TaggedServerFrame::CredentialIssueError { request_id, error } => {
+                assert_eq!(request_id, 99);
+                assert_eq!(error, "rate limited");
+            }
+            other => panic!("unexpected frame variant: {other:?}"),
+        }
     }
 }
