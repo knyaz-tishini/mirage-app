@@ -40,6 +40,7 @@ use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
+use crate::token_pool::{self, TokenPool};
 use crate::tunnel::{establish_raw_tunnel, freshen_chain_pubkeys};
 
 // ── Reaper constants ──────────────────────────────────────────────────────────
@@ -86,6 +87,11 @@ struct PoolInner {
     /// Shared via Arc::clone — pool snapshots it on each dial and mints a fresh
     /// per-dial token.  None = credential feature inactive (tolerant mode).
     credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
+    /// Blind-RSA token pool (Phase 4 spend).  Each dial pops one token when the
+    /// pool is non-empty and presents it as a `pre_minted` BlindRsaBatch credential
+    /// (scheme `0x03`).  When empty, the dial falls back to EpochHmac self-mint or
+    /// proceeds without a credential (existing behaviour).
+    token_pool: Arc<ArcSwap<TokenPool>>,
 }
 
 // ── Pool statistics ───────────────────────────────────────────────────────────
@@ -137,6 +143,11 @@ impl TunnelPool {
     /// Pass `Arc::new(ArcSwap::from_pointee(PeerTable::empty()))` when there
     /// is no monitor link; only chains with `hop.public_key = Some(hex)` will
     /// be dialable in that case.
+    ///
+    /// `token_pool` — shared blind-RSA token pool (Phase 4).  Pass
+    /// `Arc::new(ArcSwap::from_pointee(TokenPool::default()))` when no
+    /// MonitorLink is present; the pool will always be empty and dials fall
+    /// back to EpochHmac self-mint.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
@@ -144,6 +155,7 @@ impl TunnelPool {
         mesh_id: Vec<u8>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
+        token_pool: Arc<ArcSwap<TokenPool>>,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // (hops[0].role == Exit) reaches `handle_exit` server-side as a
@@ -165,9 +177,15 @@ impl TunnelPool {
             let pt = peer_table.load_full();
             // Snapshot credential_params for this dial attempt.
             let cred_snap = credential_params.load_full();
+            // Phase 4: pop one blind token for this dial (single-use).
+            let spent = token_pool::pop_one(&token_pool);
             join_set.spawn(async move {
+                let pre_minted = spent.as_ref().map(|t| {
+                    debug!(epoch_id = t.epoch_id, "pool: spending blind token on initial dial");
+                    mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
+                });
                 let cred_ref = cred_snap.as_ref().as_ref();
-                (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid, None, cred_ref).await)
+                (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid, pre_minted.as_ref(), cred_ref).await)
             });
         }
 
@@ -228,6 +246,7 @@ impl TunnelPool {
             mesh_id,
             peer_table,
             credential_params,
+            token_pool,
         }));
 
         let pool = Arc::new(Self {
@@ -948,6 +967,7 @@ mod pool_smoke_tests {
             vec![],
             Arc::clone(&peer_table),
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+            Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
         )
         .await
         .expect("TunnelPool::new must not fail during construction");
@@ -1001,6 +1021,7 @@ mod pool_smoke_tests {
             vec![],
             peer_table,
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+            Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
         )
         .await
         .expect("TunnelPool::new must not fail during construction");
@@ -1015,7 +1036,7 @@ mod pool_smoke_tests {
 async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
-         peer_table_notify, credential_params_shared) = {
+         peer_table_notify, credential_params_shared, token_pool_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1026,6 +1047,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             Arc::clone(&guard.peer_table),
             Arc::clone(&pool.peer_table_notify),
             Arc::clone(&guard.credential_params),
+            Arc::clone(&guard.token_pool),
         )
     };
 
@@ -1059,7 +1081,33 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
         };
         let cred_snap = credential_params_shared.load_full();
         let cred_ref = cred_snap.as_ref().as_ref();
-        match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, None, cred_ref).await {
+        // Phase 4: pop one blind token for this reconnect dial.
+        // A popped token must not be re-inserted on failure — it may have reached
+        // the node's SpentSet and would be rejected as a replay on any retry.
+        let spent = token_pool::pop_one(&token_pool_shared);
+        if spent.is_none() {
+            // Warn once if credential_params advertises a BlindRsaBatch authority —
+            // an empty pool means dials will be rejected by enforce-mode nodes.
+            let creds = credential_params_shared.load();
+            if let Some(cp) = creds.as_ref() {
+                let has_blind = cp.authorities.iter().any(|a| {
+                    a.scheme == mirage_core::mirage::wire::CredentialScheme::BlindRsaBatch
+                });
+                if has_blind {
+                    warn!(
+                        chain_id = %chain_id,
+                        slot = slot_idx,
+                        "token pool empty but BlindRsaBatch authority is active — \
+                         dials may be rejected by enforce-mode nodes"
+                    );
+                }
+            }
+        }
+        let pre_minted = spent.as_ref().map(|t| {
+            debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "pool: spending blind token on reconnect");
+            mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
+        });
+        match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, pre_minted.as_ref(), cred_ref).await {
             Ok(tunnel) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "reconnect succeeded");
                 let mut guard = pool.inner.lock().await;

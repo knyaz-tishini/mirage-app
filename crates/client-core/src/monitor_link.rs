@@ -653,6 +653,7 @@ impl MonitorLink {
             monitor_api_key,
             peer_table,
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+            Arc::new(ArcSwap::from_pointee(TokenPool::default())),
             chain_set,
             transports,
             mesh_id,
@@ -661,17 +662,18 @@ impl MonitorLink {
         )
     }
 
-    /// Like [`new`] but accepts a pre-created `credential_params` arc so that
-    /// the arc can be shared with `TunnelPool` / `MuxPool` instances created
-    /// before the `MonitorLink` is constructed.
+    /// Like [`new`] but accepts pre-created `credential_params` and `token_pool`
+    /// arcs so that they can be shared with `TunnelPool` / `MuxPool` instances
+    /// created before the `MonitorLink` is constructed.
     ///
-    /// Use `link.credential_params()` to retrieve an `Arc::clone` from a link
-    /// built with the ordinary [`new`] constructor.
+    /// Use `link.credential_params()` / `link.token_pool()` to retrieve
+    /// `Arc::clone`s from a link built with the ordinary [`new`] constructor.
     pub fn new_with_credential_arc(
         monitor_urls: Vec<String>,
         _monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
+        token_pool: Arc<ArcSwap<TokenPool>>,
         chain_set: Arc<ChainSet>,
         transports: Vec<MonitorTransport>,
         mesh_id: String,
@@ -710,7 +712,7 @@ impl MonitorLink {
             operator_pub,
             last_credential_generation: std::sync::atomic::AtomicU64::new(0),
             enrol_token: std::sync::Mutex::new(None),
-            token_pool: Arc::new(ArcSwap::from_pointee(TokenPool::default())),
+            token_pool,
             inflight: std::sync::Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(0),
             request_in_flight: AtomicBool::new(false),

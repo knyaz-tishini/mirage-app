@@ -133,6 +133,14 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
     let credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>> =
         Arc::new(ArcSwap::from_pointee(None));
 
+    // ── Shared blind-token pool arc (Phase 4 spend) ────────────────────────────
+    //
+    // MonitorLink fills this on every successful blind-issue exchange.  Pools
+    // drain it one token per dial.  Pre-allocated and shared so pools created
+    // before MonitorLink see the same pool.
+    let token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>> =
+        Arc::new(ArcSwap::from_pointee(mirage_client_core::token_pool::TokenPool::default()));
+
     // ── Build tunnel pools (one per chain) ────────────────────────────────────
     let all_chains = select_all_chains(&config);
     if all_chains.is_empty() {
@@ -189,9 +197,10 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         let mid = mesh_id.clone();
         let pt = Arc::clone(&peer_table);
         let cred = Arc::clone(&credential_params);
+        let tok = Arc::clone(&token_pool);
         pool_tasks.spawn(async move {
             let id = chain_owned.chain_id.clone();
-            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt, cred).await {
+            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt, cred, tok).await {
                 Ok(pool) => Some((id, pool)),
                 Err(e) => {
                     tracing::warn!(chain = %id, "pool init failed, skipping: {e}");
@@ -242,8 +251,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             let mid = mesh_id.clone();
             let pt = Arc::clone(&peer_table);
             let cred = Arc::clone(&credential_params);
+            let tok = Arc::clone(&token_pool);
             mux_tasks.spawn(async move {
-                match MuxPool::new(chain_owned, protocols, cfg, mid, pt, cred).await {
+                match MuxPool::new(chain_owned, protocols, cfg, mid, pt, cred, tok).await {
                     Ok(mux) => Some((id, mux)),
                     Err(e) => {
                         tracing::warn!(
@@ -423,6 +433,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             None,
             Arc::clone(&peer_table),
             Arc::clone(&credential_params),
+            Arc::clone(&token_pool),
             ChainSet::empty(),
             transports,
             config.mesh_id.clone(),
@@ -455,6 +466,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         let use_mux_for_watcher = use_mux;
         let peer_table_for_watcher = Arc::clone(&peer_table);
         let credential_params_for_watcher = Arc::clone(&credential_params);
+        let token_pool_for_watcher = Arc::clone(&token_pool);
 
         tokio::spawn(async move {
             loop {
@@ -512,6 +524,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             mesh_id_for_watcher.clone(),
                             Arc::clone(&peer_table_for_watcher),
                             Arc::clone(&credential_params_for_watcher),
+                            Arc::clone(&token_pool_for_watcher),
                         )
                         .await
                         {

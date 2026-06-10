@@ -18,6 +18,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::relay::TunnelCompat;
+use crate::token_pool::{self, TokenPool};
 use crate::tunnel::{establish_mux_tunnel, freshen_chain_pubkeys};
 
 // ── Circuit breaker state constants ──────────────────────────────────────────
@@ -191,6 +192,9 @@ struct PoolInner {
     /// Shared via Arc::clone — pool snapshots it on each dial and mints a fresh
     /// per-dial token.  None = credential feature inactive (tolerant mode).
     credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
+    /// Blind-RSA token pool (Phase 4 spend).  Each mux session dial pops one
+    /// token.  When empty, falls back to EpochHmac or no credential.
+    token_pool: Arc<ArcSwap<TokenPool>>,
 }
 
 /// Semaphore capacity for the post-recovery burst limiter.
@@ -219,6 +223,10 @@ impl MuxPool {
     /// `peer_table` — shared live peer table from the monitor link (Phase 8.5).
     /// Pass `Arc::new(ArcSwap::from_pointee(PeerTable::empty()))` when there
     /// is no monitor link.
+    ///
+    /// `token_pool` — shared blind-RSA token pool (Phase 4).  Pass
+    /// `Arc::new(ArcSwap::from_pointee(TokenPool::default()))` when no
+    /// MonitorLink is present.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
@@ -226,6 +234,7 @@ impl MuxPool {
         mesh_id: Vec<u8>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
+        token_pool: Arc<ArcSwap<TokenPool>>,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // sends the address bytes raw (no length-prefix) so the
@@ -250,9 +259,15 @@ impl MuxPool {
             let pt = peer_table.load_full();
             // Snapshot credential_params for this dial attempt.
             let cred_snap = credential_params.load_full();
+            // Phase 4: pop one blind token for this initial mux session dial.
+            let spent = token_pool::pop_one(&token_pool);
             join_set.spawn(async move {
+                let pre_minted = spent.as_ref().map(|t| {
+                    debug!(epoch_id = t.epoch_id, "mux_pool: spending blind token on initial dial");
+                    mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
+                });
                 let cred_ref = cred_snap.as_ref().as_ref();
-                (idx, build_session(&cp, &ch, &pt, &mid, cred_ref).await)
+                (idx, build_session(&cp, &ch, &pt, &mid, pre_minted.as_ref(), cred_ref).await)
             });
         }
 
@@ -302,6 +317,7 @@ impl MuxPool {
             mesh_id,
             peer_table,
             credential_params,
+            token_pool,
         }));
 
         let pool = Arc::new(Self {
@@ -560,12 +576,13 @@ async fn build_session(
     chain: &ChainConfig,
     peer_table: &PeerTable,
     mesh_id: &[u8],
+    pre_minted: Option<&mirage_protocol::driver::ClientCredential>,
     credential_params: Option<&CredentialParams>,
 ) -> Result<SessionHandle, MirageError> {
     // Onion chains send MUX\0 magic so the exit upgrades to a mux server.
     // Direct chains use the raw tunnel path (no magic needed — they connect
     // directly to a relay that already runs a mux server).
-    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, peer_table, mesh_id, None, credential_params).await?;
+    let tunnel: Box<dyn Tunnel> = establish_mux_tunnel(chain_protocols, chain, peer_table, mesh_id, pre_minted, credential_params).await?;
     let compat = TunnelCompat::wrap(tunnel);
     Ok(SessionHandle::client(compat))
 }
@@ -1064,7 +1081,15 @@ mod tests {
         };
 
         let credential_params = Arc::new(arc_swap::ArcSwap::from_pointee(None::<mirage_core::crypto::credential::CredentialParams>));
-        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table, credential_params)
+        let pool = MuxPool::new(
+            chain,
+            chain_protocols,
+            config,
+            vec![],
+            peer_table,
+            credential_params,
+            Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+        )
             .await
             .expect("MuxPool::new must not fail during construction");
 
@@ -1107,7 +1132,15 @@ mod tests {
         };
 
         let credential_params = Arc::new(arc_swap::ArcSwap::from_pointee(None::<mirage_core::crypto::credential::CredentialParams>));
-        let pool = MuxPool::new(chain, chain_protocols, config, vec![], peer_table, credential_params)
+        let pool = MuxPool::new(
+            chain,
+            chain_protocols,
+            config,
+            vec![],
+            peer_table,
+            credential_params,
+            Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+        )
             .await
             .expect("MuxPool::new must not fail during construction");
 
@@ -1119,7 +1152,7 @@ mod tests {
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
-         peer_table_notify, credential_params_shared) = {
+         peer_table_notify, credential_params_shared, token_pool_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1130,6 +1163,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             Arc::clone(&guard.peer_table),
             Arc::clone(&pool.peer_table_notify),
             Arc::clone(&guard.credential_params),
+            Arc::clone(&guard.token_pool),
         )
     };
 
@@ -1155,7 +1189,31 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         };
         let cred_snap = credential_params_shared.load_full();
         let cred_ref = cred_snap.as_ref().as_ref();
-        match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, cred_ref).await {
+        // Phase 4: pop one blind token for this mux reconnect dial.
+        // A popped token must not be re-inserted on failure — it may have reached
+        // the node's SpentSet and would be rejected as a replay on any retry.
+        let spent = token_pool::pop_one(&token_pool_shared);
+        if spent.is_none() {
+            let creds = credential_params_shared.load();
+            if let Some(cp) = creds.as_ref() {
+                let has_blind = cp.authorities.iter().any(|a| {
+                    a.scheme == mirage_core::mirage::wire::CredentialScheme::BlindRsaBatch
+                });
+                if has_blind {
+                    warn!(
+                        chain_id = %chain_id,
+                        slot = slot_idx,
+                        "mux: token pool empty but BlindRsaBatch authority is active — \
+                         session may be rejected by enforce-mode nodes"
+                    );
+                }
+            }
+        }
+        let pre_minted = spent.as_ref().map(|t| {
+            debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "mux_pool: spending blind token on reconnect");
+            mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
+        });
+        match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, pre_minted.as_ref(), cred_ref).await {
             Ok(session) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "mux reconnect succeeded");
                 {
