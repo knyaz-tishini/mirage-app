@@ -256,6 +256,8 @@ pub(crate) fn is_managed(path: &PathBuf) -> bool {
 pub(crate) fn materialise(
     template_raw: &str,
     chains: Vec<mirage_core::config::ChainConfig>,
+    operator_pub_hex: Option<&str>,
+    enrol_token: Option<&str>,
 ) -> Result<String> {
     let mut obj: serde_json::Value =
         serde_json::from_str(template_raw).context("failed to parse client-template.json")?;
@@ -264,6 +266,19 @@ pub(crate) fn materialise(
     let chains_val = serde_json::to_value(&chains).context("failed to serialise chains")?;
     map.insert("chains".to_owned(), chains_val);
     map.insert("_managed_by".to_owned(), serde_json::Value::String(MANAGED_BY_VALUE.to_owned()));
+    // Inject blind-token credentials so the spawned cli's own MonitorLink can
+    // request a batch and spend one token per dial under a require=true fleet.
+    // `enrol_token` is one-time and operator-delivered via sentinel.toml (it
+    // cannot live statically in the template); `operator_pub_hex` verifies the
+    // monitor-pushed CredentialParams. The wire transport (monitor_wire_addr /
+    // monitor_wire_pubkey_hex) and monitor_url stay in client-template.json —
+    // they are static per deployment and survive materialisation untouched.
+    if let Some(op) = operator_pub_hex {
+        map.insert("operator_pub_hex".to_owned(), serde_json::Value::String(op.to_owned()));
+    }
+    if let Some(tok) = enrol_token {
+        map.insert("enrol_token".to_owned(), serde_json::Value::String(tok.to_owned()));
+    }
     serde_json::to_string_pretty(&obj).context("failed to serialise materialised config")
 }
 
@@ -704,7 +719,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     info!("[sentinel] first config: version={} chains={}", first_cfg.version, first_cfg.chains.len());
 
     let chains: Vec<_> = first_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-    let full_json = match materialise(&template_raw, chains.clone()) {
+    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref()) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -873,9 +888,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
                 // Task 1: send crash report over the native wire (disk fallback
                 // when wire coords are not yet available).
+                // Clone the WireCoords out of the watch guard BEFORE the await: a
+                // `watch::Ref` holds a non-Send `RwLockReadGuard`, and holding it
+                // across `.await` makes the whole `run()` future non-Send — which
+                // breaks l0-orchestrator task-mode (`tokio::spawn`). The owned
+                // Option<WireCoords> is cheap to clone.
+                let wire_coords_now = wire_coords_rx.borrow().clone();
                 report_crash(
                     &report,
-                    wire_coords_rx.borrow().as_ref(),
+                    wire_coords_now.as_ref(),
                     Some(&client_id),
                 ).await;
 
@@ -953,7 +974,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
                 info!("[sentinel] config updated: v={} chains={}", new_cfg.version, new_cfg.chains.len());
                 let chains: Vec<_> = new_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-                match materialise(&template_raw, chains.clone()) {
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref()) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
