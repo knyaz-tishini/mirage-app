@@ -195,7 +195,7 @@ async fn write_priv_key(pem: &str) -> Result<PathBuf> {
     tokio::fs::write(&path, buf.as_bytes())
         .await
         .with_context(|| format!("write key file {:?}", path))?;
-    // Windows ACL hardening is best-effort; OpenSSH on Windows usually warns
+    // Windows ACL robustness pass is best-effort; OpenSSH on Windows usually warns
     // but still accepts the key. Production deployment runs on *nix clients.
     Ok(path)
 }

@@ -77,7 +77,7 @@ TransportProtocols: []stack.TransportProtocolFactory{
 **gVisor netstack** approach:
 - The stack **owns the TCP state machine entirely**. No kernel TCP state exists for these connections — gVisor is the TCP peer.
 - Handles retransmits, window scaling, keepalives, RST, FIN sequences correctly by design (full RFC implementation).
-- Promiscuous mode + address spoofing: stack accepts packets for **any** IP, responds as if it owns every address.
+- Promiscuous mode + address impersonation: stack accepts packets for **any** IP, responds as if it owns every address.
 - Forwarder completes the 3-way handshake synchronously → only then opens SOCKS5 connection → no state desync possible.
 - Edge cases handled: connection refused → proper RST back to app; SOCKS5 error → clean FIN to app.
 
@@ -106,7 +106,7 @@ func init() {
 Two lines do all the work:
 
 1. `PreferGo = true` — forces Go's pure-Go DNS resolver (not CGO/system stub resolver). Ensures DNS queries go through Go's `net.Resolver` pipeline, not libc.
-2. `Dial = dialer.DialContext` — hijacks the DNS transport. All DNS UDP/TCP connections now go through tun2socks's dialer, which routes them through the TUN interface and out the SOCKS5 proxy (or direct, depending on config).
+2. `Dial = dialer.DialContext` — takes over the DNS transport. All DNS UDP/TCP connections now go through tun2socks's dialer, which routes them through the TUN interface and out the SOCKS5 proxy (or direct, depending on config).
 
 **Result**: DNS queries are transparently tunneled alongside TCP/UDP traffic. No separate DNS interception rule needed. DNS-over-SOCKS5 is automatic.
 
@@ -156,7 +156,7 @@ Wintun uses a shared memory ring buffer between kernel and userspace — much fa
 | `main.go` | CLI entry point, flag parsing, calls `engine.Insert()` + `engine.Start()` |
 | `engine/engine.go` | Orchestrator: sets up logger, REST API, then calls `core/` to build netstack + TUN |
 | `core/stack.go` | Creates gVisor stack with IPv4/IPv6/TCP/UDP/ICMP, registers transport handlers before NIC creation (race prevention) |
-| `core/nic.go` | Creates NIC from LinkEndpoint; enables promiscuous mode + address spoofing; handles multicast |
+| `core/nic.go` | Creates NIC from LinkEndpoint; enables promiscuous mode + address impersonation; handles multicast |
 | `core/tcp.go` | `withTCPHandler` — gVisor TCP forwarder; completes 3-way handshake; wraps as `tcpConn`; sets keepalive (60s idle, 30s interval, 9 probes) |
 | `core/udp.go` | `withUDPHandler` — gVisor UDP forwarder; wraps as `udpConn` with `TransportEndpointID` |
 | `core/route.go` | IP route configuration for the stack |

@@ -8,7 +8,7 @@
 //!
 //! 2. **OverChain** (`MonitorTransport::OverChain`) — MonitorLink frames over a
 //!    Mirage chain (via a worker SOCKS5 port or the local chain pool).  Fallback
-//!    for censored networks where direct `:19444` is DPI-blocked.
+//!    for restricted networks where direct `:19444` is DPI-blocked.
 //!
 //! No HTTPS, no `Authorization: Bearer` — all communication is authenticated by
 //! the Mirage V9 wire handshake or the OverChain Mirage tunnel.
@@ -85,7 +85,7 @@ fn default_chain_id() -> ChainId {
 /// How to reach the monitor control plane.
 ///
 /// A [`MonitorLink`] accepts a list of transports; they are probed in order.
-/// Priority: `Wire` (primary) > `OverChain` (censored-network fallback).
+/// Priority: `Wire` (primary) > `OverChain` (restricted-network fallback).
 ///
 /// `DirectWs` (HTTPS/WSS + bearer) has been removed — all client→monitor
 /// communication must go over Mirage-native transports.
@@ -1152,7 +1152,7 @@ impl MonitorLink {
     /// - An OverChain connection closes and no replacement is available.
     ///
     /// Caller (`run()`) retries Wire after this function returns — OverChain
-    /// is a temporary fallback for censored networks where direct `:19444` is
+    /// is a temporary fallback for restricted networks where direct `:19444` is
     /// DPI-blocked, not a permanent transport.
     async fn run_over_chain_fallback(&self) {
         let channel = self.try_connect_over_chain().await;

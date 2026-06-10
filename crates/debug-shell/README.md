@@ -43,7 +43,7 @@ Config schema (JSON, written by sentinel from the WS frame payload):
    - `ttl_secs` elapsed → same teardown as SIGTERM.
 4. Removes the temp key file on shutdown.
 
-Standard L0 hardening:
+Standard L0 robustness:
 
 - `mirage-runtime-guard` `MemoryGuard` — `exit(0)` on fatal RSS so parent
   (sentinel) can respawn.

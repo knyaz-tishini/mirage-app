@@ -372,7 +372,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         }
 
         // OverChain transports only (DirectWs removed — Wire is primary,
-        // OverChain is the censored-network fallback).
+        // OverChain is the restricted-network fallback).
         for t in &config.monitor_transports {
             match t {
                 MonitorTransportConfig::DirectWs { .. } => {

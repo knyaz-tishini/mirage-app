@@ -3,7 +3,7 @@
 Source: https://github.com/SagerNet/sing-tun  
 License: GPL-3.0 (nekohasekai)  
 Language: Go 98%, Assembly 2%  
-Used by: sing-box, Clash.Meta, SagerNet Android app, millions of anti-censorship users
+Used by: sing-box, Clash.Meta, SagerNet Android app, millions of resilient-connectivity users
 
 ---
 
@@ -230,7 +230,7 @@ Mixed.processPacket()
                     Response packets → WritePackets() → Wintun
 ```
 
-DNS flow (with StrictRoute + DNS hijacking configured in sing-box):
+DNS flow (with StrictRoute + DNS redirection configured in sing-box):
 ```
 App DNS query (UDP port 53)
     → TUN (caught by WFP, cannot escape via physical NIC)
@@ -248,7 +248,7 @@ App DNS query (UDP port 53)
 `StrictRoute=true` installs WFP filters blocking port-53 traffic on non-TUN interfaces.
 Windows sends DNS to all interfaces simultaneously by default ("multihomed DNS") — WFP stops this.
 
-### 5.2 DNS Hijacking (sing-box layer, not sing-tun)
+### 5.2 DNS Redirection (sing-box layer, not sing-tun)
 
 sing-box configures a DNS server on the TUN's assigned DNS address.
 In Options: `DNSServers: []netip.Addr{tunGatewayAddr}`.

@@ -209,7 +209,7 @@ Forward direction уже raw post-RELAY frame для telescopic, поэтому 
 
 `MonitorChain.chain` — полный `mirage_core::config::ChainConfig` (с pubkey/hops/protocol/...). Раньше был урезанный stub — теперь монитор отдаёт всё нужное чтобы клиент мог поднять chain без локального config (см. etap A в mirage2monitor).
 
-## Reliability hardening
+## Reliability robustness
 
 Каждый L0 процесс (cli, sentinel, supervisor, worker) умеет защищаться от утечек памяти и зомби-state. Четыре механизма:
 
