@@ -662,6 +662,24 @@ impl MonitorLink {
         )
     }
 
+    /// Parse a 64-char hex Ed25519 operator verifying key.
+    ///
+    /// Shared by the standalone cli / cli2-worker config paths (which lack the
+    /// `ed25519_dalek` + `hex` deps directly) so they can turn a config
+    /// `operator_pub_hex` string into the `VerifyingKey` expected by
+    /// [`MonitorLink::new_with_credential_arc`]. Mirrors the decode in l0-sentinel.
+    pub fn parse_operator_pub_hex(
+        hex_str: &str,
+    ) -> Result<ed25519_dalek::VerifyingKey, String> {
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| format!("operator_pub_hex is not valid hex: {e}"))?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            "operator_pub_hex must be exactly 32 bytes (64 hex chars)".to_string()
+        })?;
+        ed25519_dalek::VerifyingKey::from_bytes(&arr)
+            .map_err(|e| format!("operator_pub_hex is not a valid Ed25519 key: {e}"))
+    }
+
     /// Like [`new`] but accepts pre-created `credential_params` and `token_pool`
     /// arcs so that they can be shared with `TunnelPool` / `MuxPool` instances
     /// created before the `MonitorLink` is constructed.

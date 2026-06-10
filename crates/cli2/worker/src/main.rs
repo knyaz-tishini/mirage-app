@@ -157,6 +157,9 @@ async fn main() -> anyhow::Result<()> {
     // Wire transport fields from ClientConfig (task #78).
     let wire_addr_str = client_config.monitor_wire_addr.clone();
     let wire_pubkey_str = client_config.monitor_wire_pubkey_hex.clone();
+    // Blind-token credential fields from ClientConfig.
+    let operator_pub_hex_str = client_config.operator_pub_hex.clone();
+    let enrol_token_str = client_config.enrol_token.clone();
 
     // Build protocol chain for the entry hop.
     //
@@ -348,6 +351,8 @@ async fn main() -> anyhow::Result<()> {
         orphan_timeout_secs,
         wire_addr_str,
         wire_pubkey_str,
+        operator_pub_hex_str,
+        enrol_token_str,
     )
     .await;
 
@@ -387,6 +392,8 @@ async fn supervisor_loop(
     orphan_timeout_secs: u64,
     wire_addr: Option<String>,
     wire_pubkey: Option<String>,
+    operator_pub_hex: Option<String>,
+    enrol_token: Option<String>,
 ) -> anyhow::Result<()> {
     let mut ipc = initial_ipc;
 
@@ -409,6 +416,8 @@ async fn supervisor_loop(
             &stop_tx,
             wire_addr.clone(),
             wire_pubkey.clone(),
+            operator_pub_hex.clone(),
+            enrol_token.clone(),
         )
         .await;
 
@@ -516,6 +525,8 @@ async fn handle_session(
     stop_tx: &watch::Sender<bool>,
     wire_addr: Option<String>,
     wire_pubkey: Option<String>,
+    operator_pub_hex: Option<String>,
+    enrol_token: Option<String>,
 ) -> SessionEnd {
     loop {
         tokio::select! {
@@ -586,6 +597,8 @@ async fn handle_session(
                     Arc::clone(&outgoing_tx),
                     wire_addr.clone(),
                     wire_pubkey.clone(),
+                    operator_pub_hex.clone(),
+                    enrol_token.clone(),
                 );
             }
             Ok(Some(SupervisorMsg::Drain { timeout_secs })) => {
@@ -690,6 +703,8 @@ fn spawn_monitor_link_in_worker(
     outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
     wire_addr: Option<String>,
     wire_pubkey: Option<String>,
+    operator_pub_hex: Option<String>,
+    enrol_token: Option<String>,
 ) {
     // Parse transport specs from JSON.
     let transport_specs: Vec<MonitorTransportSpec> = match serde_json::from_str(&transports_json) {
@@ -779,6 +794,22 @@ fn spawn_monitor_link_in_worker(
         }
     }
 
+    // Blind-token credential wiring (mirrors cli + l0-sentinel): verify pushed
+    // CredentialParams against the operator key when configured, arm blind-RSA
+    // batch requests with the enrol token. Bad operator_pub_hex → log + unverified.
+    let operator_pub = operator_pub_hex.as_deref().and_then(|hex_str| {
+        match MonitorLink::parse_operator_pub_hex(hex_str) {
+            Ok(k) => {
+                info!(chain_id, "worker: operator_pub_hex decoded — CredentialParams will be verified");
+                Some(k)
+            }
+            Err(e) => {
+                warn!(chain_id, "worker: invalid operator_pub_hex ({e}); CredentialParams applied unverified");
+                None
+            }
+        }
+    });
+
     let (monitor_link, mut config_rx) = MonitorLink::new_with_credential_arc(
         monitor_urls,
         monitor_api_key,
@@ -789,8 +820,9 @@ fn spawn_monitor_link_in_worker(
         transports,
         mesh_id,
         node_client_id,
-        None,
+        operator_pub,
     );
+    monitor_link.set_enrol_token(enrol_token);
     monitor_link.spawn();
 
     let chain_id_owned = chain_id.to_string();

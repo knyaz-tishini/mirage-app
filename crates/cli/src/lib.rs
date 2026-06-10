@@ -428,6 +428,25 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             }
         }
 
+        // Blind-token credential wiring: verify monitor-pushed CredentialParams
+        // against the operator key (when configured), and arm blind-RSA batch
+        // requests with the enrol token. Mirrors l0-sentinel; on a bad
+        // operator_pub_hex we log and proceed unverified rather than crash.
+        let operator_pub = config.operator_pub_hex.as_deref().and_then(|hex_str| {
+            match MonitorLink::parse_operator_pub_hex(hex_str) {
+                Ok(k) => {
+                    info!("cli: operator_pub_hex decoded — CredentialParams will be verified");
+                    Some(k)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "cli: invalid operator_pub_hex ({e}); CredentialParams applied unverified"
+                    );
+                    None
+                }
+            }
+        });
+
         let (link, mut config_rx) = MonitorLink::new_with_credential_arc(
             vec![monitor_url.clone()],
             None,
@@ -438,8 +457,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             transports,
             config.mesh_id.clone(),
             config.client_id.clone(),
-            None,
+            operator_pub,
         );
+        link.set_enrol_token(config.enrol_token.clone());
         link.spawn();
         info!(url = %monitor_url, "monitor link spawned");
 
