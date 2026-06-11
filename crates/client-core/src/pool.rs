@@ -35,6 +35,7 @@ use mirage_core::{
     crypto::credential::CredentialParams,
     error::MirageError,
     mirage::mesh::PeerTable,
+    mirage::wire::CredentialScheme,
 };
 use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::{Mutex, Notify};
@@ -42,6 +43,123 @@ use tracing::{debug, error, info, warn};
 
 use crate::token_pool::{self, TokenPool};
 use crate::tunnel::{establish_raw_tunnel, freshen_chain_pubkeys};
+
+// ── Cold-start credential gate ────────────────────────────────────────────────
+
+/// Maximum time to wait for a credential to become ready on the first dial.
+const CREDENTIAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Poll interval while waiting for credential readiness.
+const CREDENTIAL_GATE_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+/// Returns `true` when a usable credential is available for the active scheme
+/// in `credential_params`.
+///
+/// Readiness depends on the primary scheme advertised by `credential_params`:
+/// - `RingMembership` (0x04): `ring_credential` must be `Some(_)`.
+/// - `BlindRsaBatch` (0x03): `token_pool` must have at least one token.
+/// - `EpochHmac` (0x01) / `SignedCapability` (0x02): only `credential_params`
+///   itself needs to be `Some` (the client derives the credential on-the-fly).
+/// - `None` / `Legacy` (0x00): always ready (no gating needed).
+///
+/// "Primary scheme" = the first non-Legacy authority in `credential_params`.
+fn credential_is_ready(
+    credential_params: &ArcSwap<Option<CredentialParams>>,
+    token_pool: &ArcSwap<TokenPool>,
+    ring_credential: &crate::token_pool::RingCredentialCell,
+) -> bool {
+    let params_guard = credential_params.load();
+    let params = match params_guard.as_ref().as_ref() {
+        Some(p) => p,
+        None => return false, // params not yet delivered
+    };
+
+    // Find the first non-Legacy authority to determine which credential the
+    // dial site will actually use.
+    let primary_scheme = params
+        .authorities
+        .iter()
+        .map(|a| a.scheme)
+        .find(|&s| s != CredentialScheme::Legacy);
+
+    match primary_scheme {
+        Some(CredentialScheme::RingMembership) => {
+            ring_credential.load().as_ref().is_some()
+        }
+        Some(CredentialScheme::BlindRsaBatch) => {
+            !token_pool.load().is_empty()
+        }
+        // EpochHmac / SignedCapability: params alone is sufficient.
+        Some(CredentialScheme::EpochHmac)
+        | Some(CredentialScheme::SignedCapability)
+        | Some(CredentialScheme::Legacy)
+        | None => true,
+    }
+}
+
+/// Wait (bounded by `CREDENTIAL_GATE_TIMEOUT`) for the credential to be ready.
+///
+/// Called once per slot at startup when `credential_gated == true`. Logs once
+/// at debug when gating starts and when it either clears or times out. After
+/// the gate resolves (either way) the caller proceeds to the normal dial path.
+async fn wait_for_credential_ready(
+    chain_id: &str,
+    slot: usize,
+    credential_params: &ArcSwap<Option<CredentialParams>>,
+    token_pool: &ArcSwap<TokenPool>,
+    ring_credential: &crate::token_pool::RingCredentialCell,
+) {
+    if credential_is_ready(credential_params, token_pool, ring_credential) {
+        return;
+    }
+
+    // Identify the scheme we are waiting on for the log message.
+    let scheme_name = {
+        let params_guard = credential_params.load();
+        match params_guard.as_ref().as_ref() {
+            Some(p) => p
+                .authorities
+                .iter()
+                .map(|a| a.scheme)
+                .find(|&s| s != CredentialScheme::Legacy)
+                .map(|s| s.name())
+                .unwrap_or("unknown"),
+            None => "credential_params",
+        }
+    };
+
+    debug!(
+        chain_id,
+        slot,
+        scheme = scheme_name,
+        timeout_ms = CREDENTIAL_GATE_TIMEOUT.as_millis(),
+        "cold-start gate: waiting for credential readiness before first dial"
+    );
+
+    let deadline = tokio::time::Instant::now() + CREDENTIAL_GATE_TIMEOUT;
+    loop {
+        tokio::time::sleep(CREDENTIAL_GATE_POLL_INTERVAL).await;
+        if credential_is_ready(credential_params, token_pool, ring_credential) {
+            debug!(
+                chain_id,
+                slot,
+                scheme = scheme_name,
+                "cold-start gate: credential ready, proceeding to dial"
+            );
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                chain_id,
+                slot,
+                scheme = scheme_name,
+                "cold-start gate: timed out waiting for credential -- proceeding to dial anyway"
+            );
+            return;
+        }
+    }
+}
 
 // ── Reaper constants ──────────────────────────────────────────────────────────
 
@@ -159,6 +277,12 @@ impl TunnelPool {
     /// Pass `Arc::new(ArcSwap::from_pointee(None))` when ring membership is not
     /// configured. MonitorLink writes into the same cell on epoch rotation; pool
     /// dial sites read a snapshot via `load_full()`.
+    ///
+    /// `credential_gated` — when `true`, each slot's FIRST dial waits (bounded
+    /// by ~8 s) until the active credential scheme has a presentable credential
+    /// before connecting. Set `true` when `operator_pub_hex` is present in the
+    /// client config (i.e. credential-gated nodes are expected). Set `false`
+    /// for non-gated deployments — behaviour is unchanged.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
@@ -168,6 +292,7 @@ impl TunnelPool {
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         token_pool: Arc<ArcSwap<TokenPool>>,
         ring_credential: crate::token_pool::RingCredentialCell,
+        credential_gated: bool,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // (hops[0].role == Exit) reaches `handle_exit` server-side as a
@@ -185,18 +310,38 @@ impl TunnelPool {
             let cp = Arc::clone(&chain_protocols);
             let ch = chain.clone();
             let mid = mesh_id.clone();
-            // Load a peer_table snapshot for the initial dial (Phase 8.5).
-            let pt = peer_table.load_full();
-            // Snapshot credential_params for this dial attempt.
-            let cred_snap = credential_params.load_full();
-            // Phase 4: pop one blind token for this dial (single-use).
-            let spent = token_pool::pop_one(&token_pool);
-            // Clone the ring-credential cell Arc so the spawned closure can own it.
-            let ring_cell = Arc::clone(&ring_credential);
+            // Shared arcs captured for the gate and the subsequent dial.
+            let pt_arc = Arc::clone(&peer_table);
+            let cred_params_arc = Arc::clone(&credential_params);
+            let token_pool_arc = Arc::clone(&token_pool);
+            let ring_cell_arc = Arc::clone(&ring_credential);
+            let chain_id_log: Arc<str> = Arc::clone(&chain_id);
+            let gated = credential_gated;
             join_set.spawn(async move {
+                // Cold-start credential gate: wait (bounded) for the active
+                // credential scheme to be presentable before the first dial.
+                // Reconnects do NOT pass through this gate -- only the initial
+                // slot spawn at pool construction does.
+                if gated {
+                    wait_for_credential_ready(
+                        &chain_id_log,
+                        idx,
+                        &cred_params_arc,
+                        &token_pool_arc,
+                        &ring_cell_arc,
+                    ).await;
+                }
+
+                // Load a fresh peer_table snapshot AFTER the gate (picks up
+                // any peer data that arrived during the credential wait).
+                let pt = pt_arc.load_full();
+                // Snapshot credential_params for this dial attempt.
+                let cred_snap = cred_params_arc.load_full();
+                // Phase 4: pop one blind token for this dial (single-use).
+                let spent = token_pool::pop_one(&token_pool_arc);
                 // Prefer ring-membership (0x04) when a RingMembership authority is
                 // active; fall back to the blind token (0x03) otherwise.
-                let ring_snap = ring_cell.load_full();
+                let ring_snap = ring_cell_arc.load_full();
                 let pre_minted = token_pool::build_ring_credential(
                     cred_snap.as_ref().as_ref(),
                     ring_snap.as_ref().as_ref(),
@@ -991,6 +1136,7 @@ mod pool_smoke_tests {
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
             Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
             Arc::new(ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            false, // credential_gated: no gating in tests
         )
         .await
         .expect("TunnelPool::new must not fail during construction");
@@ -1046,6 +1192,7 @@ mod pool_smoke_tests {
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
             Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
             Arc::new(ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            false, // credential_gated: no gating in tests
         )
         .await
         .expect("TunnelPool::new must not fail during construction");

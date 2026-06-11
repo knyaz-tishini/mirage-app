@@ -254,6 +254,10 @@ async fn main() -> anyhow::Result<()> {
             ring_epoch_id_str,
         )));
 
+    // Gate initial dials when the operator key is configured: credential-gated
+    // nodes require a valid credential before accepting any connection.
+    let credential_gated = client_config.operator_pub_hex.is_some();
+
     // MuxPool requires onion reply mode: the mux exit (run_mux_server_session_wrapped_v7)
     // AEAD-wraps its replies, which OnionTunnel::recv unwraps per layer. Chains with
     // reply=raw never receive AEAD-wrapped replies — their exit byte-pumps raw bytes.
@@ -270,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&credential_params),
             Arc::clone(&token_pool),
             Arc::clone(&ring_credential),
+            credential_gated,
         ).await {
             Ok(mp) => {
                 info!(chain_id = %chain_id, "mux pool ready");
@@ -284,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential))
+    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), credential_gated)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 

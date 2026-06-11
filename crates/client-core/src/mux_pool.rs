@@ -10,6 +10,7 @@ use mirage_core::{
     crypto::credential::CredentialParams,
     error::MirageError,
     mirage::mesh::PeerTable,
+    mirage::wire::CredentialScheme,
 };
 use mirage_mux::MuxError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
@@ -20,6 +21,107 @@ use tracing::{debug, error, info, warn};
 use crate::relay::TunnelCompat;
 use crate::token_pool::{self, TokenPool};
 use crate::tunnel::{establish_mux_tunnel, freshen_chain_pubkeys};
+
+// ── Cold-start credential gate ────────────────────────────────────────────────
+
+/// Maximum time to wait for a credential to become ready on the first dial.
+const MUX_CREDENTIAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Poll interval while waiting for credential readiness.
+const MUX_CREDENTIAL_GATE_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+/// Returns `true` when a usable credential is available for the active scheme.
+/// Mirrors the same logic in `pool.rs` for MuxPool.
+fn mux_credential_is_ready(
+    credential_params: &ArcSwap<Option<CredentialParams>>,
+    token_pool: &ArcSwap<TokenPool>,
+    ring_credential: &crate::token_pool::RingCredentialCell,
+) -> bool {
+    let params_guard = credential_params.load();
+    let params = match params_guard.as_ref().as_ref() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let primary_scheme = params
+        .authorities
+        .iter()
+        .map(|a| a.scheme)
+        .find(|&s| s != CredentialScheme::Legacy);
+
+    match primary_scheme {
+        Some(CredentialScheme::RingMembership) => {
+            ring_credential.load().as_ref().is_some()
+        }
+        Some(CredentialScheme::BlindRsaBatch) => {
+            !token_pool.load().is_empty()
+        }
+        Some(CredentialScheme::EpochHmac)
+        | Some(CredentialScheme::SignedCapability)
+        | Some(CredentialScheme::Legacy)
+        | None => true,
+    }
+}
+
+/// Wait (bounded) for the mux session credential to become ready.
+/// Only called for the initial pool slot construction, not reconnects.
+async fn mux_wait_for_credential_ready(
+    chain_id: &str,
+    slot: usize,
+    credential_params: &ArcSwap<Option<CredentialParams>>,
+    token_pool: &ArcSwap<TokenPool>,
+    ring_credential: &crate::token_pool::RingCredentialCell,
+) {
+    if mux_credential_is_ready(credential_params, token_pool, ring_credential) {
+        return;
+    }
+
+    let scheme_name = {
+        let params_guard = credential_params.load();
+        match params_guard.as_ref().as_ref() {
+            Some(p) => p
+                .authorities
+                .iter()
+                .map(|a| a.scheme)
+                .find(|&s| s != CredentialScheme::Legacy)
+                .map(|s| s.name())
+                .unwrap_or("unknown"),
+            None => "credential_params",
+        }
+    };
+
+    debug!(
+        chain_id,
+        slot,
+        scheme = scheme_name,
+        timeout_ms = MUX_CREDENTIAL_GATE_TIMEOUT.as_millis(),
+        "mux cold-start gate: waiting for credential readiness before first dial"
+    );
+
+    let deadline = tokio::time::Instant::now() + MUX_CREDENTIAL_GATE_TIMEOUT;
+    loop {
+        tokio::time::sleep(MUX_CREDENTIAL_GATE_POLL_INTERVAL).await;
+        if mux_credential_is_ready(credential_params, token_pool, ring_credential) {
+            debug!(
+                chain_id,
+                slot,
+                scheme = scheme_name,
+                "mux cold-start gate: credential ready, proceeding to dial"
+            );
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                chain_id,
+                slot,
+                scheme = scheme_name,
+                "mux cold-start gate: timed out waiting for credential -- proceeding to dial anyway"
+            );
+            return;
+        }
+    }
+}
 
 // ── Circuit breaker state constants ──────────────────────────────────────────
 const CIRCUIT_CLOSED: u8 = 0;
@@ -236,6 +338,11 @@ impl MuxPool {
     /// `ring_credential` — hot-swappable ring-membership (0x04) credential cell.
     /// Pass `Arc::new(ArcSwap::from_pointee(None))` when ring membership is not
     /// configured. MonitorLink writes into the same cell on epoch rotation.
+    ///
+    /// `credential_gated` — when `true`, each slot's FIRST dial waits (bounded
+    /// by ~8 s) until the active credential scheme has a presentable credential
+    /// before opening the mux session. Set `true` when `operator_pub_hex` is
+    /// present in the client config. Set `false` for non-gated deployments.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
@@ -245,6 +352,7 @@ impl MuxPool {
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         token_pool: Arc<ArcSwap<TokenPool>>,
         ring_credential: crate::token_pool::RingCredentialCell,
+        credential_gated: bool,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // sends the address bytes raw (no length-prefix) so the
@@ -265,18 +373,36 @@ impl MuxPool {
             let cp = Arc::clone(&chain_protocols);
             let ch = chain.clone();
             let mid = mesh_id.clone();
-            // Load a peer_table snapshot for the initial dial (Phase 8.5).
-            let pt = peer_table.load_full();
-            // Snapshot credential_params for this dial attempt.
-            let cred_snap = credential_params.load_full();
-            // Phase 4: pop one blind token for this initial mux session dial.
-            let spent = token_pool::pop_one(&token_pool);
-            // Clone the ring-credential cell Arc so the spawned closure can own it.
-            let ring_cell = Arc::clone(&ring_credential);
+            // Shared arcs captured for the gate and the subsequent dial.
+            let pt_arc = Arc::clone(&peer_table);
+            let cred_params_arc = Arc::clone(&credential_params);
+            let token_pool_arc = Arc::clone(&token_pool);
+            let ring_cell_arc = Arc::clone(&ring_credential);
+            let chain_id_log: Arc<str> = Arc::clone(&chain_id);
+            let gated = credential_gated;
             join_set.spawn(async move {
+                // Cold-start credential gate: wait (bounded) for the active
+                // credential scheme to be presentable before the first mux dial.
+                // Reconnects do NOT pass through this gate.
+                if gated {
+                    mux_wait_for_credential_ready(
+                        &chain_id_log,
+                        idx,
+                        &cred_params_arc,
+                        &token_pool_arc,
+                        &ring_cell_arc,
+                    ).await;
+                }
+
+                // Load a fresh peer_table snapshot AFTER the gate.
+                let pt = pt_arc.load_full();
+                // Snapshot credential_params for this dial attempt.
+                let cred_snap = cred_params_arc.load_full();
+                // Phase 4: pop one blind token for this initial mux session dial.
+                let spent = token_pool::pop_one(&token_pool_arc);
                 // Prefer ring-membership (0x04) when a RingMembership authority is
                 // active; fall back to the blind token (0x03) otherwise.
-                let ring_snap = ring_cell.load_full();
+                let ring_snap = ring_cell_arc.load_full();
                 let pre_minted = crate::token_pool::build_ring_credential(
                     cred_snap.as_ref().as_ref(),
                     ring_snap.as_ref().as_ref(),
@@ -1110,6 +1236,7 @@ mod tests {
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
             Arc::new(arc_swap::ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            false, // credential_gated: no gating in tests
         )
             .await
             .expect("MuxPool::new must not fail during construction");
@@ -1162,6 +1289,7 @@ mod tests {
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
             Arc::new(arc_swap::ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            false, // credential_gated: no gating in tests
         )
             .await
             .expect("MuxPool::new must not fail during construction");

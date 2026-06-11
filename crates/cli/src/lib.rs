@@ -208,9 +208,12 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         let cred = Arc::clone(&credential_params);
         let tok = Arc::clone(&token_pool);
         let ring = Arc::clone(&ring_credential);
+        // Gate initial dials when the operator key is configured: credential-gated
+        // nodes require a valid credential before accepting any connection.
+        let cred_gated = config.operator_pub_hex.is_some();
         pool_tasks.spawn(async move {
             let id = chain_owned.chain_id.clone();
-            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt, cred, tok, ring).await {
+            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt, cred, tok, ring, cred_gated).await {
                 Ok(pool) => Some((id, pool)),
                 Err(e) => {
                     tracing::warn!(chain = %id, "pool init failed, skipping: {e}");
@@ -263,8 +266,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             let cred = Arc::clone(&credential_params);
             let tok = Arc::clone(&token_pool);
             let ring = Arc::clone(&ring_credential);
+            let cred_gated = config.operator_pub_hex.is_some();
             mux_tasks.spawn(async move {
-                match MuxPool::new(chain_owned, protocols, cfg, mid, pt, cred, tok, ring).await {
+                match MuxPool::new(chain_owned, protocols, cfg, mid, pt, cred, tok, ring, cred_gated).await {
                     Ok(mux) => Some((id, mux)),
                     Err(e) => {
                         tracing::warn!(
@@ -550,6 +554,12 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             }
                         };
 
+                        // Preserve gating for hot-swapped pools: the operator
+                        // key presence is stable for the process lifetime.
+                        let cred_gated_for_watcher = credential_params_for_watcher
+                            .load()
+                            .as_ref()
+                            .is_some();
                         match TunnelPool::new(
                             chain_cfg,
                             protocols_for_chain,
@@ -559,6 +569,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             Arc::clone(&credential_params_for_watcher),
                             Arc::clone(&token_pool_for_watcher),
                             Arc::clone(&ring_credential_for_watcher),
+                            cred_gated_for_watcher,
                         )
                         .await
                         {
