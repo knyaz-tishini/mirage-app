@@ -277,6 +277,7 @@ impl MuxPool {
                 let pre_minted = crate::token_pool::build_ring_credential(
                     cred_snap.as_ref().as_ref(),
                     ring.as_ref().as_ref(),
+                    &crate::token_pool::ring_dial_context(&ch),
                 ).or_else(|| spent.as_ref().map(|t| {
                     debug!(epoch_id = t.epoch_id, "mux_pool: spending blind token on initial dial");
                     mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
@@ -1234,6 +1235,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         let pre_minted = crate::token_pool::build_ring_credential(
             cred_snap.as_ref().as_ref(),
             ring_credential_shared.as_ref().as_ref(),
+            &crate::token_pool::ring_dial_context(&fresh_chain),
         ).or_else(|| spent.as_ref().map(|t| {
             debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "mux_pool: spending blind token on reconnect");
             mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }

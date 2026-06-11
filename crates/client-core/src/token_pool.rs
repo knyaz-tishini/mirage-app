@@ -191,9 +191,23 @@ impl RingCredential {
 /// than replaying one. `max_dials` is read from the epoch's published
 /// `verify_material` (root || max_dials_le); a bare 32-byte root means strict
 /// single-use (1).
+/// Per-dial context bytes a ring proof binds to: the EXIT hop's node_id (the
+/// node that verifies the credential). Empty when the chain has no resolved
+/// exit node_id. Must byte-match what the verifying exit passes as its own
+/// node_id, or the DLEQ challenge diverges and the proof is rejected.
+pub(crate) fn ring_dial_context(chain: &mirage_core::config::ChainConfig) -> Vec<u8> {
+    chain
+        .hops
+        .last()
+        .and_then(|h| h.node_id.as_deref())
+        .map(|id| id.as_bytes().to_vec())
+        .unwrap_or_default()
+}
+
 pub(crate) fn build_ring_credential(
     params: Option<&mirage_core::crypto::credential::CredentialParams>,
     ring: Option<&RingCredential>,
+    dial_context: &[u8],
 ) -> Option<mirage_protocol::driver::ClientCredential> {
     let ring = ring?;
     let params = params?;
@@ -223,7 +237,11 @@ pub(crate) fn build_ring_credential(
         );
         return None;
     }
-    let transcript = ring.epoch_id.to_le_bytes();
+    // Transcript = epoch_id (LE) || dial_context (exit node_id). Must match the
+    // verifying exit's transcript (epoch_id || its own node_id) exactly, so the
+    // proof is valid only at the intended exit.
+    let mut transcript = ring.epoch_id.to_le_bytes().to_vec();
+    transcript.extend_from_slice(dial_context);
     let token = mirage_ringmember::prove_membership(
         &ring.member_sk,
         &ring.path,
