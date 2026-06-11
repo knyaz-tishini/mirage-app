@@ -833,5 +833,5 @@ fn ring_credential_from_config(
             .ok()?;
         path.push((sib, step.is_right));
     }
-    Some(mirage_client_core::RingCredential { member_sk, path, epoch_id })
+    Some(mirage_client_core::RingCredential::new(member_sk, path, epoch_id))
 }

@@ -151,31 +151,76 @@ pub fn absorb_issue_result(
 
 // ── RingCredential (scheme 0x04) ──────────────────────────────────────────────
 
-/// Static ring-membership credential material (scheme 0x04). Unlike the blind
-/// token pool, this does not deplete: the member secret + Merkle path + the
-/// epoch_id whose tree the path matches are fixed for the process lifetime. At
-/// dial time the client derives a fresh proof from this WHEN a RingMembership
-/// authority is currently published in the gossiped credential params.
+/// Static ring-membership credential material (scheme 0x04). The member secret
+/// + Merkle path + the epoch_id whose tree the path matches are fixed for the
+/// process lifetime; only `next_nf` mutates. At dial time the client derives a
+/// fresh proof from this WHEN a RingMembership authority is currently published
+/// in the gossiped credential params.
+///
+/// `next_nf` is a monotonic per-process nullifier-index counter. Every dial
+/// (initial connection AND each reconnect) consumes the next index so no two
+/// live dials present the same nullifier (which the node SpentSet would reject
+/// as a replay). The epoch's published `max_dials` bounds it; once exhausted the
+/// member must wait for an epoch rotation. Shared across the whole connection
+/// pool via the enclosing `Arc<Option<RingCredential>>`.
 pub struct RingCredential {
     pub member_sk: mirage_ringmember::MemberSecret,
     pub path: Vec<mirage_ringmember::PathStep>,
     pub epoch_id: u32,
+    pub next_nf: std::sync::atomic::AtomicU32,
+}
+
+impl RingCredential {
+    /// Construct from decoded material; the nullifier counter starts at 0.
+    pub fn new(
+        member_sk: mirage_ringmember::MemberSecret,
+        path: Vec<mirage_ringmember::PathStep>,
+        epoch_id: u32,
+    ) -> Self {
+        Self { member_sk, path, epoch_id, next_nf: std::sync::atomic::AtomicU32::new(0) }
+    }
 }
 
 /// Build a 0x04 ring-membership credential IFF a RingMembership authority is
-/// currently published in `params` AND the client holds ring material. Returns
-/// `None` otherwise — caller then falls back to the blind 0x03 token / EpochHmac.
+/// currently published in `params` AND the client holds ring material AND the
+/// member's per-epoch dial budget is not exhausted. Returns `None` otherwise —
+/// caller then falls back to the blind 0x03 token / EpochHmac.
+///
+/// Each call consumes the next nullifier index from `ring.next_nf`, so a pool of
+/// N connections (and their reconnects) presents N distinct nullifiers rather
+/// than replaying one. `max_dials` is read from the epoch's published
+/// `verify_material` (root || max_dials_le); a bare 32-byte root means strict
+/// single-use (1).
 pub(crate) fn build_ring_credential(
     params: Option<&mirage_core::crypto::credential::CredentialParams>,
     ring: Option<&RingCredential>,
 ) -> Option<mirage_protocol::driver::ClientCredential> {
     let ring = ring?;
     let params = params?;
-    let active = params
+    // Find the live RingMembership authority and the epoch whose tree this
+    // member's path was issued against.
+    let authority = params
         .authorities
         .iter()
-        .any(|a| a.scheme == mirage_core::mirage::wire::CredentialScheme::RingMembership);
-    if !active {
+        .find(|a| a.scheme == mirage_core::mirage::wire::CredentialScheme::RingMembership)?;
+    let entry = authority.epochs.iter().find(|e| e.epoch_id == ring.epoch_id)?;
+    let vm = &entry.verify_material;
+    let max_dials = if vm.len() >= 36 {
+        u32::from_le_bytes(vm[32..36].try_into().ok()?).max(1)
+    } else {
+        1
+    };
+    // Claim the next nullifier index. Once the budget is spent, stop minting —
+    // dialing without a credential under require=true then fails fast, the
+    // correct signal that the epoch's budget is exhausted (rotate / raise it).
+    let nf_index = ring.next_nf.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if nf_index >= max_dials {
+        tracing::warn!(
+            nf_index,
+            max_dials,
+            epoch_id = ring.epoch_id,
+            "ring credential: per-epoch dial budget exhausted — no 0x04 minted for this dial"
+        );
         return None;
     }
     let transcript = ring.epoch_id.to_le_bytes();
@@ -184,6 +229,7 @@ pub(crate) fn build_ring_credential(
         &ring.path,
         ring.epoch_id,
         &transcript,
+        nf_index,
     )
     .encode();
     Some(mirage_protocol::driver::ClientCredential { scheme: 0x04, token })
