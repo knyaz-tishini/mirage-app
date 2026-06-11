@@ -197,8 +197,9 @@ struct PoolInner {
     token_pool: Arc<ArcSwap<TokenPool>>,
     /// Ring-membership (scheme 0x04) credential material. Static for process
     /// lifetime — doesn't deplete. Preferred over the blind token pool when a
-    /// RingMembership authority is active in `credential_params`.
-    ring_credential: Arc<Option<crate::token_pool::RingCredential>>,
+    /// RingMembership authority is active in `credential_params`. Hot-swappable
+    /// via ArcSwap — MonitorLink writes a new credential on epoch rotation.
+    ring_credential: crate::token_pool::RingCredentialCell,
 }
 
 /// Semaphore capacity for the post-recovery burst limiter.
@@ -232,8 +233,9 @@ impl MuxPool {
     /// `Arc::new(ArcSwap::from_pointee(TokenPool::default()))` when no
     /// MonitorLink is present.
     ///
-    /// `ring_credential` — static ring-membership (0x04) material. Pass
-    /// `Arc::new(None)` when the client is not configured for ring membership.
+    /// `ring_credential` — hot-swappable ring-membership (0x04) credential cell.
+    /// Pass `Arc::new(ArcSwap::from_pointee(None))` when ring membership is not
+    /// configured. MonitorLink writes into the same cell on epoch rotation.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
@@ -242,7 +244,7 @@ impl MuxPool {
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         token_pool: Arc<ArcSwap<TokenPool>>,
-        ring_credential: Arc<Option<crate::token_pool::RingCredential>>,
+        ring_credential: crate::token_pool::RingCredentialCell,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // sends the address bytes raw (no length-prefix) so the
@@ -269,14 +271,15 @@ impl MuxPool {
             let cred_snap = credential_params.load_full();
             // Phase 4: pop one blind token for this initial mux session dial.
             let spent = token_pool::pop_one(&token_pool);
-            // Clone the ring-credential Arc so the spawned closure can own it.
-            let ring = Arc::clone(&ring_credential);
+            // Clone the ring-credential cell Arc so the spawned closure can own it.
+            let ring_cell = Arc::clone(&ring_credential);
             join_set.spawn(async move {
                 // Prefer ring-membership (0x04) when a RingMembership authority is
                 // active; fall back to the blind token (0x03) otherwise.
+                let ring_snap = ring_cell.load_full();
                 let pre_minted = crate::token_pool::build_ring_credential(
                     cred_snap.as_ref().as_ref(),
-                    ring.as_ref().as_ref(),
+                    ring_snap.as_ref().as_ref(),
                     &crate::token_pool::ring_dial_context(&ch),
                 ).or_else(|| spent.as_ref().map(|t| {
                     debug!(epoch_id = t.epoch_id, "mux_pool: spending blind token on initial dial");
@@ -1106,7 +1109,7 @@ mod tests {
             peer_table,
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
-            Arc::new(None),
+            Arc::new(arc_swap::ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
         )
             .await
             .expect("MuxPool::new must not fail during construction");
@@ -1158,7 +1161,7 @@ mod tests {
             peer_table,
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
-            Arc::new(None),
+            Arc::new(arc_swap::ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
         )
             .await
             .expect("MuxPool::new must not fail during construction");
@@ -1232,9 +1235,10 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         }
         // Prefer ring-membership (0x04) when a RingMembership authority is
         // active; fall back to the blind token (0x03) otherwise.
+        let ring_snap = ring_credential_shared.load_full();
         let pre_minted = crate::token_pool::build_ring_credential(
             cred_snap.as_ref().as_ref(),
-            ring_credential_shared.as_ref().as_ref(),
+            ring_snap.as_ref().as_ref(),
             &crate::token_pool::ring_dial_context(&fresh_chain),
         ).or_else(|| spent.as_ref().map(|t| {
             debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "mux_pool: spending blind token on reconnect");

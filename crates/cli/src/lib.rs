@@ -145,9 +145,10 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
     //
     // Parsed once from config at startup. None when the config doesn't carry
     // ring_member_sk_hex / ring_path / ring_epoch_id. Shared across all pools
-    // via Arc (no ArcSwap needed — the material never changes at runtime).
-    let ring_credential: Arc<Option<mirage_client_core::RingCredential>> =
-        Arc::new(ring_credential_from_config(&config));
+    // via RingCredentialCell (Arc<ArcSwap<Option<...>>>) so MonitorLink can
+    // hot-swap the credential on epoch rotation without restarting pools.
+    let ring_credential: mirage_client_core::token_pool::RingCredentialCell =
+        Arc::new(arc_swap::ArcSwap::from_pointee(ring_credential_from_config(&config)));
 
     // ── Build tunnel pools (one per chain) ────────────────────────────────────
     let all_chains = select_all_chains(&config);

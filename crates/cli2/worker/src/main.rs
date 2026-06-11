@@ -245,14 +245,14 @@ async fn main() -> anyhow::Result<()> {
     let token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>> =
         Arc::new(ArcSwap::from_pointee(mirage_client_core::token_pool::TokenPool::default()));
 
-    // Ring-membership credential (scheme 0x04, static). Parsed once at startup.
-    // None when config doesn't carry ring_member_sk_hex / ring_path / ring_epoch_id.
-    let ring_credential: Arc<Option<mirage_client_core::RingCredential>> =
-        Arc::new(ring_credential_from_config(
+    // Ring-membership credential (scheme 0x04). Parsed once at startup; wrapped
+    // in a RingCredentialCell so MonitorLink can hot-swap it on epoch rotation.
+    let ring_credential: mirage_client_core::token_pool::RingCredentialCell =
+        Arc::new(ArcSwap::from_pointee(ring_credential_from_config(
             ring_member_sk_hex_str.as_deref(),
             ring_path_str.as_deref(),
             ring_epoch_id_str,
-        ));
+        )));
 
     // MuxPool requires onion reply mode: the mux exit (run_mux_server_session_wrapped_v7)
     // AEAD-wraps its replies, which OnionTunnel::recv unwraps per layer. Chains with

@@ -149,6 +149,16 @@ pub fn absorb_issue_result(
     out
 }
 
+// ── RingCredentialCell ────────────────────────────────────────────────────────
+
+/// Shared hot-swappable ring-membership credential cell.
+///
+/// The monitor link WRITES via [`arc_swap::ArcSwap::store`]; pool dial sites
+/// READ via `.load()`.  Wraps `Option<RingCredential>` so the cell can represent
+/// "no credential" as `None` (cleared on stale-epoch detection or when ring
+/// membership is not configured).
+pub type RingCredentialCell = std::sync::Arc<arc_swap::ArcSwap<Option<RingCredential>>>;
+
 // ── RingCredential (scheme 0x04) ──────────────────────────────────────────────
 
 /// Static ring-membership credential material (scheme 0x04). The member secret

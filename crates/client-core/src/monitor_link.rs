@@ -312,6 +312,16 @@ struct ConfigResponse {
     peer_table: Option<PeerTable>,
 }
 
+/// One step of a ring-membership Merkle inclusion path as received from the
+/// monitor in a `RingSlot` frame. Field names MUST match the wire contract
+/// byte-for-byte (`"sibling_hex"`, `"is_right"`) — this is parsed by string tag
+/// and a typo is a silent runtime mismatch.
+#[derive(Debug, Deserialize)]
+struct WireRingPathStep {
+    sibling_hex: String,
+    is_right: bool,
+}
+
 /// Tagged wire frame matching `WsServerFrame`. Used only on WebSocket — the
 /// HTTP poll path always parses `ConfigResponse` directly.
 #[derive(Debug, Deserialize)]
@@ -339,10 +349,28 @@ enum TaggedServerFrame {
         request_id: u64,
         error: String,
     },
+    /// Monitor relays a fresh ring-membership slot assigned by opbox.
+    ///
+    /// Wire: `{"kind":"ring_slot","request_id":<u64>,"epoch_id":<u32>,
+    ///         "slot_index":<u64>,"member_sk_hex":"<hex>","path":[...]}`
+    RingSlot {
+        request_id: u64,
+        epoch_id: u32,
+        slot_index: u64,
+        member_sk_hex: String,
+        path: Vec<WireRingPathStep>,
+    },
+    /// Monitor relays an error for a ring-enrol request.
+    ///
+    /// Wire: `{"kind":"ring_enrol_error","request_id":<u64>,"error":"<string>"}`
+    RingEnrolError {
+        request_id: u64,
+        error: String,
+    },
 }
 
 /// Tagged client→server frame sent over the same JSON channel.
-/// Used for app-level ping-pong and blind-token batch requests.
+/// Used for app-level ping-pong, blind-token batch requests, and ring-enrol.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum TaggedClientFrame {
@@ -356,6 +384,15 @@ enum TaggedClientFrame {
         request_id: u64,
         enrol_token: String,
         blinded_hex: Vec<String>,
+    },
+    /// Ring-membership enrol request — monitor enqueues for opbox to assign a slot.
+    ///
+    /// Wire: `{"kind":"ring_enrol_request","request_id":<u64>,"sentinel_id":"<uuid>"}`
+    /// The monitor uses the authenticated session `client_id` as the authoritative
+    /// sentinel_id for the opbox call; the client-supplied field is advisory.
+    RingEnrolRequest {
+        request_id: u64,
+        sentinel_id: String,
     },
 }
 
@@ -586,6 +623,34 @@ pub struct MonitorLink {
     ///
     /// Limits outstanding requests to one at a time; cleared on result/error.
     request_in_flight: AtomicBool,
+
+    // ── Ring-membership re-enrol fields ──────────────────────────────────────
+
+    /// Shared hot-swappable ring credential cell.
+    ///
+    /// MonitorLink writes a new `RingCredential` into this cell when a
+    /// `RingSlot` frame is received (epoch rotated, opbox assigned a new slot).
+    /// The same Arc is shared with all pool instances — they read via
+    /// `.load_full()` on every dial, so they pick up the new credential
+    /// immediately without any restart.
+    ///
+    /// Construction: caller must pass the same Arc into `TunnelPool::new` /
+    /// `MuxPool::new` via `ring_credential_cell()`.
+    pub ring_cell: crate::token_pool::RingCredentialCell,
+    /// True while a ring-enrol request is outstanding.
+    ///
+    /// Dedupe guard: prevents spamming the monitor on every `CredentialParams`
+    /// tick when a previous request is still in-flight. Mirrors
+    /// `request_in_flight` used by the blind-token path.
+    ring_enrol_in_flight: AtomicBool,
+    /// The `epoch_id` of the most recent ring-enrol request we sent.
+    ///
+    /// Prevents re-sending on subsequent `CredentialParams` ticks that carry
+    /// the same epoch_id while the request is in-flight or has been fulfilled.
+    /// Stored as `u64` (u32 epoch_id + 1, or 0 = no request sent yet) so we
+    /// can use a single atomic without needing a sentinel value that collides
+    /// with real epoch_ids.
+    last_ring_epoch_requested: AtomicU64,
 }
 
 impl MonitorLink {
@@ -680,12 +745,13 @@ impl MonitorLink {
             .map_err(|e| format!("operator_pub_hex is not a valid Ed25519 key: {e}"))
     }
 
-    /// Like [`new`] but accepts pre-created `credential_params` and `token_pool`
-    /// arcs so that they can be shared with `TunnelPool` / `MuxPool` instances
-    /// created before the `MonitorLink` is constructed.
+    /// Like [`new`] but accepts pre-created `credential_params`, `token_pool`,
+    /// and `ring_cell` arcs so that they can be shared with `TunnelPool` /
+    /// `MuxPool` instances created before the `MonitorLink` is constructed.
     ///
-    /// Use `link.credential_params()` / `link.token_pool()` to retrieve
-    /// `Arc::clone`s from a link built with the ordinary [`new`] constructor.
+    /// Use `link.credential_params()` / `link.token_pool()` /
+    /// `link.ring_credential_cell()` to retrieve `Arc::clone`s from a link
+    /// built with the ordinary [`new`] constructor.
     pub fn new_with_credential_arc(
         monitor_urls: Vec<String>,
         _monitor_api_key: Option<String>,
@@ -711,6 +777,11 @@ impl MonitorLink {
             key
         };
 
+        // Ring credential cell — empty until a RingSlot frame is received or
+        // the constructor's caller pre-populates it via `ring_credential_cell()`.
+        let ring_cell: crate::token_pool::RingCredentialCell =
+            Arc::new(ArcSwap::from_pointee(None));
+
         let link = Arc::new(Self {
             monitor_urls: Mutex::new(monitor_urls),
             mesh_id,
@@ -734,9 +805,21 @@ impl MonitorLink {
             inflight: std::sync::Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(0),
             request_in_flight: AtomicBool::new(false),
+            ring_cell,
+            ring_enrol_in_flight: AtomicBool::new(false),
+            last_ring_epoch_requested: AtomicU64::new(0),
         });
 
         (link, config_rx)
+    }
+
+    /// Return the shared ring-credential cell.
+    ///
+    /// Pass the returned Arc to `TunnelPool::new` / `MuxPool::new` so that
+    /// pool dial sites always read the latest ring credential (including any
+    /// hot-swap on epoch rotation) without a restart.
+    pub fn ring_credential_cell(&self) -> crate::token_pool::RingCredentialCell {
+        Arc::clone(&self.ring_cell)
     }
 
     /// Set (or clear) the enrolment token used for blind-token batch requests.
@@ -833,13 +916,68 @@ impl MonitorLink {
         }
 
         // Step 4: accept.
-        self.credential_params.store(Arc::new(Some(params)));
+        self.credential_params.store(Arc::new(Some(params.clone())));
         self.last_credential_generation.store(generation, Ordering::Release);
         debug!(
             generation,
             transport = transport_label,
             "monitor_link: CredentialParams updated"
         );
+
+        // Step 5: ring-epoch change detection.
+        // Find the RingMembership authority in the new params and extract its epoch_id.
+        let ring_epoch_in_params: Option<u32> = params
+            .authorities
+            .iter()
+            .find(|a| a.scheme == CredentialScheme::RingMembership)
+            .and_then(|auth| auth.epochs.first())
+            .map(|ep| ep.epoch_id);
+
+        if let Some(params_epoch) = ring_epoch_in_params {
+            // Compare against the live credential in the cell.
+            let live_epoch: Option<u32> = self.ring_cell.load()
+                .as_ref()
+                .as_ref()
+                .map(|rc| rc.epoch_id);
+
+            let needs_enrol = match live_epoch {
+                None => true,
+                Some(live) => live != params_epoch,
+            };
+
+            if needs_enrol {
+                // Dedupe: only send if we haven't already requested this epoch.
+                let last_requested = self.last_ring_epoch_requested.load(Ordering::Acquire);
+                // We encode epoch_id as (epoch_id as u64) + 1 so that 0 means "not sent yet".
+                let sentinel_value = (params_epoch as u64) + 1;
+                if last_requested != sentinel_value
+                    && !self.ring_enrol_in_flight.load(Ordering::Acquire)
+                {
+                    // Clear the stale credential immediately so dials fail-fast
+                    // rather than presenting a known-bad token.
+                    self.ring_cell.store(Arc::new(None));
+                    info!(
+                        params_epoch,
+                        live_epoch = live_epoch.unwrap_or(0),
+                        transport = transport_label,
+                        "monitor_link: ring epoch changed — requesting re-enrol"
+                    );
+                    self.last_ring_epoch_requested.store(sentinel_value, Ordering::Release);
+                    self.ring_enrol_in_flight.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// True when a ring-enrol request was just armed by `apply_credential_params`.
+    ///
+    /// The receive loops call this after `apply_credential_params` to decide
+    /// whether to fire the WS send.  The flag is NOT automatically cleared here —
+    /// the caller is responsible for firing the send and clearing the flag if
+    /// the send fails.  On success the flag stays `true` until `RingSlot` or
+    /// `RingEnrolError` arrives.
+    fn should_send_ring_enrol(&self) -> bool {
+        self.ring_enrol_in_flight.load(Ordering::Acquire)
     }
 
     /// Fire a blind-token batch request if conditions are met.
@@ -1046,6 +1184,140 @@ impl MonitorLink {
                 self.request_in_flight.store(false, Ordering::Release);
             }
         }
+    }
+
+    /// Send a `RingEnrolRequest` over the Wire WS write half if the in-flight
+    /// flag is set.  The flag is set by `apply_credential_params` when a ring
+    /// epoch change is detected.  Mirrors `maybe_request_batch_ws`.
+    async fn maybe_request_ring_enrol_ws<S>(&self, write: &mut S)
+    where
+        S: futures::SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        if !self.ring_enrol_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Resolve sentinel_id from the registered client_id (advisory — monitor
+        // uses session client_id authoritatively).  Falls back to empty string
+        // if not yet set; monitor tolerates this.
+        let sentinel_id = self.client_id.lock().await.clone().unwrap_or_default();
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let frame = TaggedClientFrame::RingEnrolRequest { request_id, sentinel_id };
+        match serde_json::to_string(&frame) {
+            Ok(json) => {
+                if let Err(e) = write.send(Message::Text(json.into())).await {
+                    warn!(request_id, "monitor_link: ring enrol request: Wire send failed: {e}");
+                    self.ring_enrol_in_flight.store(false, Ordering::Release);
+                } else {
+                    info!(request_id, "monitor_link: ring enrol request sent (Wire)");
+                }
+            }
+            Err(e) => {
+                warn!(request_id, "monitor_link: ring enrol request: serialize failed: {e}");
+                self.ring_enrol_in_flight.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Same as `maybe_request_ring_enrol_ws` but for the OverChain path.
+    async fn maybe_request_ring_enrol_oc(
+        &self,
+        channel: &mut crate::monitor_channel::OverChainChannel,
+    ) {
+        if !self.ring_enrol_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+
+        let sentinel_id = self.client_id.lock().await.clone().unwrap_or_default();
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let frame = TaggedClientFrame::RingEnrolRequest { request_id, sentinel_id };
+        match serde_json::to_string(&frame) {
+            Ok(json) => {
+                if let Err(e) = channel.send_text(&json).await {
+                    warn!(request_id, "monitor_link: ring enrol request: OC send failed: {e}");
+                    self.ring_enrol_in_flight.store(false, Ordering::Release);
+                } else {
+                    info!(request_id, "monitor_link: ring enrol request sent (OverChain)");
+                }
+            }
+            Err(e) => {
+                warn!(request_id, "monitor_link: ring enrol request: serialize failed: {e}");
+                self.ring_enrol_in_flight.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Handle a `RingSlot` frame: parse material, build `RingCredential`, and
+    /// hot-swap into the shared cell.  Clears the in-flight flag.
+    fn handle_ring_slot(
+        &self,
+        request_id: u64,
+        epoch_id: u32,
+        slot_index: u64,
+        member_sk_hex: String,
+        path: Vec<WireRingPathStep>,
+    ) {
+        // Hex-decode + parse member secret key.
+        let sk_bytes: [u8; 32] = match hex::decode(&member_sk_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+        {
+            Some(b) => b,
+            None => {
+                warn!(request_id, epoch_id, "monitor_link: RingSlot: invalid member_sk_hex — ignoring");
+                self.ring_enrol_in_flight.store(false, Ordering::Release);
+                return;
+            }
+        };
+        let member_sk = match mirage_ringmember::MemberSecret::from_bytes(sk_bytes) {
+            Some(sk) => sk,
+            None => {
+                warn!(request_id, epoch_id, "monitor_link: RingSlot: member_sk not a canonical ristretto scalar — ignoring");
+                self.ring_enrol_in_flight.store(false, Ordering::Release);
+                return;
+            }
+        };
+
+        // Decode and map path steps to (sibling_bytes, is_right) tuples.
+        let mut decoded_path: Vec<mirage_ringmember::PathStep> = Vec::with_capacity(path.len());
+        for step in &path {
+            let sib: [u8; 32] = match hex::decode(&step.sibling_hex)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+            {
+                Some(b) => b,
+                None => {
+                    warn!(request_id, epoch_id, sibling = %step.sibling_hex, "monitor_link: RingSlot: invalid sibling_hex in path — ignoring");
+                    self.ring_enrol_in_flight.store(false, Ordering::Release);
+                    return;
+                }
+            };
+            decoded_path.push((sib, step.is_right));
+        }
+
+        let rc = crate::token_pool::RingCredential::new(member_sk, decoded_path, epoch_id);
+        self.ring_cell.store(Arc::new(Some(rc)));
+        self.ring_enrol_in_flight.store(false, Ordering::Release);
+        info!(
+            request_id,
+            epoch_id,
+            slot_index,
+            "monitor_link: ring credential hot-swapped (epoch rotated)"
+        );
+    }
+
+    /// Handle a `RingEnrolError` frame: log, clear in-flight flag so the next
+    /// params tick can retry.
+    fn handle_ring_enrol_error(&self, request_id: u64, error: String) {
+        warn!(
+            request_id,
+            error = %error,
+            "monitor_link: ring enrol request failed by monitor — will retry on next epoch tick"
+        );
+        self.ring_enrol_in_flight.store(false, Ordering::Release);
+        // Also reset the last-epoch sentinel so the next params tick re-arms.
+        self.last_ring_epoch_requested.store(0, Ordering::Release);
     }
 
     /// Handle a `CredentialIssueResult` frame from the monitor.
@@ -1427,6 +1699,7 @@ impl MonitorLink {
                                 Ok(TaggedServerFrame::CredentialParams(params)) => {
                                     self.apply_credential_params(params, "wire");
                                     self.maybe_request_batch_ws(&mut write).await;
+                                    self.maybe_request_ring_enrol_ws(&mut write).await;
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if app_ping_nonce == Some(nonce) {
@@ -1443,6 +1716,12 @@ impl MonitorLink {
                                 }
                                 Ok(TaggedServerFrame::CredentialIssueError { request_id, error }) => {
                                     self.handle_issue_error(request_id, error);
+                                }
+                                Ok(TaggedServerFrame::RingSlot { request_id, epoch_id, slot_index, member_sk_hex, path }) => {
+                                    self.handle_ring_slot(request_id, epoch_id, slot_index, member_sk_hex, path);
+                                }
+                                Ok(TaggedServerFrame::RingEnrolError { request_id, error }) => {
+                                    self.handle_ring_enrol_error(request_id, error);
                                 }
                                 Err(e) => {
                                     warn!("monitor_link: Wire frame parse error: {e}");
@@ -1658,8 +1937,10 @@ impl MonitorLink {
 
         loop {
             // `channel` must not be borrowed across the select! boundary when we
-            // call maybe_request_batch_oc after the block, so we use a flag.
+            // call maybe_request_batch_oc / maybe_request_ring_enrol_oc after
+            // the block, so we use flags.
             let mut request_batch_after = false;
+            let mut request_ring_enrol_after = false;
 
             tokio::select! {
                 // Drive OverChain receive.
@@ -1709,6 +1990,7 @@ impl MonitorLink {
                                 Ok(TaggedServerFrame::CredentialParams(params)) => {
                                     self.apply_credential_params(params, "over_chain");
                                     request_batch_after = true;
+                                    request_ring_enrol_after = self.should_send_ring_enrol();
                                 }
                                 Ok(TaggedServerFrame::Pong { nonce }) => {
                                     if outstanding_nonce == Some(nonce) {
@@ -1725,6 +2007,12 @@ impl MonitorLink {
                                 }
                                 Ok(TaggedServerFrame::CredentialIssueError { request_id, error }) => {
                                     self.handle_issue_error(request_id, error);
+                                }
+                                Ok(TaggedServerFrame::RingSlot { request_id, epoch_id, slot_index, member_sk_hex, path }) => {
+                                    self.handle_ring_slot(request_id, epoch_id, slot_index, member_sk_hex, path);
+                                }
+                                Ok(TaggedServerFrame::RingEnrolError { request_id, error }) => {
+                                    self.handle_ring_enrol_error(request_id, error);
                                 }
                                 Err(e) => {
                                     warn!("monitor_link: OverChain frame parse error: {e}");
@@ -1791,6 +2079,10 @@ impl MonitorLink {
             // Fire batch request outside the select! to avoid double-borrow of channel.
             if request_batch_after {
                 self.maybe_request_batch_oc(channel).await;
+            }
+            // Fire ring-enrol request outside the select! to avoid double-borrow.
+            if request_ring_enrol_after {
+                self.maybe_request_ring_enrol_oc(channel).await;
             }
         }
     }
