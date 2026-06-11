@@ -252,7 +252,6 @@ enum SsCipher {
 impl SsCipher {
     fn new(method: SsMethod, key: &[u8]) -> Result<Self> {
         use aes_gcm::aead::KeyInit;
-        use chacha20poly1305::KeyInit as _;
         Ok(match method {
             SsMethod::Aes128Gcm => SsCipher::Aes128(
                 aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|e| anyhow!("aes128: {e}"))?,
@@ -312,7 +311,6 @@ struct SsReadHalf {
     rd: ReadHalf<TcpStream>,
     cipher: SsCipher,
     counter: u64,
-    overflow: Vec<u8>,
 }
 
 struct SsWriteHalf {
@@ -377,7 +375,7 @@ async fn proxy_via_ss(args: &Args, mut client: TcpStream, target: Target) -> Res
 
     let (up_rd, up_wr) = tokio::io::split(upstream);
     let mut up_r = SsReadHalf {
-        rd: up_rd, cipher: read_cipher, counter: 0, overflow: Vec::new(),
+        rd: up_rd, cipher: read_cipher, counter: 0,
     };
     let mut up_w = SsWriteHalf {
         wr: up_wr, cipher: write_cipher, counter: 0,
