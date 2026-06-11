@@ -18,7 +18,12 @@ const MAX_RESTARTS_IN_WINDOW: u32 = 5;
 /// Window length for restart rate limiting.
 const RESTART_WINDOW_SECS: u64 = 60;
 /// How many times to retry connecting to the worker pipe after spawn.
-const PIPE_CONNECT_ATTEMPTS: u32 = 25;
+/// 100 (= 20s at 200ms) not 25 (= 5s): a cold-cache worker binary on a small
+/// box (8GB Mac tester) can take ~5-6s just to start and bind its pipe, so a
+/// 5s window lost the race on the first run after every rebuild — the
+/// supervisor gave up, SetupMonitorLink failed, and the MonitorLink never came
+/// up (no credential_params, no relay). 20s covers a cold start with margin.
+const PIPE_CONNECT_ATTEMPTS: u32 = 100;
 /// Delay between pipe connect retries (ms).
 const PIPE_CONNECT_DELAY_MS: u64 = 200;
 
