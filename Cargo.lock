@@ -1075,6 +1075,7 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest 0.10.7",
  "fiat-crypto",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -2690,11 +2691,13 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "dashmap",
+ "hex",
  "libc",
  "mirage-chain-ipc",
  "mirage-client-core",
  "mirage-core",
  "mirage-protocol",
+ "mirage-ringmember",
  "mirage-runtime-guard",
  "serde",
  "serde_json",
@@ -2710,10 +2713,12 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "clap",
+ "hex",
  "libloading",
  "mirage-client-core",
  "mirage-core",
  "mirage-protocol",
+ "mirage-ringmember",
  "mirage-runtime-guard",
  "serde_json",
  "thiserror 2.0.18",
@@ -2744,6 +2749,7 @@ dependencies = [
  "mirage-mesh-client",
  "mirage-mux",
  "mirage-protocol",
+ "mirage-ringmember",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -2788,6 +2794,7 @@ dependencies = [
  "libc",
  "mirage-blindtoken",
  "mirage-ids",
+ "mirage-ringmember",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -2979,6 +2986,18 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "mirage-ringmember"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "sha2",
+ "thiserror 1.0.69",
  "zeroize",
 ]
 

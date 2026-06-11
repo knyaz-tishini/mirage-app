@@ -195,6 +195,10 @@ struct PoolInner {
     /// Blind-RSA token pool (Phase 4 spend).  Each mux session dial pops one
     /// token.  When empty, falls back to EpochHmac or no credential.
     token_pool: Arc<ArcSwap<TokenPool>>,
+    /// Ring-membership (scheme 0x04) credential material. Static for process
+    /// lifetime — doesn't deplete. Preferred over the blind token pool when a
+    /// RingMembership authority is active in `credential_params`.
+    ring_credential: Arc<Option<crate::token_pool::RingCredential>>,
 }
 
 /// Semaphore capacity for the post-recovery burst limiter.
@@ -227,6 +231,9 @@ impl MuxPool {
     /// `token_pool` — shared blind-RSA token pool (Phase 4).  Pass
     /// `Arc::new(ArcSwap::from_pointee(TokenPool::default()))` when no
     /// MonitorLink is present.
+    ///
+    /// `ring_credential` — static ring-membership (0x04) material. Pass
+    /// `Arc::new(None)` when the client is not configured for ring membership.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
@@ -235,6 +242,7 @@ impl MuxPool {
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         token_pool: Arc<ArcSwap<TokenPool>>,
+        ring_credential: Arc<Option<crate::token_pool::RingCredential>>,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // sends the address bytes raw (no length-prefix) so the
@@ -261,11 +269,18 @@ impl MuxPool {
             let cred_snap = credential_params.load_full();
             // Phase 4: pop one blind token for this initial mux session dial.
             let spent = token_pool::pop_one(&token_pool);
+            // Clone the ring-credential Arc so the spawned closure can own it.
+            let ring = Arc::clone(&ring_credential);
             join_set.spawn(async move {
-                let pre_minted = spent.as_ref().map(|t| {
+                // Prefer ring-membership (0x04) when a RingMembership authority is
+                // active; fall back to the blind token (0x03) otherwise.
+                let pre_minted = crate::token_pool::build_ring_credential(
+                    cred_snap.as_ref().as_ref(),
+                    ring.as_ref().as_ref(),
+                ).or_else(|| spent.as_ref().map(|t| {
                     debug!(epoch_id = t.epoch_id, "mux_pool: spending blind token on initial dial");
                     mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
-                });
+                }));
                 let cred_ref = cred_snap.as_ref().as_ref();
                 (idx, build_session(&cp, &ch, &pt, &mid, pre_minted.as_ref(), cred_ref).await)
             });
@@ -318,6 +333,7 @@ impl MuxPool {
             peer_table,
             credential_params,
             token_pool,
+            ring_credential,
         }));
 
         let pool = Arc::new(Self {
@@ -1089,6 +1105,7 @@ mod tests {
             peer_table,
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+            Arc::new(None),
         )
             .await
             .expect("MuxPool::new must not fail during construction");
@@ -1140,6 +1157,7 @@ mod tests {
             peer_table,
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+            Arc::new(None),
         )
             .await
             .expect("MuxPool::new must not fail during construction");
@@ -1152,7 +1170,8 @@ mod tests {
 async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
-         peer_table_notify, credential_params_shared, token_pool_shared) = {
+         peer_table_notify, credential_params_shared, token_pool_shared,
+         ring_credential_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1164,6 +1183,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             Arc::clone(&pool.peer_table_notify),
             Arc::clone(&guard.credential_params),
             Arc::clone(&guard.token_pool),
+            Arc::clone(&guard.ring_credential),
         )
     };
 
@@ -1209,10 +1229,15 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                 }
             }
         }
-        let pre_minted = spent.as_ref().map(|t| {
+        // Prefer ring-membership (0x04) when a RingMembership authority is
+        // active; fall back to the blind token (0x03) otherwise.
+        let pre_minted = crate::token_pool::build_ring_credential(
+            cred_snap.as_ref().as_ref(),
+            ring_credential_shared.as_ref().as_ref(),
+        ).or_else(|| spent.as_ref().map(|t| {
             debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "mux_pool: spending blind token on reconnect");
             mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
-        });
+        }));
         match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, pre_minted.as_ref(), cred_ref).await {
             Ok(session) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "mux reconnect succeeded");

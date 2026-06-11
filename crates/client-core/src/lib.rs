@@ -25,6 +25,8 @@ pub use chain_set::{
     router::{Router, RouterImpl, RoutingPolicy, TargetKey, FlowKey, ProtocolHint, BypassMatcher},
 };
 
+pub use token_pool::RingCredential;
+
 /// Re-export dial primitives so existing call-sites
 /// (`mirage_client_core::tunnel::*`, `mirage_client_core::onion_tunnel::*`,
 /// ...) continue to compile after the dial-stack moved into

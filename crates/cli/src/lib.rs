@@ -141,6 +141,14 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
     let token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>> =
         Arc::new(ArcSwap::from_pointee(mirage_client_core::token_pool::TokenPool::default()));
 
+    // ── Ring-membership credential (scheme 0x04, static) ─────────────────────
+    //
+    // Parsed once from config at startup. None when the config doesn't carry
+    // ring_member_sk_hex / ring_path / ring_epoch_id. Shared across all pools
+    // via Arc (no ArcSwap needed — the material never changes at runtime).
+    let ring_credential: Arc<Option<mirage_client_core::RingCredential>> =
+        Arc::new(ring_credential_from_config(&config));
+
     // ── Build tunnel pools (one per chain) ────────────────────────────────────
     let all_chains = select_all_chains(&config);
     if all_chains.is_empty() {
@@ -198,9 +206,10 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         let pt = Arc::clone(&peer_table);
         let cred = Arc::clone(&credential_params);
         let tok = Arc::clone(&token_pool);
+        let ring = Arc::clone(&ring_credential);
         pool_tasks.spawn(async move {
             let id = chain_owned.chain_id.clone();
-            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt, cred, tok).await {
+            match TunnelPool::new(chain_owned, protocols, pool_cfg, mid, pt, cred, tok, ring).await {
                 Ok(pool) => Some((id, pool)),
                 Err(e) => {
                     tracing::warn!(chain = %id, "pool init failed, skipping: {e}");
@@ -252,8 +261,9 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             let pt = Arc::clone(&peer_table);
             let cred = Arc::clone(&credential_params);
             let tok = Arc::clone(&token_pool);
+            let ring = Arc::clone(&ring_credential);
             mux_tasks.spawn(async move {
-                match MuxPool::new(chain_owned, protocols, cfg, mid, pt, cred, tok).await {
+                match MuxPool::new(chain_owned, protocols, cfg, mid, pt, cred, tok, ring).await {
                     Ok(mux) => Some((id, mux)),
                     Err(e) => {
                         tracing::warn!(
@@ -487,6 +497,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
         let peer_table_for_watcher = Arc::clone(&peer_table);
         let credential_params_for_watcher = Arc::clone(&credential_params);
         let token_pool_for_watcher = Arc::clone(&token_pool);
+        let ring_credential_for_watcher = Arc::clone(&ring_credential);
 
         tokio::spawn(async move {
             loop {
@@ -545,6 +556,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
                             Arc::clone(&peer_table_for_watcher),
                             Arc::clone(&credential_params_for_watcher),
                             Arc::clone(&token_pool_for_watcher),
+                            Arc::clone(&ring_credential_for_watcher),
                         )
                         .await
                         {
@@ -794,4 +806,32 @@ fn build_chain_protocol_chain(
         mesh_id.to_vec(),
     ).with_wire_version(9)));
     Ok(ProtocolChain::new(protocols))
+}
+
+/// Parse ring-membership credential material from the client config, if present
+/// and well-formed. Returns None (with a warn) if any field is missing/invalid —
+/// the client then dials without a 0x04 credential.
+fn ring_credential_from_config(
+    config: &mirage_core::config::ClientConfig,
+) -> Option<mirage_client_core::RingCredential> {
+    let sk_hex = config.ring_member_sk_hex.as_deref()?;
+    let path_cfg = config.ring_path.as_ref()?;
+    let epoch_id = config.ring_epoch_id?;
+    let sk_bytes: [u8; 32] = hex::decode(sk_hex)
+        .ok()?
+        .try_into()
+        .ok()?;
+    let member_sk = mirage_ringmember::MemberSecret::from_bytes(sk_bytes).or_else(|| {
+        tracing::warn!("ring_credential_from_config: ring_member_sk_hex is not a canonical ristretto scalar — ring credential disabled");
+        None
+    })?;
+    let mut path = Vec::with_capacity(path_cfg.len());
+    for step in path_cfg {
+        let sib: [u8; 32] = hex::decode(&step.sibling_hex)
+            .ok()?
+            .try_into()
+            .ok()?;
+        path.push((sib, step.is_right));
+    }
+    Some(mirage_client_core::RingCredential { member_sk, path, epoch_id })
 }

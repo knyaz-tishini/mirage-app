@@ -160,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
     // Blind-token credential fields from ClientConfig.
     let operator_pub_hex_str = client_config.operator_pub_hex.clone();
     let enrol_token_str = client_config.enrol_token.clone();
+    // Ring-membership (0x04) fields from ClientConfig.
+    let ring_member_sk_hex_str = client_config.ring_member_sk_hex.clone();
+    let ring_path_str = client_config.ring_path.clone();
+    let ring_epoch_id_str = client_config.ring_epoch_id;
 
     // Build protocol chain for the entry hop.
     //
@@ -241,6 +245,15 @@ async fn main() -> anyhow::Result<()> {
     let token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>> =
         Arc::new(ArcSwap::from_pointee(mirage_client_core::token_pool::TokenPool::default()));
 
+    // Ring-membership credential (scheme 0x04, static). Parsed once at startup.
+    // None when config doesn't carry ring_member_sk_hex / ring_path / ring_epoch_id.
+    let ring_credential: Arc<Option<mirage_client_core::RingCredential>> =
+        Arc::new(ring_credential_from_config(
+            ring_member_sk_hex_str.as_deref(),
+            ring_path_str.as_deref(),
+            ring_epoch_id_str,
+        ));
+
     // MuxPool requires onion reply mode: the mux exit (run_mux_server_session_wrapped_v7)
     // AEAD-wraps its replies, which OnionTunnel::recv unwraps per layer. Chains with
     // reply=raw never receive AEAD-wrapped replies — their exit byte-pumps raw bytes.
@@ -256,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&peer_table),
             Arc::clone(&credential_params),
             Arc::clone(&token_pool),
+            Arc::clone(&ring_credential),
         ).await {
             Ok(mp) => {
                 info!(chain_id = %chain_id, "mux pool ready");
@@ -270,7 +284,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool))
+    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential))
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 
@@ -941,4 +955,34 @@ async fn wait_for_start(
             }
         }
     }
+}
+
+/// Parse ring-membership credential material from config fields, if present
+/// and well-formed. Returns None (with a warn) if any field is missing/invalid —
+/// the worker then dials without a 0x04 credential.
+fn ring_credential_from_config(
+    sk_hex: Option<&str>,
+    path_cfg: Option<&[mirage_core::config::RingPathStep]>,
+    epoch_id: Option<u32>,
+) -> Option<mirage_client_core::RingCredential> {
+    let sk_hex = sk_hex?;
+    let path_cfg = path_cfg?;
+    let epoch_id = epoch_id?;
+    let sk_bytes: [u8; 32] = hex::decode(sk_hex)
+        .ok()?
+        .try_into()
+        .ok()?;
+    let member_sk = mirage_ringmember::MemberSecret::from_bytes(sk_bytes).or_else(|| {
+        warn!("ring_credential_from_config: ring_member_sk_hex is not a canonical ristretto scalar — ring credential disabled");
+        None
+    })?;
+    let mut path = Vec::with_capacity(path_cfg.len());
+    for step in path_cfg {
+        let sib: [u8; 32] = hex::decode(&step.sibling_hex)
+            .ok()?
+            .try_into()
+            .ok()?;
+        path.push((sib, step.is_right));
+    }
+    Some(mirage_client_core::RingCredential { member_sk, path, epoch_id })
 }

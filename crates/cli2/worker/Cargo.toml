@@ -21,6 +21,8 @@ dashmap = "5.5"
 mirage-core = { workspace = true }
 mirage-protocol = { workspace = true }
 mirage-client-core = { workspace = true }
+mirage-ringmember = { workspace = true }
+hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

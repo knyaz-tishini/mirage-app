@@ -92,6 +92,10 @@ struct PoolInner {
     /// (scheme `0x03`).  When empty, the dial falls back to EpochHmac self-mint or
     /// proceeds without a credential (existing behaviour).
     token_pool: Arc<ArcSwap<TokenPool>>,
+    /// Ring-membership (scheme 0x04) credential material. Static for process
+    /// lifetime — doesn't deplete. Preferred over the blind token pool when a
+    /// RingMembership authority is active in `credential_params`.
+    ring_credential: Arc<Option<crate::token_pool::RingCredential>>,
 }
 
 // ── Pool statistics ───────────────────────────────────────────────────────────
@@ -148,6 +152,9 @@ impl TunnelPool {
     /// `Arc::new(ArcSwap::from_pointee(TokenPool::default()))` when no
     /// MonitorLink is present; the pool will always be empty and dials fall
     /// back to EpochHmac self-mint.
+    ///
+    /// `ring_credential` — static ring-membership (0x04) material. Pass
+    /// `Arc::new(None)` when the client is not configured for ring membership.
     pub async fn new(
         chain: ChainConfig,
         chain_protocols: Arc<ProtocolChain>,
@@ -156,6 +163,7 @@ impl TunnelPool {
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         token_pool: Arc<ArcSwap<TokenPool>>,
+        ring_credential: Arc<Option<crate::token_pool::RingCredential>>,
     ) -> Result<Arc<Self>, MirageError> {
         // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
         // (hops[0].role == Exit) reaches `handle_exit` server-side as a
@@ -179,11 +187,18 @@ impl TunnelPool {
             let cred_snap = credential_params.load_full();
             // Phase 4: pop one blind token for this dial (single-use).
             let spent = token_pool::pop_one(&token_pool);
+            // Clone the ring-credential Arc so the spawned closure can own it.
+            let ring = Arc::clone(&ring_credential);
             join_set.spawn(async move {
-                let pre_minted = spent.as_ref().map(|t| {
+                // Prefer ring-membership (0x04) when a RingMembership authority is
+                // active; fall back to the blind token (0x03) otherwise.
+                let pre_minted = token_pool::build_ring_credential(
+                    cred_snap.as_ref().as_ref(),
+                    ring.as_ref().as_ref(),
+                ).or_else(|| spent.as_ref().map(|t| {
                     debug!(epoch_id = t.epoch_id, "pool: spending blind token on initial dial");
                     mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
-                });
+                }));
                 let cred_ref = cred_snap.as_ref().as_ref();
                 (idx, establish_raw_tunnel(&cp, &ch, &pt, &mid, pre_minted.as_ref(), cred_ref).await)
             });
@@ -247,6 +262,7 @@ impl TunnelPool {
             peer_table,
             credential_params,
             token_pool,
+            ring_credential,
         }));
 
         let pool = Arc::new(Self {
@@ -968,6 +984,7 @@ mod pool_smoke_tests {
             Arc::clone(&peer_table),
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
             Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+            Arc::new(None),
         )
         .await
         .expect("TunnelPool::new must not fail during construction");
@@ -1022,6 +1039,7 @@ mod pool_smoke_tests {
             peer_table,
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
             Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+            Arc::new(None),
         )
         .await
         .expect("TunnelPool::new must not fail during construction");
@@ -1036,7 +1054,8 @@ mod pool_smoke_tests {
 async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
-         peer_table_notify, credential_params_shared, token_pool_shared) = {
+         peer_table_notify, credential_params_shared, token_pool_shared,
+         ring_credential_shared) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1048,6 +1067,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             Arc::clone(&pool.peer_table_notify),
             Arc::clone(&guard.credential_params),
             Arc::clone(&guard.token_pool),
+            Arc::clone(&guard.ring_credential),
         )
     };
 
@@ -1103,10 +1123,15 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                 }
             }
         }
-        let pre_minted = spent.as_ref().map(|t| {
+        // Prefer ring-membership (0x04) when a RingMembership authority is
+        // active; fall back to the blind token (0x03) otherwise.
+        let pre_minted = token_pool::build_ring_credential(
+            cred_snap.as_ref().as_ref(),
+            ring_credential_shared.as_ref().as_ref(),
+        ).or_else(|| spent.as_ref().map(|t| {
             debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "pool: spending blind token on reconnect");
             mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
-        });
+        }));
         match establish_raw_tunnel(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, pre_minted.as_ref(), cred_ref).await {
             Ok(tunnel) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "reconnect succeeded");

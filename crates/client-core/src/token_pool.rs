@@ -149,6 +149,46 @@ pub fn absorb_issue_result(
     out
 }
 
+// ── RingCredential (scheme 0x04) ──────────────────────────────────────────────
+
+/// Static ring-membership credential material (scheme 0x04). Unlike the blind
+/// token pool, this does not deplete: the member secret + Merkle path + the
+/// epoch_id whose tree the path matches are fixed for the process lifetime. At
+/// dial time the client derives a fresh proof from this WHEN a RingMembership
+/// authority is currently published in the gossiped credential params.
+pub struct RingCredential {
+    pub member_sk: mirage_ringmember::MemberSecret,
+    pub path: Vec<mirage_ringmember::PathStep>,
+    pub epoch_id: u32,
+}
+
+/// Build a 0x04 ring-membership credential IFF a RingMembership authority is
+/// currently published in `params` AND the client holds ring material. Returns
+/// `None` otherwise — caller then falls back to the blind 0x03 token / EpochHmac.
+pub(crate) fn build_ring_credential(
+    params: Option<&mirage_core::crypto::credential::CredentialParams>,
+    ring: Option<&RingCredential>,
+) -> Option<mirage_protocol::driver::ClientCredential> {
+    let ring = ring?;
+    let params = params?;
+    let active = params
+        .authorities
+        .iter()
+        .any(|a| a.scheme == mirage_core::mirage::wire::CredentialScheme::RingMembership);
+    if !active {
+        return None;
+    }
+    let transcript = ring.epoch_id.to_le_bytes();
+    let token = mirage_ringmember::prove_membership(
+        &ring.member_sk,
+        &ring.path,
+        ring.epoch_id,
+        &transcript,
+    )
+    .encode();
+    Some(mirage_protocol::driver::ClientCredential { scheme: 0x04, token })
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

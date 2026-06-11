@@ -195,6 +195,20 @@ pub struct SentinelConfig {
     /// is preserved (pool stays empty, spending returns an error).
     #[serde(default)]
     pub enrol_token: Option<String>,
+    /// Ring-membership (scheme 0x04) member secret — 64-char hex of the member's
+    /// ristretto scalar, from operator-box `POST /credential/ring-enrol`. Injected
+    /// into the materialised ClientConfig so the spawned cli can derive a 0x04
+    /// credential at dial time. Mirrors `enrol_token` for the blind path.
+    #[serde(default)]
+    pub ring_member_sk_hex: Option<String>,
+    /// Ring-membership Merkle inclusion path (leaf→root), from `/credential/ring-enrol`.
+    /// Injected into the materialised ClientConfig alongside `ring_member_sk_hex`.
+    #[serde(default)]
+    pub ring_path: Option<Vec<mirage_core::config::RingPathStep>>,
+    /// Epoch id whose Merkle tree `ring_path` corresponds to. Injected into the
+    /// materialised ClientConfig so the node can find the matching published root.
+    #[serde(default)]
+    pub ring_epoch_id: Option<u32>,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -258,6 +272,9 @@ pub(crate) fn materialise(
     chains: Vec<mirage_core::config::ChainConfig>,
     operator_pub_hex: Option<&str>,
     enrol_token: Option<&str>,
+    ring_member_sk_hex: Option<&str>,
+    ring_path: Option<&[mirage_core::config::RingPathStep]>,
+    ring_epoch_id: Option<u32>,
 ) -> Result<String> {
     let mut obj: serde_json::Value =
         serde_json::from_str(template_raw).context("failed to parse client-template.json")?;
@@ -278,6 +295,24 @@ pub(crate) fn materialise(
     }
     if let Some(tok) = enrol_token {
         map.insert("enrol_token".to_owned(), serde_json::Value::String(tok.to_owned()));
+    }
+    // Inject ring-membership credential fields so the spawned cli can derive a
+    // 0x04 token at dial time without contacting the issuer.  All three fields
+    // must be present; absent → no ring credential injected.
+    if let Some(sk) = ring_member_sk_hex {
+        map.insert("ring_member_sk_hex".to_owned(), serde_json::Value::String(sk.to_owned()));
+    }
+    if let Some(path) = ring_path {
+        map.insert(
+            "ring_path".to_owned(),
+            serde_json::to_value(path).context("failed to serialise ring_path")?,
+        );
+    }
+    if let Some(eid) = ring_epoch_id {
+        map.insert(
+            "ring_epoch_id".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(eid)),
+        );
     }
     serde_json::to_string_pretty(&obj).context("failed to serialise materialised config")
 }
@@ -719,7 +754,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     info!("[sentinel] first config: version={} chains={}", first_cfg.version, first_cfg.chains.len());
 
     let chains: Vec<_> = first_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref()) {
+    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -974,7 +1009,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
                 info!("[sentinel] config updated: v={} chains={}", new_cfg.version, new_cfg.chains.len());
                 let chains: Vec<_> = new_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref()) {
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
