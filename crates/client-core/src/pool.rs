@@ -47,7 +47,13 @@ use crate::tunnel::{establish_raw_tunnel, freshen_chain_pubkeys};
 // ── Cold-start credential gate ────────────────────────────────────────────────
 
 /// Maximum time to wait for a credential to become ready on the first dial.
-const CREDENTIAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// 30s, not 8s: in the cli2 supervisor->worker flow the MonitorLink is set up
+/// AFTER the pool (via a SetupMonitorLink IPC handshake), so the first
+/// credential_params + relay-provisioned ring slot can take ~11s to arrive. An
+/// 8s cap timed out before the credential landed, defeating the gate. A
+/// credential-gated client cannot dial without a credential anyway, so a longer
+/// wait costs nothing in the failure case.
+const CREDENTIAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Poll interval while waiting for credential readiness.
 const CREDENTIAL_GATE_POLL_INTERVAL: std::time::Duration =

@@ -25,7 +25,9 @@ use crate::tunnel::{establish_mux_tunnel, freshen_chain_pubkeys};
 // ── Cold-start credential gate ────────────────────────────────────────────────
 
 /// Maximum time to wait for a credential to become ready on the first dial.
-const MUX_CREDENTIAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// 30s (see pool.rs CREDENTIAL_GATE_TIMEOUT): cli2 MonitorLink+relay latency can
+/// reach ~11s, so an 8s cap timed out before the ring slot arrived.
+const MUX_CREDENTIAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Poll interval while waiting for credential readiness.
 const MUX_CREDENTIAL_GATE_POLL_INTERVAL: std::time::Duration =
