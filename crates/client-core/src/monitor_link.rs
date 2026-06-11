@@ -719,6 +719,7 @@ impl MonitorLink {
             peer_table,
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
             Arc::new(ArcSwap::from_pointee(TokenPool::default())),
+            Arc::new(ArcSwap::from_pointee(None)),
             chain_set,
             transports,
             mesh_id,
@@ -749,6 +750,12 @@ impl MonitorLink {
     /// and `ring_cell` arcs so that they can be shared with `TunnelPool` /
     /// `MuxPool` instances created before the `MonitorLink` is constructed.
     ///
+    /// `ring_cell` MUST be the same `Arc` that was passed to every
+    /// `TunnelPool::new` / `MuxPool::new` call in the same binary.  MonitorLink
+    /// writes into this cell on every `RingSlot` frame; pools read from it on
+    /// every dial.  Passing a different (fresh) arc breaks hot-swap — the pools
+    /// never see the updated credential.
+    ///
     /// Use `link.credential_params()` / `link.token_pool()` /
     /// `link.ring_credential_cell()` to retrieve `Arc::clone`s from a link
     /// built with the ordinary [`new`] constructor.
@@ -758,6 +765,7 @@ impl MonitorLink {
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         token_pool: Arc<ArcSwap<TokenPool>>,
+        ring_cell: crate::token_pool::RingCredentialCell,
         chain_set: Arc<ChainSet>,
         transports: Vec<MonitorTransport>,
         mesh_id: String,
@@ -776,11 +784,6 @@ impl MonitorLink {
             rand::rngs::OsRng.fill_bytes(&mut key);
             key
         };
-
-        // Ring credential cell — empty until a RingSlot frame is received or
-        // the constructor's caller pre-populates it via `ring_credential_cell()`.
-        let ring_cell: crate::token_pool::RingCredentialCell =
-            Arc::new(ArcSwap::from_pointee(None));
 
         let link = Arc::new(Self {
             monitor_urls: Mutex::new(monitor_urls),

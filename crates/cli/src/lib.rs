@@ -464,6 +464,7 @@ pub async fn run(opts: CliRunOptions) -> Result<(), BoxError> {
             Arc::clone(&peer_table),
             Arc::clone(&credential_params),
             Arc::clone(&token_pool),
+            Arc::clone(&ring_credential),
             ChainSet::empty(),
             transports,
             config.mesh_id.clone(),
