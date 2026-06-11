@@ -125,6 +125,14 @@ async fn mux_wait_for_credential_ready(
     }
 }
 
+// ── Credential-rejected retry cap ────────────────────────────────────────────
+
+/// Maximum sleep interval (ms) between retries when every mux session dial
+/// fails with CREDENTIAL_REJECTED on a credential-gated pool.  The slot never
+/// permanently parks in this case -- it keeps retrying at this capped interval
+/// until the ring credential hot-swap lands.
+const MUX_CREDENTIAL_REJECTED_RETRY_CAP_MS: u64 = 20_000;
+
 // ── Circuit breaker state constants ──────────────────────────────────────────
 const CIRCUIT_CLOSED: u8 = 0;
 const CIRCUIT_OPEN: u8 = 1;
@@ -304,6 +312,10 @@ struct PoolInner {
     /// RingMembership authority is active in `credential_params`. Hot-swappable
     /// via ArcSwap — MonitorLink writes a new credential on epoch rotation.
     ring_credential: crate::token_pool::RingCredentialCell,
+    /// Whether this pool requires a credential to be present before dialing.
+    /// When `true`, CREDENTIAL_REJECTED errors are treated as transient and the
+    /// slot keeps retrying at a capped interval instead of permanently parking.
+    credential_gated: bool,
 }
 
 /// Semaphore capacity for the post-recovery burst limiter.
@@ -466,6 +478,7 @@ impl MuxPool {
             credential_params,
             token_pool,
             ring_credential,
+            credential_gated,
         }));
 
         let pool = Arc::new(Self {
@@ -1305,7 +1318,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
          peer_table_notify, credential_params_shared, token_pool_shared,
-         ring_credential_shared) = {
+         ring_credential_shared, credential_gated) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1318,6 +1331,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             Arc::clone(&guard.credential_params),
             Arc::clone(&guard.token_pool),
             Arc::clone(&guard.ring_credential),
+            guard.credential_gated,
         )
     };
 
@@ -1392,6 +1406,40 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                 pool.circuit_breaker.record_failure();
                 let limit_reached = max_attempts > 0 && attempt >= max_attempts;
                 if limit_reached {
+                    // CREDENTIAL_REJECTED on a credential-gated pool is a transient
+                    // condition: the ring slot is provisioned asynchronously and may
+                    // arrive 15-45 s after the first dial.  Do NOT park on
+                    // peer_table_change -- that signal never fires for credential
+                    // delivery.  Keep retrying at the capped interval so the next
+                    // attempt picks up the hot-swapped RingCredential from the cell.
+                    if credential_gated && crate::pool::is_credential_rejected(&e) {
+                        debug!(
+                            chain_id = %chain_id,
+                            slot = slot_idx,
+                            attempt,
+                            "mux: credential not yet available (CREDENTIAL_REJECTED), \
+                             will retry in {}ms",
+                            MUX_CREDENTIAL_REJECTED_RETRY_CAP_MS,
+                        );
+                        // Reset attempt so regular backoff resumes; cap kicks in
+                        // again if the credential still has not arrived.
+                        attempt = 0;
+                        tokio::select! {
+                            _ = tokio::time::sleep(
+                                std::time::Duration::from_millis(MUX_CREDENTIAL_REJECTED_RETRY_CAP_MS)
+                            ) => {}
+                            _ = peer_table_notify.notified() => {
+                                info!(
+                                    chain_id = %chain_id,
+                                    slot = slot_idx,
+                                    "mux: peer_table changed during credential-wait backoff \
+                                     -- retrying immediately"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     error!(
                         chain_id = %chain_id,
                         slot = slot_idx,

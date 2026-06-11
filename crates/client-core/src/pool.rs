@@ -167,6 +167,27 @@ async fn wait_for_credential_ready(
     }
 }
 
+// ── Credential-rejected retry cap ────────────────────────────────────────────
+
+/// Maximum sleep interval (ms) between retries when every attempt fails with
+/// CREDENTIAL_REJECTED on a credential-gated pool.  The slot never permanently
+/// parks in this case -- it keeps retrying at this capped interval until the
+/// ring credential hot-swap lands and the next dial succeeds.
+const CREDENTIAL_REJECTED_RETRY_CAP_MS: u64 = 20_000;
+
+/// Returns `true` when the dial error is a transient CREDENTIAL_REJECTED
+/// response from the remote hop (code 6 in the v9-fs FS-handshake frame).
+///
+/// The error arrives as `MirageError::Protocol("v9-fs hop[N]: CREDENTIAL_REJECTED (code 6)")`
+/// or the test-path variant `"v9-fs test hop[N]: CREDENTIAL_REJECTED (code 6)"`.
+/// Both share the substring `"CREDENTIAL_REJECTED"`.
+pub(crate) fn is_credential_rejected(err: &MirageError) -> bool {
+    match err {
+        MirageError::Protocol(msg) => msg.contains("CREDENTIAL_REJECTED"),
+        _ => false,
+    }
+}
+
 // ── Reaper constants ──────────────────────────────────────────────────────────
 
 /// How often the idle reaper wakes to scan for stale idle slots.
@@ -222,6 +243,11 @@ struct PoolInner {
     /// token pool when a RingMembership authority is active in
     /// `credential_params`.
     ring_credential: crate::token_pool::RingCredentialCell,
+    /// Whether this pool requires a credential to be present before dialing.
+    /// When `true`, CREDENTIAL_REJECTED errors are treated as transient
+    /// (credential not yet delivered) and the slot keeps retrying at a capped
+    /// interval instead of permanently parking on peer_table_change.
+    credential_gated: bool,
 }
 
 // ── Pool statistics ───────────────────────────────────────────────────────────
@@ -420,6 +446,7 @@ impl TunnelPool {
             credential_params,
             token_pool,
             ring_credential,
+            credential_gated,
         }));
 
         let pool = Arc::new(Self {
@@ -1214,7 +1241,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
          peer_table_notify, credential_params_shared, token_pool_shared,
-         ring_credential_shared) = {
+         ring_credential_shared, credential_gated) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1227,6 +1254,7 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             Arc::clone(&guard.credential_params),
             Arc::clone(&guard.token_pool),
             Arc::clone(&guard.ring_credential),
+            guard.credential_gated,
         )
     };
 
@@ -1307,6 +1335,44 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             Err(e) => {
                 let limit_reached = max_attempts > 0 && attempt >= max_attempts;
                 if limit_reached {
+                    // CREDENTIAL_REJECTED on a credential-gated pool is a transient
+                    // condition: the ring slot is provisioned asynchronously via the
+                    // monitor relay and may arrive 15-45 s after the first dial.
+                    // Do NOT park on peer_table_change in this case -- that signal
+                    // never fires for credential delivery.  Instead keep retrying at
+                    // the capped interval so the next retry picks up the hot-swapped
+                    // RingCredential from the shared cell.
+                    if credential_gated && is_credential_rejected(&e) {
+                        debug!(
+                            chain_id = %chain_id,
+                            slot = slot_idx,
+                            attempt,
+                            "credential not yet available (CREDENTIAL_REJECTED), \
+                             will retry in {}ms",
+                            CREDENTIAL_REJECTED_RETRY_CAP_MS,
+                        );
+                        // Reset attempt so the regular backoff path below continues
+                        // to use normal delays; cap kicks in when we re-enter the
+                        // limit_reached branch again.
+                        attempt = 0;
+                        // Sleep at the cap, but still wake on peer_table change so
+                        // a topology update also unblocks the slot.
+                        tokio::select! {
+                            _ = tokio::time::sleep(
+                                std::time::Duration::from_millis(CREDENTIAL_REJECTED_RETRY_CAP_MS)
+                            ) => {}
+                            _ = peer_table_notify.notified() => {
+                                info!(
+                                    chain_id = %chain_id,
+                                    slot = slot_idx,
+                                    "peer_table changed during credential-wait backoff \
+                                     -- retrying immediately"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     error!(
                         chain_id = %chain_id,
                         slot = slot_idx,
