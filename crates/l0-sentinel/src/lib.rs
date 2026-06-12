@@ -324,6 +324,39 @@ pub(crate) fn write_atomic(path: &PathBuf, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Captures the inputs required to re-materialise and atomically write the
+/// supervisor config on demand (e.g. from `ChainAvailable` fast-path nudge).
+/// All fields are immutable after construction; shared via `Arc`.
+pub(crate) struct MaterialiseCtx {
+    pub template_raw: String,
+    pub client_config_path: PathBuf,
+    pub operator_pub_hex: Option<String>,
+    pub enrol_token: Option<String>,
+    pub ring_member_sk_hex: Option<String>,
+    pub ring_path: Option<Vec<mirage_core::config::RingPathStep>>,
+    pub ring_epoch_id: Option<u32>,
+}
+
+impl MaterialiseCtx {
+    /// Materialise using the supplied chain list and atomically write
+    /// `client_config_path`.  Returns the written path on success.
+    pub(crate) fn rewrite(
+        &self,
+        chains: Vec<mirage_core::config::ChainConfig>,
+    ) -> Result<()> {
+        let json = materialise(
+            &self.template_raw,
+            chains,
+            self.operator_pub_hex.as_deref(),
+            self.enrol_token.as_deref(),
+            self.ring_member_sk_hex.as_deref(),
+            self.ring_path.as_deref(),
+            self.ring_epoch_id,
+        )?;
+        write_atomic(&self.client_config_path, &json)
+    }
+}
+
 pub(crate) fn build_child_args(template_args: &[String], config_path: &PathBuf) -> Vec<String> {
     let path_str = config_path.to_string_lossy();
     template_args.iter().map(|a| a.replace("{client_config_path}", &path_str)).collect()
@@ -699,6 +732,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         .debug_shell_binary
         .clone()
         .map(|bin| debug_shell::DebugShellManager::new(bin, state_dir.clone()));
+    let mat_ctx = Arc::new(MaterialiseCtx {
+        template_raw: template_raw.clone(),
+        client_config_path: cfg.client_config_path.clone(),
+        operator_pub_hex: cfg.operator_pub_hex.clone(),
+        enrol_token: cfg.enrol_token.clone(),
+        ring_member_sk_hex: cfg.ring_member_sk_hex.clone(),
+        ring_path: cfg.ring_path.clone(),
+        ring_epoch_id: cfg.ring_epoch_id,
+    });
     spawn_frame_watcher(
         Arc::clone(&link),
         debug_mgr.clone(),
@@ -706,6 +748,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         active_urls.clone(),
         cfg.mesh_id.clone(),
         wire_coords_tx,
+        mat_ctx,
     );
 
     // Disk-first: if a managed config from a prior session is on disk, run cli
@@ -1154,6 +1197,8 @@ fn unix_now_u64() -> u64 {
 /// - `DebugTunnelOpen` → write `<state_dir>/debug-tunnel.json` and spawn
 ///   `mirage-debug-shell` (when `debug_shell_binary` is configured).
 /// - `DebugTunnelClose` → SIGTERM the child.
+/// - `ChainAvailable` → re-materialise supervisor config from the current
+///   cached chain list and atomically write `client_config_path` (B3 fast-path).
 fn spawn_frame_watcher(
     link: Arc<MonitorLink>,
     debug_mgr: Option<Arc<debug_shell::DebugShellManager>>,
@@ -1161,6 +1206,7 @@ fn spawn_frame_watcher(
     initial_urls: Vec<String>,
     mesh_id: String,
     wire_coords_tx: tokio::sync::watch::Sender<Option<monitor_wire::WireCoords>>,
+    mat_ctx: Arc<MaterialiseCtx>,
 ) {
     use mirage_client_core::monitor_link::WsServerFrame;
 
@@ -1278,19 +1324,57 @@ fn spawn_frame_watcher(
                     }
                 }
                 WsServerFrame::ChainAvailable(ca) => {
-                    // Phase 1.14a (memory wave): the monitor is telling us
-                    // a freshly built chain has a better score than what
-                    // we're using. Full pool migration / drain-and-swap
-                    // lands in 1.14b/c (cli2 supervisor work). For now
-                    // we just log so live runs surface the signal.
+                    // B3 fast-path: a freshly built chain is ready.  The
+                    // authoritative full state will also arrive via the
+                    // imminent WsServerFrame::Config push (bump_version on
+                    // the monitor side), but we re-materialise immediately
+                    // from the current cached chain list so the cli2
+                    // supervisor's mtime poll fires without waiting for the
+                    // next 5-second poll tick.
+                    //
+                    // Why "current cached chain list" and not ca's entry
+                    // coords alone: ChainAvailable only carries partial
+                    // metadata (host, port, score) — the full ChainConfig
+                    // with hops/protocol/camouflage lives in the Config
+                    // snapshot already delivered by MonitorLink.  If we
+                    // tried to synthesise a minimal ChainConfig from ca we'd
+                    // produce an incomplete worker config; using the current
+                    // snapshot is correct and safe.
                     info!(
                         chain_id = %ca.chain_id,
                         est_score = ca.est_score,
                         replaces = ?ca.replaces_chain_id,
                         entry_host = %ca.entry.host,
                         entry_port = ca.entry.port,
-                        "[sentinel] ChainAvailable received (pool migration deferred to 1.14b/c)"
+                        "[sentinel] ChainAvailable — triggering immediate config rewrite"
                     );
+                    let snapshot = link.subscribe().borrow().clone();
+                    if let Some(cfg_snap) = snapshot {
+                        let chains: Vec<_> = cfg_snap
+                            .chains
+                            .iter()
+                            .map(|c| c.chain.clone())
+                            .collect();
+                        match mat_ctx.rewrite(chains) {
+                            Ok(()) => info!(
+                                chain_id = %ca.chain_id,
+                                path = %mat_ctx.client_config_path.display(),
+                                "[sentinel] ChainAvailable: supervisor config rewritten"
+                            ),
+                            Err(e) => warn!(
+                                chain_id = %ca.chain_id,
+                                "[sentinel] ChainAvailable: config rewrite failed: {}", e
+                            ),
+                        }
+                    } else {
+                        // No cached snapshot yet — the full Config frame
+                        // will arrive shortly and the main loop will write it.
+                        warn!(
+                            chain_id = %ca.chain_id,
+                            "[sentinel] ChainAvailable: no cached config snapshot yet, \
+                             deferring to Config frame"
+                        );
+                    }
                 }
                 WsServerFrame::CredentialParams(_) => {
                     // Anon-credential epoch secrets are consumed inside MonitorLink
