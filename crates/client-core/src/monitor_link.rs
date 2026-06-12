@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -582,6 +582,20 @@ pub struct MonitorLink {
     /// when `transports` has none).  `None` means no runtime override — the
     /// static `transports` list is used as-is.
     wire_override: Mutex<Option<WireParams>>,
+    /// Consecutive Wire connect failures on the current target.
+    ///
+    /// Reset to 0 on any clean Wire session (server-initiated close or clean
+    /// return from `run_wire_loop`).  When this reaches
+    /// `MIRAGE_MONITOR_WIRE_ROTATE_AFTER` (default 3), the run loop advances
+    /// `wire_candidate_idx` and seeds the next monitor candidate from
+    /// `peer_table`.  This implements round-robin rotation across all
+    /// `"monitor"` labeled peers in the live peer table.
+    wire_fail_count: AtomicU32,
+    /// Round-robin cursor over monitor Wire candidates extracted from
+    /// `peer_table`.  Incremented by the rotation path; wraps at the length
+    /// of the candidate list.  Index 0 = the initial/preferred candidate
+    /// (the one set via `seed_wire_transport`).
+    wire_candidate_idx: AtomicU32,
     /// Static operator Ed25519 verifying key pinned in sentinel.toml.
     ///
     /// When `Some`, every incoming `CredentialParams` frame is verified against
@@ -801,6 +815,8 @@ impl MonitorLink {
             chain_set,
             ephemeral_client_priv,
             wire_override: Mutex::new(None),
+            wire_fail_count: AtomicU32::new(0),
+            wire_candidate_idx: AtomicU32::new(0),
             operator_pub,
             last_credential_generation: std::sync::atomic::AtomicU64::new(0),
             enrol_token: std::sync::Mutex::new(None),
@@ -1424,12 +1440,38 @@ impl MonitorLink {
         // On every failed Wire attempt, escalate to OverChain if configured.
         let wire_retry_interval = Duration::from_secs(20);
 
+        // B2a: rotate to next monitor candidate after this many consecutive
+        // Wire connect failures on the same address.  Env knob:
+        // `MIRAGE_MONITOR_WIRE_ROTATE_AFTER` (default 3, min 1).
+        let rotate_after: u32 = std::env::var("MIRAGE_MONITOR_WIRE_ROTATE_AFTER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(3);
+
         loop {
             if let Some(wire) = self.wire_transport().await {
                 info!("monitor_link: Wire transport configured — attempting Mirage wire WS");
                 match self.run_wire_loop(&wire).await {
-                    Ok(()) => info!("monitor_link: Wire WS closed cleanly"),
-                    Err(e) => warn!("monitor_link: Wire WS failed ({e})"),
+                    Ok(()) => {
+                        info!("monitor_link: Wire WS closed cleanly");
+                        // Clean close = server-side shutdown; stay sticky on
+                        // the working address, reset the failure counter.
+                        self.wire_fail_count.store(0, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        warn!("monitor_link: Wire WS failed ({e})");
+                        let prev = self.wire_fail_count.fetch_add(1, Ordering::Relaxed);
+                        let now_count = prev + 1;
+                        if now_count >= rotate_after {
+                            // Attempt to rotate to the next monitor candidate.
+                            // Rotation resets the counter regardless of whether
+                            // a new candidate was found (avoids spinning if the
+                            // peer_table has only one entry).
+                            self.wire_fail_count.store(0, Ordering::Relaxed);
+                            self.rotate_wire_candidate().await;
+                        }
+                    }
                 }
             } else {
                 warn!("monitor_link: no Wire transport configured — waiting before retry");
@@ -1445,6 +1487,87 @@ impl MonitorLink {
                 tokio::time::sleep(wire_retry_interval).await;
             }
         }
+    }
+
+    /// Extract all `"monitor"`-labeled Wire candidates (`:19444`) from the live
+    /// `peer_table` and advance `wire_override` to the next entry in round-robin
+    /// order.
+    ///
+    /// Pin preservation: every candidate carries its own `pubkey_hex` from the
+    /// peer_table entry — the same source `seed_wire_transport` uses for the
+    /// initial entry.  No candidate is ever used without its paired key.
+    ///
+    /// If the table is empty or has only one entry that matches the current
+    /// override, the override is unchanged and a `warn!` is emitted.
+    async fn rotate_wire_candidate(&self) {
+        let pt = self.peer_table.load();
+        let mesh_id = self.mesh_id.clone();
+
+        // Collect all monitor Wire entries (label="monitor", addr=*:19444).
+        let candidates: Vec<WireParams> = pt
+            .peers
+            .iter()
+            .filter(|e| {
+                e.labels.iter().any(|l| l == "monitor") && e.addr.ends_with(":19444")
+            })
+            .map(|e| WireParams {
+                monitor_addr: e.addr.clone(),
+                monitor_pubkey_hex: e.pubkey_hex.clone(),
+                mesh_id: mesh_id.clone(),
+                host_hint: None,
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            warn!(
+                "monitor_link: Wire rotation requested but peer_table has no \
+                 monitor Wire candidates — keeping current target"
+            );
+            return;
+        }
+
+        if candidates.len() == 1 {
+            // Only one candidate: log and stay (already rotating to itself).
+            let only = &candidates[0];
+            let current = self.wire_override.lock().await.clone();
+            if current.as_ref().map(|w| w.monitor_addr.as_str()) == Some(only.monitor_addr.as_str()) {
+                warn!(
+                    current = %only.monitor_addr,
+                    "monitor_link: Wire rotation — only one monitor candidate in peer_table, \
+                     cannot advance; per-URL backoff will pace retries"
+                );
+            } else {
+                let new_addr = only.monitor_addr.clone();
+                info!(
+                    new = %new_addr,
+                    "monitor_link: Wire rotation — single candidate, seeding"
+                );
+                *self.wire_override.lock().await = Some(only.clone());
+            }
+            return;
+        }
+
+        // Advance the candidate index and pick.
+        let idx = self.wire_candidate_idx.fetch_add(1, Ordering::Relaxed);
+        let next_idx = ((idx + 1) as usize) % candidates.len();
+        let next = candidates[next_idx].clone();
+
+        let old_addr = self
+            .wire_override
+            .lock()
+            .await
+            .as_ref()
+            .map(|w| w.monitor_addr.clone())
+            .unwrap_or_default();
+
+        info!(
+            old = %old_addr,
+            new = %next.monitor_addr,
+            candidates = candidates.len(),
+            "monitor_link: Wire rotation — advancing to next monitor candidate"
+        );
+
+        *self.wire_override.lock().await = Some(next);
     }
 
     /// True when any `OverChain` transport is configured.
