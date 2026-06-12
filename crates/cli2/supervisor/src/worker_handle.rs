@@ -6,7 +6,12 @@ use mirage_chain_ipc::{
     pipe::{PipePair, connect_with_retry},
     pipe_path,
 };
-use std::{path::Path, time::Instant};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    path::Path,
+    time::Instant,
+};
 use tokio::process::Child;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -72,6 +77,19 @@ impl RestartTracker {
     }
 }
 
+/// Compute a fingerprint of `chain` by serializing to JSON and hashing with
+/// `DefaultHasher`.  Two `ChainConfig` values that serialize identically will
+/// produce the same fingerprint; any field change produces a different value.
+///
+/// `DefaultHasher` is not stable across Rust releases but is sufficient here:
+/// we only compare fingerprints within a single process lifetime.
+pub fn chain_fingerprint(chain: &crate::config::ChainConfig) -> u64 {
+    let json = serde_json::to_string(chain).unwrap_or_default();
+    let mut h = DefaultHasher::new();
+    json.hash(&mut h);
+    h.finish()
+}
+
 /// Handle to a worker process. IPC is via named pipe / Unix socket.
 pub struct WorkerHandle {
     pub chain_id: String,
@@ -81,6 +99,10 @@ pub struct WorkerHandle {
     pub intentional_restart: bool,
     /// Tracks how often this worker has been respawned.
     pub restart_tracker: RestartTracker,
+    /// Fingerprint of the `ChainConfig` this worker was started with.
+    /// Computed at spawn time via [`chain_fingerprint`].  Used by the reconcile
+    /// loop to detect same-id config changes that require a drain+respawn.
+    pub config_fingerprint: u64,
     /// Child process handle. `None` for reattached orphans (supervisor didn't spawn them).
     child: Option<Child>,
     /// IPC write half (send SupervisorMsg to worker).
@@ -109,6 +131,8 @@ impl WorkerHandle {
     /// After spawn, connects to its named pipe / Unix socket with retries.
     /// Expects the worker to send `Hello` on connect; sends `Continue` if the
     /// worker already has config (shouldn't happen on fresh spawn, but safe).
+    /// The effective config is fingerprinted at this point so the reconcile
+    /// loop can later detect same-id config changes.
     pub fn spawn(binary_path: &Path, chain_config: &ChainConfig) -> anyhow::Result<Self> {
         Self::spawn_with_tracker(binary_path, chain_config, RestartTracker::default())
     }
@@ -217,12 +241,15 @@ impl WorkerHandle {
             ipc_relay_loop(ipc, sup_rx, worker_tx, chain_id_bg).await;
         });
 
+        let config_fingerprint = chain_fingerprint(chain_config);
+
         Ok(Self {
             chain_id,
             pid: None,
             state: HandleState::Spawned,
             intentional_restart: false,
             restart_tracker,
+            config_fingerprint,
             child: Some(child),
             ipc_writer: IpcSender { tx: sup_tx },
             rx: worker_rx,
@@ -248,6 +275,9 @@ impl WorkerHandle {
             state: HandleState::Ready, // orphan was running; assume Ready until proven otherwise
             intentional_restart: false,
             restart_tracker: RestartTracker::default(),
+            // Orphan config is unknown to the supervisor — use 0 so the first
+            // reconcile always treats it as "changed" if the config differs.
+            config_fingerprint: 0,
             child: None,
             ipc_writer: IpcSender { tx: sup_tx },
             rx: worker_rx,

@@ -51,7 +51,7 @@ pub async fn reconcile(
 
     let mut to_spawn: Vec<&ChainConfig> = Vec::new();
     let mut to_remove: Vec<String> = Vec::new();
-    let to_replace: Vec<&ChainConfig> = Vec::new();
+    let mut to_replace: Vec<&ChainConfig> = Vec::new();
 
     // Check each desired chain.
     for chain in new_chains {
@@ -66,32 +66,22 @@ pub async fn reconcile(
                 info!(chain_id = %chain.id, "reconcile: exited worker — will respawn");
                 to_spawn.push(chain);
             }
-            Some(_) => {
-                // Running handle exists. Check if config changed.
-                // We compare only the fields the worker actually uses.
-                // Config equality: we do NOT have a snapshot of what config the
-                // running worker was started with, so we compare against the
-                // current live config's chain entry for the same id.  This
-                // means the first reconcile after supervisor restart will always
-                // see "no change" for already-running workers — correct
-                // behaviour (workers survive supervisor restart).
-                //
-                // To detect a *change*, we check the new_chains set against the
-                // config that was passed in this call.  If the caller loaded a
-                // fresh config file, `new_chains` reflects what the operator
-                // wants; a mismatch vs the current `handles` key implies the
-                // operator edited the file.
-                //
-                // We have no record of the per-handle socks5_bind the worker
-                // was started with (it's not stored on WorkerHandle).  Use the
-                // chain id as the identity key — if the operator wants to change
-                // socks5_bind or config_path they can rename the chain id, or we
-                // detect the mismatch here by comparing against a mirror stored
-                // in ReconcileState below.
-                //
-                // For now: same id → same config (no change).  The operator can
-                // force a replace by removing and re-adding the chain id, or by
-                // triggering replace logic via `known_configs` (see below).
+            Some(handle) => {
+                // Running handle exists. Compare config fingerprints to detect
+                // same-id config changes (e.g. monitor pushes a replacement
+                // chain spec under the same chain id — B3 feature).
+                let new_fp = crate::worker_handle::chain_fingerprint(chain);
+                let old_fp = handle.config_fingerprint;
+                if old_fp != new_fp {
+                    info!(
+                        chain_id = %chain.id,
+                        old_fingerprint = old_fp,
+                        new_fingerprint = new_fp,
+                        "reconcile: config changed — will drain+respawn"
+                    );
+                    to_replace.push(chain);
+                }
+                // Fingerprints match → worker is running the correct config.
             }
         }
     }
@@ -158,7 +148,7 @@ pub async fn reconcile(
 
     // ── 5. Push updated TUN registry if anything changed ──────────────────────
 
-    let any_change = !to_remove.is_empty() || !newly_ready.is_empty();
+    let any_change = !to_remove.is_empty() || !to_replace.is_empty() || !newly_ready.is_empty();
     if any_change {
         push_tun_registry(config).await;
     }
