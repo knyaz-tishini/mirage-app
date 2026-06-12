@@ -61,6 +61,33 @@ pub struct Config {
     /// worker's SOCKS5 port to forward each connection to.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+
+    /// Path to the config file that the supervisor re-reads for runtime chain
+    /// adoption.  Defaults to the path passed on the CLI (populated by
+    /// `main.rs` after load).  Setting this explicitly lets the sentinel
+    /// materialise a *separate* chains config file while the supervisor config
+    /// stays static.
+    ///
+    /// The supervisor polls `mtime` every `reload_poll_secs` seconds.  When the
+    /// file changes, it reconciles the new `[[chains]]` set against running
+    /// workers (spawn new, drain+kill removed, drain+kill+respawn changed).
+    #[serde(default)]
+    pub reload_config_path: Option<String>,
+
+    /// Poll interval for config-file mtime checks (seconds).  Default: 5.
+    #[serde(default = "default_reload_poll")]
+    pub reload_poll_secs: u64,
+
+    /// Optional bind address for the supervisor's local control HTTP listener.
+    ///
+    /// When set (e.g. `"127.0.0.1:19491"`), the supervisor binds a minimal
+    /// HTTP server that exposes `POST /chains/reload`.  Posting to that
+    /// endpoint triggers an immediate config reconcile (same code path as the
+    /// poll loop) without waiting for the next mtime tick.
+    ///
+    /// Default: absent (no HTTP listener).
+    #[serde(default)]
+    pub control_http_bind: Option<String>,
 }
 
 /// Router policy used by the supervisor's own SOCKS5 listener.
@@ -89,6 +116,10 @@ fn default_router_bind() -> String {
 
 fn default_ota_poll() -> u64 {
     300
+}
+
+fn default_reload_poll() -> u64 {
+    5
 }
 
 /// Single chain definition.

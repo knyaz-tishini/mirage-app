@@ -4,8 +4,10 @@
 //! handles IPC, polls for OTA updates, and performs rolling binary rollouts.
 
 mod config;
+mod control_endpoint;
 mod ota_poller;
 mod reattach;
+mod reconcile;
 mod rollout;
 mod router_listener;
 mod state;
@@ -20,10 +22,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use config::Config;
+use control_endpoint::spawn_control_endpoint;
 use mirage_chain_ipc::WorkerMsg;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use ota_poller::{UpdateAvailable, spawn_ota_poller};
 use reattach::discover_orphans;
+use reconcile::{reconcile, try_reload_config};
 use rollout::{download_new_binary, rolling_update, shutdown_all};
 use tun_registry::push_tun_registry;
 use worker_handle::{HandleState, WorkerHandle};
@@ -87,8 +91,14 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "supervisor.toml".to_string());
 
-    let config = Config::load(&config_path)
+    let mut config = Config::load(&config_path)
         .with_context(|| format!("loading config from {config_path}"))?;
+
+    // If no explicit reload_config_path, default to the CLI config path so the
+    // operator can trigger chain adoption simply by editing supervisor.toml.
+    if config.reload_config_path.is_none() {
+        config.reload_config_path = Some(config_path.clone());
+    }
 
     info!(
         chains = config.chains.len(),
@@ -381,6 +391,55 @@ async fn main() -> anyhow::Result<()> {
         ota_tx,
     );
 
+    // ── Config-reload channel ─────────────────────────────────────────────────
+    // Both the mtime poll task and the control HTTP endpoint send `()` here to
+    // trigger an immediate reconcile in the main loop.
+    let (reload_tx, mut reload_rx) = mpsc::channel::<()>(4);
+
+    // ── Control HTTP endpoint (optional) ─────────────────────────────────────
+    if let Some(ref bind_str) = config.control_http_bind {
+        match bind_str.parse::<std::net::SocketAddr>() {
+            Err(e) => {
+                warn!(bind = %bind_str, "control_http_bind is invalid: {e} — control endpoint not started");
+            }
+            Ok(bind_addr) => {
+                spawn_control_endpoint(bind_addr, reload_tx.clone());
+            }
+        }
+    }
+
+    // ── Config-file mtime poll task ───────────────────────────────────────────
+    // Polls every `reload_poll_secs` seconds.  Sends `()` on `reload_tx` when
+    // the file's mtime advances (i.e. the config was written by the sentinel or
+    // the operator).
+    {
+        let poll_path = config
+            .reload_config_path
+            .clone()
+            .expect("reload_config_path is always Some after startup normalisation");
+        let poll_interval = tokio::time::Duration::from_secs(config.reload_poll_secs);
+        let poll_tx = reload_tx.clone();
+        tokio::spawn(async move {
+            // Seed with current mtime so we don't trigger on startup.
+            let mut last_mtime = std::fs::metadata(&poll_path)
+                .and_then(|m| m.modified())
+                .ok();
+            loop {
+                tokio::time::sleep(poll_interval).await;
+                let current_mtime = std::fs::metadata(&poll_path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                if current_mtime != last_mtime && current_mtime.is_some() {
+                    debug!(path = %poll_path, "config file changed — signalling reconcile");
+                    last_mtime = current_mtime;
+                    // Best-effort: if the channel is full the main loop will catch
+                    // the change on the next poll tick.
+                    let _ = poll_tx.try_send(());
+                }
+            }
+        });
+    }
+
     // Shutdown signal.
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -567,6 +626,35 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                }
+            }
+
+            // ── Config-reload trigger (mtime poll or control endpoint) ─────────
+            _ = reload_rx.recv() => {
+                // Drain any additional signals that queued up while we were busy
+                // so we do one reconcile, not N.
+                while reload_rx.try_recv().is_ok() {}
+
+                let reload_path = config
+                    .reload_config_path
+                    .as_deref()
+                    .unwrap_or(&config_path);
+                info!(path = %reload_path, "config-reload triggered — reconciling chains");
+
+                if let Some(new_config) = try_reload_config(reload_path) {
+                    // Replace in-memory config so the new chain set is used for
+                    // future peer_table broadcasts, TUN registry, etc.
+                    config = new_config;
+                    // Normalise reload_config_path again in case it was absent.
+                    if config.reload_config_path.is_none() {
+                        config.reload_config_path = Some(config_path.clone());
+                    }
+                    reconcile(
+                        &mut handles,
+                        &config,
+                        &binary_path,
+                        &state_dir_path,
+                    ).await;
                 }
             }
 
