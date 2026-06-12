@@ -133,6 +133,19 @@ async fn mux_wait_for_credential_ready(
 /// until the ring credential hot-swap lands.
 const MUX_CREDENTIAL_REJECTED_RETRY_CAP_MS: u64 = 20_000;
 
+// ── Park-with-timeout knob (shared with pool.rs semantics) ───────────────────
+
+/// Reads the same `MIRAGE_SLOT_PARK_TIMEOUT_MS` env var used by TunnelPool so
+/// both pool types behave identically when a slot parks after max attempts
+/// (bug 5 / F2 fix for the mux path).
+fn mux_slot_park_timeout() -> std::time::Duration {
+    let ms = std::env::var("MIRAGE_SLOT_PARK_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15_000);
+    std::time::Duration::from_millis(ms)
+}
+
 // ── Circuit breaker state constants ──────────────────────────────────────────
 const CIRCUIT_CLOSED: u8 = 0;
 const CIRCUIT_OPEN: u8 = 1;
@@ -1446,13 +1459,31 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                         attempt,
                         is_onion,
                         error = %e,
-                        "mux reconnect gave up after max attempts — waiting for peer_table change"
+                        "mux reconnect gave up after max attempts — parking (timeout={}ms)",
+                        mux_slot_park_timeout().as_millis(),
                     );
-                    // Block until a peer_table update arrives, then restart the
-                    // attempt counter.  This prevents permanent lockup when the
-                    // peer_table was empty at dial time and arrives later.
-                    peer_table_notify.notified().await;
-                    info!(chain_id = %chain_id, slot = slot_idx, "mux: peer_table changed — resetting attempt counter");
+                    // B4a: park with a bounded timeout instead of blocking
+                    // forever on peer_table_notify.  For a dead or static entry
+                    // the notify never fires, permanently stranding the slot.
+                    // On timeout, re-resolve by resetting the attempt counter
+                    // and re-entering the loop — freshen_chain_pubkeys at the
+                    // top of the loop picks up any peer_table changes.  The
+                    // timeout IS the retry cadence for dead-entry chains
+                    // (bug 5 / F2 — mux path).
+                    let park_timeout = mux_slot_park_timeout();
+                    tokio::select! {
+                        _ = tokio::time::sleep(park_timeout) => {
+                            info!(
+                                chain_id = %chain_id,
+                                slot = slot_idx,
+                                timeout_ms = park_timeout.as_millis(),
+                                "mux: park timeout expired — re-resolving slot target and retrying",
+                            );
+                        }
+                        _ = peer_table_notify.notified() => {
+                            info!(chain_id = %chain_id, slot = slot_idx, "mux: peer_table changed — resetting attempt counter");
+                        }
+                    }
                     attempt = 0;
                     continue;
                 }

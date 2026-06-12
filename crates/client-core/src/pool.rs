@@ -188,6 +188,31 @@ pub(crate) fn is_credential_rejected(err: &MirageError) -> bool {
     }
 }
 
+// ── Park-with-timeout knob ────────────────────────────────────────────────────
+
+/// Maximum time (ms) a slot parks waiting for a `peer_table_notify` signal
+/// before giving up and re-resolving the target from the current peer_table /
+/// chain set.  For a dead/static entry `peer_table_notify` never fires, so
+/// the slot would park forever.  This timeout breaks the livelock: on expiry
+/// the attempt counter is reset and the reconnect loop retries with the
+/// freshest chain data available, which may resolve to a live entry if any
+/// existed (B4a fix for bug 5 / F2).
+///
+/// The timeout doubles as the cadence for these "dead-entry" retries — set it
+/// long enough to avoid thrashing, short enough to recover within one
+/// monitoring interval when a new peer_table push arrives out-of-band.
+///
+/// Override with the `MIRAGE_SLOT_PARK_TIMEOUT_MS` environment variable.
+const SLOT_PARK_TIMEOUT_MS_DEFAULT: u64 = 15_000;
+
+fn slot_park_timeout() -> std::time::Duration {
+    let ms = std::env::var("MIRAGE_SLOT_PARK_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(SLOT_PARK_TIMEOUT_MS_DEFAULT);
+    std::time::Duration::from_millis(ms)
+}
+
 // ── Reaper constants ──────────────────────────────────────────────────────────
 
 /// How often the idle reaper wakes to scan for stale idle slots.
@@ -1379,13 +1404,31 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                         attempt,
                         is_onion,
                         error = %e,
-                        "reconnect gave up after max attempts — waiting for peer_table change"
+                        "reconnect gave up after max attempts — parking (timeout={}ms)",
+                        slot_park_timeout().as_millis(),
                     );
-                    // Block until a peer_table update arrives, then restart the
-                    // attempt counter.  This prevents permanent lockup when the
-                    // peer_table was empty at dial time and arrives later.
-                    peer_table_notify.notified().await;
-                    info!(chain_id = %chain_id, slot = slot_idx, "peer_table changed — resetting attempt counter");
+                    // B4a: park with a bounded timeout instead of blocking
+                    // forever on peer_table_notify.  For a dead or static entry
+                    // the notify never fires, permanently stranding the slot.
+                    // On timeout, re-resolve by resetting the attempt counter
+                    // and re-entering the loop — freshen_chain_pubkeys at the
+                    // top of the loop picks up any peer_table changes, and
+                    // retrying on a live entry unparks the slot.  The timeout
+                    // IS the retry cadence for dead-entry chains (bug 5 / F2).
+                    let park_timeout = slot_park_timeout();
+                    tokio::select! {
+                        _ = tokio::time::sleep(park_timeout) => {
+                            info!(
+                                chain_id = %chain_id,
+                                slot = slot_idx,
+                                timeout_ms = park_timeout.as_millis(),
+                                "park timeout expired — re-resolving slot target and retrying",
+                            );
+                        }
+                        _ = peer_table_notify.notified() => {
+                            info!(chain_id = %chain_id, slot = slot_idx, "peer_table changed — resetting attempt counter");
+                        }
+                    }
                     attempt = 0;
                     continue;
                 }
