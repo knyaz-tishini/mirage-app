@@ -1419,13 +1419,22 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                 pool.circuit_breaker.record_failure();
                 let limit_reached = max_attempts > 0 && attempt >= max_attempts;
                 if limit_reached {
-                    // CREDENTIAL_REJECTED on a credential-gated pool is a transient
-                    // condition: the ring slot is provisioned asynchronously and may
-                    // arrive 15-45 s after the first dial.  Do NOT park on
+                    // CREDENTIAL_REJECTED on a credential-gated pool is transient:
+                    // the ring slot is provisioned asynchronously and may arrive
+                    // 15-45 s after the first dial.  Do NOT park on
                     // peer_table_change -- that signal never fires for credential
-                    // delivery.  Keep retrying at the capped interval so the next
-                    // attempt picks up the hot-swapped RingCredential from the cell.
-                    if credential_gated && crate::pool::is_credential_rejected(&e) {
+                    // delivery.  Retry at the capped interval so the next attempt
+                    // picks up the hot-swapped RingCredential from the cell.
+                    //
+                    // B4b: same effective_credential_gated derivation as pool.rs --
+                    // gate on CredentialParams.require (explicit server-side signal)
+                    // not on operator_pub_hex.is_some() (construction-time heuristic).
+                    let effective_credential_gated = cred_snap
+                        .as_ref()
+                        .as_ref()
+                        .map(|p| p.require)
+                        .unwrap_or(credential_gated);
+                    if effective_credential_gated && crate::pool::is_credential_rejected(&e) {
                         debug!(
                             chain_id = %chain_id,
                             slot = slot_idx,

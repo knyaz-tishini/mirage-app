@@ -1360,14 +1360,30 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             Err(e) => {
                 let limit_reached = max_attempts > 0 && attempt >= max_attempts;
                 if limit_reached {
-                    // CREDENTIAL_REJECTED on a credential-gated pool is a transient
-                    // condition: the ring slot is provisioned asynchronously via the
-                    // monitor relay and may arrive 15-45 s after the first dial.
-                    // Do NOT park on peer_table_change in this case -- that signal
-                    // never fires for credential delivery.  Instead keep retrying at
-                    // the capped interval so the next retry picks up the hot-swapped
-                    // RingCredential from the shared cell.
-                    if credential_gated && is_credential_rejected(&e) {
+                    // CREDENTIAL_REJECTED on a credential-gated pool is transient:
+                    // the ring slot is provisioned asynchronously via the monitor
+                    // relay and may arrive 15-45 s after the first dial.  Do NOT
+                    // park on peer_table_change in this case -- that signal never
+                    // fires for credential delivery.  Retry at the capped interval
+                    // so the next attempt picks up the hot-swapped RingCredential.
+                    //
+                    // B4b: derive the gate from CredentialParams.require (the
+                    // explicit server-side policy flag, monitor-pushed) rather than
+                    // from operator_pub_hex.is_some() (the construction-time
+                    // heuristic).  operator_pub_hex is a WIRE key, not a
+                    // requirement signal: a wire can carry an operator key while
+                    // the target node has require=false, and vice versa — both
+                    // cases create a livelock variant under the old heuristic.
+                    // When CredentialParams have not arrived yet (None), fall back
+                    // to the construction-time flag and rely on the
+                    // CREDENTIAL_REJECTED-transient retry path (3be78a3) to
+                    // converge once the server does reject.
+                    let effective_credential_gated = cred_snap
+                        .as_ref()
+                        .as_ref()
+                        .map(|p| p.require)
+                        .unwrap_or(credential_gated);
+                    if effective_credential_gated && is_credential_rejected(&e) {
                         debug!(
                             chain_id = %chain_id,
                             slot = slot_idx,
