@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use config::Config;
 use control_endpoint::spawn_control_endpoint;
-use mirage_chain_ipc::WorkerMsg;
+use mirage_chain_ipc::{MonitorTransportSpec, WorkerMsg};
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use ota_poller::{UpdateAvailable, spawn_ota_poller};
 use reattach::discover_orphans;
@@ -31,6 +31,105 @@ use reconcile::{reconcile, try_reload_config};
 use rollout::{download_new_binary, rolling_update, shutdown_all};
 use tun_registry::push_tun_registry;
 use worker_handle::{HandleState, WorkerHandle};
+
+/// Resolved SetupMonitorLink parameters ready to send to the ML-host worker.
+///
+/// Stored after the initial send so the respawn path can re-send without
+/// reconstructing from config (config may change between boot and respawn).
+#[derive(Clone)]
+struct MlSetup {
+    /// chain_id of the designated ML-host worker.
+    host_chain_id: String,
+    monitor_urls: Vec<String>,
+    monitor_api_key: Option<String>,
+    transports_json: String,
+}
+
+/// Build the `MlSetup` struct from the current `Config`.
+///
+/// Returns `None` when:
+/// - No chain has `monitor_link_host = true`.
+/// - Transport serialisation fails (logged as `warn`).
+fn build_ml_setup(config: &Config) -> Option<MlSetup> {
+    use config::MonitorTransportConfig;
+
+    let host_chain = config.chains.iter().find(|c| c.monitor_link_host)?;
+    let host_chain_id = host_chain.id.clone();
+
+    let mut ipc_specs: Vec<MonitorTransportSpec> = Vec::new();
+
+    // Wire — flat fields take precedence.
+    if let (Some(wire_addr), Some(wire_pubkey)) = (
+        config.monitor_wire_addr.clone(),
+        config.monitor_wire_pubkey_hex.clone(),
+    ) {
+        ipc_specs.push(MonitorTransportSpec::Wire {
+            monitor_addr: wire_addr,
+            monitor_pubkey_hex: wire_pubkey,
+            mesh_id: config
+                .monitor_transports
+                .iter()
+                .find_map(|t| {
+                    if let MonitorTransportConfig::Wire { mesh_id, .. } = t {
+                        Some(mesh_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "v3-staging".to_string()),
+        });
+    }
+
+    for t in &config.monitor_transports {
+        match t {
+            MonitorTransportConfig::DirectWs { .. } => {}
+            MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
+                let chain_cfg = config.chains.iter().find(|c| &c.id == chain_id)?;
+                let socks5: std::net::SocketAddr = match chain_cfg.socks5_bind.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(
+                            "supervisor: build_ml_setup: chain {chain_id} socks5_bind \
+                             invalid: {e} — MonitorLink setup skipped"
+                        );
+                        return None;
+                    }
+                };
+                ipc_specs.push(MonitorTransportSpec::OverChain {
+                    worker_socks5: socks5,
+                    monitor_addr: *monitor_addr,
+                    chain_id: chain_id.clone(),
+                });
+            }
+            MonitorTransportConfig::Wire { monitor_addr, monitor_pubkey_hex, mesh_id } => {
+                let already = config.monitor_wire_addr.is_some()
+                    && config.monitor_wire_pubkey_hex.is_some();
+                if !already {
+                    ipc_specs.push(MonitorTransportSpec::Wire {
+                        monitor_addr: monitor_addr.clone(),
+                        monitor_pubkey_hex: monitor_pubkey_hex.clone(),
+                        mesh_id: mesh_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    let transports_json = match serde_json::to_string(&ipc_specs) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("supervisor: build_ml_setup: serialise transports failed: {e}");
+            return None;
+        }
+    };
+
+    Some(MlSetup {
+        host_chain_id,
+        monitor_urls: vec![config.monitor_url.clone()],
+        monitor_api_key: config.monitor_api_key.clone(),
+        transports_json,
+    })
+}
 
 /// Fetch the peer_table JSON from monitor's `/relay/clients/config` on cold start.
 async fn bootstrap_peer_table_http(
@@ -260,119 +359,34 @@ async fn main() -> anyhow::Result<()> {
     // the main loop for broadcast to all other workers.
     let (pt_tx, mut pt_rx) = mpsc::channel::<String>(8);
 
-    // Find the designated MonitorLink host chain (if any).
-    let ml_host_chain = config.chains.iter().find(|c| c.monitor_link_host);
+    // Build the resolved SetupMonitorLink params once and store them so the
+    // respawn path (B2b) can re-send without reconstructing from config.
+    let ml_setup: Option<MlSetup> = build_ml_setup(&config);
 
-    match ml_host_chain {
+    match &ml_setup {
         None => {
-            warn!("supervisor: no chain has monitor_link_host = true — running without MonitorLink (peer_table will not update)");
+            warn!("supervisor: no chain has monitor_link_host = true (or transport build failed) — running without MonitorLink (peer_table will not update)");
         }
-        Some(host_chain) => {
-            let host_chain_id = host_chain.id.clone();
-            if let Some(handle) = handles.get_mut(&host_chain_id) {
-                // Convert TOML-side MonitorTransportConfig into IPC-side
-                // MonitorTransportSpec. For OverChain we look up the named
-                // chain's socks5_bind from [[chains]] and inject it as
-                // worker_socks5 (option b — transport via SOCKS5 to worker,
-                // not via decrypted Tunnel).
-                use mirage_chain_ipc::MonitorTransportSpec;
-                use config::MonitorTransportConfig;
-                let mut ipc_specs: Vec<MonitorTransportSpec> = Vec::new();
-                let mut conv_err: Option<String> = None;
-
-                // Wire transport — prepended first (preferred over DirectWs).
-                // Can be specified either via the flat supervisor.toml fields
-                // or as a `[[monitor_transports]]` entry with kind = "wire".
-                // The flat fields are checked here; the tagged entry is handled
-                // in the loop below.
-                if let (Some(wire_addr), Some(wire_pubkey)) = (
-                    config.monitor_wire_addr.clone(),
-                    config.monitor_wire_pubkey_hex.clone(),
-                ) {
-                    ipc_specs.push(MonitorTransportSpec::Wire {
-                        monitor_addr: wire_addr,
-                        monitor_pubkey_hex: wire_pubkey,
-                        mesh_id: config.monitor_transports
-                            .iter()
-                            .find_map(|t| {
-                                if let MonitorTransportConfig::Wire { mesh_id, .. } = t {
-                                    Some(mesh_id.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| "v3-staging".to_string()),
-                    });
-                }
-
-                for t in &config.monitor_transports {
-                    match t {
-                        MonitorTransportConfig::DirectWs { .. } => {
-                            // DirectWs has been removed — skip silently.
-                            tracing::debug!("supervisor: DirectWs transport config ignored (removed)");
-                        }
-                        MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
-                            let chain_cfg = match config.chains.iter().find(|c| &c.id == chain_id) {
-                                Some(c) => c,
-                                None => {
-                                    conv_err = Some(format!(
-                                        "monitor_transports.over_chain references unknown chain_id={chain_id}"
-                                    ));
-                                    break;
-                                }
-                            };
-                            let socks5: std::net::SocketAddr = match chain_cfg.socks5_bind.parse() {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    conv_err = Some(format!(
-                                        "chain {chain_id} socks5_bind invalid: {e}"
-                                    ));
-                                    break;
-                                }
-                            };
-                            ipc_specs.push(MonitorTransportSpec::OverChain {
-                                worker_socks5: socks5,
-                                monitor_addr: *monitor_addr,
-                                chain_id: chain_id.clone(),
-                            });
-                        }
-                        MonitorTransportConfig::Wire { monitor_addr, monitor_pubkey_hex, mesh_id } => {
-                            // Skip if already inserted from flat fields to avoid duplicate.
-                            let already_inserted = config.monitor_wire_addr.is_some()
-                                && config.monitor_wire_pubkey_hex.is_some();
-                            if !already_inserted {
-                                ipc_specs.push(MonitorTransportSpec::Wire {
-                                    monitor_addr: monitor_addr.clone(),
-                                    monitor_pubkey_hex: monitor_pubkey_hex.clone(),
-                                    mesh_id: mesh_id.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-                if let Some(err) = conv_err {
-                    warn!("supervisor: monitor_transports conversion failed: {err} — MonitorLink not delegated");
+        Some(setup) => {
+            if let Some(handle) = handles.get_mut(&setup.host_chain_id) {
+                if let Err(e) = handle.send_setup_monitor_link(
+                    setup.monitor_urls.clone(),
+                    setup.monitor_api_key.clone(),
+                    setup.transports_json.clone(),
+                ).await {
+                    warn!(
+                        chain_id = %setup.host_chain_id,
+                        "supervisor: failed to send SetupMonitorLink: {e}"
+                    );
                 } else {
-                match serde_json::to_string(&ipc_specs) {
-                    Err(e) => {
-                        warn!("supervisor: failed to serialize monitor_transports: {e} — MonitorLink not delegated");
-                    }
-                    Ok(transports_json) => {
-                        if let Err(e) = handle.send_setup_monitor_link(
-                            vec![config.monitor_url.clone()],
-                            config.monitor_api_key.clone(),
-                            transports_json,
-                        ).await {
-                            warn!("supervisor: failed to send SetupMonitorLink to {host_chain_id}: {e}");
-                        } else {
-                            info!("supervisor: SetupMonitorLink sent to worker {host_chain_id}");
-                        }
-                    }
-                }
+                    info!(
+                        chain_id = %setup.host_chain_id,
+                        "supervisor: SetupMonitorLink sent to worker"
+                    );
                 }
             } else {
                 warn!(
-                    chain_id = %host_chain.id,
+                    chain_id = %setup.host_chain_id,
                     "supervisor: monitor_link_host chain has no live handle — MonitorLink not delegated"
                 );
             }
@@ -529,6 +543,29 @@ async fn main() -> anyhow::Result<()> {
                     if let Err(e) = new_handle.send_start(chain_cfg, respawn_pt).await {
                         error!(chain_id = %chain_id, "send_start after respawn failed: {e:#}");
                     }
+
+                    // B2b: if the respawned worker is the ML-host, re-send
+                    // SetupMonitorLink so the MonitorLink comes back up without
+                    // requiring a supervisor restart.
+                    if let Some(ref setup) = ml_setup {
+                        if setup.host_chain_id == chain_id {
+                            info!(
+                                chain_id = %chain_id,
+                                "supervisor: ML-host worker respawned — re-sending SetupMonitorLink"
+                            );
+                            if let Err(e) = new_handle.send_setup_monitor_link(
+                                setup.monitor_urls.clone(),
+                                setup.monitor_api_key.clone(),
+                                setup.transports_json.clone(),
+                            ).await {
+                                warn!(
+                                    chain_id = %chain_id,
+                                    "supervisor: re-send SetupMonitorLink after respawn failed: {e:#}"
+                                );
+                            }
+                        }
+                    }
+
                     handles.insert(chain_id, new_handle);
                 }
             }
