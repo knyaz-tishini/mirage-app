@@ -90,8 +90,10 @@ pub enum RestartPolicy {
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentKind {
     Sentinel,
-    Cli,
-    /// Generic — orchestrator just spawns the binary; not embeddable in task mode.
+    /// Generic — orchestrator just spawns the binary; not embeddable in task
+    /// mode. The cli2 data-plane (`mirage-chain-supervisor`) is a Generic
+    /// process-mode component. (cli1's dedicated `Cli` kind was removed with
+    /// cli1, 2026-06-14.)
     Generic,
 }
 

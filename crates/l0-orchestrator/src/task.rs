@@ -74,22 +74,12 @@ async fn run_component(
             mirage_l0_sentinel::run(cfg).await?;
             Ok(0)
         }
-        ComponentKind::Cli => {
-            let cfg_path = extract_config_path(&args)
-                .ok_or_else(|| anyhow::anyhow!("cli task requires --config <path>"))?;
-            let opts = mirage_client_cli::CliRunOptions {
-                config_path: cfg_path.into(),
-                bind: extract_bind(&args),
-                install_panic_hook: false,
-                install_memory_guard: false,
-                exit_on_memory_fatal: false,
-            };
-            mirage_client_cli::run(opts)
-                .await
-                .map_err(|e| anyhow::anyhow!("cli run failed: {}", e))?;
-            Ok(0)
-        }
         ComponentKind::Generic => {
+            // The cli2 data-plane (mirage-chain-supervisor) runs ONLY in process
+            // mode (Generic) — its workers are detached OS processes (OTA-safe),
+            // which task mode cannot host. Task-mode embedding of a data-plane is
+            // deferred to the future mobile cli2-as-lib work; cli1's task arm was
+            // removed with cli1 (2026-06-14).
             anyhow::bail!("Generic component kind cannot run in task mode — use process mode")
         }
     }
@@ -103,19 +93,6 @@ fn extract_config_path(args: &[String]) -> Option<String> {
         }
         if let Some(rest) = a.strip_prefix("--config=") {
             return Some(rest.to_string());
-        }
-    }
-    None
-}
-
-fn extract_bind(args: &[String]) -> Option<std::net::SocketAddr> {
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
-        if a == "--bind" || a == "-b" {
-            return iter.next().and_then(|s| s.parse().ok());
-        }
-        if let Some(rest) = a.strip_prefix("--bind=") {
-            return rest.parse().ok();
         }
     }
     None

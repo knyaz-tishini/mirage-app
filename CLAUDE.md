@@ -140,8 +140,8 @@ mirage2app содержит **headless backend клиента**. Три проц
 |-------|------|
 | `crates/l0-orchestrator/` (`mirage-l0-orchestrator`) | Топ-уровневый supervisor для desktop+mobile. Process mode (desktop) спавнит компоненты бинарями; task mode (mobile) — встраивает их через `lib::run()` в один процесс. См. `orchestrator.example.toml` |
 | `crates/l0-sentinel/` (`mirage-l0-sentinel`) | Bootstrap: связь с монитором, материализация client-config, спавн cli. **Двойной крейт (lib + bin)** — `pub async fn run(SentinelConfig)` для embedded use из orchestrator |
-| `crates/cli/` (`mirage-client-cli`) | SOCKS5/HTTP proxy server, TunnelPool/MuxPool, push в TUN через `/chains/update`. **Двойной крейт (lib + bin)** — `pub async fn run(CliRunOptions)` для embedded use |
-| `crates/cli2/` (`supervisor` + `worker`) | Split-arch: один supervisor + N worker-процессов (по чейну) с reattach через named pipes — для soft-restart на OTA |
+| `crates/cli2/` (`supervisor` + `worker`) | **Единственный data-plane.** Split-arch: один supervisor + N worker-процессов (по чейну) с reattach через named pipes — soft-restart на OTA. Supervisor читает sentinel-овский `ClientConfig` JSON через `Config::load_any`/`from_client_config` |
+| ~~`crates/cli/` (`mirage-client-cli`)~~ | 🔴 **RETIRED 2026-06-14** → `crates/_deprecated/cli/`. Legacy single-process data-plane (cli1). Полностью заменён cli2. НЕ использовать, НЕ собирать. Убран из workspace members, orchestrator dep, build-win-bins.sh, installer |
 
 mirage2tun (отдельный submodule) — низкоуровневый TUN-перехватчик. Получает chains через `cli` POST. **Нельзя ходить в монитор напрямую из cli или tun** — только через sentinel. MonitorLink в самих cli/tun допустим только как fallback на случай мёртвого sentinel.
 
@@ -172,7 +172,13 @@ respect_user_config = true
 
 **Marker `_managed_by`**: если файл уже существует **без** этого маркера и `respect_user_config=true` — sentinel **не перезаписывает**, просто спавнит cli с существующим файлом. Это для пользовательских конфигов (file/QR) — sentinel их не трогает.
 
-## cli (`mirage-client-cli`)
+## cli (`mirage-client-cli`) — 🔴 RETIRED 2026-06-14
+
+> **Legacy. Не использовать.** cli1 перенесён в `crates/_deprecated/cli/` и
+> полностью заменён cli2 (см. ниже + `_deprecated/cli/_DEPRECATED.md`). Убран из
+> workspace members, `l0-orchestrator` dep (+ `ComponentKind::Cli`),
+> `scripts/build-win-bins.sh`, и Windows-installer. Раздел ниже — историческая
+> справка. E2E-доказательство замены: `nemo/docs/mirage/handoffs/handoff-2026-06-13-phase2-and-critiques.md` §8.
 
 Читает `client-config.json` (включая `chains[]`, `monitor_url`, `monitor_api_key?`). Поднимает SOCKS5 listener'ы, TunnelPool/MuxPool на каждый чейн.
 
