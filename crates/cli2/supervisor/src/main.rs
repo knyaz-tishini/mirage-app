@@ -488,6 +488,11 @@ async fn main() -> anyhow::Result<()> {
     // trigger an immediate reconcile in the main loop.
     let (reload_tx, mut reload_rx) = mpsc::channel::<()>(4);
 
+    // Shared per-worker status snapshot: the main loop writes it each iteration,
+    // the control HTTP endpoint serves it on GET /status and /admin/health.
+    let shared_status: control_endpoint::SharedStatus =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // ── Control HTTP endpoint (optional) ─────────────────────────────────────
     if let Some(ref bind_str) = config.control_http_bind {
         match bind_str.parse::<std::net::SocketAddr>() {
@@ -495,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
                 warn!(bind = %bind_str, "control_http_bind is invalid: {e} — control endpoint not started");
             }
             Ok(bind_addr) => {
-                spawn_control_endpoint(bind_addr, reload_tx.clone());
+                spawn_control_endpoint(bind_addr, reload_tx.clone(), std::sync::Arc::clone(&shared_status));
             }
         }
     }
@@ -557,6 +562,21 @@ async fn main() -> anyhow::Result<()> {
                 }
                 handle.apply_msg(&event.msg);
                 log_worker_event(chain_id, &event.msg);
+            }
+        }
+
+        // Refresh the shared status snapshot served by the control endpoint.
+        {
+            let snap: Vec<control_endpoint::WorkerStatusSnapshot> = handles
+                .iter()
+                .map(|(id, h)| control_endpoint::WorkerStatusSnapshot {
+                    chain_id: id.clone(),
+                    pid: h.pid,
+                    state: format!("{:?}", h.state),
+                })
+                .collect();
+            if let Ok(mut s) = shared_status.lock() {
+                *s = snap;
             }
         }
 
