@@ -388,6 +388,44 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ── Supervisor-level HTTP CONNECT proxy ───────────────────────────────────
+    // Process-wide singleton (one fixed TCP port) → supervisor-level, not
+    // per-worker. When enabled AND a router is configured, chain each CONNECT
+    // through the router's SOCKS5 egress.
+    if let Some(http_cfg) = &config.http_proxy {
+        if http_cfg.enabled {
+            match &config.routing {
+                None => warn!(
+                    "http_proxy.enabled but no [routing] configured — the HTTP CONNECT proxy \
+                     needs the router's SOCKS5 egress; not started"
+                ),
+                Some(routing_cfg) => match http_cfg.bind_addr.parse::<std::net::SocketAddr>() {
+                    Err(e) => warn!(
+                        bind = %http_cfg.bind_addr,
+                        "http_proxy.bind_addr invalid: {e} — not started"
+                    ),
+                    Ok(bind_addr) => {
+                        let socks = routing_cfg.socks5_bind.clone();
+                        let server =
+                            mirage_client_core::http_proxy::HttpProxyServer::new_with_socks_upstream(
+                                bind_addr,
+                                socks.clone(),
+                            );
+                        tokio::spawn(async move {
+                            if let Err(e) = server.run_via_socks().await {
+                                error!("HTTP CONNECT proxy exited with error: {e}");
+                            }
+                        });
+                        info!(
+                            bind = %bind_addr, socks = %socks,
+                            "supervisor HTTP CONNECT proxy spawned (via router SOCKS5)"
+                        );
+                    }
+                },
+            }
+        }
+    }
+
     // ── MonitorLink: delegate to the designated worker ────────────────────────
     // The supervisor no longer owns a MonitorLink. Instead it finds the chain
     // with `monitor_link_host = true` and sends `SetupMonitorLink` to that

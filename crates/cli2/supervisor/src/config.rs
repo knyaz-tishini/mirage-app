@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use mirage_core::config::DnsConfig;
+use mirage_core::config::{DnsConfig, HttpProxyConfig};
 use serde::{Deserialize, Serialize};
 
 /// Top-level supervisor config.
@@ -98,6 +98,13 @@ pub struct Config {
     /// to the router's `socks5_bind`.
     #[serde(default)]
     pub dns: Option<DnsConfig>,
+
+    /// Optional HTTP CONNECT proxy. When `http_proxy.enabled = true` AND
+    /// `[routing]` is configured, the supervisor binds an HTTP CONNECT proxy at
+    /// `http_proxy.bind_addr` and chains each CONNECT through the router's
+    /// SOCKS5 egress. Process-wide singleton → supervisor-level, not per-worker.
+    #[serde(default)]
+    pub http_proxy: Option<HttpProxyConfig>,
 }
 
 /// Router policy used by the supervisor's own SOCKS5 listener.
