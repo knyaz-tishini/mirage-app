@@ -209,6 +209,14 @@ pub struct SentinelConfig {
     /// materialised ClientConfig so the node can find the matching published root.
     #[serde(default)]
     pub ring_epoch_id: Option<u32>,
+    /// When `false`, sentinel performs bootstrap + identity + config materialisation +
+    /// MonitorLink + TUN normally, but **does not spawn the cli** child process.
+    /// Use this when an external supervisor (e.g. `mirage-l0-orchestrator`) owns
+    /// the cli lifecycle directly.
+    ///
+    /// Defaults to `true` (existing behaviour — sentinel spawns cli on its own).
+    #[serde(default = "default_spawn_cli")]
+    pub spawn_cli: bool,
 }
 
 pub(crate) fn default_client_args() -> Vec<String> {
@@ -247,6 +255,7 @@ pub(crate) fn default_supervisor_args() -> Vec<String> {
 }
 pub(crate) fn default_mesh_id() -> String { "v3-staging".into() }
 pub(crate) fn default_role() -> String { "sentry-client".into() }
+pub(crate) fn default_spawn_cli() -> bool { true }
 
 // ── Managed marker ────────────────────────────────────────────────────────────
 
@@ -837,20 +846,22 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "mirage2tun".to_owned());
 
-    if let Some(cli_pid_path) = pid_file::cli_pid_path() {
-        match pid_file::probe(&cli_pid_path, &cli_hint) {
-            pid_file::ProbeResult::Alive { pid } => {
-                info!("[sentinel] adopting existing cli pid={}", pid);
-                match adopt_child(pid, cli_pid_path) {
-                    Ok(h) => {
-                        let adopted_pid = h.process.id();
-                        children.lock().await.cli = Some(h);
-                        publisher.set(SentinelPhase::ChildRunning { pid: adopted_pid });
+    if cfg.spawn_cli {
+        if let Some(cli_pid_path) = pid_file::cli_pid_path() {
+            match pid_file::probe(&cli_pid_path, &cli_hint) {
+                pid_file::ProbeResult::Alive { pid } => {
+                    info!("[sentinel] adopting existing cli pid={}", pid);
+                    match adopt_child(pid, cli_pid_path) {
+                        Ok(h) => {
+                            let adopted_pid = h.process.id();
+                            children.lock().await.cli = Some(h);
+                            publisher.set(SentinelPhase::ChildRunning { pid: adopted_pid });
+                        }
+                        Err(e) => warn!("[sentinel] adopt cli failed: {} — will spawn fresh", e),
                     }
-                    Err(e) => warn!("[sentinel] adopt cli failed: {} — will spawn fresh", e),
                 }
+                pid_file::ProbeResult::Stale | pid_file::ProbeResult::Missing => {}
             }
-            pid_file::ProbeResult::Stale | pid_file::ProbeResult::Missing => {}
         }
     }
 
@@ -868,40 +879,44 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
     // ── End adopt-on-startup ──────────────────────────────────────────────────
 
-    let already_running = children.lock().await.cli.is_some();
-    if already_running {
-        publisher.set(SentinelPhase::ChildRunning { pid: None });
-    } else {
-        publisher.set(SentinelPhase::ConfigReady {
-            version: first_cfg.version,
-            chains: first_cfg.chains.len(),
-            materialised_at_ms: unix_now_u64() as u128,
-        });
+    if cfg.spawn_cli {
+        let already_running = children.lock().await.cli.is_some();
+        if already_running {
+            publisher.set(SentinelPhase::ChildRunning { pid: None });
+        } else {
+            publisher.set(SentinelPhase::ConfigReady {
+                version: first_cfg.version,
+                chains: first_cfg.chains.len(),
+                materialised_at_ms: unix_now_u64() as u128,
+            });
 
-        // Auto-spawn cli — ChildRunning fires (amber dancing cube in launcher).
-        let (cli_binary_auto, cli_args_auto) = resolve_cli_binary_and_args(&cfg);
-        let spawn_flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
-        match crate::supervisor::spawn_child_with_flags_and_mirror(
-            &cli_binary_auto,
-            &cli_args_auto,
-            spawn_flags,
-            crate::supervisor::unified_log_path(),
-        ) {
-            Ok(handle) => {
-                let cli_pid = handle.process.id();
-                info!("[sentinel] auto-spawned cli pid={:?}", cli_pid);
-                if let Some(pid) = cli_pid {
-                    if let Some(path) = pid_file::cli_pid_path() {
-                        pid_file::write(&path, pid);
+            // Auto-spawn cli — ChildRunning fires (amber dancing cube in launcher).
+            let (cli_binary_auto, cli_args_auto) = resolve_cli_binary_and_args(&cfg);
+            let spawn_flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+            match crate::supervisor::spawn_child_with_flags_and_mirror(
+                &cli_binary_auto,
+                &cli_args_auto,
+                spawn_flags,
+                crate::supervisor::unified_log_path(),
+            ) {
+                Ok(handle) => {
+                    let cli_pid = handle.process.id();
+                    info!("[sentinel] auto-spawned cli pid={:?}", cli_pid);
+                    if let Some(pid) = cli_pid {
+                        if let Some(path) = pid_file::cli_pid_path() {
+                            pid_file::write(&path, pid);
+                        }
                     }
+                    children.lock().await.cli = Some(handle);
+                    publisher.set(SentinelPhase::ChildRunning { pid: cli_pid });
                 }
-                children.lock().await.cli = Some(handle);
-                publisher.set(SentinelPhase::ChildRunning { pid: cli_pid });
-            }
-            Err(e) => {
-                warn!("[sentinel] auto-spawn cli failed: {} — staying ConfigReady", e);
+                Err(e) => {
+                    warn!("[sentinel] auto-spawn cli failed: {} — staying ConfigReady", e);
+                }
             }
         }
+    } else {
+        info!("[sentinel] spawn_cli=false — cli lifecycle managed externally (orchestrator)");
     }
 
     // Task 5: telemetry push over the native wire (0 = disabled by default)

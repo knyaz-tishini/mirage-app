@@ -88,6 +88,32 @@ async fn supervise_one(
             return;
         }
 
+        // ── wait_for_file readiness gate ─────────────────────────────────────
+        if let Some(ref path) = cc.wait_for_file {
+            info!(
+                component = %cc.name,
+                path = %path.display(),
+                "supervisor: waiting for file before spawning"
+            );
+            loop {
+                if shutdown.is_cancelled() || *kill_rx.borrow() {
+                    info!(component = %cc.name, "supervisor: shutdown during wait_for_file — exiting loop");
+                    return;
+                }
+                if tokio::fs::metadata(path).await.is_ok() {
+                    info!(component = %cc.name, "supervisor: wait_for_file satisfied");
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = shutdown.cancelled() => {
+                        info!(component = %cc.name, "supervisor: shutdown during wait_for_file poll — exiting loop");
+                        return;
+                    }
+                }
+            }
+        }
+
         let component = Component {
             name: cc.name.clone(),
             kind: cc.kind,

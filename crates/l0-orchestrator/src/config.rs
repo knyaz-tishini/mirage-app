@@ -65,6 +65,13 @@ pub struct ComponentConfig {
     pub env: Vec<String>,
     #[serde(default = "default_restart")]
     pub restart: RestartPolicy,
+    /// If set, the supervisor will poll for this file's existence every 500 ms
+    /// before spawning this component.  Use this to sequence components without
+    /// a race: set it to the path that the preceding component writes atomically
+    /// (e.g. the materialised `client-config.json` written by sentinel) so the
+    /// data-plane never starts before the config is on disk.
+    #[serde(default)]
+    pub wait_for_file: Option<std::path::PathBuf>,
 }
 
 fn default_restart() -> RestartPolicy { RestartPolicy::OnFailure }
