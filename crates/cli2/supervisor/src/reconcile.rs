@@ -318,7 +318,7 @@ fn build_monitor_transport_specs(config: &Config) -> Vec<MonitorTransportSpec> {
 
 /// Reload the config from `path` and return a fresh `Config`, or `None` on error.
 pub fn try_reload_config(path: &str) -> Option<Config> {
-    match Config::load(path) {
+    match Config::load_any(path) {
         Ok(c) => Some(c),
         Err(e) => {
             warn!(path, "reconcile: config reload failed: {e:#}");

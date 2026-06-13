@@ -3,7 +3,9 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use mirage_core::config::{DnsConfig, HttpProxyConfig};
+use mirage_core::config::{
+    ClientConfig, DnsConfig, HttpProxyConfig, MonitorTransportConfig as CoreMonitorTransport,
+};
 use serde::{Deserialize, Serialize};
 
 /// Top-level supervisor config.
@@ -203,12 +205,147 @@ fn default_monitor_addr() -> SocketAddr {
 }
 
 impl Config {
-    /// Load and parse a TOML config file.
-    pub fn load(path: &str) -> anyhow::Result<Self> {
+    /// Load a config file, auto-detecting the format.
+    ///
+    /// A `.json` path (or a file whose first non-whitespace byte is `{`) is
+    /// parsed as a [`ClientConfig`] — the unified config the sentinel
+    /// materialises and the cli2 worker already reads (`worker/main.rs`) — and
+    /// lowered into a supervisor `Config` via [`Config::from_client_config`].
+    /// Any other path falls back to the legacy supervisor TOML.
+    ///
+    /// This is the production sentinel→cli2 path: ONE JSON, emitted by the
+    /// sentinel, consumed by BOTH the supervisor (here) and every worker.
+    pub fn load_any(path: &str) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
-        let config: Config =
-            toml::from_str(&text).with_context(|| format!("parsing config {path}"))?;
-        Ok(config)
+        let is_json = path
+            .rsplit('.')
+            .next()
+            .map(|e| e.eq_ignore_ascii_case("json"))
+            .unwrap_or(false)
+            || text.trim_start().starts_with('{');
+        if is_json {
+            let cc: ClientConfig = serde_json::from_str(&text)
+                .with_context(|| format!("parsing client config JSON {path}"))?;
+            Self::from_client_config(&cc, path)
+        } else {
+            toml::from_str::<Config>(&text).with_context(|| format!("parsing config {path}"))
+        }
+    }
+
+    /// Lower a unified [`ClientConfig`] into a supervisor `Config`.
+    ///
+    /// The dynamic wire/chain spec (chains, mesh, monitor transports, creds via
+    /// the worker) comes from the ClientConfig itself; the install-static
+    /// orchestration knobs (`worker_binary`, `ota_pubkey`, router, …) come from
+    /// its `supervisor` sub-object. `config_path` is the path the ClientConfig
+    /// was read from — every worker is pointed back at it (each worker finds its
+    /// own chain by `chain_id`), and it becomes the supervisor's mtime-watched
+    /// reload source.
+    pub fn from_client_config(cc: &ClientConfig, config_path: &str) -> anyhow::Result<Self> {
+        let sup = cc.supervisor.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "client config {config_path} has no `supervisor` block — cannot run \
+                 cli2-supervisor from it (cli1-only config?)"
+            )
+        })?;
+
+        // MonitorLink-host designation: explicit chain_id, else the first chain.
+        let ml_host: Option<String> = sup
+            .monitor_link_host_chain
+            .clone()
+            .or_else(|| cc.chains.first().map(|c| c.chain_id.clone()));
+
+        // Per-chain run-set: every worker reads THIS json (config_path) and finds
+        // its own chain by id. A chain without a socks5_bind cannot host a worker
+        // SOCKS5 ingress → hard error (caught here, not a silent dead worker).
+        let mut chains = Vec::with_capacity(cc.chains.len());
+        for c in &cc.chains {
+            let socks5_bind = c.socks5_bind.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "chain '{}' has no socks5_bind — the cli2 worker needs a SOCKS5 \
+                     ingress per chain; set chains[].socks5_bind in the client config",
+                    c.chain_id
+                )
+            })?;
+            chains.push(ChainConfig {
+                id: c.chain_id.clone(),
+                socks5_bind,
+                config_path: config_path.to_string(),
+                monitor_link_host: ml_host.as_deref() == Some(c.chain_id.as_str()),
+            });
+        }
+
+        // Map monitor transports: mirage-core variants → supervisor variants.
+        // The `Wire` transport is synthesised from the flat wire fields below.
+        let mut monitor_transports: Vec<MonitorTransportConfig> = Vec::new();
+        for t in &cc.monitor_transports {
+            match t {
+                CoreMonitorTransport::DirectWs { url, sni, .. } => {
+                    monitor_transports.push(MonitorTransportConfig::DirectWs {
+                        url: url.clone(),
+                        sni: sni.clone(),
+                    });
+                }
+                CoreMonitorTransport::OverChain {
+                    chain_id,
+                    monitor_endpoint,
+                    ..
+                } => match monitor_endpoint.parse::<SocketAddr>() {
+                    Ok(addr) => monitor_transports.push(MonitorTransportConfig::OverChain {
+                        chain_id: chain_id.clone(),
+                        monitor_addr: addr,
+                    }),
+                    Err(e) => tracing::warn!(
+                        "from_client_config: over-chain monitor_endpoint '{monitor_endpoint}' \
+                         for chain {chain_id} is not a socket addr: {e} — transport skipped"
+                    ),
+                },
+            }
+        }
+        // Synthesise a Wire transport carrying the real mesh_id so build_ml_setup's
+        // flat-field branch resolves mesh_id from it (instead of defaulting).
+        if let (Some(addr), Some(pubkey)) =
+            (cc.monitor_wire_addr.clone(), cc.monitor_wire_pubkey_hex.clone())
+        {
+            monitor_transports.push(MonitorTransportConfig::Wire {
+                monitor_addr: addr,
+                monitor_pubkey_hex: pubkey,
+                mesh_id: cc.mesh_id.clone(),
+            });
+        }
+
+        let routing = sup.routing.as_ref().map(|r| RoutingConfig {
+            policy: r.policy.clone(),
+            socks5_bind: r.socks5_bind.clone(),
+            chain_ids: r.chain_ids.clone(),
+        });
+
+        if cc.monitor_url.is_none() {
+            tracing::warn!(
+                "from_client_config: client config {config_path} has no monitor_url — \
+                 HTTP peer_table bootstrap will be skipped (Wire/over-chain transport only)"
+            );
+        }
+
+        Ok(Config {
+            monitor_url: cc.monitor_url.clone().unwrap_or_default(),
+            ota_pubkey: sup.ota_pubkey.clone(),
+            ota_poll_interval_secs: sup.ota_poll_interval_secs,
+            worker_binary: sup.worker_binary.clone(),
+            tun_api_url: cc.tun_api_url.clone(),
+            monitor_api_key: sup.monitor_api_key.clone(),
+            state_dir: sup.state_dir.clone(),
+            chains,
+            monitor_transports,
+            monitor_wire_addr: cc.monitor_wire_addr.clone(),
+            monitor_wire_pubkey_hex: cc.monitor_wire_pubkey_hex.clone(),
+            routing,
+            reload_config_path: Some(config_path.to_string()),
+            reload_poll_secs: sup.reload_poll_secs,
+            control_http_bind: sup.control_http_bind.clone(),
+            dns: Some(cc.dns.clone()),
+            http_proxy: Some(cc.http_proxy.clone()),
+        })
     }
 }

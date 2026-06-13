@@ -190,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "supervisor.toml".to_string());
 
-    let mut config = Config::load(&config_path)
+    let mut config = Config::load_any(&config_path)
         .with_context(|| format!("loading config from {config_path}"))?;
 
     // If no explicit reload_config_path, default to the CLI config path so the
