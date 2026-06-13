@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
+use mirage_core::config::DnsConfig;
 use serde::{Deserialize, Serialize};
 
 /// Top-level supervisor config.
@@ -88,6 +89,15 @@ pub struct Config {
     /// Default: absent (no HTTP listener).
     #[serde(default)]
     pub control_http_bind: Option<String>,
+
+    /// Optional local DoH DNS forwarder. When `dns.enabled = true` AND
+    /// `[routing]` is configured, the supervisor binds a UDP DNS listener
+    /// (`dns.listen_addr`) and tunnels queries (DoH) through the router's
+    /// SOCKS5 egress, so DNS exits via the chains instead of leaking to the
+    /// system resolver. `dns.socks_addr` is ignored — the upstream is pinned
+    /// to the router's `socks5_bind`.
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
 }
 
 /// Router policy used by the supervisor's own SOCKS5 listener.

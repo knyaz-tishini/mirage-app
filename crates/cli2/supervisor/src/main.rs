@@ -348,6 +348,46 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ── Supervisor-level DNS forwarder ────────────────────────────────────────
+    // When `[dns] enabled = true` AND a router is configured, run a local DoH
+    // forwarder that tunnels DNS queries through the router's SOCKS5 egress, so
+    // DNS exits via the chains (no system-resolver leak). The forwarder's SOCKS5
+    // upstream is pinned to the router bind regardless of `dns.socks_addr`.
+    // Process-wide singleton (binds one fixed UDP port) → supervisor-level, not
+    // per-worker.
+    if let Some(dns_cfg) = &config.dns {
+        if dns_cfg.enabled {
+            match &config.routing {
+                None => warn!(
+                    "dns.enabled but no [routing] configured — the DNS forwarder needs the \
+                     router's SOCKS5 egress; not started"
+                ),
+                Some(routing_cfg) => {
+                    let mut dns_cfg = dns_cfg.clone();
+                    dns_cfg.socks_addr = format!("socks5h://{}", routing_cfg.socks5_bind);
+                    let listen = dns_cfg.listen_addr.clone();
+                    match mirage_client_core::dns_forwarder::DnsForwarder::new(dns_cfg) {
+                        Ok(fwd) => {
+                            let fwd = std::sync::Arc::new(fwd);
+                            tokio::spawn(async move {
+                                if let Err(e) = fwd.run().await {
+                                    error!("dns forwarder exited with error: {e}");
+                                }
+                            });
+                            info!(
+                                listen = %listen, socks = %routing_cfg.socks5_bind,
+                                "supervisor DNS forwarder spawned (DoH via router SOCKS5)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!("dns forwarder construction failed: {e} — not started")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── MonitorLink: delegate to the designated worker ────────────────────────
     // The supervisor no longer owns a MonitorLink. Instead it finds the chain
     // with `monitor_link_host = true` and sends `SetupMonitorLink` to that
