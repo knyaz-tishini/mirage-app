@@ -9,7 +9,7 @@
 //! supervisor restarts: after the supervisor exits and is relaunched, it
 //! simply reconnects to the same pipe.
 
-use std::{net::SocketAddr, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::SystemTime};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -25,7 +25,8 @@ use mirage_client_core::{
     monitor_link::{MonitorLink, MonitorTransport},
     mux_pool::MuxPool,
     pool::TunnelPool,
-    socks5::Socks5Server,
+    socks5::{Socks5Server, SocksFailurePolicy},
+    wire_health::WireHealthMap,
 };
 use mirage_core::{
     config::{ClientConfig, ProtocolId, ReplyMode, TcpProtocolId},
@@ -308,8 +309,27 @@ async fn main() -> anyhow::Result<()> {
     // Channel to signal SOCKS5 server to stop.
     let (stop_tx, stop_rx) = watch::channel(false);
 
+    // Per-worker kill-switch setup.
+    //
+    // A worker owns exactly one chain — no cross-chain failover pools are
+    // available here (General-group cross-wire rerouting spans multiple workers
+    // and is a supervisor-level concern, not handled inside a single worker).
+    // We pass an empty failover list so the server is purely fail-closed for
+    // its own wire.  The policy map contains this worker's single chain so the
+    // kill-switch invariant (dead wire → SOCKS5 error, never bypass) is enforced.
+    let shared_wire_health = WireHealthMap::new();
+    let worker_policy = SocksFailurePolicy::from_chain_config(
+        chain.kill_switch.as_ref(),
+        chain.group.as_deref(),
+        &chain_id,
+    );
+    let chain_policies: HashMap<String, SocksFailurePolicy> =
+        [(chain_id.clone(), worker_policy)].into();
+
     // Spawn SOCKS5 server.
-    let server = Socks5Server::new(addr);
+    let server = Socks5Server::new_with_failover(addr, vec![])
+        .with_kill_switch(chain_id.clone(), chain_policies)
+        .with_shared_wire_health(Arc::clone(&shared_wire_health));
     // Clone for supervisor_loop; original moves into server closure below.
     let mux_pool_for_loop = mux_pool_opt.as_ref().map(Arc::clone);
     let server_handle = tokio::spawn({
