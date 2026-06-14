@@ -40,7 +40,7 @@ function vnoise(x,y,s){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,u
 function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
  const Ng=30,ns=4242,PX=[],PZ=[],DIRW=[];
  for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const u=i/(Ng-1),v=j/(Ng-1),px=(u-0.5)*2.0,pz=(v-0.5)*2.0,idx=i*Ng+j;
-  PX[idx]=px;PZ[idx]=pz;const rho=Math.hypot(px,pz),rhoN=Math.min(1,rho/1.30),th=rhoN*Math.PI,ph=Math.atan2(pz,px);
+  PX[idx]=px;PZ[idx]=pz;const rho=Math.hypot(px,pz),ph=Math.atan2(pz,px),rb=1.0/Math.max(Math.abs(Math.cos(ph)),Math.abs(Math.sin(ph)),1e-6),rhoN=Math.min(1,rho/rb),th=rhoN*Math.PI;
   DIRW[idx]=[Math.sin(th)*Math.cos(ph),Math.cos(th),Math.sin(th)*Math.sin(ph)];}
  const NODES=[{lat:55,lon:37,l:"ru-094.74"},{lat:39,lon:35,l:"tr-094.247"},{lat:52,lon:5,l:"nl-173.104"},{lat:47,lon:8,l:"ch-119.139"},{lat:55,lon:49,l:"ru-245.247"}];
  function v3(la,lo){la*=Math.PI/180;lo*=Math.PI/180;return[Math.cos(la)*Math.cos(lo),Math.sin(la),Math.cos(la)*Math.sin(lo)];}
