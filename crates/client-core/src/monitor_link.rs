@@ -526,6 +526,25 @@ struct InflightBatch {
     retained: Vec<([u8; bt::MSG_LEN], bt::ClientBlind)>,
 }
 
+// ── CredentialSummary ─────────────────────────────────────────────────────────
+
+/// A lightweight, serialisable snapshot of the current credential configuration.
+///
+/// Derived from the live [`CredentialParams`] stored in
+/// [`MonitorLink::credential_params`].  Intended for GUI / polling consumers that
+/// need to display the scheme name, generation counter, and enforce-mode flag
+/// without exposing epoch secrets or internal crypto state.
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialSummary {
+    /// Snake-case scheme name matching the JSON serialisation of
+    /// [`CredentialScheme`] (e.g. `"ring_membership"`, `"epoch_hmac"`).
+    pub scheme: String,
+    /// Monotonic generation counter from the latest accepted [`CredentialParams`].
+    pub generation: u64,
+    /// When `true`, credential-less (legacy) dials are REJECTED on the data plane.
+    pub require: bool,
+}
+
 // ── MonitorLink ───────────────────────────────────────────────────────────────
 
 /// Background task that keeps the client in sync with mirage2monitor.
@@ -878,6 +897,23 @@ impl MonitorLink {
     /// channel slot.
     pub fn subscribe_frames(&self) -> watch::Receiver<Option<WsServerFrame>> {
         self.frame_tx.subscribe()
+    }
+
+    /// Return a snapshot of the current credential configuration for GUI consumers.
+    ///
+    /// Returns `None` when no [`CredentialParams`] frame has been received yet
+    /// (e.g. the link is still connecting or the monitor does not push credentials).
+    ///
+    /// The returned [`CredentialSummary`] reflects the PRIMARY authority's scheme
+    /// (first in the authority set).  Secrets and per-epoch detail are not exposed.
+    pub fn credential_summary(&self) -> Option<CredentialSummary> {
+        let guard = self.credential_params.load();
+        let params = guard.as_ref().as_ref()?;
+        Some(CredentialSummary {
+            scheme: params.primary_scheme().as_str().to_owned(),
+            generation: params.generation,
+            require: params.require,
+        })
     }
 
     /// Validate and apply a `CredentialParams` frame received from the monitor.

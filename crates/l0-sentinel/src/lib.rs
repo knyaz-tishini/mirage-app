@@ -815,6 +815,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         return Err(e);
     }
     info!("[sentinel] wrote {:?}", cfg.client_config_path);
+    write_client_state(&state_dir, &first_cfg.chains, &link);
     if let Some(ref tun_path) = cfg.tun_config_path {
         if let Err(e) = tun_config::write_tun_config(
             &chains,
@@ -1071,6 +1072,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
+                            write_client_state(&state_dir, &new_cfg.chains, &link);
                             if let Some(ref tun_path) = cfg.tun_config_path {
                                 if let Err(e) = tun_config::write_tun_config(
                                     &chains,
@@ -1202,6 +1204,70 @@ fn unix_now_u64() -> u64 {
         .as_millis() as u64
 }
 
+// ── client-state.json ────────────────────────────────────────────────────────
+
+/// Serialisable snapshot of per-chain health + credential state for GUI polling.
+///
+/// Written atomically to `${state_dir}/client-state.json` on every config
+/// materialise and on every [`WsServerFrame::Config`] or
+/// [`WsServerFrame::CredentialParams`] update.
+#[derive(Serialize)]
+struct ClientStateFile {
+    chains: Vec<ClientStateChain>,
+    credential: Option<mirage_client_core::monitor_link::CredentialSummary>,
+    updated_at_ms: u64,
+}
+
+/// Per-chain health entry within [`ClientStateFile`].
+#[derive(Serialize)]
+struct ClientStateChain {
+    chain_id: String,
+    healthy: bool,
+    latency_ms: Option<u64>,
+}
+
+/// Build and atomically write `client-state.json` into `state_dir`.
+///
+/// `monitor_chains` comes from [`MonitorConfig::chains`].  `link` is used to
+/// read the current [`CredentialSummary`] (may be `None` before the first
+/// `CredentialParams` frame).  Errors are logged but never propagated — this
+/// file is best-effort for GUI consumers.
+fn write_client_state(
+    state_dir: &std::path::Path,
+    monitor_chains: &[mirage_client_core::monitor_link::MonitorChain],
+    link: &MonitorLink,
+) {
+    let chains = monitor_chains
+        .iter()
+        .map(|c| ClientStateChain {
+            chain_id: c.chain.chain_id.clone(),
+            healthy: c.healthy,
+            latency_ms: c.latency_ms,
+        })
+        .collect();
+
+    let updated_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let state = ClientStateFile {
+        chains,
+        credential: link.credential_summary(),
+        updated_at_ms,
+    };
+
+    let path: PathBuf = state_dir.join("client-state.json");
+    match serde_json::to_string_pretty(&state) {
+        Ok(json) => {
+            if let Err(e) = write_atomic(&path, &json) {
+                warn!("[sentinel] client-state.json write failed: {}", e);
+            }
+        }
+        Err(e) => warn!("[sentinel] client-state.json serialize failed: {}", e),
+    }
+}
+
 /// Spawn a background task that consumes server-pushed frames from
 /// [`MonitorLink`]:
 /// - `Config` → diff `peer_lm_urls` vs `current_active`; on change, rewrite
@@ -1305,6 +1371,11 @@ fn spawn_frame_watcher(
                     }
                     // ─────────────────────────────────────────────────────────
 
+                    // Update client-state.json on every Config frame so the GUI
+                    // sees fresh health + latency data even when peer_lm_urls
+                    // is unchanged or empty.
+                    write_client_state(&state_dir, &cfg.chains, &link);
+
                     if cfg.peer_lm_urls.is_empty() {
                         continue;
                     }
@@ -1396,9 +1467,16 @@ fn spawn_frame_watcher(
                     // (stored in its credential_params ArcSwap, shared with the
                     // cli's TunnelPool/MuxPool for per-dial token minting).
                     // Sentinel itself does not dial, so nothing to do here.
+                    // However, we do update client-state.json so the GUI sees the
+                    // new credential scheme/generation without waiting for the next
+                    // Config frame.
                     tracing::debug!(
                         "[sentinel] CredentialParams frame observed (handled by MonitorLink)"
                     );
+                    let chains_snapshot = link.subscribe().borrow().clone();
+                    if let Some(cfg_snap) = chains_snapshot {
+                        write_client_state(&state_dir, &cfg_snap.chains, &link);
+                    }
                 }
             }
         }
