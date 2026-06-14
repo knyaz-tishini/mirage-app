@@ -55,7 +55,11 @@ function petal(x,cx,cy,a,rb,L,w,col,h){const bx=cx+Math.cos(a)*rb,by=cy+Math.sin
 const buf=makeBuf(),bx=buf.x,seedi=987654;
 const inner=[251,168,96],outer=[255,226,190],coreC=[120,66,30];
 let state=0,auto=true,frame=0,rot=0;
-let glowI=0.35,stemT=0,bloomG=0,o=0,kick=0;
+let glowI=0.35,stemT=0,bloomG=0,spd=30,eNorm=0,kick=0;
+function smooth(u){return u*u*(3-2*u);}
+function spreadDeg(h){if(h>=8&&h<=16)return 360;if(h>=23||h<=1)return 30;
+ if(h>16&&h<23)return 360+(30-360)*smooth((h-16)/7);
+ return 30+(360-30)*smooth((h-1)/7);}
 const outs=[{c:q("cpix"),m:1},{c:q("chalf"),m:2},{c:q("casc"),m:3}];
 outs.forEach(o2=>o2.x=o2.c.getContext("2d"));
 const STEP={1:4,2:5,3:5};
@@ -72,7 +76,7 @@ function drawScene(){const hx=BW/2,hy=95-37*stemT;bx.fillStyle=BG;bx.fillRect(0,
  g.addColorStop(1,"rgba(251,168,96,0)");
  bx.fillStyle=g;bx.beginPath();bx.arc(hx,hy,gr*pulse,0,TAU);bx.fill();
  if(stemT>0.05){bx.strokeStyle="rgb(70,90,46)";bx.lineWidth=2.2;bx.globalAlpha=Math.min(1,stemT*1.6);bx.beginPath();bx.moveTo(hx,162);bx.quadraticCurveTo(hx+3,(162+hy)/2,hx,hy+5);bx.stroke();bx.globalAlpha=1;}
- if(stemT>0.25){const P=11,headR=9+15*stemT,e=o,spread=0.5+(TAU*0.46-0.5)*e;
+ if(stemT>0.25){const P=11,headR=9+15*stemT,e=eNorm,spread=spd*Math.PI/180;
   for(let i=0;i<P;i++){const ti=(i/(P-1)-0.5),a=-Math.PI/2+ti*spread,h=ihash(i,1,seedi),L=headR*(0.85+0.7*e)*(0.85+h*0.3),w=0.10+0.24*e,col=lerpC(inner,outer,clamp(Math.abs(ti)*1.5,0,1));
    petal(bx,hx,hy,a,3,L,w,col,h);}
   bx.fillStyle=css(coreC);bx.beginPath();bx.arc(hx,hy,2+3*stemT,0,TAU);bx.fill();
@@ -86,10 +90,10 @@ function pad(n){return(n<10?"0":"")+n;}
  if(auto){const seq=[80,80,110,640],tot=910,f=frame%tot;let acc=0,st=0;for(let k=0;k<seq.length;k++){acc+=seq[k];if(f<acc){st=k;break;}}state=st;if(st>=3&&f-(seq[0]+seq[1]+seq[2])<6)kick=1;}
  const gT=[0.35,0.7,0.85,1.0][state],pulseBoot=state===1?0.12*Math.sin(frame*0.12):0;
  glowI+=((gT+pulseBoot)-glowI)*0.06;stemT+=((state>=2?1:0)-stemT)*0.03;bloomG+=((state>=3?1:0)-bloomG)*0.04;
- const simHour=(frame*0.06)%24,dayOpen=clamp(Math.sin(clamp((simHour-6)/12,0,1)*Math.PI),0,1);
- kick*=0.97;const oTarget=bloomG>0.5?Math.max(dayOpen,kick):0;o+=(oTarget-o)*0.05;rot+=0.0009;
+ const simHour=(frame*0.06)%24,timeSp=spreadDeg(simHour);
+ kick*=0.97;const tgt=bloomG>0.5?Math.max(timeSp,30+kick*330):30;spd+=(tgt-spd)*0.05;eNorm=(spd-30)/330;rot+=0.0009;
  q("clk").textContent="sim "+pad(simHour|0)+":00";
- q("ph").textContent=state<2?"· dormant":state<3?"· bud":("· "+(dayOpen>0.5?"day / open":"night / folded")+" "+(o*100|0)+"%");
+ q("ph").textContent=state<2?"· dormant":state<3?"· bud":("· "+(spd|0)+"° "+(eNorm*100|0)+"%");
  drawScene();
  const id=bx.getImageData(0,0,BW,BH).data;
  for(const o2 of outs)rasterize(o2.x,o2.c.width,o2.c.height,id,o2.m,STEP[o2.m]);
