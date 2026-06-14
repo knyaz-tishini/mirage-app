@@ -6,13 +6,15 @@
       version="0.1.0.0"
       processorArchitecture="*"/>
 
-  <!-- Force the user to elevate to Administrator on launch.
-       wintun.dll requires Administrator to create the TUN adapter, and
-       child processes (cli, tun) inherit our token. -->
+  <!-- TEMP (visual-sandbox debugging): run as the invoking user, NOT elevated.
+       wintun.dll (real TUN) needs Administrator, but the mock sandbox never
+       touches the TUN, and elevation just blocks the iterate/kill loop. RESTORE
+       requireAdministrator (or elevate only the TUN child) before shipping a
+       build that actually creates the adapter. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>
