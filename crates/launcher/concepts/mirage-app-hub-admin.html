@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirage App Hub — admin</title>
+<!-- MIRAGE APP HUB — ADMIN VERSION.
+     One of several app-hub variants (sibling files: mirage-app-hub-*.html).
+     This is the fleet-owner / admin build: connect, live mesh globe, and a
+     node MARKETPLACE — buy resell hosting points straight off the globe, we
+     push configs, the box boots and joins the mesh live.
+
+     Scene = the single centerpiece (replaces the old cube / draw_mesh_wheel):
+       boot  = white wave plane (vibrating grid)
+       ready = amber wave plane (services up)
+       click = plane folds into the granular planet (connect)
+       dbl-click = unfolds back to the plane (disconnect)
+     Top-left M = menu overlay (control plane) which holds the MESH ⇄ BUY NODES
+     toggle. No status text on the scene — it lives in the menu.
+
+     Real size 380x540, chromeless — maps 1:1 to the uzor/tiny-skia launcher.
+     For the Rust port: bake the land mask to a static array (drop the runtime
+     d3/world-atlas CDN), feed OWNED from inventory.toml / opbox /mesh/inventory,
+     and feed MARKET from the hosting-reseller API. Everything is drawn on the
+     canvas (titlebar, toggle, panels) so it ports without DOM. -->
+<style>
+  body{margin:0;background:#0b0b0e;color:#f4f4f5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:18px}
+  .h{font-size:11px;letter-spacing:.14em;color:#878b91;margin:0 0 10px}
+  .h b{color:#fbb26a;font-weight:500}
+  .wrap{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+  .frame{background:#000;border:1px solid #ffffff1f;border-radius:14px;padding:6px;box-shadow:0 10px 40px #00000088}
+  canvas{display:block;width:380px;border-radius:9px;cursor:grab;touch-action:none}
+  .note{max-width:300px;font-size:11px;line-height:1.7;color:#878b91}
+  .note b{color:#f4f4f5;font-weight:500}
+  .note .am{color:#fbb26a}
+</style>
+</head>
+<body>
+<div class="h">MIRAGE · APP HUB — <b>admin</b> · click folds the wave plane into the live globe · <b>M</b> menu = MESH ⇄ BUY NODES</div>
+<div class="wrap">
+  <div class="frame"><canvas id="cv" width="380" height="540"></canvas></div>
+  <div class="note">
+    · launch → <span style="color:#f4f4f5">white</span> wave plane (boot)<br>
+    · services up → <span class="am">amber</span> plane (ready)<br>
+    · <span class="am">click</span> → folds into the planet (connect)<br>
+    · <span class="am">double-click</span> → unfolds (disconnect)<br>
+    · drag = rotate · wheel = zoom · <span class="am">M</span> menu = MESH ⇄ BUY NODES<br>
+    · <b>BUY NODES</b>: tap a ring → buy panel → <span class="am">Deploy</span> → node joins live
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
+<script>
+(function(){
+const BG="#0b0b0e",SURF="#14151a",FG0="#f4f4f5",FG1="#878b91",FG3="#555860",AMBER="#fbb26a",AMBER_HI="#ffd9b0",GREEN="#7fd6a0",TAU=Math.PI*2,DEG=180/Math.PI;
+const q=id=>document.getElementById(id),clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+function ihash(i,j,s){let h=(Math.imul(i,374761393)+Math.imul(j,668265263)+s)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296;}
+function vnoise(X,Y,s){const xi=Math.floor(X),yi=Math.floor(Y),xf=X-xi,yf=Y-yi,u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+ const a=ihash(xi,yi,s),b=ihash(xi+1,yi,s),cc=ihash(xi,yi+1,s),d=ihash(xi+1,yi+1,s);return a+(b-a)*u+(cc-a)*v+(a-b-cc+d)*u*v;}
+const c=q("cv"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2;
+const TB=36, cyP=296;
+let yaw=0.45,pitch=0.5,vyaw=0,vpitch=0,zoom=1,drag=null,t=0,mode="mesh",sel=null,menuOpen=false;
+let deploying=[],toast=null,now=0;
+let conn=false,connectTimer=null,bootT=0,servicesUp=false,fold=0,colT=0,amp=0.16,mesh=0;
+
+const Ng=46,ns=4242,N=Ng*Ng,GA=Math.PI*(3-Math.sqrt(5)),PTS=[];
+for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const u=i/(Ng-1),v=j/(Ng-1),k=i*Ng+j,fy=1-(k/(N-1))*2,fr=Math.sqrt(Math.max(0,1-fy*fy)),fth=GA*k,fib=[Math.cos(fth)*fr,fy,Math.sin(fth)*fr];
+ PTS[k]={px:(u-0.5)*2.0,pz:(v-0.5)*2.0,fib,i,j,latd:Math.asin(clamp(fy,-1,1))*DEG,lond:-Math.atan2(fib[2],fib[0])*DEG,land:false};}
+const MW=360,MH=180;let mask=null;
+function isLand(la,lo){if(!mask)return false;const px=((Math.floor((lo+180)/360*MW))%MW+MW)%MW,py=clamp(Math.floor((90-la)/180*MH),0,MH-1);return mask[(py*MW+px)*4]>128;}
+(async function(){try{const topo=await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json").then(r=>r.json());
+ const off=document.createElement("canvas");off.width=MW;off.height=MH;const o=off.getContext("2d");
+ const proj=d3.geoEquirectangular().scale(MW/TAU).translate([MW/2,MH/2]),path=d3.geoPath(proj,o);
+ o.fillStyle="#fff";o.beginPath();path(topojson.merge(topo,topo.objects.countries.geometries));o.fill();
+ mask=o.getImageData(0,0,MW,MH).data;for(let k=0;k<N;k++)PTS[k].land=isLand(PTS[k].latd,PTS[k].lond);}catch(e){}})();
+function geo(lat,lon){const la=lat/DEG,lo=lon/DEG;return[Math.cos(la)*Math.cos(lo),Math.sin(la),-Math.cos(la)*Math.sin(lo)];}
+
+const ROLES="monitor · node · sentry · mshd";
+let OWNED=[
+ {reg:"RU",city:"Moscow",ip:"193.187.94.74",prov:"HostKey",lat:55.75,lon:37.62},
+ {reg:"RU",city:"St Petersburg",ip:"91.218.245.247",prov:"HostKey",lat:59.93,lon:30.34},
+ {reg:"TR",city:"Istanbul",ip:"82.26.94.247",prov:"HostKey",lat:41.01,lon:28.98},
+ {reg:"NL",city:"Amsterdam",ip:"45.12.212.226",prov:"Omro",lat:52.37,lon:4.90},
+ {reg:"NL",city:"Rotterdam",ip:"151.243.173.104",prov:"HostKey",lat:51.92,lon:4.48},
+ {reg:"CH",city:"Zurich",ip:"45.59.119.139",prov:"Cloudzy",lat:47.37,lon:8.54}];
+let MARKET=[
+ {reg:"DE",city:"Frankfurt",prov:"Hetzner",price:4,specs:"2 vCPU · 4 GB",lat:50.11,lon:8.68},
+ {reg:"GB",city:"London",prov:"Vultr",price:6,specs:"2 vCPU · 4 GB",lat:51.51,lon:-0.13},
+ {reg:"US",city:"Ashburn",prov:"DigitalOcean",price:6,specs:"2 vCPU · 4 GB",lat:39.04,lon:-77.49},
+ {reg:"SG",city:"Singapore",prov:"Vultr",price:7,specs:"2 vCPU · 4 GB",lat:1.35,lon:103.82},
+ {reg:"JP",city:"Tokyo",prov:"Linode",price:7,specs:"2 vCPU · 4 GB",lat:35.68,lon:139.69},
+ {reg:"AE",city:"Dubai",prov:"Cloudzy",price:9,specs:"2 vCPU · 4 GB",lat:25.20,lon:55.27},
+ {reg:"BR",city:"Sao Paulo",prov:"Vultr",price:8,specs:"2 vCPU · 4 GB",lat:-23.55,lon:-46.63}];
+function prep(a){a.forEach(n=>{n.p=geo(n.lat,n.lon);n.sx=0;n.sy=0;n.front=false;});}
+prep(OWNED);prep(MARKET);
+let LINKS=[];
+function nearest(p,arr,skip){let bi=-1,bd=1e9;for(let i=0;i<arr.length;i++){if(i===skip)continue;const d=(p[0]-arr[i].p[0])**2+(p[1]-arr[i].p[1])**2+(p[2]-arr[i].p[2])**2;if(d<bd){bd=d;bi=i;}}return bi;}
+function rebuildLinks(){LINKS=[];for(let i=0;i<OWNED.length;i++){const j=nearest(OWNED[i].p,OWNED,i);if(j<0)continue;const a=Math.min(i,j),b=Math.max(i,j);if(!LINKS.some(l=>l[0]===a&&l[1]===b))LINKS.push([a,b]);}}
+rebuildLinks();
+
+function rot(p){const cyw=Math.cos(yaw),syw=Math.sin(yaw),x1=p[0]*cyw+p[2]*syw,z1=-p[0]*syw+p[2]*cyw,y1=p[1];
+ const cp=Math.cos(pitch),sp=Math.sin(pitch),y2=y1*cp-z1*sp,z2=y1*sp+z1*cp;return[x1,y2,z2];}
+const Rr=()=>120*zoom;
+function proj(p){const r=rot(p),R=Rr();return[cx+r[0]*R,cyP-r[1]*R,r[2]];}
+const connected=()=>mesh*clamp((fold-0.9)/0.08,0,1)>0.4;
+
+function toBuf(e){const sc=W/c.clientWidth;return[e.offsetX*sc,e.offsetY*sc];}
+c.addEventListener("pointerdown",e=>{const b=toBuf(e);drag={x:b[0],y:b[1],ox:b[0],oy:b[1],m:0};vyaw=vpitch=0;c.style.cursor="grabbing";});
+c.addEventListener("pointermove",e=>{if(!drag)return;const b=toBuf(e),dx=b[0]-drag.x,dy=b[1]-drag.y;drag.m+=Math.abs(dx)+Math.abs(dy);
+ if(b[1]>TB&&!menuOpen){yaw+=dx*0.008;pitch=clamp(pitch+dy*0.008,-1.4,1.4);vyaw=dx*0.008;vpitch=dy*0.008;}drag.x=b[0];drag.y=b[1];});
+window.addEventListener("pointerup",()=>{if(drag&&drag.m<7)clickAt(drag.ox,drag.oy);drag=null;c.style.cursor="grab";});
+c.addEventListener("dblclick",()=>{if(connectTimer){clearTimeout(connectTimer);connectTimer=null;}if(conn){conn=false;sel=null;}});
+c.addEventListener("wheel",e=>{e.preventDefault();zoom=clamp(zoom*(e.deltaY<0?1.08:0.926),0.7,2.6);},{passive:false});
+
+function panelRect(){return{px:14,py:H-150,pw:W-28,ph:128};}
+function deployBtnRect(){const r=panelRect();return{bx:r.px+r.pw-104,by:r.py+r.ph-38,bw:90,bh:26};}
+function mTogRect(){return{px:18,py:244,pw:W-36,ph:30};}
+
+function clickAt(bxp,byp){
+ if(menuOpen){
+  if(byp<TB&&bxp<44){menuOpen=false;return;}
+  const tg=mTogRect();if(byp>=tg.py&&byp<=tg.py+tg.ph&&bxp>=tg.px&&bxp<=tg.px+tg.pw){mode=(bxp<cx)?"mesh":"market";sel=null;return;}
+  menuOpen=false;return;
+ }
+ if(byp<TB){if(bxp<44)menuOpen=true;return;}
+ if(!connected()){
+  if(!conn){if(connectTimer)clearTimeout(connectTimer);connectTimer=setTimeout(()=>{conn=true;connectTimer=null;},200);}
+  return;
+ }
+ if(sel){const r=panelRect();
+  if(bxp>=r.px+r.pw-26&&bxp<=r.px+r.pw-6&&byp>=r.py+6&&byp<=r.py+26){sel=null;return;}
+  if(sel.type==="market"){const d=deployBtnRect();if(bxp>=d.bx&&bxp<=d.bx+d.bw&&byp>=d.by&&byp<=d.by+d.bh){startDeploy(sel.idx);return;}}
+  if(byp>=r.py)return;
+ }
+ if(mode==="market"){let bi=-1,bd=16*16;for(let i=0;i<MARKET.length;i++){const m=MARKET[i];if(!m.front)continue;const dx=m.sx-bxp,dy=m.sy-byp,dd=dx*dx+dy*dy;if(dd<bd){bd=dd;bi=i;}}sel=bi>=0?{type:"market",idx:bi}:null;return;}
+ let bi=-1,bd=16*16;for(let i=0;i<OWNED.length;i++){const o=OWNED[i];if(!o.front)continue;const dx=o.sx-bxp,dy=o.sy-byp,dd=dx*dx+dy*dy;if(dd<bd){bd=dd;bi=i;}}sel=bi>=0?{type:"owned",idx:bi}:null;
+}
+function startDeploy(idx){const m=MARKET[idx];if(!m||m.deploying)return;m.deploying=true;deploying.push({m,t0:now});sel=null;}
+function finishDeploy(d){const m=d.m;OWNED.push({reg:m.reg,city:m.city,ip:"assigned on boot",prov:m.prov,lat:m.lat,lon:m.lon,p:m.p,sx:0,sy:0,front:false,fresh:now});
+ MARKET=MARKET.filter(z=>z!==m);rebuildLinks();toast={msg:m.reg+" "+m.city+" — deployed, joining mesh",t0:now};}
+
+function txt(s,px,py,col,f,al){x.fillStyle=col;x.font=(f||"9px")+" ui-monospace,monospace";x.textAlign=al||"left";x.fillText(s,px,py);x.textAlign="left";}
+function rr(px,py,w,h,r){x.beginPath();x.moveTo(px+r,py);x.arcTo(px+w,py,px+w,py+h,r);x.arcTo(px+w,py+h,px,py+h,r);x.arcTo(px,py+h,px,py,r);x.arcTo(px,py,px+w,py,r);x.closePath();}
+function dotGrid(){x.fillStyle="#ffffff0e";for(let yy=TB+6;yy<H;yy+=24)for(let xx=8;xx<W;xx+=24)x.fillRect(xx,yy,1,1);}
+function titlebar(){x.fillStyle="#0c0c10";x.fillRect(0,0,W,TB);x.strokeStyle="#ffffff14";x.lineWidth=1;x.beginPath();x.moveTo(0,TB+.5);x.lineTo(W,TB+.5);x.stroke();
+ x.fillStyle=connected()?AMBER:FG0;x.font="15px ui-monospace,monospace";x.textAlign="center";x.fillText("M",22,24);
+ txt("MIRAGE",cx,23,FG1,"10px","center");
+ x.strokeStyle=FG1;x.lineWidth=1.2;x.beginPath();x.moveTo(W-66,18);x.lineTo(W-56,18);x.stroke();
+ x.beginPath();x.moveTo(W-28,13);x.lineTo(W-18,23);x.moveTo(W-18,13);x.lineTo(W-28,23);x.stroke();}
+
+function meshLinks(a){const R=Rr();for(let li=0;li<LINKS.length;li++){const A=OWNED[LINKS[li][0]],B=OWNED[LINKS[li][1]];if(!A||!B)continue;const ra=rot(A.p),rb=rot(B.p),path=[];
+  for(let k=0;k<=18;k++){const tt=k/18;let mx=ra[0]+(rb[0]-ra[0])*tt,my=ra[1]+(rb[1]-ra[1])*tt,mz=ra[2]+(rb[2]-ra[2])*tt,L=Math.hypot(mx,my,mz)||1;mx/=L;my/=L;mz/=L;const lift=1+0.14*Math.sin(tt*Math.PI);path.push([cx+mx*lift*R,cyP-my*lift*R,mz]);}
+  x.strokeStyle="rgba(255,217,176,"+(0.55*a).toFixed(2)+")";x.lineWidth=1.1;let st=false;x.beginPath();
+  for(let k=0;k<path.length;k++){const P=path[k];if(P[2]>=-0.02){if(st)x.lineTo(P[0],P[1]);else{x.moveTo(P[0],P[1]);st=true;}}else st=false;}x.stroke();}}
+function ownedNodes(A,dim){for(let i=0;i<OWNED.length;i++){const o=OWNED[i],s=proj(o.p);o.sx=s[0];o.sy=s[1];o.front=s[2]>=-0.02;if(!o.front)continue;
+  const a=A*(dim?0.42:1),selo=sel&&sel.type==="owned"&&sel.idx===i;x.globalAlpha=a;
+  if(o.fresh!==undefined){const age=now-o.fresh;if(age<1.4){const rr2=4+22*(1-age/1.4);x.strokeStyle="rgba(251,178,106,"+(0.7*(1-age/1.4)*A).toFixed(2)+")";x.lineWidth=1.4;x.beginPath();x.arc(s[0],s[1],rr2,0,TAU);x.stroke();}}
+  if(selo){x.strokeStyle=AMBER;x.lineWidth=1.3;x.beginPath();x.arc(s[0],s[1],9,0,TAU);x.stroke();}
+  x.fillStyle=FG0;x.beginPath();x.arc(s[0],s[1],4.2,0,TAU);x.fill();x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],2.5,0,TAU);x.fill();
+  txt(o.reg,s[0]+8,s[1]-3,AMBER,"9px");x.globalAlpha=1;}}
+function marketNodes(A){for(let i=0;i<MARKET.length;i++){const m=MARKET[i],s=proj(m.p);m.sx=s[0];m.sy=s[1];m.front=s[2]>=-0.02;if(!m.front)continue;
+  const selm=sel&&sel.type==="market"&&sel.idx===i,pulse=0.6+0.4*Math.sin(t*2.2+i);x.globalAlpha=A;
+  x.strokeStyle="rgba(251,178,106,"+(selm?0.95:0.5*pulse+0.2).toFixed(2)+")";x.lineWidth=selm?1.8:1.2;x.beginPath();x.arc(s[0],s[1],selm?8:6,0,TAU);x.stroke();
+  x.strokeStyle=selm?AMBER_HI:"rgba(251,178,106,0.7)";x.lineWidth=1;x.beginPath();x.moveTo(s[0]-2.4,s[1]);x.lineTo(s[0]+2.4,s[1]);x.moveTo(s[0],s[1]-2.4);x.lineTo(s[0],s[1]+2.4);x.stroke();
+  if(selm)txt(m.reg+" $"+m.price,s[0]+11,s[1]-4,AMBER_HI,"9px");x.globalAlpha=1;}}
+function deployFx(A){for(let di=deploying.length-1;di>=0;di--){const d=deploying[di],age=now-d.t0,s=proj(d.m.p);x.globalAlpha=A;
+  if(s[2]>=-0.02){for(let r=0;r<3;r++){const ph=(age*1.4+r*0.33)%1,rr2=6+30*ph;x.strokeStyle="rgba(251,178,106,"+(0.5*(1-ph)).toFixed(2)+")";x.lineWidth=1.3;x.beginPath();x.arc(s[0],s[1],rr2,0,TAU);x.stroke();}
+   x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],3,0,TAU);x.fill();txt("provisioning",s[0]+10,s[1]-3,AMBER,"8px");}
+  x.globalAlpha=1;if(age>2.0){finishDeploy(d);deploying.splice(di,1);}}}
+
+function infoPanel(){if(!sel||!connected())return;const r=panelRect();
+ x.fillStyle="#101116f5";rr(r.px,r.py,r.pw,r.ph,12);x.fill();x.strokeStyle="#ffffff22";x.lineWidth=1;rr(r.px,r.py,r.pw,r.ph,12);x.stroke();x.fillStyle=AMBER;x.fillRect(r.px,r.py+10,2,r.ph-20);
+ x.strokeStyle=FG1;x.lineWidth=1.2;x.beginPath();x.moveTo(r.px+r.pw-22,r.py+10);x.lineTo(r.px+r.pw-12,r.py+20);x.moveTo(r.px+r.pw-12,r.py+10);x.lineTo(r.px+r.pw-22,r.py+20);x.stroke();
+ if(sel.type==="market"){const m=MARKET[sel.idx];if(!m){sel=null;return;}
+  txt(m.reg+" · "+m.city,r.px+14,r.py+24,AMBER_HI,"12px");txt("AVAILABLE",r.px+14,r.py+40,FG1,"9px");
+  txt("provider",r.px+14,r.py+60,FG1,"9px");txt(m.prov,r.px+96,r.py+60,FG0,"9px");
+  txt("specs",r.px+14,r.py+74,FG1,"9px");txt(m.specs,r.px+96,r.py+74,FG0,"9px");
+  txt("roles",r.px+14,r.py+88,FG1,"9px");txt(ROLES,r.px+96,r.py+88,FG0,"9px");
+  txt("$"+m.price,r.px+14,r.py+r.ph-15,AMBER,"15px");txt("/mo · billed in app",r.px+56,r.py+r.ph-16,FG1,"9px");
+  const d=deployBtnRect();x.fillStyle=AMBER;rr(d.bx,d.by,d.bw,d.bh,7);x.fill();txt("Deploy",d.bx+d.bw/2,d.by+17,"#1a1206","11px","center");
+ }else{const o=OWNED[sel.idx];if(!o){sel=null;return;}const st=o.fresh!==undefined?"PROVISIONED":"ONLINE";
+  txt(o.reg+" · "+o.city,r.px+14,r.py+24,AMBER_HI,"12px");txt(st,r.px+14,r.py+40,st==="ONLINE"?GREEN:AMBER,"9px");
+  txt("ip",r.px+14,r.py+60,FG1,"9px");txt(o.ip,r.px+96,r.py+60,AMBER_HI,"9px");
+  txt("provider",r.px+14,r.py+74,FG1,"9px");txt(o.prov,r.px+96,r.py+74,FG0,"9px");
+  txt("roles",r.px+14,r.py+88,FG1,"9px");txt(ROLES,r.px+96,r.py+88,FG0,"9px");
+  txt("latency 24ms · up 6d",r.px+14,r.py+r.ph-15,FG1,"9px");}}
+
+function menu(){x.fillStyle="#0e0e11f7";x.fillRect(0,0,W,H);x.fillStyle=AMBER;x.fillRect(0,TB,2,H-TB);titlebar();
+ let yy=TB+30;txt("CONTROL PLANE",18,yy,AMBER,"11px");yy+=22;
+ const ph=connected()?"CONNECTED":(conn?"CONNECTING":(servicesUp?"READY":"BOOT"));
+ const rows=[["phase",ph],["monitor","reachable"],["credential","RingMembership"],["fleet",OWNED.length+" nodes"],["mesh links",LINKS.length],["data-plane","cli2 · 6 workers"]];
+ rows.forEach(rw=>{txt(rw[0],18,yy,FG1,"10px");txt(""+rw[1],W-18,yy,FG0,"10px","right");yy+=19;});
+ txt("VIEW",18,236,FG1,"9px");
+ const tg=mTogRect();x.fillStyle=SURF;rr(tg.px,tg.py,tg.pw,tg.ph,9);x.fill();x.strokeStyle="#ffffff20";x.lineWidth=1;rr(tg.px,tg.py,tg.pw,tg.ph,9);x.stroke();
+ const onMesh=mode==="mesh";x.fillStyle=AMBER;if(onMesh)rr(tg.px+2,tg.py+2,tg.pw/2-3,tg.ph-4,7);else rr(tg.px+tg.pw/2+1,tg.py+2,tg.pw/2-3,tg.ph-4,7);x.fill();
+ txt("MESH",tg.px+tg.pw*0.25,tg.py+19,onMesh?"#1a1206":FG1,"10px","center");
+ txt("BUY NODES",tg.px+tg.pw*0.75,tg.py+19,onMesh?FG1:"#1a1206","10px","center");
+ let my=tg.py+tg.ph+26;txt("MARKETPLACE",18,my,AMBER,"11px");my+=18;
+ ["BUY NODES shows resell hosting points","on the globe. Tap one → Deploy →","we push configs, it boots and joins","your mesh live — no SSH, no console."].forEach(s=>{txt(s,18,my,FG1,"10px");my+=15;});
+ my+=10;txt("click globe = connect   ·   dbl-click = disconnect",18,my,FG3,"9px");
+ txt("tap M to close",W-18,H-22,FG3,"10px","right");}
+
+(function loop(){now+=0.016;t=now;
+ bootT++;if(bootT>78)servicesUp=true;
+ const tf=conn?1:0,ta=servicesUp?0.26:0.16,tc=servicesUp?1:0,tm=conn?1:0;
+ fold+=(tf-fold)*0.011;amp+=(ta-amp)*0.04;colT+=(tc-colT)*0.04;mesh+=(tm-mesh)*0.06;
+ const fe=fold*fold*(3-2*fold),meshA=mesh*clamp((fold-0.9)/0.08,0,1),R=Rr();
+ const lineFade=clamp(1-fe/0.12,0,1),dotFade=clamp((fe-0.03)/0.16,0,1);
+ if(!drag){yaw+=vyaw+(connected()?0.0011:0);pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=clamp(pitch,-1.4,1.4);}
+ x.fillStyle=BG;x.fillRect(0,0,W,H);dotGrid();
+ const PR=new Array(N);
+ for(let k=0;k<N;k++){const P=PTS[k],flatY=amp*1.5*((vnoise(P.i*0.22,P.j*0.22+t*0.4,ns)-0.5)+0.25*Math.sin((P.i+P.j)*0.42+t*1.8)),wx=P.px+(P.fib[0]-P.px)*fe,wy=flatY+(P.fib[1]-flatY)*fe,wz=P.pz+(P.fib[2]-P.pz)*fe,r=rot([wx,wy,wz]);PR[k]=[cx+r[0]*R,cyP-r[1]*R,r[2]];}
+ if(fe>0.55){x.strokeStyle="rgba(255,255,255,"+(0.05*clamp((fe-0.55)/0.3,0,1)).toFixed(2)+")";x.lineWidth=1;x.beginPath();x.arc(cx,cyP,R,0,TAU);x.stroke();}
+ if(lineFade>0.01){const cr=Math.round(244+(251-244)*colT),cg=Math.round(244+(178-244)*colT),cb=Math.round(245+(106-245)*colT);
+  x.lineWidth=1;x.strokeStyle="rgba("+cr+","+cg+","+cb+","+(0.42*lineFade).toFixed(2)+")";
+  for(let i=0;i<Ng;i++){x.beginPath();for(let j=0;j<Ng;j++){const s=PR[i*Ng+j];if(j)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
+  for(let j=0;j<Ng;j++){x.beginPath();for(let i=0;i<Ng;i++){const s=PR[i*Ng+j];if(i)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}}
+ if(dotFade>0.01){for(let k=0;k<N;k++){const P=PTS[k];if(!P.land)continue;const s=PR[k];if(s[2]<-0.04)continue;const sB=0.30+0.70*clamp(s[2],0,1),tw=0.85+0.15*Math.sin(t*2.4+k*0.7);
+   x.fillStyle="rgba(251,178,106,"+(sB*tw*dotFade).toFixed(2)+")";x.fillRect(s[0]-1,s[1]-1,2.0,2.0);}}
+ if(meshA>0.01){
+  if(mode==="mesh"){meshLinks(meshA);ownedNodes(meshA,false);}
+  else{meshLinks(meshA*0.35);ownedNodes(meshA,true);marketNodes(meshA);}
+  deployFx(meshA);}
+ if(toast){const age=now-toast.t0,a=clamp(1-age/2.6,0,1);if(a<=0)toast=null;else{x.globalAlpha=a;x.fillStyle="#101116";rr(cx-132,H-44,264,26,8);x.fill();x.strokeStyle="#fbb26a55";rr(cx-132,H-44,264,26,8);x.stroke();txt(toast.msg,cx,H-27,AMBER_HI,"9px","center");x.globalAlpha=1;}}
+ infoPanel();
+ titlebar();
+ if(menuOpen)menu();
+ requestAnimationFrame(loop);})();
+})();
+</script>
+</body>
+</html>
