@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirage viz — re-imagined (interactive)</title>
+<style>
+  body{margin:0;background:#0b0b0e;color:#f4f4f5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:18px}
+  h1{font-size:13px;letter-spacing:.16em;font-weight:500;color:#fbb26a;margin:0 0 14px}
+  .lbl{font-size:11px;color:#878b91;margin-bottom:6px;letter-spacing:.05em}
+  .hint{color:#555860}
+  .card{background:#14151a;border:1px solid #ffffff14;border-radius:12px;padding:10px;margin-bottom:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+  canvas{display:block;width:100%;border-radius:6px;touch-action:none;cursor:grab}
+</style>
+</head>
+<body>
+<h1>MIRAGE · VISUAL SYSTEM — RE-IMAGINED</h1>
+<div class="card"><div class="lbl">MESH GLOBE <span class="hint">— drag rotate · wheel zoom · flick to spin · dbl-click reset</span></div><canvas id="gglobe" width="600" height="320" style="background:#0b0b0e"></canvas></div>
+<div class="grid">
+  <div class="card"><div class="lbl">BLOOM A · DAHLIA <span class="hint">— click connect · drag curl</span></div><canvas id="gdahlia" width="260" height="240" style="background:#0b0b0e"></canvas></div>
+  <div class="card"><div class="lbl">BLOOM B · PEONY <span class="hint">— click connect · drag bloom</span></div><canvas id="gpeony" width="260" height="240" style="background:#0b0b0e"></canvas></div>
+  <div class="card"><div class="lbl">FLEET RELIEF <span class="hint">— drag to probe load</span></div><canvas id="gterrain" width="260" height="240" style="background:#0b0b0e"></canvas></div>
+  <div class="card"><div class="lbl">LINK MATRIX <span class="hint">— click to rescramble</span></div><canvas id="gglyph" width="260" height="240" style="background:#0b0b0e"></canvas></div>
+</div>
+<script>
+(function(){
+const BG="#0b0b0e",FG0="#f4f4f5",FG1="#878b91",FG3="#555860",AMBER="#fbb26a",AMBER_HI="#ffd9b0",RED="#e05656",TAU=Math.PI*2;
+const q=id=>document.getElementById(id);
+function ihash(i,j,s){let h=(Math.imul(i,374761393)+Math.imul(j,668265263)+s)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296;}
+function vnoise(x,y,s){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+ const a=ihash(xi,yi,s),b=ihash(xi+1,yi,s),c=ihash(xi,yi+1,s),d=ihash(xi+1,yi+1,s);return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;}
+function lerpC(a,b,k){return[a[0]+(b[0]-a[0])*k,a[1]+(b[1]-a[1])*k,a[2]+(b[2]-a[2])*k];}
+
+function GLOBE(){const c=q("gglobe"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
+ const ga=Math.PI*(3-Math.sqrt(5)),N=920,pts=[];
+ for(let i=0;i<N;i++){const y=1-(i/(N-1))*2,rad=Math.sqrt(1-y*y),th=ga*i;pts.push([Math.cos(th)*rad,y,Math.sin(th)*rad,(Math.sin(th*3)+Math.cos(y*5))>0.45]);}
+ const NODES=[{lat:55,lon:37,l:"ru-094.74"},{lat:39,lon:35,l:"tr-094.247"},{lat:52,lon:5,l:"nl-173.104"},{lat:47,lon:8,l:"ch-119.139"},{lat:55,lon:49,l:"ru-245.247"}];
+ function v3(la,lo){la*=Math.PI/180;lo*=Math.PI/180;return[Math.cos(la)*Math.cos(lo),Math.sin(la),Math.cos(la)*Math.sin(lo)];}
+ NODES.forEach(n=>n.p=v3(n.lat,n.lon));const LINKS=[[0,1],[2,3],[0,4],[1,3]];
+ let yaw=0.4,pitch=0.32,vyaw=0.02,vpitch=0,zoom=1,drag=null,t=0;
+ function rot(p){const cyw=Math.cos(yaw),syw=Math.sin(yaw),x1=p[0]*cyw+p[2]*syw,z1=-p[0]*syw+p[2]*cyw,y1=p[1];
+  const cp=Math.cos(pitch),sp=Math.sin(pitch),y2=y1*cp-z1*sp,z2=y1*sp+z1*cp;return[x1,y2,z2];}
+ const Rr=()=>148*zoom;
+ function pj(p){return[cx+p[0]*Rr(),cy-p[1]*Rr(),p[2]];}
+ c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,y:e.offsetY};vyaw=vpitch=0;c.style.cursor="grabbing";});
+ c.addEventListener("pointermove",e=>{if(drag){const dx=e.offsetX-drag.x,dy=e.offsetY-drag.y;yaw+=dx*0.008;pitch=Math.max(-1.3,Math.min(1.3,pitch+dy*0.008));vyaw=dx*0.008;vpitch=dy*0.008;drag={x:e.offsetX,y:e.offsetY};}});
+ window.addEventListener("pointerup",()=>{drag=null;c.style.cursor="grab";});
+ c.addEventListener("wheel",e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:0.926;zoom=Math.max(0.55,Math.min(3.4,zoom));},{passive:false});
+ c.addEventListener("dblclick",()=>{zoom=1;pitch=0.32;vyaw=0.02;});
+ (function d(){t+=0.016;if(!drag){yaw+=vyaw+0.0014;pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=Math.max(-1.3,Math.min(1.3,pitch));}
+  x.fillStyle=BG;x.fillRect(0,0,W,H);
+  x.strokeStyle="rgba(255,255,255,.08)";x.lineWidth=1;x.beginPath();x.arc(cx,cy,Rr(),0,TAU);x.stroke();
+  for(const p of pts){const r=rot(p);if(r[2]<-0.08)continue;const s=pj(r),b=0.12+0.5*Math.max(0,r[2]);
+   x.fillStyle=p[3]?"rgba(244,244,245,"+b.toFixed(2)+")":"rgba(135,139,145,"+(b*0.7).toFixed(2)+")";const sz=p[3]?1.6:1.1;x.fillRect(s[0]-sz/2,s[1]-sz/2,sz,sz);}
+  for(let li=0;li<LINKS.length;li++){const a=LINKS[li][0],bb=LINKS[li][1],ra=rot(NODES[a].p),rb=rot(NODES[bb].p),path=[];
+   for(let k=0;k<=22;k++){const tt=k/22;let mx=ra[0]+(rb[0]-ra[0])*tt,my=ra[1]+(rb[1]-ra[1])*tt,mz=ra[2]+(rb[2]-ra[2])*tt,L=Math.hypot(mx,my,mz)||1;mx/=L;my/=L;mz/=L;const lift=1+0.22*Math.sin(tt*Math.PI);path.push(pj([mx*lift,my*lift,mz]));}
+   x.strokeStyle="rgba(251,178,106,.5)";x.lineWidth=1.3;x.beginPath();for(let k=0;k<path.length;k++){if(k)x.lineTo(path[k][0],path[k][1]);else x.moveTo(path[k][0],path[k][1]);}x.stroke();
+   const bt=(t*0.22+li*0.27)%1,bi=Math.floor(bt*(path.length-1)),bp=path[bi];if(bp){x.fillStyle=AMBER_HI;x.beginPath();x.arc(bp[0],bp[1],2.4,0,TAU);x.fill();x.globalAlpha=.3;x.beginPath();x.arc(bp[0],bp[1],5,0,TAU);x.fill();x.globalAlpha=1;}}
+  for(const n of NODES){const r=rot(n.p),s=pj(r),front=r[2]>=-0.05;x.globalAlpha=front?1:0.22;
+   x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],front?4:2.4,0,TAU);x.fill();x.fillStyle=BG;x.beginPath();x.arc(s[0],s[1],1.6,0,TAU);x.fill();
+   if(front&&zoom>1.15){x.fillStyle=FG0;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.l,s[0]+7,s[1]+3);}x.globalAlpha=1;}
+  x.fillStyle=FG3;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText("zoom "+zoom.toFixed(2)+"x  nodes "+NODES.length+"  links "+LINKS.length,10,H-10);
+  requestAnimationFrame(d);})();}
+
+function DAHLIA(){const c=q("gdahlia"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
+ const ga=Math.PI*(3-Math.sqrt(5));let N=150,bloom=0.15,target=null,curl=1.1,rot=0,t=0,drag=null,on=false;
+ const inner=[251,150,80],outer=[255,225,190],core=[40,24,14];
+ function petal(a,rb,L,w,col,h){const a1=a-w,a2=a+w,b1x=cx+Math.cos(a1)*rb,b1y=cy+Math.sin(a1)*rb,b2x=cx+Math.cos(a2)*rb,b2y=cy+Math.sin(a2)*rb,tx=cx+Math.cos(a)*(rb+L),ty=cy+Math.sin(a)*(rb+L),v=0.85+h*0.3;
+  x.fillStyle="rgb("+(col[0]*v|0)+","+(col[1]*v|0)+","+(col[2]*v|0)+")";x.beginPath();x.moveTo(b1x,b1y);x.quadraticCurveTo(b1x*0.3+tx*0.7,b1y*0.3+ty*0.7,tx,ty);x.quadraticCurveTo(b2x*0.3+tx*0.7,b2y*0.3+ty*0.7,b2x,b2y);x.closePath();x.fill();}
+ c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,m:0};});
+ c.addEventListener("pointermove",e=>{if(drag){drag.m+=Math.abs(e.offsetX-drag.x);drag.x=e.offsetX;if(drag.m>6)curl=0.5+(e.offsetX/W)*1.2;}});
+ window.addEventListener("pointerup",()=>{if(drag&&drag.m<=6){on=!on;target=on?0.95:0.12;}drag=null;});
+ (function d(){t+=0.016;rot+=0.0016;
+  if(target!=null)bloom+=(target-bloom)*0.08;else bloom+=(0.8+0.12*Math.sin(t*0.4)-bloom)*0.02;
+  const e=bloom*bloom*(3-2*bloom),maxR=82;x.fillStyle=BG;x.fillRect(0,0,W,H);
+  for(let i=N-1;i>=0;i--){const r=maxR*Math.sqrt(i/N)*(0.4+0.6*e),a=i*ga+rot,kt=r/maxR,col=lerpC(inner,outer,kt),L=(4+r*0.30)*curl*(1+0.03*Math.sin(t*0.8+i*0.3));petal(a,r*0.96,L,0.10+0.05*kt,col,ihash(i,1,7));}
+  x.fillStyle="rgb("+core[0]+","+core[1]+","+core[2]+")";x.beginPath();x.arc(cx,cy,6,0,TAU);x.fill();
+  x.fillStyle=on?AMBER:FG3;x.font="9px ui-monospace,monospace";x.textAlign="center";x.fillText(on?"CONNECTED":"OFF",cx,H-12);
+  requestAnimationFrame(d);})();}
+
+function PEONY(){const c=q("gpeony"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
+ let bloom=0.2,target=null,rot=0,t=0,drag=null,on=false;const rings=6,R=70;const outer=[255,222,185],inner=[245,150,82];
+ function petal(a,rb,L,w,col){const tx=cx+Math.cos(a)*(rb+L),ty=cy+Math.sin(a)*(rb+L),lx=cx+Math.cos(a-w)*rb,ly=cy+Math.sin(a-w)*rb,rx=cx+Math.cos(a+w)*rb,ry=cy+Math.sin(a+w)*rb;
+  x.fillStyle="rgb("+(col[0]|0)+","+(col[1]|0)+","+(col[2]|0)+")";x.beginPath();x.moveTo(lx,ly);x.quadraticCurveTo(tx,ty,rx,ry);x.quadraticCurveTo(cx+Math.cos(a)*rb,cy+Math.sin(a)*rb,lx,ly);x.fill();}
+ c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,m:0};});
+ c.addEventListener("pointermove",e=>{if(drag){drag.m+=Math.abs(e.offsetX-drag.x);drag.x=e.offsetX;if(drag.m>6)target=Math.max(0.05,Math.min(1,e.offsetX/W));}});
+ window.addEventListener("pointerup",()=>{if(drag&&drag.m<=6)on=!on;drag=null;});
+ (function d(){t+=0.016;rot+=0.001;
+  if(target!=null)bloom+=(target-bloom)*0.12;else bloom+=((on?0.9:0.2)+0.08*Math.sin(t*0.4)-bloom)*0.03;
+  const e=bloom*bloom*(3-2*bloom),headR=R*(0.5+0.5*e);x.fillStyle=BG;x.fillRect(0,0,W,H);
+  for(let k=0;k<rings;k++){const kt=k/(rings-1),count=10-k,col=lerpC(outer,inner,kt),L=headR*(1-kt*0.6)*(0.35+0.65*e),rb=2+headR*0.08*(1-kt),w=TAU/count*0.46*(0.45+0.55*e);
+   for(let i=0;i<count;i++){const a=rot*(k%2?1.25:-1)+(i+k*0.5)/count*TAU;petal(a,rb,L,w,col);}}
+  x.fillStyle="rgb(40,22,14)";x.beginPath();x.arc(cx,cy,(1-e)*12+5,0,TAU);x.fill();
+  x.fillStyle=on?AMBER:FG3;x.font="9px ui-monospace,monospace";x.textAlign="center";x.fillText(on?"CONNECTED":"OFF",cx,H-12);
+  requestAnimationFrame(d);})();}
+
+function TERRAIN(){const c=q("gterrain"),x=c.getContext("2d"),W=c.width,H=c.height;
+ const Ng=24,hmap=new Float32Array(Ng*Ng),ns=12345;let t=0,bumps=[],down=false;
+ const cx=W/2,baseY=58,sx=W/2/Ng*0.92,sy=4.0;
+ function push(e){const u=(e.offsetX-cx)/sx,v=(e.offsetY-baseY)/sy;bumps.push({x:Math.max(0,Math.min(Ng-1,(u+v)/2)),y:Math.max(0,Math.min(Ng-1,(v-u)/2)),a:1});if(bumps.length>30)bumps.shift();}
+ c.addEventListener("pointerdown",e=>{down=true;push(e);});
+ c.addEventListener("pointermove",e=>{if(down)push(e);});
+ window.addEventListener("pointerup",()=>{down=false;});
+ (function d(){t+=0.004;for(let i=bumps.length-1;i>=0;i--){bumps[i].a*=0.985;if(bumps[i].a<0.02)bumps.splice(i,1);}
+  for(let y=0;y<Ng;y++)for(let xx=0;xx<Ng;xx++){let h=Math.pow(vnoise(xx*0.16,y*0.16+t,ns),1.6)*44;for(const b of bumps){const dx=xx-b.x,dy=y-b.y;h+=b.a*38*Math.exp(-(dx*dx+dy*dy)/12);}hmap[y*Ng+xx]=h;}
+  x.fillStyle=BG;x.fillRect(0,0,W,H);const P=(xx,y,h)=>[cx+(xx-y)*sx,baseY+(xx+y)*sy-h];x.lineWidth=1;
+  for(let y=0;y<Ng;y++){x.beginPath();for(let xx=0;xx<Ng;xx++){const p=P(xx,y,hmap[y*Ng+xx]);if(xx)x.lineTo(p[0],p[1]);else x.moveTo(p[0],p[1]);}const k=y/Ng;x.strokeStyle="rgba(251,178,106,"+(0.22+0.5*k).toFixed(2)+")";x.stroke();}
+  x.strokeStyle="rgba(135,139,145,.16)";for(let xx=0;xx<Ng;xx++){x.beginPath();for(let y=0;y<Ng;y++){const p=P(xx,y,hmap[y*Ng+xx]);if(y)x.lineTo(p[0],p[1]);else x.moveTo(p[0],p[1]);}x.stroke();}
+  requestAnimationFrame(d);})();}
+
+function GLYPH(){const c=q("gglyph"),x=c.getContext("2d"),W=c.width,H=c.height;
+ const cols=18,rows=10,cw=W/cols,chh=H/rows,Nn=cols*rows,g=new Uint16Array(Nn),tag=new Uint8Array(Nn),flash=new Float32Array(Nn);const TAG=[AMBER,FG0,RED];
+ for(let i=0;i<Nn;i++){g[i]=(Math.random()*32768)|0;tag[i]=Math.random()<0.08?1+((Math.random()*3)|0):0;}
+ c.addEventListener("pointerdown",e=>{const cc=Math.min(cols-1,Math.max(0,(e.offsetX/cw)|0)),rr=Math.min(rows-1,Math.max(0,(e.offsetY/chh)|0));for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const c2=cc+dx,r2=rr+dy;if(c2>=0&&r2>=0&&c2<cols&&r2<rows){const i=r2*cols+c2;g[i]=(Math.random()*32768)|0;flash[i]=1;}}});
+ (function d(){for(let k=0;k<3;k++){const i=(Math.random()*Nn)|0;g[i]^=1<<((Math.random()*15)|0);flash[i]=Math.max(flash[i],0.5);}for(let i=0;i<Nn;i++)if(flash[i]>0)flash[i]-=0.04;
+  x.fillStyle=BG;x.fillRect(0,0,W,H);
+  for(let r=0;r<rows;r++)for(let cc=0;cc<cols;cc++){const i=r*cols+cc,gv=g[i],x0=cc*cw+3,y0=r*chh+3,pw=(cw-6)/3,ph=(chh-6)/5;
+   x.fillStyle=tag[i]?TAG[tag[i]-1]:(flash[i]>0?"rgba(244,244,245,"+Math.min(0.5+flash[i],1).toFixed(2)+")":"rgba(135,139,145,.5)");
+   for(let b=0;b<15;b++)if(gv>>b&1)x.fillRect(x0+(b%3)*pw,y0+((b/3)|0)*ph,pw-0.7,ph-0.7);}
+  requestAnimationFrame(d);})();}
+
+GLOBE();DAHLIA();PEONY();TERRAIN();GLYPH();
+})();
+</script>
+</body>
+</html>

@@ -41,3 +41,35 @@ the flowing "packet/bead" speed = `bytes_per_sec`, color = protocol/health.
 - Isoline radar (Isoline Survey #9 / Meridian Radar #28) — tasteful replacement for the removed doppler radar.
 
 Source collection: `at-orr` (73 instruments, MIT). See its `README.md` for per-panel papers.
+
+## v2 — re-imagined interactive set (CURRENT DIRECTION → `reimagined.html`)
+
+Owner review of v1: only the **globe** was acceptable. New direction = the globe as the
+interactive hero + a small focused set, **all genuinely interactive**, all in the real
+**Mirage identity palette** (from `launcher/src/main.rs`):
+
+| token | hex | use |
+|-------|-----|-----|
+| bg | `#0B0B0E` | canvas |
+| surface | `#14151A` | cards |
+| FG0 | `#F4F4F5` | near-white text / land dots |
+| FG1 | `#878B91` | muted brand grey (sea dots, idle) |
+| FG3 | `#555860` | HUD / dim |
+| ACCENT (amber) | `#FBB26A` | hero accent: nodes, arcs, active |
+| amber-hi | `#FFD9B0` | flowing beads / highlight |
+| RED | `#E05656` | alert only |
+
+Discipline: amber + white + grey on near-black; red only for alerts. **No hue rainbow** —
+differentiate by brightness/opacity, not by color. State encodes color (healthy=amber,
+idle=grey, error=red).
+
+| Panel | Source | Interaction | Mirage role |
+|-------|--------|-------------|-------------|
+| Mesh globe (hero) | Census Globe #33 | drag-rotate + inertia, **wheel zoom**, flick-to-spin, dbl-click reset, labels fade in on zoom | mesh/topology overview; nodes at real lat/lon, chains = great-circle arcs + beads |
+| Bloom A · Dahlia | Dahlia Synod #49 | click = connect/disconnect (opens/closes), drag = curl petals | **cube replacement** — centerpiece opens when connected, breathes when on |
+| Bloom B · Peony | Peony Reliquary #48 | click = connect, drag = bloom amount | alt cube replacement (layered petals) |
+| Fleet relief | Block Survey #34 | drag to raise/probe | axonometric heightfield = per-node load/latency telemetry |
+| Link matrix | Glyph Census #37 | click = rescramble a district | connections/credential matrix; ratified (amber/white/red) cells = active flows/states |
+
+Open `reimagined.html` standalone, or render via visualize. v1's `gallery.html` (6 probes)
+kept for reference but superseded except the globe.
