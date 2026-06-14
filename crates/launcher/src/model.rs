@@ -422,6 +422,13 @@ impl Default for BypassBpsState {
 /// Spawn the model poller. Returns a `watch::Receiver` that the render loop
 /// (and future visual layer) can call `.borrow()` on every frame.
 ///
+/// True when the launcher runs in the offline mock sandbox
+/// (`MIRAGE_LAUNCHER_MOCK=1`): no real backend is spawned and every poller
+/// serves synthetic data so the GUI behaves as if connected to a live mesh.
+pub fn mock_enabled() -> bool {
+    std::env::var("MIRAGE_LAUNCHER_MOCK").as_deref() == Ok("1")
+}
+
 /// If `MIRAGE_LAUNCHER_MOCK=1` is set the poller immediately publishes
 /// `ClientState::mock()` and never polls the network.
 pub fn spawn_model_poller(
@@ -431,7 +438,7 @@ pub fn spawn_model_poller(
     let initial = Arc::new(ClientState::default());
     let (tx, rx) = watch::channel(initial);
 
-    if std::env::var("MIRAGE_LAUNCHER_MOCK").as_deref() == Ok("1") {
+    if mock_enabled() {
         let mock = Arc::new(ClientState::mock());
         let _ = tx.send(mock);
         // Keep the sender alive so the receiver never sees a closed channel.

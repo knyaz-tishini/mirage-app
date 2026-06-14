@@ -58,6 +58,14 @@ fn parse_phase(raw: SentinelStatusRaw) -> SentinelPhaseLocal {
 pub fn spawn_poller(rt: &tokio::runtime::Handle) -> watch::Receiver<SentinelPhaseLocal> {
     let (tx, rx) = watch::channel(SentinelPhaseLocal::Unknown);
 
+    // Offline mock sandbox: no sentinel is running — pretend the data-plane is
+    // up so the cube is in its "ready" (amber) state and the connect button
+    // works. The watch retains this value after the sender drops.
+    if crate::model::mock_enabled() {
+        let _ = tx.send(SentinelPhaseLocal::ChildRunning);
+        return rx;
+    }
+
     rt.spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))

@@ -174,6 +174,67 @@ struct ChainCounters {
     smoothed_bps: f64,
 }
 
+/// Synthetic mesh snapshot for the offline mock sandbox. `tick` advances each
+/// poll so `bytes_per_sec` pulses and the wheel looks alive.
+fn mock_snapshot(tick: u64) -> MeshSnapshot {
+    let osc = |phase: f64, base: f64| -> f64 {
+        base * (1.0 + 0.5 * ((tick as f64) * 0.3 + phase).sin())
+    };
+    let chain = |id: &str, hops: Vec<HopView>, bps: f64, dests: Vec<DestView>| ChainView {
+        id: id.to_string(),
+        hops,
+        bytes_per_sec: bps,
+        last_active_ms: 0.0,
+        destinations: dests,
+    };
+    let hop = |addr: &str, role: HopRole, name: &str| HopView {
+        addr: addr.to_string(),
+        role,
+        display_name: Some(name.to_string()),
+    };
+    let dest = |ip: &str, port: u16, domain: &str, bytes: u64| DestView {
+        ip: ip.to_string(),
+        port,
+        domain: Some(domain.to_string()),
+        bytes,
+    };
+    MeshSnapshot {
+        chains: vec![
+            chain(
+                "auto-ru-direct",
+                vec![
+                    hop("91.218.245.247:4700", HopRole::Entry, "l1-ru-1"),
+                    hop("82.26.94.247:6700", HopRole::Exit, "tr-exit-1"),
+                ],
+                osc(0.0, 180_000.0),
+                vec![
+                    dest("140.82.121.4", 443, "github.com", 820_000),
+                    dest("104.16.132.229", 443, "cloudflare.com", 410_000),
+                ],
+            ),
+            chain(
+                "auto-eu-onion",
+                vec![
+                    hop("151.243.173.104:4700", HopRole::Entry, "l1-nl-1"),
+                    hop("45.59.119.139:5700", HopRole::Middle, "ch-relay-1"),
+                    hop("82.26.94.247:6701", HopRole::Exit, "tr-exit-1"),
+                ],
+                osc(2.1, 90_000.0),
+                vec![dest("142.250.74.78", 443, "google.com", 350_000)],
+            ),
+            chain(
+                "auto-ru-quic",
+                vec![
+                    hop("193.187.94.74:4700", HopRole::Entry, "l1-ru-2"),
+                    hop("45.59.119.139:6700", HopRole::Exit, "ch-exit-1"),
+                ],
+                osc(4.2, 40_000.0),
+                vec![dest("1.1.1.1", 443, "one.one.one.one", 60_000)],
+            ),
+        ],
+    }
+}
+
 pub fn spawn_poller(
     rt: &tokio::runtime::Handle,
     config_path: PathBuf,
@@ -181,6 +242,21 @@ pub fn spawn_poller(
 ) -> watch::Receiver<MeshSnapshot> {
     let topology = load_chain_topology(&config_path);
     let (tx, rx) = watch::channel(MeshSnapshot::default());
+
+    // Offline mock sandbox: serve an animated synthetic mesh instead of polling
+    // the (absent) TUN, so the On-state wheel renders live traffic on fake data.
+    if crate::model::mock_enabled() {
+        let _ = dns; // unused in mock — no reverse-DNS needed
+        rt.spawn(async move {
+            let mut tick: u64 = 0;
+            loop {
+                let _ = tx.send(mock_snapshot(tick));
+                tick = tick.wrapping_add(1);
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        });
+        return rx;
+    }
 
     rt.spawn(async move {
         let client = reqwest::Client::builder()

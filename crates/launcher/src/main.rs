@@ -1275,16 +1275,20 @@ impl ApplicationHandler for LauncherHandler {
         // Defer orchestrator spawn by 3s so the window paints first — testers see
         // the GUI immediately, and any crash that follows is logged but
         // does NOT block window creation.
-        tracing::info!("[stage] window up — deferring orchestrator spawn 3s");
         let initial_sentinel: Option<std::process::Child> = None;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
-            tracing::info!("[stage] deferred: spawning orchestrator");
-            match spawn_orchestrator() {
-                Ok(_c) => tracing::info!("[stage] orchestrator spawned"),
-                Err(e) => tracing::warn!("failed to spawn orchestrator: {}", e),
-            }
-        });
+        if model::mock_enabled() {
+            tracing::info!("[mock] sandbox — NOT spawning the real backend (orchestrator/sentinel/cli2/tun)");
+        } else {
+            tracing::info!("[stage] window up — deferring orchestrator spawn 3s");
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                tracing::info!("[stage] deferred: spawning orchestrator");
+                match spawn_orchestrator() {
+                    Ok(_c) => tracing::info!("[stage] orchestrator spawned"),
+                    Err(e) => tracing::warn!("failed to spawn orchestrator: {}", e),
+                }
+            });
+        }
 
         // If a mirage:// URL was passed on the CLI, POST it to sentinel
         // once sentinel's HTTP server becomes reachable (poll up to 15s).
@@ -1322,8 +1326,10 @@ impl ApplicationHandler for LauncherHandler {
         let sentinel_arc = Arc::new(Mutex::new(initial_sentinel));
 
         // Watchdog task: checks every 1500ms if sentinel exited; respawns up
-        // to 5 times in 60s before giving up.
-        spawn_orchestrator_watchdog(self.rt.handle(), Arc::downgrade(&sentinel_arc));
+        // to 5 times in 60s before giving up. Skipped in the mock sandbox.
+        if !model::mock_enabled() {
+            spawn_orchestrator_watchdog(self.rt.handle(), Arc::downgrade(&sentinel_arc));
+        }
 
         self.app = Some(LauncherApp {
             window,
@@ -1519,6 +1525,15 @@ impl ApplicationHandler for LauncherHandler {
                         LauncherState::Off | LauncherState::Error(_) => {
                             app.state = LauncherState::Connecting { started_at_ms: t };
                             let tx = app.event_tx.clone();
+                            if model::mock_enabled() {
+                                // Mock sandbox: simulate the connect handshake (no backend).
+                                let txm = app.event_tx.clone();
+                                app.rt.spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(1600)).await;
+                                    let _ = txm.send(LauncherEvent::Started);
+                                });
+                                continue;
+                            }
                             app.rt.spawn(async move {
                                 let client = reqwest::Client::builder()
                                     .timeout(Duration::from_secs(5))
@@ -1561,6 +1576,11 @@ impl ApplicationHandler for LauncherHandler {
                         }
                         LauncherState::On { .. } => {
                             let tx = app.event_tx.clone();
+                            if model::mock_enabled() {
+                                // Mock sandbox: disconnect instantly (no backend).
+                                let _ = app.event_tx.send(LauncherEvent::Stopped);
+                                continue;
+                            }
                             app.rt.spawn(async move {
                                 let client = reqwest::Client::builder()
                                     .timeout(Duration::from_secs(5))
@@ -1845,6 +1865,15 @@ fn main() {
         .skip(1)
         .find(|a| a.starts_with("mirage://"))
         .map(|s| s.trim().to_owned());
+
+    // `--mock` CLI flag → offline sandbox. A CLI arg survives UAC elevation
+    // (manifest requireAdministrator), whereas an env var may not, so the flag
+    // is the reliable way to engage the mock on the elevated launcher. We set
+    // the env var that `model::mock_enabled()` reads so both paths converge.
+    if std::env::args().skip(1).any(|a| a == "--mock") {
+        std::env::set_var("MIRAGE_LAUNCHER_MOCK", "1");
+        tracing::info!("[mock] --mock flag → offline sandbox engaged");
+    }
 
     tracing::info!("[stage] tokio runtime build");
     let rt = match tokio::runtime::Builder::new_multi_thread()
