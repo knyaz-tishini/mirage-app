@@ -63,7 +63,7 @@ q("b-time").addEventListener("click",()=>{dayMul=TIMES[(TIMES.indexOf(dayMul)+1)
 oc.addEventListener("pointerdown",()=>{setState((state+1)%4);});
 
 function drawScene(){const hx=BW/2+2.5*trem*Math.sin(T*3),hy=108-24*stemT;bx.fillStyle=BG;bx.fillRect(0,0,BW,BH);
- const headR=46,O=eNorm,spreadR=spd*Math.PI/180,lenF=0.7+0.3*O;
+ const headR=46,O=eNorm,spreadR=spd*Math.PI/180,lenF=1.1-0.1*O;
  if(glowI>0.02){const gr=headR*1.28,pulse=1+0.08*Math.sin(T*2.5),g=bx.createRadialGradient(hx,hy,headR*0.3,hx,hy,gr*pulse);
   g.addColorStop(0,"rgba(255,216,152,"+(0.6*glowI).toFixed(2)+")");g.addColorStop(0.55,"rgba(251,168,96,"+(0.24*glowI).toFixed(2)+")");g.addColorStop(1,"rgba(251,168,96,0)");
   bx.fillStyle=g;bx.beginPath();bx.arc(hx,hy,gr*pulse,0,TAU);bx.fill();}
@@ -90,7 +90,7 @@ function ez(x,t,r,dt){return x+(t-x)*Math.min(1,r*dt);}
  const id=bx.getImageData(0,0,BW,BH).data,mode=state<=1?3:state===2?2:1;
  rasterize(octx,oc.width,oc.height,id,mode,mode===1?4:5);
  q("clk").textContent=state>=3?("sim "+pad(simT|0)+":"+pad((simT%1*60)|0)):"";
- q("ph").textContent=["· off · ascii","· bud · ascii · stem","· ready · halftone","· connected · pixel · "+(spd|0)+"° len "+(70+30*eNorm|0)+"%"][state];
+ q("ph").textContent=["· off · ascii","· bud · ascii · stem","· ready · halftone","· connected · pixel · "+(spd|0)+"° len "+(110-10*eNorm|0)+"%"][state];
  requestAnimationFrame(loop);})();
 })();
 </script>
