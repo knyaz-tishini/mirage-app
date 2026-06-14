@@ -203,8 +203,8 @@ fn mock_snapshot(tick: u64) -> MeshSnapshot {
             chain(
                 "auto-ru-direct",
                 vec![
-                    hop("91.218.245.247:4700", HopRole::Entry, "l1-ru-1"),
-                    hop("82.26.94.247:6700", HopRole::Exit, "tr-exit-1"),
+                    hop("91.218.245.247:4700", HopRole::Entry, "ru-hostkey-094.74"),
+                    hop("82.26.94.247:6700", HopRole::Exit, "tr-hostkey-094.247"),
                 ],
                 osc(0.0, 180_000.0),
                 vec![
@@ -215,9 +215,9 @@ fn mock_snapshot(tick: u64) -> MeshSnapshot {
             chain(
                 "auto-eu-onion",
                 vec![
-                    hop("151.243.173.104:4700", HopRole::Entry, "l1-nl-1"),
-                    hop("45.59.119.139:5700", HopRole::Middle, "ch-relay-1"),
-                    hop("82.26.94.247:6701", HopRole::Exit, "tr-exit-1"),
+                    hop("151.243.173.104:4700", HopRole::Entry, "nl-hostkey-173.104"),
+                    hop("45.59.119.139:5700", HopRole::Middle, "ch-cloudzy-119.139"),
+                    hop("82.26.94.247:6701", HopRole::Exit, "tr-hostkey-094.247"),
                 ],
                 osc(2.1, 90_000.0),
                 vec![dest("142.250.74.78", 443, "google.com", 350_000)],
@@ -225,8 +225,8 @@ fn mock_snapshot(tick: u64) -> MeshSnapshot {
             chain(
                 "auto-ru-quic",
                 vec![
-                    hop("193.187.94.74:4700", HopRole::Entry, "l1-ru-2"),
-                    hop("45.59.119.139:6700", HopRole::Exit, "ch-exit-1"),
+                    hop("193.187.94.74:4700", HopRole::Entry, "ru-hostkey-245.247"),
+                    hop("45.59.119.139:6700", HopRole::Exit, "ch-cloudzy-119.139"),
                 ],
                 osc(4.2, 40_000.0),
                 vec![dest("1.1.1.1", 443, "one.one.one.one", 60_000)],

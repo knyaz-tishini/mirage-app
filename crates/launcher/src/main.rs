@@ -1,4 +1,6 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// GUI subsystem on Windows for ALL profiles — no console window ever. All logs
+// go to `mirage-launcher.log` next to the exe, so the debug console is just noise.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::f64::consts::TAU;
 use std::num::NonZeroU32;
@@ -67,6 +69,7 @@ const DOT_STEP: f64 = 26.0;
 const SURFACE: &str = "#14151A";
 const BORDERS: &str = "#ffffff24"; // rgba(255,255,255,0.14)
 const FG0: &str = "#F4F4F5";
+const FG1: &str = "#878B91"; // muted mid-tone (brand)
 const FG3: &str = "#555860";
 const ACCENT: &str = "#FBB26A";
 
@@ -394,6 +397,9 @@ struct LauncherApp {
     /// Prefixed `_` because no draw code consumes it yet; field kept so the
     /// poller task stays alive for the lifetime of the app.
     _model_rx: tokio::sync::watch::Receiver<std::sync::Arc<model::ClientState>>,
+    /// Whether the slide-down menu overlay is open (toggled by the top-left
+    /// "M" / parked-cube button).
+    menu_open: bool,
 }
 
 struct LauncherHandler {
@@ -456,8 +462,8 @@ fn draw_mesh_wheel(
 ) {
     use std::collections::HashMap;
 
-    // Doppler scan covers the whole window, sits beneath the routing tree.
-    draw_doppler(ctx, cx, cy, FULL_RADAR_R, t_local, ACCENT);
+    // Radar removed (owner: too jarring — to be redesigned later).
+    let _ = t_local;
 
     // Filter synthetic chains.
     let chains: Vec<&mesh_state::ChainView> = snapshot.chains.iter()
@@ -732,17 +738,26 @@ fn draw_mesh_wheel(
             }
         }
 
-        // Node label — display_name or addr, below the node.
+        // Node label — placed to the SIDE of the node (toward the centre, where
+        // there's room) instead of underneath where it collided with the
+        // destination lines. Brighter than before; tied to the node position.
         let label = node_display.get(addr)
             .and_then(|d| d.as_deref())
             .unwrap_or(addr.as_str());
         let trimmed: String = label.chars().take(18).collect();
-        ctx.set_global_alpha(alpha * 0.8);
-        ctx.set_fill_color(FG3);
+        let r = match role { HopRole::Exit => 11.0, _ => 8.0 };
+        // Left-half node → label on its right; right-half → on its left.
+        let (lx, lalign) = if pos.0 <= W * 0.5 {
+            (pos.0 + r + 5.0, TextAlign::Left)
+        } else {
+            (pos.0 - r - 5.0, TextAlign::Right)
+        };
+        ctx.set_global_alpha(if active { 1.0 } else { 0.65 });
+        ctx.set_fill_color(if active { FG0 } else { FG1 });
         ctx.set_font("9px jetbrains mono");
-        ctx.set_text_align(TextAlign::Center);
-        ctx.set_text_baseline(TextBaseline::Top);
-        ctx.fill_text(&trimmed, pos.0, pos.1 + 12.0);
+        ctx.set_text_align(lalign);
+        ctx.set_text_baseline(TextBaseline::Middle);
+        ctx.fill_text(&trimmed, lx, pos.1);
 
         ctx.set_global_alpha(1.0);
     }
@@ -908,15 +923,9 @@ fn draw_big_button(
         LauncherState::Error(_) => {
             draw_cube_idle(ctx, cx, cy, CUBE_OFF_SIZE, t, CUBE_RED, draw_inner, 0.7, false);
         }
-        LauncherState::Connecting { started_at_ms } => {
-            let elapsed = (t - started_at_ms).max(0.0);
-
-            if elapsed < CUBE_DISSOLVE_MS {
-                let dissolve = elapsed / CUBE_DISSOLVE_MS;
-                draw_cube_idle(ctx, cx, cy, CUBE_OFF_SIZE, t, effective_color, draw_inner, 1.0 - dissolve, shimmer);
-            }
-
-            draw_doppler(ctx, cx, cy, FULL_RADAR_R, elapsed, ACCENT);
+        LauncherState::Connecting { .. } => {
+            // Radar removed (owner: jarring). Keep the cube dancing while connecting.
+            draw_cube_idle(ctx, cx, cy, CUBE_OFF_SIZE, t, effective_color, draw_inner, 1.0, shimmer);
         }
         LauncherState::On { .. } => unreachable!(),
     }
@@ -966,6 +975,8 @@ fn draw_frame(
     mesh: &MeshSnapshot,
     sentinel_phase: &SentinelPhaseLocal,
     sentinel_phase_since_ms: f64,
+    model: &model::ClientState,
+    menu_open: bool,
 ) {
     // Background — mirage perforated dot grid
     ctx.set_fill_color(BG);
@@ -975,13 +986,9 @@ fn draw_frame(
     let cx = W / 2.0;
     let cy = (H + TITLEBAR_H) / 2.0;
 
-    let centre_cube_visible = match state {
-        LauncherState::Off | LauncherState::Error(_) => true,
-        LauncherState::Connecting { started_at_ms } => {
-            (t - started_at_ms).max(0.0) < CUBE_DISSOLVE_MS
-        }
-        LauncherState::On { .. } => false,
-    };
+    // Centre cube dances for everything except On (where it parks top-left as
+    // the menu button). When the centre cube is visible, the top-left shows "M".
+    let centre_cube_visible = !matches!(state, LauncherState::On { .. });
 
     match state {
         LauncherState::On { radar_anchor_ms } => {
@@ -994,6 +1001,59 @@ fn draw_frame(
     }
 
     draw_titlebar(ctx, titlebar_hover.minimize, titlebar_hover.close, !centre_cube_visible, t, sentinel_phase, sentinel_phase_since_ms);
+
+    // Slide-down menu overlay (opens header-style under the chrome, over the canvas).
+    if menu_open {
+        draw_menu_overlay(ctx, model);
+    }
+}
+
+/// Placeholder menu overlay — a panel that drops from under the titlebar over
+/// the canvas, rendering the live ClientState model. Content is provisional
+/// (owner: "throw whatever in for now, check the mechanic").
+fn draw_menu_overlay(ctx: &mut TinySkiaCpuRenderContext, model: &model::ClientState) {
+    // Near-opaque panel over the whole canvas area.
+    ctx.set_fill_color("#0E0E11F2");
+    ctx.fill_rect(0.0, TITLEBAR_H, W, H - TITLEBAR_H);
+    // Left accent rail.
+    ctx.set_fill_color(ACCENT);
+    ctx.fill_rect(0.0, TITLEBAR_H, 2.0, H - TITLEBAR_H);
+
+    let mut y = TITLEBAR_H + 14.0;
+    let pad = 14.0;
+    let mut line = |ctx: &mut TinySkiaCpuRenderContext, s: &str, color: &str, size: f64, dy: f64| {
+        ctx.set_fill_color(color);
+        ctx.set_font(&format!("{size}px jetbrains mono"));
+        ctx.set_text_align(TextAlign::Left);
+        ctx.set_text_baseline(TextBaseline::Top);
+        ctx.fill_text(s, pad, y);
+        y += dy;
+    };
+
+    line(ctx, "MENU", ACCENT, 13.0, 22.0);
+
+    // Connection / credential summary.
+    let c = &model.conn;
+    line(ctx, &format!("phase    {}", c.phase), FG0, 10.0, 15.0);
+    line(ctx, &format!("monitor  {}", if c.monitor_reachable { "reachable" } else { "—" }), FG1, 10.0, 15.0);
+    if let Some(cr) = &model.credential {
+        let req = if cr.require { "require" } else { "open" };
+        line(ctx, &format!("cred     {} g{} {}", cr.scheme, cr.generation, req), FG1, 10.0, 15.0);
+    }
+    line(ctx, &format!("data     {}", c.cli_variant), FG3, 10.0, 18.0);
+
+    // Chains.
+    line(ctx, &format!("CHAINS ({})", model.chains.len()), ACCENT, 11.0, 18.0);
+    for ch in model.chains.iter().take(6) {
+        let health = match ch.healthy {
+            Some(true) => "ok",
+            Some(false) => "down",
+            None => "?",
+        };
+        let lat = ch.latency_ms.map(|l| format!("{l}ms")).unwrap_or_else(|| "—".into());
+        let hops = ch.hops.len();
+        line(ctx, &format!("· {}  {}  {}  {}h", ch.chain_id, health, lat, hops), FG1, 10.0, 14.0);
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1090,6 +1150,16 @@ fn draw_titlebar(
         };
         let _ = inner_alpha; // used implicitly via draw_inner fade-in on ConfigReady
         draw_cube_idle(ctx, cx, cy, logo_size, t, effective_color, draw_inner, 1.0, shimmer);
+    } else {
+        // Centre cube is dancing — show the "M" menu entry top-left instead of
+        // the parked cube. Same hit region; opens the same overlay.
+        let mx = 14.0 + 26.0 / 2.0;
+        let my = TITLEBAR_H / 2.0;
+        ctx.set_fill_color(ACCENT);
+        ctx.set_font("16px jetbrains mono");
+        ctx.set_text_align(TextAlign::Center);
+        ctx.set_text_baseline(TextBaseline::Middle);
+        ctx.fill_text("M", mx, my);
     }
 
     let close_x = W - TITLEBAR_BTN_W;
@@ -1349,6 +1419,7 @@ impl ApplicationHandler for LauncherHandler {
             sentinel_phase_since_ms: 0.0,
             sentinel_phase_prev: SentinelPhaseLocal::Unknown,
             _model_rx: model_rx,
+            menu_open: false,
         });
     }
 
@@ -1499,6 +1570,7 @@ impl ApplicationHandler for LauncherHandler {
                 let dpr = app.window.scale_factor();
                 let mut ctx = TinySkiaCpuRenderContext::new(width, height, dpr);
                 let mesh_snapshot = app.mesh_rx.borrow().clone();
+                let model_snapshot = app._model_rx.borrow().clone();
                 draw_frame(
                     &mut ctx,
                     &app.state,
@@ -1507,6 +1579,8 @@ impl ApplicationHandler for LauncherHandler {
                     &mesh_snapshot,
                     &current_sentinel,
                     app.sentinel_phase_since_ms,
+                    &model_snapshot,
+                    app.menu_open,
                 );
                 for (id, resp) in &responses {
                     if !resp.clicked || id.as_str() != "btn" {
@@ -1630,6 +1704,11 @@ impl ApplicationHandler for LauncherHandler {
 
                 if button == MouseButton::Left && state == ElementState::Pressed {
                     if let Some((x, y)) = app.mouse.pos {
+                        // Top-left "M" / parked-cube → toggle the menu overlay.
+                        if y < TITLEBAR_H && x < 44.0 {
+                            app.menu_open = !app.menu_open;
+                            return;
+                        }
                         if y < TITLEBAR_H && x < W - TITLEBAR_BTN_W * 2.0 {
                             let _ = app.window.drag_window();
                             return;
