@@ -73,3 +73,26 @@ idle=grey, error=red).
 
 Open `reimagined.html` standalone, or render via visualize. v1's `gallery.html` (6 probes)
 kept for reference but superseded except the globe.
+
+## v3 — centerpiece morph scene (CURRENT → `morph-scene.html`)
+
+Owner's idea for the cube replacement: **one continuous scene that morphs with connection
+state**, not a static centerpiece. State machine:
+
+1. **BOOT** — a **white relief** (Block Survey #34 heightfield) gently undulating.
+2. **READY** (services connected) — relief turns **amber** and writhes more actively.
+3. **COLLAPSE** (click the scene) — the relief folds into a **sphere** (lat/lon grid wraps:
+   grid `(u,v)` → `lon=u·2π, lat=(v−0.5)·π`; per-vertex `lerp(relief, sphere, fold)`).
+4. **MESH** (all connected) — the mesh nodes + great-circle arcs + beads fade in **on the
+   sphere** (= the current mesh globe), grid wireframe dims under them.
+
+One shared camera (drag-rotate + inertia, wheel zoom) the whole way through. Auto-cycles for
+demo; `boot/services up/collapse/connected` buttons + `auto` toggle drive it manually; click
+the scene to collapse. This unifies two earlier cube-replacement variants (fleet relief +
+globe) into a single object. **Primary candidate.**
+
+`morph-scene.html` also carries the **softened blooms** (owner: v2 blooms too sharp): peony +
+dahlia redrawn with **ellipse petals + shadow-blur glow**, slow breathing, amber bud — soft
+alt cube-replacement. uzor/tiny-skia port note: ellipse petals = `Path` arc-approx; the
+relief↔sphere morph is per-vertex lerp on the same projected-grid draw as the globe (no GPU);
+shadow-blur softness → a pre-blurred petal sprite or a couple of low-alpha offset passes.
