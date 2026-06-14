@@ -67,15 +67,15 @@ function drawScene(){const hx=BW/2+2.5*trem*Math.sin(frame*0.05),hy=92-30*stemT;
   g.addColorStop(0,"rgba(255,216,152,"+(0.82*glowI).toFixed(2)+")");g.addColorStop(0.5,"rgba(251,168,96,"+(0.30*glowI).toFixed(2)+")");g.addColorStop(1,"rgba(251,168,96,0)");
   bx.fillStyle=g;bx.beginPath();bx.arc(hx,hy,gr*pulse,0,TAU);bx.fill();}
  if(stemT>0.05){bx.strokeStyle="rgb(70,90,46)";bx.lineWidth=2.6;bx.globalAlpha=Math.min(1,stemT*1.6);bx.beginPath();bx.moveTo(hx,170);bx.quadraticCurveTo(hx+3,(170+hy)/2,hx,hy+8);bx.stroke();bx.globalAlpha=1;}
- const rings=6,headR=32,O=eNorm,spreadR=spd*Math.PI/180,HR=headR*(0.72+0.28*O);
+ const rings=6,headR=32,O=eNorm,spreadR=spd*Math.PI/180,lenF=0.7+0.3*O;
  for(let k=0;k<rings;k++){const kt=k/(rings-1),count=10-k,col=lerpC(outer,k<rings-2?inner:deep,kt),
-   L=HR*(1-kt*0.45)*(0.55+0.45*O),rb=2+HR*0.09*(1-kt),w=clamp((spreadR/count)*0.62,0.16,0.7),
+   L=headR*(1-kt*0.45)*lenF,rb=2+headR*0.09*(1-kt),w=clamp((spreadR/count)*0.62,0.16,0.7),
    sway=0.08*Math.sin(frame*0.02+k*1.3)*(k%2?1:-1);
   for(let i=0;i<count;i++){const h=ihash(k,i,seedi),
     a=-Math.PI/2+((i+0.5)/count-0.5)*spreadR+sway+(h-0.5)*0.10+0.03*Math.sin(frame*0.028+i+k),
     Lb=L*(0.85+h*0.3)*(1+0.05*Math.sin(frame*0.024+i*0.6+k));
    petal(bx,hx,hy,a,rb,Lb,w,col,h);}}
- bx.fillStyle=css(coreC);bx.beginPath();bx.arc(hx,hy,3+HR*0.07*(1-O)+0.5*Math.sin(frame*0.04),0,TAU);bx.fill();
+ bx.fillStyle=css(coreC);bx.beginPath();bx.arc(hx,hy,4+0.5*Math.sin(frame*0.04),0,TAU);bx.fill();
  if(glowI>0.05){const nsp=Math.floor(4+9*glowI),gr2=32+22*glowI;for(let i=0;i<nsp;i++){const a=Math.random()*TAU,rr=gr2*0.5+Math.random()*gr2*0.8,px=hx+Math.cos(a)*rr,py=hy+Math.sin(a)*rr,al=Math.random()*glowI*0.85;bx.fillStyle="rgba(255,236,200,"+al.toFixed(2)+")";bx.fillRect(px,py,1.3,1.3);}}
 }
 
