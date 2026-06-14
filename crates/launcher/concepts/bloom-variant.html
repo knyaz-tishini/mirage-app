@@ -7,25 +7,25 @@
 <style>
   body{margin:0;background:#0b0b0e;color:#f4f4f5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:18px}
   h1{font-size:13px;letter-spacing:.16em;font-weight:500;color:#fbb26a;margin:0 0 6px}
-  .sub{font-size:11px;color:#878b91;margin-bottom:14px}
+  .sub{font-size:11px;color:#878b91;margin-bottom:12px}
   .clk{color:#fbb26a}
   .lbl{font-size:11px;color:#878b91;margin-bottom:6px;letter-spacing:.05em}
   .card{background:#14151a;border:1px solid #ffffff14;border-radius:12px;padding:10px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
-  canvas{display:block;width:100%;border-radius:6px;background:#060507}
-  .mctl{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+  canvas{display:block;width:100%;border-radius:6px;background:#060507;cursor:pointer}
+  .mctl{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
   .mbtn{font:11px ui-monospace,monospace;background:#0b0b0e;color:#c9ccd1;border:1px solid #ffffff24;border-radius:6px;padding:4px 9px;cursor:pointer;letter-spacing:.04em}
   .mbtn:hover{border-color:#fbb26a;color:#fbb26a}
 </style>
 </head>
 <body>
 <h1>MIRAGE · CENTERPIECE — BLOOM VARIANT</h1>
-<div class="sub">one model, three rasterizers · grows on ready · opens/closes by local time <span class="clk" id="clk">--:--:--</span> <span id="ph"></span></div>
-<div class="mctl"><button class="mbtn" id="b-ready">ready: off</button><button class="mbtn" id="b-auto">auto: on</button></div>
+<div class="sub">off = glow only · ready = stem grows · click = bloom · time folds the bud (day open / night closed), keeps sparkling &nbsp; <span class="clk" id="clk">sim --:--</span> <span id="ph"></span></div>
+<div class="mctl"><button class="mbtn" data-st="0">off</button><button class="mbtn" data-st="1">boot</button><button class="mbtn" data-st="2">ready</button><button class="mbtn" data-st="3">bloom</button><button class="mbtn" id="b-auto">auto: on</button></div>
 <div class="grid">
-  <div class="card"><div class="lbl">PIXEL</div><canvas id="cpix" width="240" height="200"></canvas></div>
-  <div class="card"><div class="lbl">HALFTONE</div><canvas id="chalf" width="240" height="200"></canvas></div>
-  <div class="card"><div class="lbl">ASCII</div><canvas id="casc" width="240" height="200"></canvas></div>
+  <div class="card"><div class="lbl">PIXEL</div><canvas id="cpix" width="240" height="210"></canvas></div>
+  <div class="card"><div class="lbl">HALFTONE</div><canvas id="chalf" width="240" height="210"></canvas></div>
+  <div class="card"><div class="lbl">ASCII</div><canvas id="casc" width="240" height="210"></canvas></div>
 </div>
 <script>
 (function(){
@@ -37,9 +37,7 @@ const css=c=>"rgb("+c[0]+","+c[1]+","+c[2]+")";
 const BW=240,BH=180,RAMP=" .,:;ox%#@";
 function makeBuf(){const c=document.createElement("canvas");c.width=BW;c.height=BH;return{c,x:c.getContext("2d")};}
 
-function rasterize(ctx,W,H,buf,mode,step){ctx.fillStyle=BG;ctx.fillRect(0,0,W,H);
- if(mode===0){ctx.imageSmoothingEnabled=true;ctx.drawImage(buf.c,0,0,W,H);return;}
- let id;try{id=buf.x.getImageData(0,0,BW,BH).data;}catch(e){return;}
+function rasterize(ctx,W,H,id,mode,step){ctx.fillStyle=BG;ctx.fillRect(0,0,W,H);
  const sx=W/BW,sy=H/BH;
  if(mode===3){ctx.textBaseline="top";ctx.font=Math.ceil(step*sy)+"px ui-monospace,monospace";}
  for(let y=0;y<BH;y+=step)for(let x2=0;x2<BW;x2+=step){const j=(y*BW+x2)*4,r=id[j],g=id[j+1],b=id[j+2],lum=(r*0.299+g*0.587+b*0.114)/255;
@@ -54,33 +52,47 @@ function petal(x,cx,cy,a,rb,L,w,col,h){const bx=cx+Math.cos(a)*rb,by=cy+Math.sin
  const v=0.88+h*0.24;x.fillStyle="rgb("+(col[0]*v|0)+","+(col[1]*v|0)+","+(col[2]*v|0)+")";
  x.beginPath();x.moveTo(bx,by);x.quadraticCurveTo(c1x,c1y,tx,ty);x.quadraticCurveTo(c2x,c2y,bx,by);x.closePath();x.fill();}
 
-const buf=makeBuf(),seedi=987654;const outer=[255,224,188],inner=[251,168,96],deep=[206,116,52],coreC=[120,66,30];
-let growT=0,ready=false,auto=true,frame=0,rot=0;
+const buf=makeBuf(),bx=buf.x,seedi=987654;
+const inner=[251,168,96],outer=[255,226,190],coreC=[120,66,30];
+let state=0,auto=true,frame=0,rot=0;
+let glowI=0.35,stemT=0,bloomG=0,o=0,kick=0;
 const outs=[{c:q("cpix"),m:1},{c:q("chalf"),m:2},{c:q("casc"),m:3}];
-outs.forEach(o=>o.x=o.c.getContext("2d"));
+outs.forEach(o2=>o2.x=o2.c.getContext("2d"));
 const STEP={1:4,2:5,3:5};
-q("b-ready").addEventListener("click",()=>{ready=!ready;auto=false;q("b-auto").textContent="auto: off";q("b-ready").textContent="ready: "+(ready?"on":"off");});
+function setState(s){state=s;auto=false;if(s>=3)kick=1;q("b-auto").textContent="auto: off";}
+document.querySelectorAll("[data-st]").forEach(b=>b.addEventListener("click",()=>setState(+b.dataset.st)));
 q("b-auto").addEventListener("click",()=>{auto=!auto;frame=0;q("b-auto").textContent="auto: "+(auto?"on":"off");});
+outs.forEach(o2=>o2.c.addEventListener("pointerdown",()=>{if(state>=2){state=3;kick=1;}else setState(2);}));
 
-function drawBloom(ge,e){const x=buf.x,cx=BW/2,cy=BH*0.46;x.fillStyle=BG;x.fillRect(0,0,BW,BH);
- if(ge<0.55){const seeds=70;for(let i=0;i<seeds;i++){const a=ihash(i,1,seedi)*TAU,rr=ihash(i,2,seedi)*40,px=cx+Math.cos(a)*rr,py=cy+18+ihash(i,3,seedi)*60;
-   const al=(0.55-ge)*0.9*ihash(i,4,seedi);x.fillStyle="rgba(251,168,96,"+al.toFixed(2)+")";x.fillRect(px,py,2,2);}}
- x.strokeStyle="rgb("+(58-e*8|0)+",84,40)";x.lineWidth=3;x.beginPath();x.moveTo(cx,BH);x.quadraticCurveTo(cx+4,BH*0.78,cx,cy+8);x.stroke();
- const rings=6,R=60*ge,headR=R*(0.5+0.5*e);
- for(let k=0;k<rings;k++){const kt=k/(rings-1),count=11-k,col=lerpC(outer,k<rings-2?inner:deep,kt),L=headR*(1-kt*0.55)*(0.4+0.6*e),rb=2+headR*0.08*(1-kt),w=TAU/count*0.46*(0.45+0.55*e);
-  for(let i=0;i<count;i++){const h1=ihash(k,i,seedi),h2=ihash(i,k,seedi+7),a=rot*(k%2?1.2:-1)+(i+k*0.5)/count*TAU+(h1-0.5)*0.22;petal(x,cx,cy,a,rb,L*(0.85+h2*0.3),w,col,h1);}}
- x.fillStyle=css(coreC);x.beginPath();x.arc(cx,cy,(1-e)*9*ge+4*ge+1,0,TAU);x.fill();
- if(e>0.6){x.fillStyle="rgb(255,212,120)";for(let i=0;i<14;i++){const a=i/14*TAU+rot*3,rr=((1-e)*9+4)*0.7*ihash(i,3,seedi)+2;x.fillRect(cx+Math.cos(a)*rr-0.8,cy+Math.sin(a)*rr-0.8,1.6,1.6);}}}
+function drawScene(){const hx=BW/2,hy=95-37*stemT;bx.fillStyle=BG;bx.fillRect(0,0,BW,BH);
+ const gr=14+22*glowI,pulse=1+0.12*Math.sin(frame*0.08);
+ const g=bx.createRadialGradient(hx,hy,0,hx,hy,gr*pulse);
+ g.addColorStop(0,"rgba(255,216,152,"+(0.95*glowI).toFixed(2)+")");
+ g.addColorStop(0.5,"rgba(251,168,96,"+(0.4*glowI).toFixed(2)+")");
+ g.addColorStop(1,"rgba(251,168,96,0)");
+ bx.fillStyle=g;bx.beginPath();bx.arc(hx,hy,gr*pulse,0,TAU);bx.fill();
+ if(stemT>0.05){bx.strokeStyle="rgb(70,90,46)";bx.lineWidth=2.2;bx.globalAlpha=Math.min(1,stemT*1.6);bx.beginPath();bx.moveTo(hx,162);bx.quadraticCurveTo(hx+3,(162+hy)/2,hx,hy+5);bx.stroke();bx.globalAlpha=1;}
+ if(stemT>0.25){const P=11,headR=9+15*stemT,e=o,spread=0.5+(TAU*0.46-0.5)*e;
+  for(let i=0;i<P;i++){const ti=(i/(P-1)-0.5),a=-Math.PI/2+ti*spread,h=ihash(i,1,seedi),L=headR*(0.85+0.7*e)*(0.85+h*0.3),w=0.10+0.24*e,col=lerpC(inner,outer,clamp(Math.abs(ti)*1.5,0,1));
+   petal(bx,hx,hy,a,3,L,w,col,h);}
+  bx.fillStyle=css(coreC);bx.beginPath();bx.arc(hx,hy,2+3*stemT,0,TAU);bx.fill();
+  if(e>0.5){bx.fillStyle="rgb(255,214,130)";for(let i=0;i<10;i++){const a=-Math.PI/2+(i/9-0.5)*spread*0.8,rr=4+ihash(i,3,seedi)*5;bx.fillRect(hx+Math.cos(a)*rr-0.8,hy+Math.sin(a)*rr-0.8,1.5,1.5);}}}
+ const nsp=Math.floor(5+11*glowI);
+ for(let i=0;i<nsp;i++){const a=Math.random()*TAU,rr=gr*0.5+Math.random()*gr*1.0,px=hx+Math.cos(a)*rr,py=hy+Math.sin(a)*rr,al=Math.random()*glowI*0.9;bx.fillStyle="rgba(255,236,200,"+al.toFixed(2)+")";bx.fillRect(px,py,1.3,1.3);}
+}
 
 function pad(n){return(n<10?"0":"")+n;}
-(function loop(){frame++;if(auto&&frame>90)ready=true;if(auto)q("b-ready").textContent="ready: "+(ready?"on":"off");
- growT+=((ready?1:0)-growT)*0.02;rot+=0.0009;
- const now=new Date(),secs=now.getHours()*3600+now.getMinutes()*60+now.getSeconds()+now.getMilliseconds()/1000;
- const period=20,ph=(secs%period)/period,open=0.5-0.5*Math.cos(ph*TAU),ge=growT*growT*(3-2*growT);
- q("clk").textContent=pad(now.getHours())+":"+pad(now.getMinutes())+":"+pad(now.getSeconds());
- q("ph").textContent="· "+(open>0.55?"opening":"closing")+" "+(open*100|0)+"%";
- drawBloom(ge,open*ge);
- for(const o of outs)rasterize(o.x,o.c.width,o.c.height,buf,o.m,STEP[o.m]);
+(function loop(){frame++;
+ if(auto){const seq=[80,80,110,640],tot=910,f=frame%tot;let acc=0,st=0;for(let k=0;k<seq.length;k++){acc+=seq[k];if(f<acc){st=k;break;}}state=st;if(st>=3&&f-(seq[0]+seq[1]+seq[2])<6)kick=1;}
+ const gT=[0.35,0.7,0.85,1.0][state],pulseBoot=state===1?0.12*Math.sin(frame*0.12):0;
+ glowI+=((gT+pulseBoot)-glowI)*0.06;stemT+=((state>=2?1:0)-stemT)*0.03;bloomG+=((state>=3?1:0)-bloomG)*0.04;
+ const simHour=(frame*0.06)%24,dayOpen=clamp(Math.sin(clamp((simHour-6)/12,0,1)*Math.PI),0,1);
+ kick*=0.97;const oTarget=bloomG>0.5?Math.max(dayOpen,kick):0;o+=(oTarget-o)*0.05;rot+=0.0009;
+ q("clk").textContent="sim "+pad(simHour|0)+":00";
+ q("ph").textContent=state<2?"· dormant":state<3?"· bud":("· "+(dayOpen>0.5?"day / open":"night / folded")+" "+(o*100|0)+"%");
+ drawScene();
+ const id=bx.getImageData(0,0,BW,BH).data;
+ for(const o2 of outs)rasterize(o2.x,o2.c.width,o2.c.height,id,o2.m,STEP[o2.m]);
  requestAnimationFrame(loop);})();
 })();
 </script>
