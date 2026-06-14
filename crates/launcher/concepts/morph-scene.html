@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mirage centerpiece — morph scene</title>
+<title>Mirage centerpiece — morph scene (grid → granular planet)</title>
 <style>
   body{margin:0;background:#0b0b0e;color:#f4f4f5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:18px}
   h1{font-size:13px;letter-spacing:.16em;font-weight:500;color:#fbb26a;margin:0 0 14px}
@@ -19,7 +19,7 @@
 <body>
 <h1>MIRAGE · CENTERPIECE — MORPH SCENE</h1>
 <div class="card">
-  <div class="lbl">RELIEF → SPHERE → MESH <span class="hint">— drag rotate · wheel zoom · buttons isolate each state (auto = full sequence)</span></div>
+  <div class="lbl">RELIEF (grid) → GRANULAR PLANET → MESH <span class="hint">— drag rotate · wheel zoom · buttons isolate each state (auto = full sequence)</span></div>
   <canvas id="gmorph" width="600" height="360" style="background:#0b0b0e"></canvas>
   <div class="mctl">
     <button class="mbtn" data-ms="0">boot</button>
@@ -31,17 +31,19 @@
 </div>
 <script>
 (function(){
-const BG="#0b0b0e",FG0="#f4f4f5",FG1="#878b91",FG3="#555860",AMBER="#fbb26a",AMBER_HI="#ffd9b0",RED="#e05656",TAU=Math.PI*2;
-const q=id=>document.getElementById(id);
+const BG="#0b0b0e",FG0="#f4f4f5",FG1="#878b91",FG3="#555860",AMBER="#fbb26a",AMBER_HI="#ffd9b0",TAU=Math.PI*2;
+const q=id=>document.getElementById(id),clamp=(v,a,b)=>v<a?a:(v>b?b:v);
 function ihash(i,j,s){let h=(Math.imul(i,374761393)+Math.imul(j,668265263)+s)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296;}
 function vnoise(x,y,s){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
  const a=ihash(xi,yi,s),b=ihash(xi+1,yi,s),c=ihash(xi,yi+1,s),d=ihash(xi+1,yi+1,s);return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;}
+const lerpC=(a,b,t)=>[a[0]+(b[0]-a[0])*t|0,a[1]+(b[1]-a[1])*t|0,a[2]+(b[2]-a[2])*t|0];
 
 function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
- const Ng=30,ns=4242,PX=[],PZ=[],DIRW=[];
- for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const u=i/(Ng-1),v=j/(Ng-1),px=(u-0.5)*2.0,pz=(v-0.5)*2.0,idx=i*Ng+j;
-  PX[idx]=px;PZ[idx]=pz;const rho=Math.hypot(px,pz),ph=Math.atan2(pz,px),rb=1.0/Math.max(Math.abs(Math.cos(ph)),Math.abs(Math.sin(ph)),1e-6),rhoN=Math.min(1,rho/rb),th=rhoN*Math.PI;
-  DIRW[idx]=[Math.sin(th)*Math.cos(ph),Math.cos(th),Math.sin(th)*Math.sin(ph)];}
+ const Ng=34,ns=4242,ns2=771,N=Ng*Ng,GA=Math.PI*(3-Math.sqrt(5)),PTS=[];
+ for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const u=i/(Ng-1),v=j/(Ng-1),k=i*Ng+j;
+  const fy=1-(k/(N-1))*2,fr=Math.sqrt(Math.max(0,1-fy*fy)),fth=GA*k,fib=[Math.cos(fth)*fr,fy,Math.sin(fth)*fr];
+  const lat=Math.asin(clamp(fy,-1,1)),lon=Math.atan2(fib[2],fib[0]),land=vnoise(lon*1.5+9,lat*1.5+9,ns2)>0.5;
+  PTS[k]={px:(u-0.5)*2.0,pz:(v-0.5)*2.0,fib,land,i,j};}
  const NODES=[{lat:55,lon:37,l:"ru-094.74"},{lat:39,lon:35,l:"tr-094.247"},{lat:52,lon:5,l:"nl-173.104"},{lat:47,lon:8,l:"ch-119.139"},{lat:55,lon:49,l:"ru-245.247"}];
  function v3(la,lo){la*=Math.PI/180;lo*=Math.PI/180;return[Math.cos(la)*Math.cos(lo),Math.sin(la),Math.cos(la)*Math.sin(lo)];}
  NODES.forEach(n=>n.p=v3(n.lat,n.lon));const LINKS=[[0,1],[2,3],[0,4],[1,3]];
@@ -53,9 +55,9 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
  function manual(s){auto=false;state=s;lbl();}
  function lbl(){const b=q("m-auto");if(b)b.textContent="auto: "+(auto?"on":"off");}
  c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,y:e.offsetY,m:0};vyaw=vpitch=0;c.style.cursor="grabbing";});
- c.addEventListener("pointermove",e=>{if(drag){const dx=e.offsetX-drag.x,dy=e.offsetY-drag.y;drag.m+=Math.abs(dx)+Math.abs(dy);yaw+=dx*0.008;pitch=Math.max(-1.35,Math.min(1.35,pitch+dy*0.008));vyaw=dx*0.008;vpitch=dy*0.008;drag.x=e.offsetX;drag.y=e.offsetY;}});
+ c.addEventListener("pointermove",e=>{if(drag){const dx=e.offsetX-drag.x,dy=e.offsetY-drag.y;drag.m+=Math.abs(dx)+Math.abs(dy);yaw+=dx*0.008;pitch=clamp(pitch+dy*0.008,-1.35,1.35);vyaw=dx*0.008;vpitch=dy*0.008;drag.x=e.offsetX;drag.y=e.offsetY;}});
  window.addEventListener("pointerup",()=>{if(drag&&drag.m<6)manual(state<2?2:state);drag=null;c.style.cursor="grab";});
- c.addEventListener("wheel",e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:0.926;zoom=Math.max(0.6,Math.min(3.2,zoom));},{passive:false});
+ c.addEventListener("wheel",e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:0.926;zoom=clamp(zoom,0.6,3.2);},{passive:false});
  document.querySelectorAll("[data-ms]").forEach(b=>b.addEventListener("click",()=>manual(+b.dataset.ms)));
  const ab=q("m-auto");if(ab)ab.addEventListener("click",()=>{auto=!auto;autoT=0;lbl();});
  const dwell=[150,150,300,320],total=dwell.reduce((a,b)=>a+b,0);
@@ -64,16 +66,19 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
   if(auto){autoT++;if(autoT>=total)autoT=0;let acc=0,st=0;for(let k=0;k<dwell.length;k++){acc+=dwell[k];if(autoT<acc){st=k;break;}}state=st;}
   const tf=state>=2?1:0,ta=state===0?0.16:0.26,tc=state>=1?1:0,tm=state===3?1:0;
   fold+=(tf-fold)*0.011;amp+=(ta-amp)*0.04;colT+=(tc-colT)*0.05;mesh+=(tm-mesh)*0.06;
-  const fe=fold*fold*(3-2*fold),meshA=mesh*Math.max(0,Math.min(1,(fold-0.9)/0.08));
-  if(!drag){yaw+=vyaw+0.0012;pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=Math.max(-1.35,Math.min(1.35,pitch));}
+  const fe=fold*fold*(3-2*fold),meshA=mesh*clamp((fold-0.9)/0.08,0,1),R=Rr();
+  const lineFade=clamp(1-fe/0.12,0,1),dotFade=clamp((fe-0.03)/0.16,0,1);
+  if(!drag){yaw+=vyaw+0.0012;pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=clamp(pitch,-1.35,1.35);}
   x.fillStyle=BG;x.fillRect(0,0,W,H);
-  const PR=new Array(Ng*Ng),R=Rr();
-  for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const idx=i*Ng+j,px=PX[idx],pz=PZ[idx],D=DIRW[idx],hh=amp*1.6*hgt(i,j);
-   const p=rot([px+(D[0]-px)*fe,hh+(D[1]-hh)*fe,pz+(D[2]-pz)*fe]);PR[idx]=[cx+p[0]*R,cy-p[1]*R,p[2]];}
-  const cr=Math.round(244+(251-244)*colT),cg=Math.round(244+(178-244)*colT),cb=Math.round(245+(106-245)*colT),gridA=(0.5-0.34*meshA);
-  x.lineWidth=1;x.strokeStyle="rgba("+cr+","+cg+","+cb+","+gridA.toFixed(2)+")";
-  for(let i=0;i<Ng;i++){x.beginPath();for(let j=0;j<Ng;j++){const s=PR[i*Ng+j];if(j)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
-  for(let j=0;j<Ng;j++){x.beginPath();for(let i=0;i<Ng;i++){const s=PR[i*Ng+j];if(i)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
+  const PR=new Array(N);
+  for(let k=0;k<N;k++){const P=PTS[k],flatY=amp*1.5*hgt(P.i,P.j),wx=P.px+(P.fib[0]-P.px)*fe,wy=flatY+(P.fib[1]-flatY)*fe,wz=P.pz+(P.fib[2]-P.pz)*fe,r=rot([wx,wy,wz]);PR[k]=[cx+r[0]*R,cy-r[1]*R,r[2]];}
+  if(lineFade>0.01){const cr=Math.round(244+(251-244)*colT),cg=Math.round(244+(178-244)*colT),cb=Math.round(245+(106-245)*colT);
+   x.lineWidth=1;x.strokeStyle="rgba("+cr+","+cg+","+cb+","+(0.5*lineFade).toFixed(2)+")";
+   for(let i=0;i<Ng;i++){x.beginPath();for(let j=0;j<Ng;j++){const s=PR[i*Ng+j];if(j)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
+   for(let j=0;j<Ng;j++){x.beginPath();for(let i=0;i<Ng;i++){const s=PR[i*Ng+j];if(i)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}}
+  if(dotFade>0.01){for(let k=0;k<N;k++){const P=PTS[k],s=PR[k],d2=s[2],sB=d2>=-0.04?(0.28+0.72*clamp(d2,0,1)):0,b=0.82*(1-fe)+sB*fe;if(b<=0.03)continue;
+    const tw=0.82+0.18*Math.sin(t*2.4+k*0.7),al=(P.land?b:b*0.5)*tw*dotFade,col=P.land?lerpC([244,244,245],[251,178,106],colT):[122,130,142];
+    x.fillStyle="rgba("+col[0]+","+col[1]+","+col[2]+","+al.toFixed(2)+")";const sz=P.land?2.0:1.3;x.fillRect(s[0]-sz/2,s[1]-sz/2,sz,sz);}}
   if(meshA>0.01){
    for(let li=0;li<LINKS.length;li++){const a=LINKS[li][0],bb=LINKS[li][1],ra=rot(NODES[a].p),rb=rot(NODES[bb].p),path=[];
     for(let k=0;k<=20;k++){const tt=k/20;let mx=ra[0]+(rb[0]-ra[0])*tt,my=ra[1]+(rb[1]-ra[1])*tt,mz=ra[2]+(rb[2]-ra[2])*tt,L=Math.hypot(mx,my,mz)||1;mx/=L;my/=L;mz/=L;const lift=1+0.16*Math.sin(tt*Math.PI);path.push([cx+(mx*lift)*R,cy-(my*lift)*R,mz]);}
@@ -82,7 +87,7 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
    for(const n of NODES){const r=rot(n.p),s=[cx+r[0]*R,cy-r[1]*R],front=r[2]>=-0.02;if(!front)continue;x.globalAlpha=meshA;
     x.fillStyle=FG0;x.beginPath();x.arc(s[0],s[1],4.2,0,TAU);x.fill();x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],2.4,0,TAU);x.fill();
     if(zoom>1.1){x.fillStyle=FG0;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.l,s[0]+7,s[1]+3);}x.globalAlpha=1;}}
-  const names=["BOOT — relief","READY — services up","COLLAPSING -> sphere","MESH — connected"];
+  const names=["BOOT — grid relief","READY — services up","COLLAPSING -> granular","MESH — connected"];
   x.fillStyle=state>=1?AMBER:FG0;x.font="10px ui-monospace,monospace";x.textAlign="left";x.fillText(names[state],12,20);
   x.fillStyle=FG3;x.fillText((auto?"auto":"manual")+"  zoom "+zoom.toFixed(2)+"x",12,H-10);
   requestAnimationFrame(d);})();}
