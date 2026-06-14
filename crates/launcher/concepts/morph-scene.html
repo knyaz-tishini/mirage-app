@@ -3,14 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mirage centerpiece — morph scene (grid → real planet + nodes)</title>
+<title>Mirage centerpiece — morph scene (grid → real planet + node panel WIP)</title>
 <style>
   body{margin:0;background:#0b0b0e;color:#f4f4f5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:18px}
   h1{font-size:13px;letter-spacing:.16em;font-weight:500;color:#fbb26a;margin:0 0 14px}
   .lbl{font-size:11px;color:#878b91;margin-bottom:6px;letter-spacing:.05em}
   .hint{color:#555860}
   .card{background:#14151a;border:1px solid #ffffff14;border-radius:12px;padding:10px;margin-bottom:14px}
-  canvas{display:block;width:100%;border-radius:6px;touch-action:none;cursor:grab}
+  .gwrap{position:relative}
+  .gwrap canvas{display:block;width:100%;border-radius:6px;touch-action:none;cursor:grab}
+  #npop{position:absolute;display:none;pointer-events:none;z-index:3;background:#14151af2;border:1px solid #ffffff26;border-radius:8px;padding:8px 10px;font:11px ui-monospace,monospace;color:#c9ccd1;width:188px;box-shadow:0 6px 22px #00000066}
   .mctl{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
   .mbtn{font:11px ui-monospace,monospace;background:#0b0b0e;color:#c9ccd1;border:1px solid #ffffff24;border-radius:6px;padding:4px 9px;cursor:pointer;letter-spacing:.04em}
   .mbtn:hover{border-color:#fbb26a;color:#fbb26a}
@@ -18,9 +20,13 @@
 </head>
 <body>
 <h1>MIRAGE · CENTERPIECE — MORPH SCENE</h1>
+<!-- NOTE: the single-click node info panel (#npop floating popup) is WIP and was
+     rejected by the owner ("нет, плохо") — kept on disk for next-session rework.
+     Redo as a docked panel, not a floating-follow popup. See
+     nemo/docs/mirage/handoffs/handoff-2026-06-15-morph-centerpiece.md. -->
 <div class="card">
-  <div class="lbl">RELIEF → REAL PLANET → MESH <span class="hint">— drag = rotate · dbl-click = connect/disconnect · tap a node = its IP · wheel = zoom</span></div>
-  <canvas id="gmorph" width="600" height="360" style="background:#0b0b0e"></canvas>
+  <div class="lbl">RELIEF → REAL PLANET → MESH <span class="hint">— drag = rotate · dbl-click = connect/disconnect · single-click a node = info panel (WIP) · wheel = zoom</span></div>
+  <div class="gwrap"><canvas id="gmorph" width="600" height="360" style="background:#0b0b0e"></canvas><div id="npop"></div></div>
   <div class="mctl">
     <button class="mbtn" data-ms="0">boot</button>
     <button class="mbtn" data-ms="1">services up</button>
@@ -42,7 +48,7 @@ function ihash(i,j,s){let h=(Math.imul(i,374761393)+Math.imul(j,668265263)+s)|0;
 function vnoise(x,y,s){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
  const a=ihash(xi,yi,s),b=ihash(xi+1,yi,s),c=ihash(xi,yi+1,s),d=ihash(xi+1,yi+1,s);return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;}
 
-function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
+function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2,pop=q("npop");
  const Ng=50,ns=4242,N=Ng*Ng,GA=Math.PI*(3-Math.sqrt(5)),PTS=[];
  for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const u=i/(Ng-1),v=j/(Ng-1),k=i*Ng+j;
   const fy=1-(k/(N-1))*2,fr=Math.sqrt(Math.max(0,1-fy*fy)),fth=GA*k,fib=[Math.cos(fth)*fr,fy,Math.sin(fth)*fr];
@@ -57,12 +63,18 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
   mask=o.getImageData(0,0,MW,MH).data;for(let k=0;k<N;k++)PTS[k].land=isLand(PTS[k].latd,PTS[k].lond);
  }catch(e){}})();
  function geo(lat,lon){const la=lat/DEG,lo=lon/DEG;return[Math.cos(la)*Math.cos(lo),Math.sin(la),-Math.cos(la)*Math.sin(lo)];}
+ const ROLES="monitor · node · sentry · mshd · db-worker";
  const NODES=[
-  {reg:"RU",ip:"193.187.94.74",lat:55.75,lon:37.62},{reg:"RU",ip:"91.218.245.247",lat:59.93,lon:30.34},
-  {reg:"TR",ip:"82.26.94.247",lat:41.01,lon:28.98},{reg:"NL",ip:"45.12.212.226",lat:52.37,lon:4.90},
-  {reg:"NL",ip:"151.243.173.104",lat:51.92,lon:4.48},{reg:"CH",ip:"45.59.119.139",lat:47.37,lon:8.54}];
+  {id:"ru-hostkey-094.74",ip:"193.187.94.74",reg:"RU",prov:"HostKey",city:"Moscow",roles:ROLES,lat:55.75,lon:37.62},
+  {id:"ru-hostkey-245.247",ip:"91.218.245.247",reg:"RU",prov:"HostKey",city:"St Petersburg",roles:ROLES,lat:59.93,lon:30.34},
+  {id:"tr-hostkey-094.247",ip:"82.26.94.247",reg:"TR",prov:"HostKey",city:"Istanbul",roles:ROLES,lat:41.01,lon:28.98},
+  {id:"nl-hosthatch-212.226",ip:"45.12.212.226",reg:"NL",prov:"Omro",city:"Amsterdam",roles:ROLES+" · standalone",lat:52.37,lon:4.90},
+  {id:"nl-hostkey-173.104",ip:"151.243.173.104",reg:"NL",prov:"HostKey",city:"Rotterdam",roles:ROLES,lat:51.92,lon:4.48},
+  {id:"ch-cloudzy-119.139",ip:"45.59.119.139",reg:"CH",prov:"Cloudzy",city:"Zurich",roles:ROLES+" · standalone",lat:47.37,lon:8.54}];
  NODES.forEach(n=>{n.p=geo(n.lat,n.lon);n.sx=0;n.sy=0;n.front=false;});
  const LINKS=[[0,2],[2,5],[1,3],[3,5],[0,1],[4,2]];
+ function row(k,v,c2){return '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#878b91">'+k+'</span><span style="color:'+(c2||"#c9ccd1")+'">'+v+'</span></div>';}
+ function fillPop(n){pop.innerHTML='<div style="color:#fbb26a;font-weight:500;letter-spacing:.05em">'+n.reg+' · '+n.city+'</div><div style="height:1px;background:#ffffff1f;margin:6px 0"></div>'+row("IP",n.ip,"#ffd9b0")+row("ID",n.id)+row("PROVIDER",n.prov)+'<div style="color:#878b91;margin-top:5px">ROLES</div><div style="color:#c9ccd1;font-size:10px;line-height:1.5">'+n.roles+'</div>';}
  let yaw=0.5,pitch=0.4,vyaw=0.015,vpitch=0,zoom=1,drag=null,t=0,selNode=-1;
  let state=0,auto=true,autoT=0,fold=0,colT=0,amp=0.16,mesh=0;
  function rot(p){const cyw=Math.cos(yaw),syw=Math.sin(yaw),x1=p[0]*cyw+p[2]*syw,z1=-p[0]*syw+p[2]*cyw,y1=p[1];
@@ -71,9 +83,9 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
  function lbl(){const b=q("m-auto");if(b)b.textContent="auto: "+(auto?"on":"off");}
  c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,y:e.offsetY,m:0};vyaw=vpitch=0;c.style.cursor="grabbing";});
  c.addEventListener("pointermove",e=>{if(drag){const dx=e.offsetX-drag.x,dy=e.offsetY-drag.y;drag.m+=Math.abs(dx)+Math.abs(dy);yaw+=dx*0.008;pitch=clamp(pitch+dy*0.008,-1.35,1.35);vyaw=dx*0.008;vpitch=dy*0.008;drag.x=e.offsetX;drag.y=e.offsetY;}});
- window.addEventListener("pointerup",()=>{if(drag&&drag.m<6){const tx=drag.x,ty=drag.y;let best=-1,bd=16*16;
+ window.addEventListener("pointerup",()=>{if(drag&&drag.m<7){const tx=drag.x,ty=drag.y;let best=-1,bd=20*20;
    for(let ni=0;ni<NODES.length;ni++){const n=NODES[ni];if(!n.front)continue;const dx=n.sx-tx,dy=n.sy-ty,dd=dx*dx+dy*dy;if(dd<bd){bd=dd;best=ni;}}
-   selNode=(best>=0)?(selNode===best?-1:best):selNode;}drag=null;c.style.cursor="grab";});
+   selNode=(best>=0)?(selNode===best?-1:best):-1;if(selNode>=0)fillPop(NODES[selNode]);}drag=null;c.style.cursor="grab";});
  c.addEventListener("dblclick",()=>{auto=false;state=(state>=3?0:3);lbl();});
  c.addEventListener("wheel",e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:0.926;zoom=clamp(zoom,0.6,3.2);},{passive:false});
  document.querySelectorAll("[data-ms]").forEach(b=>b.addEventListener("click",()=>{auto=false;state=+b.dataset.ms;lbl();}));
@@ -87,7 +99,7 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
   fold+=(tf-fold)*0.011;amp+=(ta-amp)*0.04;colT+=(tc-colT)*0.05;mesh+=(tm-mesh)*0.06;
   const fe=fold*fold*(3-2*fold),meshA=mesh*clamp((fold-0.9)/0.08,0,1),R=Rr();
   const lineFade=clamp(1-fe/0.12,0,1),dotFade=clamp((fe-0.03)/0.16,0,1);
-  if(!drag){yaw+=vyaw+0.0012;pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=clamp(pitch,-1.35,1.35);}
+  if(!drag){yaw+=vyaw+(selNode<0?0.0012:0);pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=clamp(pitch,-1.35,1.35);}
   x.fillStyle=BG;x.fillRect(0,0,W,H);
   const PR=new Array(N);
   for(let k=0;k<N;k++){const P=PTS[k],flatY=amp*1.5*hgt(P.i,P.j),wx=P.px+(P.fib[0]-P.px)*fe,wy=flatY+(P.fib[1]-flatY)*fe,wz=P.pz+(P.fib[2]-P.pz)*fe,r=rot([wx,wy,wz]);PR[k]=[cx+r[0]*R,cy-r[1]*R,r[2]];}
@@ -105,10 +117,10 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
     x.strokeStyle="rgba(255,217,176,"+(0.8*meshA).toFixed(2)+")";x.lineWidth=1.4;let started=false;x.beginPath();for(let k=0;k<path.length;k++){const P=path[k];if(P[2]>=-0.02){if(started)x.lineTo(P[0],P[1]);else{x.moveTo(P[0],P[1]);started=true;}}else started=false;}x.stroke();}
    for(let ni=0;ni<NODES.length;ni++){const n=NODES[ni],r=rot(n.p),s=[cx+r[0]*R,cy-r[1]*R],front=r[2]>=-0.02;n.sx=s[0];n.sy=s[1];n.front=front;if(!front)continue;
     const sel=selNode===ni;x.globalAlpha=meshA;
-    if(sel){x.strokeStyle="rgba(251,178,106,"+(0.7*meshA).toFixed(2)+")";x.lineWidth=1.2;x.beginPath();x.arc(s[0],s[1],8,0,TAU);x.stroke();}
-    x.fillStyle=FG0;x.beginPath();x.arc(s[0],s[1],4.4,0,TAU);x.fill();x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],2.6,0,TAU);x.fill();
-    x.fillStyle=AMBER;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.reg,s[0]+8,s[1]-3);
-    if(sel){x.fillStyle=AMBER_HI;x.font="9px ui-monospace,monospace";x.fillText(n.ip,s[0]+8,s[1]+8);}x.globalAlpha=1;}}
+    if(sel){x.strokeStyle="rgba(251,178,106,"+(0.8*meshA).toFixed(2)+")";x.lineWidth=1.3;x.beginPath();x.arc(s[0],s[1],9,0,TAU);x.stroke();}
+    x.fillStyle=FG0;x.beginPath();x.arc(s[0],s[1],4.6,0,TAU);x.fill();x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],2.8,0,TAU);x.fill();
+    x.fillStyle=AMBER;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.reg,s[0]+9,s[1]-3);x.globalAlpha=1;}}
+  if(selNode>=0&&NODES[selNode].front&&meshA>0.5){const n=NODES[selNode],sc=c.clientWidth/W,px=clamp(n.sx*sc+14,4,c.clientWidth-200),py=clamp(n.sy*sc-12,4,c.clientHeight-104);pop.style.left=px+"px";pop.style.top=py+"px";pop.style.display="block";}else pop.style.display="none";
   const names=["BOOT — grid relief","READY — services up","COLLAPSING -> planet","MESH — connected"];
   x.fillStyle=state>=1?AMBER:FG0;x.font="10px ui-monospace,monospace";x.textAlign="left";x.fillText(names[state],12,20);
   x.fillStyle=FG3;x.fillText((auto?"auto":"manual")+"  zoom "+zoom.toFixed(2)+"x  ·  dbl-click = connect/disconnect"+(mask?"":"  loading atlas…"),12,H-10);
