@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 mod dns_resolver;
 mod mesh_state;
+mod model;
 mod sentinel_status;
 
 use dns_resolver::DnsResolver;
@@ -388,6 +389,11 @@ struct LauncherApp {
     sentinel_phase_since_ms: f64,
     /// Previous sentinel phase — used to detect transitions.
     sentinel_phase_prev: SentinelPhaseLocal,
+    /// Unified client-state model — updated every ~500 ms by `model::spawn_model_poller`.
+    /// The visual layer reads `.borrow()` when it needs a rich snapshot.
+    /// Prefixed `_` because no draw code consumes it yet; field kept so the
+    /// poller task stays alive for the lifetime of the app.
+    _model_rx: tokio::sync::watch::Receiver<std::sync::Arc<model::ClientState>>,
 }
 
 struct LauncherHandler {
@@ -1260,6 +1266,7 @@ impl ApplicationHandler for LauncherHandler {
         let cfg_path = exe_dir().join("client-config.json");
         let mesh_rx = mesh_state::spawn_poller(self.rt.handle(), cfg_path, dns_resolver.clone());
         let sentinel_rx = sentinel_status::spawn_poller(self.rt.handle());
+        let model_rx = model::spawn_model_poller(self.rt.handle(), exe_dir());
 
         ensure_sentinel_toml();
         ensure_client_template_cli2();
@@ -1335,6 +1342,7 @@ impl ApplicationHandler for LauncherHandler {
             _dns_resolver: dns_resolver,
             sentinel_phase_since_ms: 0.0,
             sentinel_phase_prev: SentinelPhaseLocal::Unknown,
+            _model_rx: model_rx,
         });
     }
 
@@ -1390,6 +1398,17 @@ impl ApplicationHandler for LauncherHandler {
                 if current_sentinel != app.sentinel_phase_prev {
                     app.sentinel_phase_since_ms = t;
                     app.sentinel_phase_prev = current_sentinel.clone();
+
+                    // Serialize the model snapshot to JSON on every sentinel-phase
+                    // transition.  This gives testers a structured state dump in
+                    // the launcher log and ensures all model fields are live
+                    // (serde Serialize reads every field through its generated impl).
+                    let model_snap = app._model_rx.borrow().clone();
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        if let Ok(json) = serde_json::to_string(&*model_snap) {
+                            tracing::debug!("[model] phase transition: {json}");
+                        }
+                    }
                 }
 
                 let size = app.window.inner_size();
