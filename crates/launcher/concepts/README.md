@@ -98,3 +98,28 @@ source's bezier petals + buffer-rasterizer pipeline; not worth pursuing now that
 uzor/tiny-skia port note: the relief↔sphere morph is a per-vertex `lerp(relief, sphere, fold)`
 on the same projected-grid draw as the globe — pure CPU, no GPU. State machine = the launcher's
 connection phase (`boot → ready → collapse(click) → mesh`).
+
+**v3.1 material pass** (`morph-scene.html`): bare wireframe → **shaded solid facets**. Each grid
+quad gets a face normal (cross of edges) · Lambert shade against a fixed light, painter's-sorted
+by depth (back-to-front) so the sphere self-occludes; colour = `lerp(white, amber)` per quad via
+a **radial sweep** (amber fills from centre outward as `colT` rises = services coming up); writhe
+got a second noise octave. Mesh arcs are front-face culled (`z >= -0.02`) so back arcs hide
+behind the solid sphere.
+
+## Alt aesthetic line — bloom variant (`bloom-variant.html`)
+
+Owner: keep the morph scene as the primary centerpiece; the bloom is a **separate alternative
+aesthetic line** (scenario TBD, **no traffic viz** — purely decorative). Built on the REAL flora
+pipeline this time (previous ellipse attempt was rejected):
+
+- one **model buffer** (240×180): a peony drawn with the source's bezier `petal()` + ring layout,
+  amber cultivar (outer `#FFE0BC` → inner `#FB A8 60` → deep `#CE7434`, core `#784A1E`).
+- **three rasterizers off the same buffer** (the "buffer trick"): PIXEL / HALFTONE / ASCII
+  (`rasterize()` samples on a `step` grid → squares / luminance-dots / `RAMP` glyphs). HALFTONE =
+  the look in the owner's reference screenshot.
+- lifecycle (Wilt Chronicle #50): on **ready** the flower **grows out of a scatter of pixels**
+  (`growT` eases 0→1; pre-grow dim seed dots); then it **opens/closes by LOCAL TIME** — `bloom =
+  0.5−0.5·cos(2π·(secs mod period)/period)`, anchored to the wall clock (HH:MM:SS shown).
+
+uzor/tiny-skia port: bezier petal = `PathBuilder` quads; the buffer→rasterizer is a downsample +
+per-cell circle/rect/glyph — cheap on tiny-skia. `new Date()` → system clock in Rust.

@@ -43,6 +43,7 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
  const NODES=[{lat:55,lon:37,l:"ru-094.74"},{lat:39,lon:35,l:"tr-094.247"},{lat:52,lon:5,l:"nl-173.104"},{lat:47,lon:8,l:"ch-119.139"},{lat:55,lon:49,l:"ru-245.247"}];
  function v3(la,lo){la*=Math.PI/180;lo*=Math.PI/180;return[Math.cos(la)*Math.cos(lo),Math.sin(la),Math.cos(la)*Math.sin(lo)];}
  NODES.forEach(n=>n.p=v3(n.lat,n.lon));const LINKS=[[0,1],[2,3],[0,4],[1,3]];
+ const lx=0.28,ly=0.5,lz=0.82;
  let yaw=0.5,pitch=0.62,vyaw=0.015,vpitch=0,zoom=1,drag=null,t=0;
  let state=0,auto=true,autoT=0,hold=0,fold=0,colT=0,writhe=0.1,mesh=0;
  function rot(p){const cyw=Math.cos(yaw),syw=Math.sin(yaw),x1=p[0]*cyw+p[2]*syw,z1=-p[0]*syw+p[2]*cyw,y1=p[1];
@@ -57,29 +58,36 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
  c.addEventListener("wheel",e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:0.926;zoom=Math.max(0.6,Math.min(3.2,zoom));},{passive:false});
  document.querySelectorAll("[data-ms]").forEach(b=>b.addEventListener("click",()=>manual(+b.dataset.ms)));
  const ab=q("m-auto");if(ab)ab.addEventListener("click",()=>{auto=!auto;autoT=0;lbl();});
- const dwell=[150,150,160,280],total=dwell.reduce((a,b)=>a+b,0);
- function relief(i,j){const u=i/(Ng-1),v=j/(Ng-1);let h=(vnoise(i*0.22,j*0.22+t*0.4,ns)-0.5);h+=0.25*Math.sin((i+j)*0.42+t*1.8);return[(u-0.5)*1.9,h*writhe*1.7,(v-0.5)*1.9];}
+ const dwell=[150,150,170,300],total=dwell.reduce((a,b)=>a+b,0);
+ function relief(i,j){const u=i/(Ng-1),v=j/(Ng-1);let h=(vnoise(i*0.22,j*0.22+t*0.4,ns)-0.5);h+=0.35*(vnoise(i*0.5+5,j*0.5-t*0.6,ns)-0.5);h+=0.13*Math.sin((i-j)*0.5+t*1.4);return[(u-0.5)*1.9,h*writhe*1.8,(v-0.5)*1.9];}
  (function d(){t+=0.016;
   if(auto){autoT++;if(autoT>=total)autoT=0;let acc=0,st=0;for(let k=0;k<dwell.length;k++){acc+=dwell[k];if(autoT<acc){st=k;break;}}state=st;}
   else if(state===2&&fold>0.97){hold++;if(hold>50)state=3;}
   const tf=state>=2?1:0,tc=state>=1?1:0,tw=state===0?0.10:(state===1?0.24:0.05),tm=state===3?1:0;
-  fold+=(tf-fold)*0.05;colT+=(tc-colT)*0.06;writhe+=(tw-writhe)*0.05;mesh+=(tm-mesh)*0.05;
+  fold+=(tf-fold)*0.045;colT+=(tc-colT)*0.05;writhe+=(tw-writhe)*0.05;mesh+=(tm-mesh)*0.05;
   if(!drag){yaw+=vyaw+0.0012;pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=Math.max(-1.35,Math.min(1.35,pitch));}
   x.fillStyle=BG;x.fillRect(0,0,W,H);
-  const fe=fold*fold*(3-2*fold),PR=new Array(Ng*Ng);
-  for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const rl=relief(i,j),sp=SPH[i*Ng+j];PR[i*Ng+j]=pj(rot([rl[0]+(sp[0]-rl[0])*fe,rl[1]+(sp[1]-rl[1])*fe,rl[2]+(sp[2]-rl[2])*fe]));}
-  const cr=Math.round(244+(251-244)*colT),cg=Math.round(244+(178-244)*colT),cb=Math.round(245+(106-245)*colT),gridA=(0.5-0.34*mesh);
-  x.lineWidth=1;x.strokeStyle="rgba("+cr+","+cg+","+cb+","+gridA.toFixed(2)+")";
-  for(let i=0;i<Ng;i++){x.beginPath();for(let j=0;j<Ng;j++){const s=PR[i*Ng+j];if(j)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
-  for(let j=0;j<Ng;j++){x.beginPath();for(let i=0;i<Ng;i++){const s=PR[i*Ng+j];if(i)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
+  const fe=fold*fold*(3-2*fold),P3=new Array(Ng*Ng),PJ=new Array(Ng*Ng),R=Rr();
+  for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const rl=relief(i,j),sp=SPH[i*Ng+j],r=rot([rl[0]+(sp[0]-rl[0])*fe,rl[1]+(sp[1]-rl[1])*fe,rl[2]+(sp[2]-rl[2])*fe]);P3[i*Ng+j]=r;PJ[i*Ng+j]=[cx+r[0]*R,cy-r[1]*R,r[2]];}
+  const quads=[];
+  for(let i=0;i<Ng-1;i++)for(let j=0;j<Ng-1;j++){const a=P3[i*Ng+j],b=P3[(i+1)*Ng+j],cc=P3[(i+1)*Ng+j+1],dd=P3[i*Ng+j+1];
+   const e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2],e2x=dd[0]-a[0],e2y=dd[1]-a[1],e2z=dd[2]-a[2];
+   let nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x,nl=Math.hypot(nx,ny,nz)||1;nx/=nl;ny/=nl;nz/=nl;if(nz<0){nx=-nx;ny=-ny;nz=-nz;}
+   const shade=0.2+0.8*Math.max(0,nx*lx+ny*ly+nz*lz),z=(a[2]+b[2]+cc[2]+dd[2])*0.25;
+   const ui=(i+0.5)/(Ng-1)-0.5,vj=(j+0.5)/(Ng-1)-0.5,rN=Math.hypot(ui,vj)/0.707,lc=Math.max(0,Math.min(1,(colT*1.5-rN)*2.2));
+   quads.push({i,j,z,shade,lc});}
+  quads.sort((p,r)=>p.z-r.z);
+  for(const Q of quads){const pa=PJ[Q.i*Ng+Q.j],pb=PJ[(Q.i+1)*Ng+Q.j],pc=PJ[(Q.i+1)*Ng+Q.j+1],pd=PJ[Q.i*Ng+Q.j+1],s=Q.shade;
+   const br=Math.round((244+7*Q.lc)*s),bg=Math.round((244-66*Q.lc)*s),bb=Math.round((245-139*Q.lc)*s);
+   x.fillStyle="rgb("+br+","+bg+","+bb+")";x.beginPath();x.moveTo(pa[0],pa[1]);x.lineTo(pb[0],pb[1]);x.lineTo(pc[0],pc[1]);x.lineTo(pd[0],pd[1]);x.closePath();x.fill();}
   if(mesh>0.01){
    for(let li=0;li<LINKS.length;li++){const a=LINKS[li][0],bb=LINKS[li][1],ra=rot(NODES[a].p),rb=rot(NODES[bb].p),path=[];
-    for(let k=0;k<=20;k++){const tt=k/20;let mx=ra[0]+(rb[0]-ra[0])*tt,my=ra[1]+(rb[1]-ra[1])*tt,mz=ra[2]+(rb[2]-ra[2])*tt,L=Math.hypot(mx,my,mz)||1;mx/=L;my/=L;mz/=L;const lift=1+0.18*Math.sin(tt*Math.PI);path.push(pj([mx*lift,my*lift,mz]));}
-    x.strokeStyle="rgba(251,178,106,"+(0.6*mesh).toFixed(2)+")";x.lineWidth=1.3;x.beginPath();for(let k=0;k<path.length;k++){if(k)x.lineTo(path[k][0],path[k][1]);else x.moveTo(path[k][0],path[k][1]);}x.stroke();
-    const bt=(t*0.22+li*0.27)%1,bi=Math.floor(bt*(path.length-1)),bp=path[bi];if(bp){x.globalAlpha=mesh;x.fillStyle=AMBER_HI;x.beginPath();x.arc(bp[0],bp[1],2.4,0,TAU);x.fill();x.globalAlpha=1;}}
-   for(const n of NODES){const r=rot(n.p),s=pj(r),front=r[2]>=-0.05;x.globalAlpha=(front?1:0.25)*mesh;
-    x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],front?4:2.4,0,TAU);x.fill();x.fillStyle=BG;x.beginPath();x.arc(s[0],s[1],1.6,0,TAU);x.fill();
-    if(front&&zoom>1.1){x.fillStyle=FG0;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.l,s[0]+7,s[1]+3);}x.globalAlpha=1;}}
+    for(let k=0;k<=22;k++){const tt=k/22;let mx=ra[0]+(rb[0]-ra[0])*tt,my=ra[1]+(rb[1]-ra[1])*tt,mz=ra[2]+(rb[2]-ra[2])*tt,L=Math.hypot(mx,my,mz)||1;mx/=L;my/=L;mz/=L;const lift=1+0.16*Math.sin(tt*Math.PI),r=rot;path.push([cx+(mx*lift)*R,cy-(my*lift)*R,mz]);}
+    x.strokeStyle="rgba(255,217,176,"+(0.75*mesh).toFixed(2)+")";x.lineWidth=1.4;let started=false;x.beginPath();for(let k=0;k<path.length;k++){const P=path[k];if(P[2]>=-0.02){if(started)x.lineTo(P[0],P[1]);else{x.moveTo(P[0],P[1]);started=true;}}else started=false;}x.stroke();
+    const bt=(t*0.22+li*0.27)%1,bi=Math.floor(bt*(path.length-1)),bp=path[bi];if(bp&&bp[2]>=-0.02){x.globalAlpha=mesh;x.fillStyle=AMBER_HI;x.beginPath();x.arc(bp[0],bp[1],2.6,0,TAU);x.fill();x.globalAlpha=1;}}
+   for(const n of NODES){const r=rot(n.p),s=[cx+r[0]*R,cy-r[1]*R],front=r[2]>=-0.02;if(!front)continue;x.globalAlpha=mesh;
+    x.fillStyle=FG0;x.beginPath();x.arc(s[0],s[1],4.2,0,TAU);x.fill();x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],2.4,0,TAU);x.fill();
+    if(zoom>1.1){x.fillStyle=FG0;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.l,s[0]+7,s[1]+3);}x.globalAlpha=1;}}
   const names=["BOOT — white relief","READY — services up","COLLAPSING -> sphere","MESH — connected"];
   x.fillStyle=state>=1?AMBER:FG0;x.font="10px ui-monospace,monospace";x.textAlign="left";x.fillText(names[state],12,20);
   x.fillStyle=FG3;x.fillText((auto?"auto":"manual")+"  zoom "+zoom.toFixed(2)+"x",12,H-10);
