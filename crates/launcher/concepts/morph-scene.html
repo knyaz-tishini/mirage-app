@@ -61,7 +61,6 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
  function relief(i,j){const u=i/(Ng-1),v=j/(Ng-1);let h=(vnoise(i*0.22,j*0.22+t*0.4,ns)-0.5);h+=0.25*Math.sin((i+j)*0.42+t*1.8);return[(u-0.5)*1.9,h*writhe*1.7,(v-0.5)*1.9];}
  (function d(){t+=0.016;
   if(auto){autoT++;if(autoT>=total)autoT=0;let acc=0,st=0;for(let k=0;k<dwell.length;k++){acc+=dwell[k];if(autoT<acc){st=k;break;}}state=st;}
-  else if(state===2&&fold>0.97){hold++;if(hold>50)state=3;}
   const tf=state>=2?1:0,tc=state>=1?1:0,tw=state===0?0.10:state===1?0.24:state===2?0.22:0.0,tm=state===3?1:0;
   fold+=(tf-fold)*0.022;colT+=(tc-colT)*0.06;writhe+=(tw-writhe)*0.04;mesh+=(tm-mesh)*0.06;
   const meshA=mesh*Math.max(0,Math.min(1,(fold-0.9)/0.08));
