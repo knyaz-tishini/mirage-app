@@ -10,7 +10,6 @@
   .lbl{font-size:11px;color:#878b91;margin-bottom:6px;letter-spacing:.05em}
   .hint{color:#555860}
   .card{background:#14151a;border:1px solid #ffffff14;border-radius:12px;padding:10px;margin-bottom:14px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
   canvas{display:block;width:100%;border-radius:6px;touch-action:none;cursor:grab}
   .mctl{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
   .mbtn{font:11px ui-monospace,monospace;background:#0b0b0e;color:#c9ccd1;border:1px solid #ffffff24;border-radius:6px;padding:4px 9px;cursor:pointer;letter-spacing:.04em}
@@ -30,10 +29,6 @@
     <button class="mbtn" id="m-auto">auto: on</button>
   </div>
 </div>
-<div class="grid">
-  <div class="card"><div class="lbl">SOFT BLOOM A · PEONY <span class="hint">— click connect · drag bloom</span></div><canvas id="gpeony" width="260" height="240" style="background:#0b0b0e"></canvas></div>
-  <div class="card"><div class="lbl">SOFT BLOOM B · DAHLIA <span class="hint">— click connect · drag curl</span></div><canvas id="gdahlia" width="260" height="240" style="background:#0b0b0e"></canvas></div>
-</div>
 <script>
 (function(){
 const BG="#0b0b0e",FG0="#f4f4f5",FG1="#878b91",FG3="#555860",AMBER="#fbb26a",AMBER_HI="#ffd9b0",RED="#e05656",TAU=Math.PI*2;
@@ -41,8 +36,6 @@ const q=id=>document.getElementById(id);
 function ihash(i,j,s){let h=(Math.imul(i,374761393)+Math.imul(j,668265263)+s)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296;}
 function vnoise(x,y,s){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
  const a=ihash(xi,yi,s),b=ihash(xi+1,yi,s),c=ihash(xi,yi+1,s),d=ihash(xi+1,yi+1,s);return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;}
-function lerpC(a,b,k){return[a[0]+(b[0]-a[0])*k,a[1]+(b[1]-a[1])*k,a[2]+(b[2]-a[2])*k];}
-const css=c=>"rgb("+(c[0]|0)+","+(c[1]|0)+","+(c[2]|0)+")";
 
 function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
  const Ng=30,ns=4242,SPH=[];
@@ -92,40 +85,7 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
   x.fillStyle=FG3;x.fillText((auto?"auto":"manual")+"  zoom "+zoom.toFixed(2)+"x",12,H-10);
   requestAnimationFrame(d);})();}
 
-function PEONY(){const c=q("gpeony"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
- let bloom=0.25,target=null,rot=0,t=0,drag=null,on=false;const rings=7,R=72;
- const outer=[255,228,196],inner=[251,168,96],deep=[206,116,52];
- function petal(a,rb,L,wr,col,al){const mx=cx+Math.cos(a)*(rb+L*0.5),my=cy+Math.sin(a)*(rb+L*0.5);x.save();x.globalAlpha=al;x.translate(mx,my);x.rotate(a);x.fillStyle=css(col);x.beginPath();x.ellipse(0,0,L*0.55,L*wr,0,0,TAU);x.fill();x.restore();}
- c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,m:0};});
- c.addEventListener("pointermove",e=>{if(drag){drag.m+=Math.abs(e.offsetX-drag.x);drag.x=e.offsetX;if(drag.m>6)target=Math.max(0.08,Math.min(1,e.offsetX/W));}});
- window.addEventListener("pointerup",()=>{if(drag&&drag.m<=6){on=!on;target=null;}drag=null;});
- (function d(){t+=0.016;rot+=0.0009;
-  if(target!=null)bloom+=(target-bloom)*0.1;else bloom+=((on?0.92:0.22)+0.05*Math.sin(t*0.5)-bloom)*0.03;
-  const e=bloom*bloom*(3-2*bloom),headR=R*(0.5+0.5*e);x.fillStyle=BG;x.fillRect(0,0,W,H);
-  x.shadowColor="rgba(251,178,106,.4)";x.shadowBlur=8;
-  for(let k=0;k<rings;k++){const kt=k/(rings-1),count=13-k,col=lerpC(outer,k<rings-2?inner:deep,kt),L=headR*(1-kt*0.5)*(0.4+0.6*e),rb=2+headR*0.07*(1-kt),al=(0.92-kt*0.12);
-   for(let i=0;i<count;i++){const a=rot*(k%2?1:-1)*0.7+(i+k*0.45)/count*TAU+0.02*Math.sin(t*0.6+i+k);petal(a,rb,L,0.5,col,al);}}
-  x.shadowBlur=0;x.fillStyle=css([120,66,30]);x.globalAlpha=1;x.beginPath();x.arc(cx,cy,(1-e)*10+5,0,TAU);x.fill();
-  x.fillStyle=on?AMBER:FG3;x.font="9px ui-monospace,monospace";x.textAlign="center";x.fillText(on?"CONNECTED":"OFF",cx,H-12);
-  requestAnimationFrame(d);})();}
-
-function DAHLIA(){const c=q("gdahlia"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
- const ga=Math.PI*(3-Math.sqrt(5));let N=170,bloom=0.2,target=null,curl=1.0,rot=0,t=0,drag=null,on=false;
- const inner=[251,160,86],outer=[255,224,188];
- function petal(a,rb,L,wr,col,al){const mx=cx+Math.cos(a)*(rb+L*0.5),my=cy+Math.sin(a)*(rb+L*0.5);x.save();x.globalAlpha=al;x.translate(mx,my);x.rotate(a);x.fillStyle=css(col);x.beginPath();x.ellipse(0,0,L*0.5,L*wr,0,0,TAU);x.fill();x.restore();}
- c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,m:0};});
- c.addEventListener("pointermove",e=>{if(drag){drag.m+=Math.abs(e.offsetX-drag.x);drag.x=e.offsetX;if(drag.m>6)curl=0.6+(e.offsetX/W)*0.9;}});
- window.addEventListener("pointerup",()=>{if(drag&&drag.m<=6){on=!on;target=on?0.95:0.15;}drag=null;});
- (function d(){t+=0.016;rot+=0.0012;
-  if(target!=null)bloom+=(target-bloom)*0.07;else bloom+=(0.78+0.07*Math.sin(t*0.45)-bloom)*0.02;
-  const e=bloom*bloom*(3-2*bloom),maxR=80;x.fillStyle=BG;x.fillRect(0,0,W,H);
-  x.shadowColor="rgba(251,178,106,.35)";x.shadowBlur=6;
-  for(let i=N-1;i>=0;i--){const r=maxR*Math.sqrt(i/N)*(0.4+0.6*e),a=i*ga+rot,kt=r/maxR,col=lerpC(inner,outer,kt),L=(6+r*0.32)*curl*(1+0.03*Math.sin(t*0.7+i*0.3)),al=0.85;petal(a,r*0.9,L,0.42,col,al);}
-  x.shadowBlur=0;x.fillStyle=css([120,66,30]);x.globalAlpha=1;x.beginPath();x.arc(cx,cy,6,0,TAU);x.fill();
-  x.fillStyle=on?AMBER:FG3;x.font="9px ui-monospace,monospace";x.textAlign="center";x.fillText(on?"CONNECTED":"OFF",cx,H-12);
-  requestAnimationFrame(d);})();}
-
-MORPH();PEONY();DAHLIA();
+MORPH();
 })();
 </script>
 </body>

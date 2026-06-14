@@ -91,8 +91,10 @@ demo; `boot/services up/collapse/connected` buttons + `auto` toggle drive it man
 the scene to collapse. This unifies two earlier cube-replacement variants (fleet relief +
 globe) into a single object. **Primary candidate.**
 
-`morph-scene.html` also carries the **softened blooms** (owner: v2 blooms too sharp): peony +
-dahlia redrawn with **ellipse petals + shadow-blur glow**, slow breathing, amber bud — soft
-alt cube-replacement. uzor/tiny-skia port note: ellipse petals = `Path` arc-approx; the
-relief↔sphere morph is per-vertex lerp on the same projected-grid draw as the globe (no GPU);
-shadow-blur softness → a pre-blurred petal sprite or a couple of low-alpha offset passes.
+Owner verdict: **morph scene is the keeper**, iterate on it. Blooms (peony/dahlia) were
+rejected as cube replacement and removed from the file — the ellipse approximation lost the
+source's bezier petals + buffer-rasterizer pipeline; not worth pursuing now that morph won.
+
+uzor/tiny-skia port note: the relief↔sphere morph is a per-vertex `lerp(relief, sphere, fold)`
+on the same projected-grid draw as the globe — pure CPU, no GPU. State machine = the launcher's
+connection phase (`boot → ready → collapse(click) → mesh`).
