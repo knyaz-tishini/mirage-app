@@ -57,27 +57,28 @@ function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,c
  c.addEventListener("wheel",e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:0.926;zoom=Math.max(0.6,Math.min(3.2,zoom));},{passive:false});
  document.querySelectorAll("[data-ms]").forEach(b=>b.addEventListener("click",()=>manual(+b.dataset.ms)));
  const ab=q("m-auto");if(ab)ab.addEventListener("click",()=>{auto=!auto;autoT=0;lbl();});
- const dwell=[150,150,160,280],total=dwell.reduce((a,b)=>a+b,0);
+ const dwell=[150,150,230,320],total=dwell.reduce((a,b)=>a+b,0);
  function relief(i,j){const u=i/(Ng-1),v=j/(Ng-1);let h=(vnoise(i*0.22,j*0.22+t*0.4,ns)-0.5);h+=0.25*Math.sin((i+j)*0.42+t*1.8);return[(u-0.5)*1.9,h*writhe*1.7,(v-0.5)*1.9];}
  (function d(){t+=0.016;
   if(auto){autoT++;if(autoT>=total)autoT=0;let acc=0,st=0;for(let k=0;k<dwell.length;k++){acc+=dwell[k];if(autoT<acc){st=k;break;}}state=st;}
   else if(state===2&&fold>0.97){hold++;if(hold>50)state=3;}
-  const tf=state>=2?1:0,tc=state>=1?1:0,tw=state===0?0.10:(state===1?0.24:0.05),tm=state===3?1:0;
-  fold+=(tf-fold)*0.05;colT+=(tc-colT)*0.06;writhe+=(tw-writhe)*0.05;mesh+=(tm-mesh)*0.05;
+  const tf=state>=2?1:0,tc=state>=1?1:0,tw=state===0?0.10:state===1?0.24:state===2?0.22:0.0,tm=state===3?1:0;
+  fold+=(tf-fold)*0.022;colT+=(tc-colT)*0.06;writhe+=(tw-writhe)*0.04;mesh+=(tm-mesh)*0.06;
+  const meshA=mesh*Math.max(0,Math.min(1,(fold-0.9)/0.08));
   if(!drag){yaw+=vyaw+0.0012;pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=Math.max(-1.35,Math.min(1.35,pitch));}
   x.fillStyle=BG;x.fillRect(0,0,W,H);
   const fe=fold*fold*(3-2*fold),PR=new Array(Ng*Ng);
   for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const rl=relief(i,j),sp=SPH[i*Ng+j];PR[i*Ng+j]=pj(rot([rl[0]+(sp[0]-rl[0])*fe,rl[1]+(sp[1]-rl[1])*fe,rl[2]+(sp[2]-rl[2])*fe]));}
-  const cr=Math.round(244+(251-244)*colT),cg=Math.round(244+(178-244)*colT),cb=Math.round(245+(106-245)*colT),gridA=(0.5-0.34*mesh);
+  const cr=Math.round(244+(251-244)*colT),cg=Math.round(244+(178-244)*colT),cb=Math.round(245+(106-245)*colT),gridA=(0.5-0.34*meshA);
   x.lineWidth=1;x.strokeStyle="rgba("+cr+","+cg+","+cb+","+gridA.toFixed(2)+")";
   for(let i=0;i<Ng;i++){x.beginPath();for(let j=0;j<Ng;j++){const s=PR[i*Ng+j];if(j)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
   for(let j=0;j<Ng;j++){x.beginPath();for(let i=0;i<Ng;i++){const s=PR[i*Ng+j];if(i)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
-  if(mesh>0.01){
+  if(meshA>0.01){
    for(let li=0;li<LINKS.length;li++){const a=LINKS[li][0],bb=LINKS[li][1],ra=rot(NODES[a].p),rb=rot(NODES[bb].p),path=[];
     for(let k=0;k<=20;k++){const tt=k/20;let mx=ra[0]+(rb[0]-ra[0])*tt,my=ra[1]+(rb[1]-ra[1])*tt,mz=ra[2]+(rb[2]-ra[2])*tt,L=Math.hypot(mx,my,mz)||1;mx/=L;my/=L;mz/=L;const lift=1+0.18*Math.sin(tt*Math.PI);path.push(pj([mx*lift,my*lift,mz]));}
-    x.strokeStyle="rgba(251,178,106,"+(0.6*mesh).toFixed(2)+")";x.lineWidth=1.3;x.beginPath();for(let k=0;k<path.length;k++){if(k)x.lineTo(path[k][0],path[k][1]);else x.moveTo(path[k][0],path[k][1]);}x.stroke();
-    const bt=(t*0.22+li*0.27)%1,bi=Math.floor(bt*(path.length-1)),bp=path[bi];if(bp){x.globalAlpha=mesh;x.fillStyle=AMBER_HI;x.beginPath();x.arc(bp[0],bp[1],2.4,0,TAU);x.fill();x.globalAlpha=1;}}
-   for(const n of NODES){const r=rot(n.p),s=pj(r),front=r[2]>=-0.05;x.globalAlpha=(front?1:0.25)*mesh;
+    x.strokeStyle="rgba(251,178,106,"+(0.6*meshA).toFixed(2)+")";x.lineWidth=1.3;x.beginPath();for(let k=0;k<path.length;k++){if(k)x.lineTo(path[k][0],path[k][1]);else x.moveTo(path[k][0],path[k][1]);}x.stroke();
+    const bt=(t*0.22+li*0.27)%1,bi=Math.floor(bt*(path.length-1)),bp=path[bi];if(bp){x.globalAlpha=meshA;x.fillStyle=AMBER_HI;x.beginPath();x.arc(bp[0],bp[1],2.4,0,TAU);x.fill();x.globalAlpha=1;}}
+   for(const n of NODES){const r=rot(n.p),s=pj(r),front=r[2]>=-0.05;x.globalAlpha=(front?1:0.25)*meshA;
     x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],front?4:2.4,0,TAU);x.fill();x.fillStyle=BG;x.beginPath();x.arc(s[0],s[1],1.6,0,TAU);x.fill();
     if(front&&zoom>1.1){x.fillStyle=FG0;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.l,s[0]+7,s[1]+3);}x.globalAlpha=1;}}
   const names=["BOOT — white relief","READY — services up","COLLAPSING -> sphere","MESH — connected"];
