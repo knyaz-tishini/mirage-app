@@ -18,7 +18,8 @@ use uzor::framework::multi_window::WindowCtx;
 use uzor::framework::widgets::lm;
 use uzor::input::core::event_processor::PlatformEvent;
 use uzor::input::keyboard::events::KeyCode;
-use uzor::layout::{ChromeWindowControl, LayoutManager};
+use uzor::input::{Sense, WidgetKind};
+use uzor::layout::{ChromeWindowControl, LayoutManager, LayoutNodeId};
 use uzor::ui::widgets::composite::chrome::theme::ChromeTheme;
 use uzor::types::unsafe_widget_id;
 
@@ -69,6 +70,17 @@ fn id_scrim() -> uzor::types::WidgetId {
 /// Menu panel body — absorbs clicks so panel-background taps don't dismiss.
 fn id_menu_panel() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:menu_panel")
+}
+
+/// Register an INVISIBLE click hit-zone (no paint). Unlike `lm::button` — which
+/// paints a hover background over its whole rect — this only adds the rect to
+/// the input coordinator so `was_clicked` resolves, leaving the scene untouched.
+fn register_hit(layout: &mut LayoutManager<NoPanel>, id: uzor::types::WidgetId, rect: Rect) {
+    let layer = layout.compute_layer_for(LayoutNodeId::ROOT);
+    layout
+        .ctx_mut()
+        .input
+        .register_atomic(id, WidgetKind::Button, rect, Sense::CLICK, &layer);
 }
 
 /// Skin-row hit-zone ids.
@@ -300,54 +312,33 @@ impl App<NoPanel> for MirageClientApp {
                 // Hit priority follows registration order (later wins). Scrim
                 // first (dismiss fallback), then the panel body (absorbs taps
                 // on the overlay background), then the skin rows on top.
-                lm::button(id_scrim(), Rect {
+                // All invisible — the sheet itself is painted in draw_menu_overlay.
+                register_hit(layout, id_scrim(), Rect {
                     x: 0.0,
                     y: CHROME_H,
                     width: w,
                     height: (h - CHROME_H).max(0.0),
-                }).build(layout, render);
-
-                lm::button(id_menu_panel(), Rect {
+                });
+                register_hit(layout, id_menu_panel(), Rect {
                     x: 0.0,
                     y: CHROME_H,
                     width: w,
                     height: menu_height(),
-                }).build(layout, render);
+                });
 
-                let row_w = w;
                 let row_h = MENU_ROW_H;
                 let rows_start = menu_rows_start();
-
-                lm::button(id_skin_bloom(), Rect {
-                    x: 0.0,
-                    y: rows_start,
-                    width: row_w,
-                    height: row_h,
-                }).build(layout, render);
-
-                lm::button(id_skin_planet(), Rect {
-                    x: 0.0,
-                    y: rows_start + row_h,
-                    width: row_w,
-                    height: row_h,
-                }).build(layout, render);
-
-                lm::button(id_skin_radar(), Rect {
-                    x: 0.0,
-                    y: rows_start + row_h * 2.0,
-                    width: row_w,
-                    height: row_h,
-                }).build(layout, render);
+                register_hit(layout, id_skin_bloom(), Rect { x: 0.0, y: rows_start, width: w, height: row_h });
+                register_hit(layout, id_skin_planet(), Rect { x: 0.0, y: rows_start + row_h, width: w, height: row_h });
+                register_hit(layout, id_skin_radar(), Rect { x: 0.0, y: rows_start + row_h * 2.0, width: w, height: row_h });
             } else {
-                // ── Menu closed: normal centerpiece ───────────────────────────
-                let centerpiece_rect = Rect {
+                // ── Menu closed: invisible centerpiece hit-zone ───────────────
+                register_hit(layout, id_centerpiece(), Rect {
                     x: 0.0,
                     y: CHROME_H,
                     width: w,
                     height: (h - CHROME_H).max(0.0),
-                };
-                lm::button(id_centerpiece(), centerpiece_rect)
-                    .build(layout, render);
+                });
             }
         }
     }
