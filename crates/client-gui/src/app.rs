@@ -15,13 +15,13 @@ use std::time::Instant;
 use uzor::core::types::Rect;
 use uzor::framework::app::{App, NoPanel};
 use uzor::framework::multi_window::WindowCtx;
+use uzor::render::{TextAlign, TextBaseline};
 use uzor::framework::widgets::lm;
 use uzor::input::core::event_processor::PlatformEvent;
 use uzor::input::keyboard::events::KeyCode;
 use uzor::input::{Sense, WidgetKind};
 use uzor::layout::{ChromeWindowControl, LayoutManager, LayoutNodeId};
 use uzor::ui::widgets::composite::chrome::theme::ChromeTheme;
-use uzor::ui::effects::text::{AsciiGrid, Cursor, GlitchLetter};
 use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
@@ -123,14 +123,6 @@ pub struct MirageClientApp {
     /// Timestamp (ms) of the last empty tap, for double-click discrimination.
     last_tap_ms: f64,
 
-    // Glitchy ASCII "M" menu glyph — driven by the cell-shader engine.
-    menu_grid: AsciiGrid,
-    menu_shader: GlitchLetter,
-    menu_time: f64,
-    /// Eased glitch intensity (hover) + a decaying click pulse.
-    menu_glitch: f64,
-    menu_pulse: f64,
-
     // Frame timing.
     last_frame: Instant,
 }
@@ -151,11 +143,6 @@ impl MirageClientApp {
             drag_moved: 0.0,
             pending_tap_at: None,
             last_tap_ms: -1.0e9,
-            menu_grid: AsciiGrid::new(5, 7), // matches GlitchLetter::letter_m() dims
-            menu_shader: GlitchLetter::letter_m(),
-            menu_time: 0.0,
-            menu_glitch: 0.0,
-            menu_pulse: 0.0,
             last_frame: Instant::now(),
         }
     }
@@ -227,20 +214,7 @@ impl App<NoPanel> for MirageClientApp {
 
         let w = win.rect.width;
         let h = win.rect.height;
-
-        // ── Glitch "M" intensity: hover over the menu button + click pulse ─────
-        let hover_menu = win
-            .layout
-            .pointer_pos()
-            .map(|(px, py)| px >= 0.0 && px < 36.0 && py >= 0.0 && py < CHROME_H)
-            .unwrap_or(false);
-        let target = if hover_menu { 1.0 } else { 0.0 };
-        self.menu_glitch += (target - self.menu_glitch) * (8.0 * dt).min(1.0);
-        self.menu_pulse = (self.menu_pulse - dt * 2.5).max(0.0);
-        let glitch_amt = self.menu_glitch.max(self.menu_pulse);
-        self.menu_time += dt;
-        self.menu_grid.set_cursor(Cursor { intensity: glitch_amt, ..Default::default() });
-        self.menu_grid.step(&self.menu_shader, self.menu_time, 1.0);
+        let pointer = win.layout.pointer_pos();
 
         // ── Process layout clicks BEFORE painting ─────────────────────────────
         // was_clicked() reads the previous frame's click state from the
@@ -311,6 +285,7 @@ impl App<NoPanel> for MirageClientApp {
             dt,
             phase: self.current_phase,
             rect: skin_rect,
+            pointer,
         };
         self.skin.render(render, state);
 
@@ -370,20 +345,21 @@ impl App<NoPanel> for MirageClientApp {
             }
         }
 
-        // ── Glitchy ASCII "M" over the menu button slot ───────────────────────
-        // Painted last, over the chrome's default hamburger (covered first).
-        // The grid + GlitchLetter shader drive it (uzor cell-shader engine).
+        // ── Plain "M" menu glyph + kill the chrome's bottom separator line ────
+        // Painted last, over the chrome's default hamburger.
         {
             let render = &mut *win.render;
             const SLOT_W: f64 = 36.0;
             render.set_fill_color("#0C0C10");
             render.fill_rect(0.0, 0.0, SLOT_W, CHROME_H);
+            // Cover the chrome bottom border (the unwanted under-chrome line).
+            render.fill_rect(0.0, CHROME_H - 1.0, w, 1.0);
 
-            let pad_x = 8.0;
-            let pad_y = 5.0;
-            let cw = (SLOT_W - pad_x * 2.0) / self.menu_grid.cols() as f64;
-            let ch = (CHROME_H - pad_y * 2.0) / self.menu_grid.rows() as f64;
-            self.menu_grid.render(render, pad_x, pad_y, cw, ch);
+            render.set_fill_color("#FBB26A");
+            render.set_font("18px sans-serif");
+            render.set_text_align(TextAlign::Center);
+            render.set_text_baseline(TextBaseline::Middle);
+            render.fill_text("M", SLOT_W / 2.0, CHROME_H / 2.0 - 1.0);
         }
     }
 
@@ -397,7 +373,6 @@ impl App<NoPanel> for MirageClientApp {
         match control {
             ChromeWindowControl::Menu => {
                 self.menu_open = !self.menu_open;
-                self.menu_pulse = 1.0; // glitch burst on click
             }
             ChromeWindowControl::CloseApp => {
                 std::process::exit(0);

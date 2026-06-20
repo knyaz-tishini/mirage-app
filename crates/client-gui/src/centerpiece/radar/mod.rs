@@ -1,122 +1,105 @@
-//! RadarSkin — concentric-ring sweep radar with fading arm and ambient blips.
+//! RadarSkin — an ASCII cell-shader scene (uzor `ui::effects::text` engine).
 //!
-//! Disconnected: 3 rings, slower sweep.
-//! Connected:    5 rings, faster sweep, brighter blips.
-//!
-//! Inspired by the "Meridian Radar" feel from zeng3ld-landing inst-signals.js
-//! but implemented as a simple first-cut using RenderContext primitives.
+//! The radar (moving rings + rotating sweep) is rendered as a character field
+//! by a per-cell shader. The cursor domain-warps the field: cells near the
+//! pointer are pushed outward so the pattern PARTS and flows around it like
+//! water, and the void right under the pointer fades to spaces — the "fill the
+//! empty space under the cursor" behaviour the pretext-canvas idea is after.
 
 use std::f64::consts::TAU;
 
 use uzor::render::RenderContext;
+use uzor::ui::effects::text::{density_char, AsciiGrid, Cell, CellShader, Coord, Cursor, GridContext};
 
-use crate::centerpiece::{CenterpieceState, ConnPhase, Skin, SkinRect};
+use crate::centerpiece::{CenterpieceState, Skin, SkinRect};
 
-// ── Blip ──────────────────────────────────────────────────────────────────────
+/// Logical px per character cell.
+const CELL: f64 = 10.0;
 
-/// A deterministic ambient blip dot on the radar.
-#[derive(Clone, Copy)]
-struct Blip {
-    /// Angle in radians (static — blip doesn't orbit).
-    angle: f64,
-    /// Normalized radius [0, 1] relative to the outermost ring.
-    r_norm: f64,
-    /// Brightness [0, 1] for variation.
-    brightness: f64,
+// ── The per-cell radar shader ────────────────────────────────────────────────────
+
+struct RadarShader;
+
+#[inline]
+fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
+    (a as f64 + (b as f64 - a as f64) * t.clamp(0.0, 1.0)) as u8
 }
 
-/// Build a fixed set of ambient blips from a deterministic seed.
-fn make_blips(n: usize, seed: u32) -> Vec<Blip> {
-    (0..n)
-        .map(|i| {
-            let h1 = ihash(i as u32, 1, seed);
-            let h2 = ihash(i as u32, 2, seed);
-            let h3 = ihash(i as u32, 3, seed);
-            Blip {
-                angle: h1 * TAU,
-                r_norm: 0.25 + h2 * 0.70,
-                brightness: 0.35 + h3 * 0.65,
+impl CellShader for RadarShader {
+    fn main(&self, coord: Coord, ctx: &GridContext, cursor: &Cursor) -> Cell {
+        let half = (ctx.cols.min(ctx.rows) as f64) / 2.0;
+        // Aspect-corrected, centre-origin coords (~[-1, 1]).
+        let nx = (coord.x as f64 - ctx.cols as f64 / 2.0 + 0.5) / half * ctx.aspect;
+        let ny = (coord.y as f64 - ctx.rows as f64 / 2.0 + 0.5) / half;
+
+        // Cursor domain-warp: push the sampled position away from the cursor so
+        // the field parts and flows around it; fade the cells right under it.
+        let mut sx = nx;
+        let mut sy = ny;
+        let mut fade = 1.0;
+        if cursor.inside {
+            let cnx = (cursor.x - ctx.cols as f64 / 2.0) / half * ctx.aspect;
+            let cny = (cursor.y - ctx.rows as f64 / 2.0) / half;
+            let dx = nx - cnx;
+            let dy = ny - cny;
+            let d = (dx * dx + dy * dy).sqrt();
+            let radius = 0.55;
+            if d < radius {
+                let push = (radius - d) / radius; // 1 at cursor → 0 at edge
+                let amp = push * push * 0.6; // displacement strength
+                if d > 1e-4 {
+                    sx = nx + dx / d * amp;
+                    sy = ny + dy / d * amp;
+                }
+                // Void under the pointer: fade to space within the inner region.
+                fade = (d / (radius * 0.4)).clamp(0.0, 1.0);
             }
-        })
-        .collect()
-}
-
-/// Simple integer hash → [0, 1).
-fn ihash(i: u32, j: u32, seed: u32) -> f64 {
-    let h = (i.wrapping_mul(374_761_393))
-        .wrapping_add(j.wrapping_mul(668_265_263))
-        .wrapping_add(seed);
-    let h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
-    let h = h ^ (h >> 16);
-    h as f64 / 4_294_967_296.0
-}
-
-// ── RadarState ────────────────────────────────────────────────────────────────
-
-struct RadarState {
-    /// Accumulated time (seconds).
-    t: f64,
-    /// Sweep arm angle (radians).
-    arm: f64,
-    /// Eased sweep speed (rad/s).
-    speed: f64,
-    /// Eased ring count target (3 disconnected, 5 connected).
-    ring_t: f64,
-    /// Eased global brightness.
-    brightness: f64,
-}
-
-impl RadarState {
-    fn new() -> Self {
-        Self {
-            t: 0.0,
-            arm: 0.0,
-            speed: 0.45,
-            ring_t: 0.0,
-            brightness: 0.6,
         }
-    }
 
-    fn tick(&mut self, dt: f64, phase: ConnPhase) {
-        self.t += dt;
+        // Radar field at the (possibly warped) sample.
+        let r = (sx * sx + sy * sy).sqrt();
+        let ang = sy.atan2(sx);
 
-        let connected = matches!(phase, ConnPhase::Connected | ConnPhase::Disconnecting);
+        // Moving concentric rings.
+        let rings = (r * 6.0 - ctx.time * 0.9).sin();
+        let ring_b = (rings * 0.5 + 0.5).powf(3.0);
 
-        let tgt_speed      = if connected { 1.1 } else { 0.45 };
-        let tgt_ring_t     = if connected { 1.0 } else { 0.0 };
-        let tgt_brightness = if connected { 1.0 } else { 0.6 };
+        // Rotating sweep beam — bright at the beam, trailing fade behind it.
+        let beam = (ctx.time * 1.1) % TAU;
+        let da = (ang - beam).rem_euclid(TAU);
+        let sweep = (1.0 - da / TAU).powf(2.5);
 
-        let ease = |x: f64, tgt: f64, r: f64| x + (tgt - x) * (r * dt).min(1.0);
+        // Fade out beyond the unit circle.
+        let edge = (1.0 - r).clamp(0.0, 1.0);
+        let v = (ring_b * 0.45 + sweep * 0.8) * edge * fade;
 
-        self.speed      = ease(self.speed, tgt_speed, 2.0);
-        self.ring_t     = ease(self.ring_t, tgt_ring_t, 2.0);
-        self.brightness = ease(self.brightness, tgt_brightness, 2.5);
-        self.arm        += self.speed * dt;
-        if self.arm >= TAU {
-            self.arm -= TAU;
+        if v < 0.04 {
+            return Cell { ch: ' ', color: [0, 0, 0], alpha: 1.0 };
         }
-    }
 
-    /// Interpolated ring count: 3 (disconnected) to 5 (connected).
-    fn ring_count(&self) -> f64 {
-        3.0 + self.ring_t * 2.0
+        // Dim amber → bright amber by brightness.
+        let dim = [120u8, 86, 50];
+        let hi = [255u8, 217, 176];
+        let color = [
+            lerp_u8(dim[0], hi[0], v),
+            lerp_u8(dim[1], hi[1], v),
+            lerp_u8(dim[2], hi[2], v),
+        ];
+        Cell { ch: density_char(v), color, alpha: 1.0 }
     }
 }
 
-// ── RadarSkin ─────────────────────────────────────────────────────────────────
+// ── Skin ──────────────────────────────────────────────────────────────────────────
 
-/// Concentric-ring sweep radar skin.
 pub struct RadarSkin {
-    state: RadarState,
-    blips: Vec<Blip>,
+    grid: AsciiGrid,
+    shader: RadarShader,
+    t: f64,
 }
 
 impl RadarSkin {
     pub fn new() -> Self {
-        Self {
-            state: RadarState::new(),
-            blips: make_blips(14, 112_233),
-        }
+        Self { grid: AsciiGrid::new(1, 1), shader: RadarShader, t: 0.0 }
     }
 }
 
@@ -127,155 +110,41 @@ impl Default for RadarSkin {
 }
 
 impl Skin for RadarSkin {
-    fn render(&mut self, ctx: &mut dyn RenderContext, st: CenterpieceState) {
-        self.state.tick(st.dt, st.phase);
-        render_radar(ctx, &self.state, &self.blips, st);
-    }
-}
+    fn render(&mut self, ctx: &mut dyn RenderContext, frame: CenterpieceState) {
+        let rect: SkinRect = frame.rect;
+        self.t += frame.dt;
 
-// ── Render ────────────────────────────────────────────────────────────────────
+        // Background.
+        ctx.set_fill_color("#0B0B0E");
+        ctx.fill_rect(rect.x, rect.y, rect.w, rect.h);
 
-fn render_radar(
-    ctx: &mut dyn RenderContext,
-    state: &RadarState,
-    blips: &[Blip],
-    frame: CenterpieceState,
-) {
-    let rect = frame.rect;
+        // Grid sized to the rect (square cells), centred.
+        let cols = (rect.w / CELL).floor().max(1.0) as usize;
+        let rows = (rect.h / CELL).floor().max(1.0) as usize;
+        if self.grid.cols() != cols || self.grid.rows() != rows {
+            self.grid = AsciiGrid::new(cols, rows);
+        }
+        let ox = rect.x + (rect.w - cols as f64 * CELL) / 2.0;
+        let oy = rect.y + (rect.h - rows as f64 * CELL) / 2.0;
 
-    // Background.
-    ctx.set_fill_color("#060C08");
-    ctx.fill_rect(rect.x, rect.y, rect.w, rect.h);
-
-    // Subtle dot grid.
-    draw_dot_grid(ctx, &rect);
-
-    let cx = rect.cx();
-    let cy = rect.cy();
-    let max_r = rect.w.min(rect.h) * 0.36;
-    let br = state.brightness;
-    let ring_count = state.ring_count();
-
-    // ── Concentric rings ──────────────────────────────────────────────────────
-
-    let rings_floor = ring_count.floor() as usize;
-    for k in 1..=5_usize {
-        // Interpolated opacity: full rings up to floor, partial for the
-        // fractional ring, invisible above.
-        let alpha = if k <= rings_floor {
-            0.22 * br
-        } else if k == rings_floor + 1 {
-            (ring_count - ring_count.floor()) * 0.22 * br
-        } else {
-            0.0
+        // Cursor in grid-cell coords (aligned to the render offset).
+        let cursor = match frame.pointer {
+            Some((px, py))
+                if px >= rect.x && px < rect.x + rect.w && py >= rect.y && py < rect.y + rect.h =>
+            {
+                Cursor {
+                    x: (px - ox) / CELL,
+                    y: (py - oy) / CELL,
+                    pressed: false,
+                    inside: true,
+                    intensity: 1.0,
+                }
+            }
+            _ => Cursor::default(),
         };
-        if alpha < 0.01 {
-            continue;
-        }
+        self.grid.set_cursor(cursor);
 
-        let ring_r = max_r * (k as f64 / 5.0);
-        let color = format!("rgba(60,220,100,{:.3})", alpha);
-        ctx.set_stroke_color(&color);
-        ctx.set_stroke_width(0.8);
-        ctx.begin_path();
-        ctx.arc(cx, cy, ring_r, 0.0, TAU);
-        ctx.stroke();
-    }
-
-    // ── Cross-hair lines ──────────────────────────────────────────────────────
-
-    let ch_alpha = 0.10 * br;
-    let ch_color = format!("rgba(60,220,100,{:.3})", ch_alpha);
-    ctx.set_stroke_color(&ch_color);
-    ctx.set_stroke_width(0.6);
-    ctx.begin_path();
-    ctx.move_to(cx - max_r, cy);
-    ctx.line_to(cx + max_r, cy);
-    ctx.stroke();
-    ctx.begin_path();
-    ctx.move_to(cx, cy - max_r);
-    ctx.line_to(cx, cy + max_r);
-    ctx.stroke();
-
-    // ── Sweep arm (fading wedge) ──────────────────────────────────────────────
-    //
-    // Draw a wedge covering ~40° behind the arm, fading from bright (at arm)
-    // to transparent.  We approximate with a filled arc using set_global_alpha.
-
-    let arm = state.arm;
-    let wedge_span = std::f64::consts::PI * 0.22; // ~40°
-    let wedge_steps = 18_usize;
-
-    for i in 0..wedge_steps {
-        let frac = i as f64 / wedge_steps as f64; // 0 = bright tip, 1 = fade tail
-        let a0 = arm - wedge_span * frac;
-        let a1 = arm - wedge_span * (frac + 1.0 / wedge_steps as f64);
-        let alpha = (1.0 - frac) * 0.55 * br;
-        if alpha < 0.005 {
-            continue;
-        }
-
-        let color = format!("rgba(60,240,110,{:.3})", alpha);
-        ctx.set_fill_color(&color);
-        ctx.begin_path();
-        ctx.move_to(cx, cy);
-        ctx.arc(cx, cy, max_r * 1.01, a0, a1);
-        ctx.close_path();
-        ctx.fill();
-    }
-
-    // Bright tip line along the arm.
-    let tip_alpha = 0.8 * br;
-    let tip_color = format!("rgba(120,255,160,{:.3})", tip_alpha);
-    ctx.set_stroke_color(&tip_color);
-    ctx.set_stroke_width(1.2);
-    ctx.begin_path();
-    ctx.move_to(cx, cy);
-    ctx.line_to(cx + arm.cos() * max_r, cy + arm.sin() * max_r);
-    ctx.stroke();
-
-    // ── Ambient blips ─────────────────────────────────────────────────────────
-
-    for blip in blips {
-        let blip_r = max_r * blip.r_norm;
-        let bx = cx + blip.angle.cos() * blip_r;
-        let by = cy + blip.angle.sin() * blip_r;
-
-        // Blip lights up when the sweep arm passes over it.
-        let angle_delta = (arm - blip.angle).rem_euclid(TAU);
-        let flash = if angle_delta < 0.25 {
-            1.0 - angle_delta / 0.25
-        } else {
-            0.0
-        };
-        let pulse = (1.0 + 0.18 * (state.t * 2.0 + blip.angle * 3.0).sin()) * 0.5;
-        let alpha = (blip.brightness * 0.20 + flash * 0.70 + pulse * 0.10) * br;
-        let dot_r = 1.5 + flash * 2.5;
-
-        let color = format!("rgba(80,255,140,{:.3})", alpha.clamp(0.0, 1.0));
-        ctx.set_fill_color(&color);
-        ctx.begin_path();
-        ctx.arc(bx, by, dot_r, 0.0, TAU);
-        ctx.fill();
-    }
-
-    // Center pivot dot.
-    ctx.set_fill_color("rgba(100,255,150,0.70)");
-    ctx.begin_path();
-    ctx.arc(cx, cy, 2.5, 0.0, TAU);
-    ctx.fill();
-}
-
-fn draw_dot_grid(ctx: &mut dyn RenderContext, rect: &SkinRect) {
-    const STEP: f64 = 24.0;
-    ctx.set_fill_color("rgba(255,255,255,0.020)");
-    let mut yy = rect.y + 8.0;
-    while yy < rect.y + rect.h {
-        let mut xx = rect.x + 8.0;
-        while xx < rect.x + rect.w {
-            ctx.fill_rect(xx, yy, 1.0, 1.0);
-            xx += STEP;
-        }
-        yy += STEP;
+        self.grid.step(&self.shader, self.t, 1.0);
+        self.grid.render(ctx, ox, oy, CELL, CELL);
     }
 }

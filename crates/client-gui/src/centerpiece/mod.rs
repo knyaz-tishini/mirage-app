@@ -52,6 +52,9 @@ pub struct CenterpieceState {
     pub phase: ConnPhase,
     /// Available paint rect (below titlebar / above bottom sheet).
     pub rect: SkinRect,
+    /// Current pointer position in window-logical px, if known. Skins that
+    /// react to the cursor (radar) read it; others ignore it.
+    pub pointer: Option<(f64, f64)>,
 }
 
 // ── Skin trait ────────────────────────────────────────────────────────────────
