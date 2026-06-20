@@ -1,0 +1,32 @@
+# mirage-client-gui — own workspace root.
+#
+# Lives inside mirage2app/crates/ but is NOT a member of the mirage2app
+# workspace (commented out in mirage2app/Cargo.toml).  The isolation is
+# necessary because:
+#   1. The launcher resolves uzor via crates.io (1.2.0, softbuffer path);
+#      uzor-fonts carries `links = "uzor_fonts_assets"` — two copies conflict.
+#   2. vello 0.9 / wgpu 29 requires windows-core 0.62; existing workspace
+#      deps resolve 0.57 — co-resolution fails.
+#
+# Same isolation pattern as crates/desktop/windows/v2/ (see the comment in
+# mirage2app/Cargo.toml).
+[workspace]
+members = ["."]
+
+[package]
+name = "mirage-client-gui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mirage-client-gui"
+path = "src/main.rs"
+
+# ── uzor desktop runtime (AppBuilder + agent-API + screenshot) ────────────────
+[dependencies]
+uzor          = { path = "../../../uzor/uzor" }
+uzor-desktop  = { path = "../../../uzor/uzor-desktop" }
+
+tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tracing                 = "0.1"
+tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
