@@ -1,101 +1,171 @@
-//! PlanetSkin — Fibonacci-sphere dotted globe, gently auto-rotating.
+//! PlanetSkin — morph scene: grid relief → fold into a real-continents globe →
+//! mesh of fleet nodes. Faithful port of `morph-scene.html`.
 //!
-//! N ≈ 720 points placed via the golden-angle Fibonacci lattice, projected
-//! orthographically onto the screen. Points on the front hemisphere (z > 0)
-//! are brighter; points on the back hemisphere are dimmer. The globe
-//! auto-rotates around the Y axis; rotation speed and dot brightness respond
-//! to ConnPhase.
+//! Disconnected: flat grid relief (height-noise plane). Connecting: the grid
+//! folds into a sphere. Connected: dotted real continents (baked Natural-Earth
+//! land mask) + the 6 fleet nodes geo-pinned with great-circle mesh links.
+//! Auto-rotates around the Y axis throughout.
 
-use std::f64::consts::TAU;
+mod landmask;
+
+use std::f64::consts::{PI, TAU};
 
 use uzor::render::RenderContext;
 
 use crate::centerpiece::{CenterpieceState, ConnPhase, Skin, SkinRect};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+const DEG: f64 = 180.0 / PI;
 
-/// Number of Fibonacci sphere points.
-const N_POINTS: usize = 720;
+// ── Grid ────────────────────────────────────────────────────────────────────────
+const NG: usize = 50;
+const N: usize = NG * NG;
+const NOISE_SEED: u32 = 4242;
 
-/// Golden angle in radians.
-const GOLDEN_ANGLE: f64 = std::f64::consts::PI * (3.0 - 2.2360679774997896); // π(3−√5)
+// White → amber endpoints (lerp by warmth).
+const COOL: [f64; 3] = [244.0, 244.0, 245.0];
+const WARM: [f64; 3] = [251.0, 178.0, 106.0];
 
-// ── Precomputed sphere point ───────────────────────────────────────────────────
+// ── Hash + value noise (ports of ihash / vnoise) ─────────────────────────────────
 
-/// A unit-sphere point in Cartesian coordinates.
+fn ihash(i: i32, j: i32, s: u32) -> f64 {
+    let h = (i as i64 * 374_761_393 + j as i64 * 668_265_263 + s as i64) as i32;
+    let h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    ((h ^ (h >> 16)) as u32) as f64 / 4_294_967_296.0
+}
+
+fn vnoise(x: f64, y: f64, s: u32) -> f64 {
+    let xi = x.floor();
+    let yi = y.floor();
+    let xf = x - xi;
+    let yf = y - yi;
+    let u = xf * xf * (3.0 - 2.0 * xf);
+    let v = yf * yf * (3.0 - 2.0 * yf);
+    let (xi, yi) = (xi as i32, yi as i32);
+    let a = ihash(xi, yi, s);
+    let b = ihash(xi + 1, yi, s);
+    let c = ihash(xi, yi + 1, s);
+    let d = ihash(xi + 1, yi + 1, s);
+    a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v
+}
+
+#[inline]
+fn clamp(v: f64, a: f64, b: f64) -> f64 {
+    v.max(a).min(b)
+}
+#[inline]
+fn smooth(u: f64) -> f64 {
+    u * u * (3.0 - 2.0 * u)
+}
+#[inline]
+fn ez(x: f64, tgt: f64, rate: f64, dt: f64) -> f64 {
+    x + (tgt - x) * (rate * dt).min(1.0)
+}
+
+// ── Grid point ───────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy)]
-struct SpherePoint {
-    x: f64,
-    y: f64,
-    z: f64,
+struct GridPt {
+    px: f64,
+    pz: f64,
+    fib: [f64; 3],
+    i: i32,
+    j: i32,
+    land: bool,
 }
 
-/// Build the Fibonacci lattice once.
-fn build_fibonacci_sphere() -> [SpherePoint; N_POINTS] {
-    let mut pts = [SpherePoint { x: 0.0, y: 0.0, z: 0.0 }; N_POINTS];
-    for (i, pt) in pts.iter_mut().enumerate() {
-        let theta = (1.0 - 2.0 * (i as f64 + 0.5) / N_POINTS as f64).acos();
-        let phi = GOLDEN_ANGLE * i as f64;
-        pt.x = theta.sin() * phi.cos();
-        pt.y = theta.cos();
-        pt.z = theta.sin() * phi.sin();
-    }
-    pts
+#[derive(Clone, Copy)]
+struct Node {
+    p: [f64; 3],
+    reg: &'static str,
 }
 
-// ── PlanetState ───────────────────────────────────────────────────────────────
-
-struct PlanetState {
-    /// Accumulated time (seconds).
-    t: f64,
-    /// Yaw angle (radians) — advances each frame.
-    yaw: f64,
-    /// Eased brightness multiplier (Connected → 1.0, Disconnected → 0.55).
-    brightness: f64,
-    /// Eased rotation speed (rad/s).
-    rot_speed: f64,
+fn geo(lat: f64, lon: f64) -> [f64; 3] {
+    let la = lat / DEG;
+    let lo = lon / DEG;
+    [la.cos() * lo.cos(), la.sin(), -la.cos() * lo.sin()]
 }
 
-impl PlanetState {
-    fn new() -> Self {
-        Self {
-            t: 0.0,
-            yaw: 0.0,
-            brightness: 0.55,
-            rot_speed: 0.18,
-        }
-    }
-
-    fn tick(&mut self, dt: f64, phase: ConnPhase) {
-        self.t += dt;
-
-        let connected = matches!(phase, ConnPhase::Connected | ConnPhase::Disconnecting);
-
-        let tgt_brightness = if connected { 1.0 } else { 0.55 };
-        let tgt_speed      = if connected { 0.32 } else { 0.18 };
-
-        let ease = |x: f64, tgt: f64, r: f64| x + (tgt - x) * (r * dt).min(1.0);
-
-        self.brightness = ease(self.brightness, tgt_brightness, 2.5);
-        self.rot_speed  = ease(self.rot_speed, tgt_speed, 1.5);
-        self.yaw       += self.rot_speed * dt;
-    }
-}
-
-// ── PlanetSkin ────────────────────────────────────────────────────────────────
-
-/// Fibonacci-sphere dotted globe skin.
+// ── Skin ──────────────────────────────────────────────────────────────────────────
 pub struct PlanetSkin {
-    state: PlanetState,
-    sphere: [SpherePoint; N_POINTS],
+    pts: Vec<GridPt>,
+    nodes: Vec<Node>,
+    links: Vec<(usize, usize)>,
+    t: f64,
+    yaw: f64,
+    pitch: f64,
+    fold: f64,
+    amp: f64,
+    col_t: f64,
+    mesh: f64,
 }
 
 impl PlanetSkin {
     pub fn new() -> Self {
-        Self {
-            state: PlanetState::new(),
-            sphere: build_fibonacci_sphere(),
+        let ga = PI * (3.0 - 5.0_f64.sqrt());
+        let mut pts = Vec::with_capacity(N);
+        for i in 0..NG {
+            for j in 0..NG {
+                let u = i as f64 / (NG as f64 - 1.0);
+                let v = j as f64 / (NG as f64 - 1.0);
+                let k = i * NG + j;
+                let fy = 1.0 - (k as f64 / (N as f64 - 1.0)) * 2.0;
+                let fr = (1.0 - fy * fy).max(0.0).sqrt();
+                let fth = ga * k as f64;
+                let fib = [fth.cos() * fr, fy, fth.sin() * fr];
+                let latd = clamp(fy, -1.0, 1.0).asin() * DEG;
+                let lond = -fib[2].atan2(fib[0]) * DEG;
+                pts.push(GridPt {
+                    px: (u - 0.5) * 2.0,
+                    pz: (v - 0.5) * 2.0,
+                    fib,
+                    i: i as i32,
+                    j: j as i32,
+                    land: landmask::is_land(latd, lond),
+                });
+            }
         }
+
+        let nodes_raw = [
+            ("RU", 55.75, 37.62),
+            ("RU", 59.93, 30.34),
+            ("TR", 41.01, 28.98),
+            ("NL", 52.37, 4.90),
+            ("NL", 51.92, 4.48),
+            ("CH", 47.37, 8.54),
+        ];
+        let nodes = nodes_raw
+            .iter()
+            .map(|&(reg, lat, lon)| Node { p: geo(lat, lon), reg })
+            .collect();
+        let links = vec![(0, 2), (2, 5), (1, 3), (3, 5), (0, 1), (4, 2)];
+
+        Self {
+            pts,
+            nodes,
+            links,
+            t: 0.0,
+            yaw: 0.5,
+            pitch: 0.38,
+            fold: 0.0,
+            amp: 0.16,
+            col_t: 0.0,
+            mesh: 0.0,
+        }
+    }
+
+    fn rot(&self, p: [f64; 3]) -> [f64; 3] {
+        let (cyw, syw) = (self.yaw.cos(), self.yaw.sin());
+        let x1 = p[0] * cyw + p[2] * syw;
+        let z1 = -p[0] * syw + p[2] * cyw;
+        let y1 = p[1];
+        let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
+        let y2 = y1 * cp - z1 * sp;
+        let z2 = y1 * sp + z1 * cp;
+        [x1, y2, z2]
+    }
+
+    fn hgt(&self, i: i32, j: i32) -> f64 {
+        (vnoise(i as f64 * 0.22, j as f64 * 0.22 + self.t * 0.4, NOISE_SEED) - 0.5)
+            + 0.25 * ((i + j) as f64 * 0.42 + self.t * 1.8).sin()
     }
 }
 
@@ -105,107 +175,184 @@ impl Default for PlanetSkin {
     }
 }
 
+#[inline]
+fn lerp3(a: [f64; 3], b: [f64; 3], t: f64) -> [u8; 3] {
+    [
+        (a[0] + (b[0] - a[0]) * t) as u8,
+        (a[1] + (b[1] - a[1]) * t) as u8,
+        (a[2] + (b[2] - a[2]) * t) as u8,
+    ]
+}
+
 impl Skin for PlanetSkin {
-    fn render(&mut self, ctx: &mut dyn RenderContext, st: CenterpieceState) {
-        self.state.tick(st.dt, st.phase);
-        render_planet(ctx, &self.state, &self.sphere, st);
-    }
-}
+    fn render(&mut self, ctx: &mut dyn RenderContext, frame: CenterpieceState) {
+        let dt = frame.dt;
+        let rect: SkinRect = frame.rect;
+        self.t += dt;
 
-// ── Render ────────────────────────────────────────────────────────────────────
+        // ── Targets by phase ───────────────────────────────────────────────────
+        let folding = matches!(frame.phase, ConnPhase::Connecting | ConnPhase::Connected);
+        let warm = folding;
+        let meshed = matches!(frame.phase, ConnPhase::Connected);
+        let tf = if folding { 1.0 } else { 0.0 };
+        let ta = if matches!(frame.phase, ConnPhase::Disconnected) { 0.16 } else { 0.26 };
+        let tc = if warm { 1.0 } else { 0.0 };
+        let tm = if meshed { 1.0 } else { 0.0 };
 
-fn render_planet(
-    ctx: &mut dyn RenderContext,
-    state: &PlanetState,
-    sphere: &[SpherePoint; N_POINTS],
-    frame: CenterpieceState,
-) {
-    let rect = frame.rect;
+        // Ease (morph per-frame rates × 60 → per-second).
+        self.fold = ez(self.fold, tf, 0.66, dt);
+        self.amp = ez(self.amp, ta, 2.4, dt);
+        self.col_t = ez(self.col_t, tc, 3.0, dt);
+        self.mesh = ez(self.mesh, tm, 3.6, dt);
+        self.yaw += 0.12 * dt;
 
-    // Background.
-    ctx.set_fill_color("#060810");
-    ctx.fill_rect(rect.x, rect.y, rect.w, rect.h);
+        let fe = smooth(clamp(self.fold, 0.0, 1.0));
+        let mesh_a = self.mesh * clamp((self.fold - 0.9) / 0.08, 0.0, 1.0);
+        let line_fade = clamp(1.0 - fe / 0.12, 0.0, 1.0);
+        let dot_fade = clamp((fe - 0.03) / 0.16, 0.0, 1.0);
 
-    // Dot grid (shared look).
-    draw_dot_grid(ctx, &rect);
+        let cx = rect.cx();
+        let cy = rect.y + rect.h * 0.5;
+        let r_globe = rect.w.min(rect.h) * 0.40;
 
-    let cx = rect.cx();
-    let cy = rect.cy();
-    let radius = rect.w.min(rect.h) * 0.30;
+        // ── Background ─────────────────────────────────────────────────────────
+        ctx.set_fill_color("#0B0B0E");
+        ctx.fill_rect(rect.x, rect.y, rect.w, rect.h);
 
-    // Subtle equator ring.
-    ctx.set_stroke_color("rgba(80,140,200,0.10)");
-    ctx.set_stroke_width(0.8);
-    ctx.begin_path();
-    ctx.arc(cx, cy, radius, 0.0, TAU);
-    ctx.stroke();
-
-    let yaw_cos = state.yaw.cos();
-    let yaw_sin = state.yaw.sin();
-
-    // Draw back-hemisphere dots first (z_rot < 0), then front on top.
-    let mut points: Vec<(f64, f64, f64)> = sphere
-        .iter()
-        .map(|p| {
-            // Rotate around Y axis by `yaw`.
-            let rx = p.x * yaw_cos + p.z * yaw_sin;
-            let ry = p.y;
-            let rz = -p.x * yaw_sin + p.z * yaw_cos;
-            // Orthographic projection: screen_x = cx + rx*radius,
-            //                          screen_y = cy - ry*radius (Y up).
-            let sx = cx + rx * radius;
-            let sy = cy - ry * radius;
-            (sx, sy, rz) // rz as depth
-        })
-        .collect();
-
-    // Sort back-to-front so front dots paint on top.
-    points.sort_unstable_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    for (sx, sy, rz) in &points {
-        // z in [-1, 1]; front hemisphere z > 0.
-        let z_norm = (*rz + 1.0) * 0.5; // [0, 1], 1 = front
-        let alpha = (0.08 + 0.82 * z_norm * z_norm) * state.brightness;
-        if alpha < 0.02 {
-            continue;
+        // ── Project all grid points ──────────────────────────────────────────────
+        let mut pr = vec![[0.0_f64; 3]; N];
+        for (k, p) in self.pts.iter().enumerate() {
+            let flat_y = self.amp * 1.5 * self.hgt(p.i, p.j);
+            let wx = p.px + (p.fib[0] - p.px) * fe;
+            let wy = flat_y + (p.fib[1] - flat_y) * fe;
+            let wz = p.pz + (p.fib[2] - p.pz) * fe;
+            let r = self.rot([wx, wy, wz]);
+            pr[k] = [cx + r[0] * r_globe, cy - r[1] * r_globe, r[2]];
         }
 
-        // Dot size: front dots slightly larger.
-        let dot_r = 0.8 + 0.8 * z_norm;
-
-        // Color: front = cyan-white, back = deep blue.
-        let r = (120.0 + 130.0 * z_norm) as u8;
-        let g = (160.0 + 80.0  * z_norm) as u8;
-        let b = (220.0 + 30.0  * z_norm) as u8;
-        let color = format!("rgba({r},{g},{b},{:.3})", alpha.clamp(0.0, 1.0));
-
-        ctx.set_fill_color(&color);
-        ctx.begin_path();
-        ctx.arc(*sx, *sy, dot_r, 0.0, TAU);
-        ctx.fill();
-    }
-
-    // Soft radial glow when connected.
-    if state.brightness > 0.6 {
-        let glow_alpha = ((state.brightness - 0.6) / 0.4) * 0.18;
-        let color = format!("rgba(80,180,255,{:.3})", glow_alpha);
-        ctx.set_fill_color(&color);
-        ctx.begin_path();
-        ctx.arc(cx, cy, radius * 1.15, 0.0, TAU);
-        ctx.fill();
-    }
-}
-
-fn draw_dot_grid(ctx: &mut dyn RenderContext, rect: &SkinRect) {
-    const STEP: f64 = 24.0;
-    ctx.set_fill_color("rgba(255,255,255,0.025)");
-    let mut yy = rect.y + 8.0;
-    while yy < rect.y + rect.h {
-        let mut xx = rect.x + 8.0;
-        while xx < rect.x + rect.w {
-            ctx.fill_rect(xx, yy, 1.0, 1.0);
-            xx += STEP;
+        // ── Sphere outline (as it nears a full globe) ────────────────────────────
+        if fe > 0.55 {
+            let a = 0.06 * clamp((fe - 0.55) / 0.3, 0.0, 1.0);
+            ctx.set_stroke_color(&format!("rgba(255,255,255,{:.3})", a));
+            ctx.set_stroke_width(1.0);
+            ctx.set_line_dash(&[]);
+            ctx.begin_path();
+            ctx.arc(cx, cy, r_globe, 0.0, TAU);
+            ctx.stroke();
         }
-        yy += STEP;
+
+        // ── Grid lines (fade out as the relief folds away) ───────────────────────
+        if line_fade > 0.01 {
+            let c = lerp3(COOL, WARM, self.col_t);
+            ctx.set_stroke_color(&format!("rgba({},{},{},{:.3})", c[0], c[1], c[2], 0.45 * line_fade));
+            ctx.set_stroke_width(1.0);
+            ctx.set_line_dash(&[]);
+            for i in 0..NG {
+                ctx.begin_path();
+                for j in 0..NG {
+                    let s = pr[i * NG + j];
+                    if j == 0 {
+                        ctx.move_to(s[0], s[1]);
+                    } else {
+                        ctx.line_to(s[0], s[1]);
+                    }
+                }
+                ctx.stroke();
+            }
+            for j in 0..NG {
+                ctx.begin_path();
+                for i in 0..NG {
+                    let s = pr[i * NG + j];
+                    if i == 0 {
+                        ctx.move_to(s[0], s[1]);
+                    } else {
+                        ctx.line_to(s[0], s[1]);
+                    }
+                }
+                ctx.stroke();
+            }
+        }
+
+        // ── Land dots (real continents) ──────────────────────────────────────────
+        if dot_fade > 0.01 {
+            let c = lerp3(COOL, WARM, self.col_t);
+            for (k, p) in self.pts.iter().enumerate() {
+                if !p.land {
+                    continue;
+                }
+                let s = pr[k];
+                let d2 = s[2];
+                if d2 < -0.04 {
+                    continue;
+                }
+                let s_b = 0.32 + 0.68 * clamp(d2, 0.0, 1.0);
+                let tw = 0.85 + 0.15 * (self.t * 2.4 + k as f64 * 0.7).sin();
+                let al = s_b * tw * dot_fade;
+                ctx.set_fill_color(&format!("rgba({},{},{},{:.3})", c[0], c[1], c[2], al));
+                ctx.fill_rect(s[0] - 1.0, s[1] - 1.0, 2.2, 2.2);
+            }
+        }
+
+        // ── Mesh (fleet nodes + great-circle links) ──────────────────────────────
+        if mesh_a > 0.01 {
+            // Links.
+            ctx.set_stroke_width(1.4);
+            ctx.set_line_dash(&[]);
+            for &(a, b) in &self.links {
+                let ra = self.rot(self.nodes[a].p);
+                let rb = self.rot(self.nodes[b].p);
+                let mut path: Vec<[f64; 3]> = Vec::with_capacity(21);
+                for k in 0..=20 {
+                    let tt = k as f64 / 20.0;
+                    let mut mx = ra[0] + (rb[0] - ra[0]) * tt;
+                    let mut my = ra[1] + (rb[1] - ra[1]) * tt;
+                    let mut mz = ra[2] + (rb[2] - ra[2]) * tt;
+                    let l = (mx * mx + my * my + mz * mz).sqrt().max(1e-6);
+                    mx /= l;
+                    my /= l;
+                    mz /= l;
+                    let lift = 1.0 + 0.16 * (tt * PI).sin();
+                    path.push([cx + mx * lift * r_globe, cy - my * lift * r_globe, mz]);
+                }
+                ctx.set_stroke_color(&format!("rgba(255,217,176,{:.3})", 0.8 * mesh_a));
+                ctx.begin_path();
+                let mut started = false;
+                for pnt in &path {
+                    if pnt[2] >= -0.02 {
+                        if started {
+                            ctx.line_to(pnt[0], pnt[1]);
+                        } else {
+                            ctx.move_to(pnt[0], pnt[1]);
+                            started = true;
+                        }
+                    } else {
+                        started = false;
+                    }
+                }
+                ctx.stroke();
+            }
+
+            // Nodes.
+            ctx.set_global_alpha(mesh_a);
+            for n in &self.nodes {
+                let r = self.rot(n.p);
+                let s = [cx + r[0] * r_globe, cy - r[1] * r_globe];
+                if r[2] < -0.02 {
+                    continue;
+                }
+                ctx.set_fill_color("#F4F4F5");
+                ctx.begin_path();
+                ctx.arc(s[0], s[1], 4.6, 0.0, TAU);
+                ctx.fill();
+                ctx.set_fill_color("#FBB26A");
+                ctx.begin_path();
+                ctx.arc(s[0], s[1], 2.8, 0.0, TAU);
+                ctx.fill();
+                ctx.set_fill_color("#FBB26A");
+                ctx.set_font("9px monospace");
+                ctx.fill_text(n.reg, s[0] + 9.0, s[1] - 3.0);
+            }
+            ctx.set_global_alpha(1.0);
+        }
     }
 }
