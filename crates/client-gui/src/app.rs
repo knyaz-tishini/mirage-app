@@ -7,6 +7,7 @@
 //!   Tab    → cycle (Bloom → Planet → Radar → Bloom)
 //!
 //! Center-tap → toggle connect / disconnect (entire area below titlebar).
+//! Menu (M button or keyboard M) → bottom-sheet overlay with skin switcher.
 //! Click routing goes through the uzor LayoutManager so `/input/click` works.
 
 use std::time::Instant;
@@ -21,6 +22,7 @@ use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
 use crate::shell::desktop::{draw_titlebar, TitlebarHover, TITLEBAR_H};
+use crate::shell::menu::{draw_menu_sheet, SHEET_HEIGHT};
 
 // ── Widget ids ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +34,22 @@ fn id_centerpiece() -> uzor::types::WidgetId {
 /// Hit-zone over the M glyph in the titlebar.
 fn id_menu_btn() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:menu_btn")
+}
+
+/// Full-window scrim behind the bottom sheet (click closes the menu).
+fn id_scrim() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:scrim")
+}
+
+/// Skin-row hit-zone ids.
+fn id_skin_bloom() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:skin:bloom")
+}
+fn id_skin_planet() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:skin:planet")
+}
+fn id_skin_radar() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:skin:radar")
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -132,11 +150,35 @@ impl App<NoPanel> for MirageClientApp {
         // ── Process layout clicks BEFORE painting ─────────────────────────────
         // was_clicked() reads the previous frame's click state from the
         // coordinator — must be queried before build() registers new nodes.
-        if win.layout.was_clicked(&id_centerpiece()) {
-            self.toggle_connection();
-        }
+
+        // Menu button always processes (opens/closes the sheet).
         if win.layout.was_clicked(&id_menu_btn()) {
             self.menu_open = !self.menu_open;
+        }
+
+        if self.menu_open {
+            // Scrim click → close menu.
+            if win.layout.was_clicked(&id_scrim()) {
+                self.menu_open = false;
+            }
+            // Skin-row clicks — switch skin and close menu.
+            if win.layout.was_clicked(&id_skin_bloom()) {
+                self.switch_skin(SkinKind::Bloom);
+                self.menu_open = false;
+            }
+            if win.layout.was_clicked(&id_skin_planet()) {
+                self.switch_skin(SkinKind::Planet);
+                self.menu_open = false;
+            }
+            if win.layout.was_clicked(&id_skin_radar()) {
+                self.switch_skin(SkinKind::Radar);
+                self.menu_open = false;
+            }
+        } else {
+            // Centerpiece toggle only when menu is closed.
+            if win.layout.was_clicked(&id_centerpiece()) {
+                self.toggle_connection();
+            }
         }
 
         let render = &mut *win.render;
@@ -162,26 +204,75 @@ impl App<NoPanel> for MirageClientApp {
         // ── Titlebar chrome ───────────────────────────────────────────────────
         draw_titlebar(render, self.hover, w, self.menu_open);
 
-        // ── Register invisible hit-zones with the LayoutManager ───────────────
-        // Hit-zones are transparent buttons with no text/icon — they paint
-        // nothing but register CLICK sense with the coordinator so that both
+        // ── Bottom-sheet menu overlay (when open) ─────────────────────────────
+        if self.menu_open {
+            draw_menu_sheet(render, w, h, self.skin_kind);
+        }
+
+        // ── Register hit-zones with the LayoutManager ─────────────────────────
+        // Hit-zones are transparent buttons that register CLICK sense so both
         // real mouse events and `/input/click` agent commands reach them.
         {
             let layout = &mut *win.layout;
             let render = &mut *win.render;
 
-            // Centerpiece hit-zone: full area below the titlebar.
-            // Covers (0, TITLEBAR_H) → (w, h).
-            let centerpiece_rect = Rect {
-                x: 0.0,
-                y: TITLEBAR_H,
-                width: w,
-                height: (h - TITLEBAR_H).max(0.0),
-            };
-            lm::button(id_centerpiece(), centerpiece_rect)
-                .build(layout, render);
+            if self.menu_open {
+                // ── Menu open: scrim + sheet rows ─────────────────────────────
+                // Register scrim FIRST (bottom z-order in the hit stack).
+                // The sheet skin-row buttons are registered AFTER so they win.
+                let scrim_rect = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: w,
+                    height: h,
+                };
+                lm::button(id_scrim(), scrim_rect)
+                    .build(layout, render);
 
-            // Menu-button hit-zone: 4..48 px wide in the titlebar.
+                // Sheet occupies the bottom SHEET_HEIGHT pixels.
+                let sheet_y = h - SHEET_HEIGHT;
+                // Row layout: skip a header area of 40 px, then 3 rows × 48 px.
+                let row_x = 0.0;
+                let row_w = w;
+                let row_h = 48.0;
+                let rows_start = sheet_y + 40.0;
+
+                lm::button(id_skin_bloom(), Rect {
+                    x: row_x,
+                    y: rows_start,
+                    width: row_w,
+                    height: row_h,
+                }).build(layout, render);
+
+                lm::button(id_skin_planet(), Rect {
+                    x: row_x,
+                    y: rows_start + row_h,
+                    width: row_w,
+                    height: row_h,
+                }).build(layout, render);
+
+                lm::button(id_skin_radar(), Rect {
+                    x: row_x,
+                    y: rows_start + row_h * 2.0,
+                    width: row_w,
+                    height: row_h,
+                }).build(layout, render);
+            } else {
+                // ── Menu closed: normal centerpiece + menu button ─────────────
+
+                // Centerpiece hit-zone: full area below the titlebar.
+                let centerpiece_rect = Rect {
+                    x: 0.0,
+                    y: TITLEBAR_H,
+                    width: w,
+                    height: (h - TITLEBAR_H).max(0.0),
+                };
+                lm::button(id_centerpiece(), centerpiece_rect)
+                    .build(layout, render);
+            }
+
+            // Menu-button hit-zone always registered (opens/closes the sheet).
+            // Registered last so it wins over the centerpiece below it.
             let menu_rect = Rect {
                 x: 4.0,
                 y: 0.0,
