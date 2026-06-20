@@ -74,7 +74,7 @@ impl CellShader for RadarShader {
         let v = (ring_b * 0.45 + sweep * 0.8) * edge * fade;
 
         if v < 0.04 {
-            return Cell { ch: ' ', color: [0, 0, 0], alpha: 1.0 };
+            return Cell { ch: ' ', color: [0, 0, 0], alpha: 1.0, scale: 0.0 };
         }
 
         // Dim amber → bright amber by brightness.
@@ -85,7 +85,9 @@ impl CellShader for RadarShader {
             lerp_u8(dim[1], hi[1], v),
             lerp_u8(dim[2], hi[2], v),
         ];
-        Cell { ch: density_char(v), color, alpha: 1.0 }
+        // Size grows with brightness for a smooth density gradient.
+        let scale = (0.4 + 0.7 * v) as f32;
+        Cell { ch: density_char(v), color, alpha: 1.0, scale }
     }
 }
 

@@ -20,47 +20,52 @@ struct AuroraShader;
 
 impl CellShader for AuroraShader {
     fn main(&self, coord: Coord, ctx: &GridContext, cursor: &Cursor) -> Cell {
-        // Cursor domain-warp in cell space. Radius grows with cursor.intensity
-        // (= smoothed speed): fast → big wake, still → small tight pocket.
+        let t = ctx.time;
+        // Cursor domain-warp in cell space. Not a flat circle: the radius
+        // wobbles per-angle (a physical droplet) and the push uses a smooth
+        // falloff so the field rounds and flows around it. Radius grows with
+        // cursor.intensity (= smoothed speed): fast → big wake, still → tight.
         let mut cx = coord.x as f64;
         let mut cy = coord.y as f64;
         let mut fade = 1.0;
         if cursor.inside {
             let dx = cx - cursor.x;
             let dy = cy - cursor.y;
-            let d = (dx * dx + dy * dy).sqrt();
-            let radius = 4.5 + cursor.intensity * 20.0; // cells
+            let d = (dx * dx + dy * dy).sqrt().max(1e-4);
+            let ang = dy.atan2(dx);
+            let wob = (ang * 3.0 + t * 3.5).sin() * 0.16 + (ang * 5.0 - t * 2.3).sin() * 0.10;
+            let radius = (5.0 + cursor.intensity * 22.0) * (1.0 + wob);
             if d < radius {
-                let push = (radius - d) / radius; // 1 at cursor → 0 at edge
-                let amp = push * push * radius * 0.55; // displacement (cells)
-                if d > 1e-4 {
-                    cx += dx / d * amp;
-                    cy += dy / d * amp;
-                }
-                fade = (d / (radius * 0.42)).clamp(0.0, 1.0);
+                let nd = (d / radius).clamp(0.0, 1.0);
+                // smootherstep falloff → rounded drop, strongest at the centre.
+                let s = 1.0 - nd * nd * (3.0 - 2.0 * nd);
+                let amp = s * radius * 0.62;
+                cx += dx / d * amp;
+                cy += dy / d * amp;
+                fade = (nd / 0.45).clamp(0.0, 1.0); // void hollow at the centre
             }
         }
 
-        // Interference / flow field at the (warped) sample.
-        let t = ctx.time;
-        let fx = cx * 0.085;
-        let fy = cy * 0.085;
-        let p = (fx + t * 0.6).sin()
-            + (fy - t * 0.5).sin()
-            + (fx * 0.6 + fy * 0.9 + t * 0.4).sin()
-            + ((fx * fx + fy * fy).sqrt() * 0.6 - t * 0.7).sin();
-        // Contrast → bright filaments on dark (sparser draw + less "rough").
+        // Interference / flow field at the (warped) sample. Lower spatial freq =
+        // bigger, smoother features; faster time = livelier.
+        let fx = cx * 0.07;
+        let fy = cy * 0.07;
+        let p = (fx + t * 1.0).sin()
+            + (fy - t * 0.85).sin()
+            + (fx * 0.6 + fy * 0.9 + t * 0.7).sin()
+            + ((fx * fx + fy * fy).sqrt() * 0.6 - t * 1.1).sin();
         let base = (p * 0.125 + 0.5).clamp(0.0, 1.0);
-        let v = base.powf(1.9) * fade;
+        let v = base.powf(1.6) * fade;
 
-        if v < 0.16 {
-            return Cell { ch: ' ', color: [0, 0, 0], alpha: 1.0 };
+        if v < 0.12 {
+            return Cell { ch: ' ', color: [0, 0, 0], alpha: 1.0, scale: 0.0 };
         }
 
-        // Iridescent: hue drifts with the field value + time + row.
-        let hue = (p * 45.0 + t * 35.0 + coord.y as f64 * 3.0).rem_euclid(360.0);
-        let color = hsl(hue, 0.6, 0.30 + 0.40 * v);
-        Cell { ch: density_char(v), color, alpha: 1.0 }
+        // Iridescent hue + size-graded glyph (smooth texture transitions).
+        let hue = (p * 45.0 + t * 50.0 + coord.y as f64 * 3.0).rem_euclid(360.0);
+        let color = hsl(hue, 0.62, 0.32 + 0.42 * v);
+        let scale = (0.3 + 1.1 * v).clamp(0.3, 1.35) as f32;
+        Cell { ch: density_char(v), color, alpha: 1.0, scale }
     }
 }
 
