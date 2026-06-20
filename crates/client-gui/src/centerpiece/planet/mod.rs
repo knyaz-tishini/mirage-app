@@ -456,7 +456,16 @@ impl Skin for PlanetSkin {
                 self.sel = if self.sel == Some(i) { None } else { Some(i) };
                 true
             }
-            None => false,
+            // Missed all nodes: if a popup is open, a tap-outside closes it
+            // (consumed). Otherwise let the shell treat it as a connect tap.
+            None => {
+                if self.sel.is_some() {
+                    self.sel = None;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
