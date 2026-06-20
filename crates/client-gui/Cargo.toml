@@ -31,7 +31,9 @@ tokio                   = { version = "1", features = ["rt", "rt-multi-thread", 
 tracing                 = "0.1"
 tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
 
-# Config import: parse/validate, file picker, clipboard.
+# Config import: parse/validate, file picker, clipboard (text + image).
 serde_json              = "1"
 rfd                     = "0.14"
-arboard                 = "3"
+arboard                 = "3"            # image-data feature is on by default → get_image()
+# QR decode (pure Rust, no platform deps — safe for the isolated workspace).
+rqrr                    = "0.7"

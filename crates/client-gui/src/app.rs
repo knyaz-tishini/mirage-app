@@ -372,7 +372,7 @@ impl App<NoPanel> for MirageClientApp {
                         self.import_config(crate::config_import::from_clipboard_text());
                     }
                     MenuRow::Action(MenuAction::ImportQrClip) => {
-                        self.menu_note = Some("QR из буфера — скоро".into());
+                        self.import_config(crate::config_import::from_clipboard_qr());
                     }
                     MenuRow::Action(MenuAction::ImportCamera) => {
                         self.menu_note = Some("скан камерой — скоро".into());
