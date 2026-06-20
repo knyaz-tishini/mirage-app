@@ -64,6 +64,23 @@ pub struct CenterpieceState {
 pub trait Skin: Send + 'static {
     /// Called every frame. Draw to `ctx` using `st`.
     fn render(&mut self, ctx: &mut dyn RenderContext, st: CenterpieceState);
+
+    /// Pointer drag delta (logical px) while the centerpiece is held.
+    /// Skins that rotate (planet) consume this; others ignore it.
+    fn drag(&mut self, _dx: f64, _dy: f64) {}
+
+    /// Scroll-wheel delta (logical units). Planet zooms; others ignore.
+    fn zoom(&mut self, _dy: f64) {}
+
+    /// A tap (press+release without dragging) at logical window coords.
+    /// Returns `true` if the skin consumed it (e.g. selected a node and opened
+    /// its info popup), `false` if the shell should treat it as a connect tap.
+    fn tap(&mut self, _x: f64, _y: f64) -> bool {
+        false
+    }
+
+    /// Drop any transient selection (e.g. node popup) — called on disconnect.
+    fn clear_selection(&mut self) {}
 }
 
 // ── Skin kind + registry ──────────────────────────────────────────────────────

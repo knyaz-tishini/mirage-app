@@ -97,6 +97,19 @@ pub struct MirageClientApp {
     // Shell state.
     menu_open: bool,
 
+    // Pointer gesture state (drag-rotate / tap / double-tap / wheel).
+    /// Left button currently held (tracked from raw on_event).
+    pointer_down: bool,
+    /// Last raw pointer position (physical px) for drag deltas.
+    last_phys: Option<(f64, f64)>,
+    /// Accumulated travel during the current press — distinguishes drag vs tap.
+    drag_moved: f64,
+    /// Deferred single-tap timestamp (ms) — fires connect if no second tap
+    /// arrives within the double-click window.
+    pending_tap_at: Option<f64>,
+    /// Timestamp (ms) of the last empty tap, for double-click discrimination.
+    last_tap_ms: f64,
+
     // Frame timing.
     last_frame: Instant,
 }
@@ -112,6 +125,11 @@ impl MirageClientApp {
             pending_connect_at: None,
             pending_disconnect_at: None,
             menu_open: false,
+            pointer_down: false,
+            last_phys: None,
+            drag_moved: 0.0,
+            pending_tap_at: None,
+            last_tap_ms: -1.0e9,
             last_frame: Instant::now(),
         }
     }
@@ -133,20 +151,29 @@ impl MirageClientApp {
 
     // ── Connection toggle ─────────────────────────────────────────────────────
 
-    fn toggle_connection(&mut self) {
-        match self.current_phase {
-            ConnPhase::Disconnected => {
-                self.current_phase = ConnPhase::Connecting;
-                self.pending_connect_at = Some(Instant::now());
-            }
-            ConnPhase::Connected => {
-                self.current_phase = ConnPhase::Disconnecting;
-                self.pending_disconnect_at = Some(Instant::now());
-            }
-            ConnPhase::Connecting | ConnPhase::Disconnecting => {}
+    /// Single tap on empty space → connect (only from a settled disconnected
+    /// state). Grid → planet, off → bloom, etc.
+    fn request_connect(&mut self) {
+        if matches!(self.current_phase, ConnPhase::Disconnected) {
+            self.current_phase = ConnPhase::Connecting;
+            self.pending_connect_at = Some(Instant::now());
+        }
+    }
+
+    /// Double tap → disconnect (only when connected). Planet → grid.
+    fn request_disconnect(&mut self) {
+        if matches!(self.current_phase, ConnPhase::Connected) {
+            self.current_phase = ConnPhase::Disconnecting;
+            self.pending_disconnect_at = Some(Instant::now());
+            self.skin.clear_selection();
         }
     }
 }
+
+/// Double-click window in ms.
+const DBLCLICK_MS: f64 = 280.0;
+/// Pointer travel (logical px) above which a press+release is a drag, not a tap.
+const TAP_SLOP: f64 = 7.0;
 
 // ── App trait ─────────────────────────────────────────────────────────────────
 
@@ -198,9 +225,32 @@ impl App<NoPanel> for MirageClientApp {
                 self.menu_open = false;
             }
         } else {
-            // Centerpiece toggle only when menu is closed.
-            if win.layout.was_clicked(&id_centerpiece()) {
-                self.toggle_connection();
+            // ── Tap / double-tap on the centerpiece (menu closed) ──────────────
+            // Drag-rotate and wheel-zoom are handled in `on_event` (raw pointer
+            // stream); here we only resolve discrete taps via the layout. A tap
+            // is a press+release that barely moved (`drag_moved < TAP_SLOP`).
+            let now_ms = win.layout.frame_time_ms();
+            if win.layout.was_clicked(&id_centerpiece()) && self.drag_moved < TAP_SLOP {
+                let (tx, ty) = win.layout.pointer_pos().unwrap_or((0.0, 0.0));
+                // Let the skin consume it first (e.g. node → info popup).
+                if !self.skin.tap(tx, ty) {
+                    if now_ms - self.last_tap_ms < DBLCLICK_MS {
+                        // Double tap → disconnect (cancel the pending single).
+                        self.pending_tap_at = None;
+                        self.request_disconnect();
+                    } else {
+                        // Provisional single tap — defer to disambiguate.
+                        self.pending_tap_at = Some(now_ms);
+                    }
+                    self.last_tap_ms = now_ms;
+                }
+            }
+            // Fire the deferred single tap once the double-click window passes.
+            if let Some(at) = self.pending_tap_at {
+                if now_ms - at >= DBLCLICK_MS {
+                    self.pending_tap_at = None;
+                    self.request_connect();
+                }
             }
         }
 
@@ -336,6 +386,35 @@ impl App<NoPanel> for MirageClientApp {
                     KeyCode::Tab  => { self.cycle_skin(); true }
                     _             => false,
                 }
+            }
+            // Drag-rotate: feed raw pointer deltas to the active skin while the
+            // button is held (planet rotates; bloom/radar ignore). Coordinates
+            // here are physical px — fine for a rotation sensitivity factor.
+            PlatformEvent::PointerDown { .. } => {
+                self.pointer_down = true;
+                self.drag_moved = 0.0;
+                false
+            }
+            PlatformEvent::PointerUp { .. } => {
+                self.pointer_down = false;
+                false
+            }
+            PlatformEvent::PointerMoved { x, y } => {
+                if let Some((lx, ly)) = self.last_phys {
+                    if self.pointer_down && !self.menu_open {
+                        self.skin.drag(x - lx, y - ly);
+                        self.drag_moved += (x - lx).abs() + (y - ly).abs();
+                    }
+                }
+                self.last_phys = Some((*x, *y));
+                false
+            }
+            // Wheel → zoom (planet).
+            PlatformEvent::Scroll { dy, .. } => {
+                if !self.menu_open {
+                    self.skin.zoom(*dy);
+                }
+                false
             }
             _ => false,
         }

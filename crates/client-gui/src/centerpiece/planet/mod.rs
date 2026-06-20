@@ -76,6 +76,11 @@ struct GridPt {
 struct Node {
     p: [f64; 3],
     reg: &'static str,
+    city: &'static str,
+    ip: &'static str,
+    id: &'static str,
+    prov: &'static str,
+    roles: &'static str,
 }
 
 fn geo(lat: f64, lon: f64) -> [f64; 3] {
@@ -92,10 +97,19 @@ pub struct PlanetSkin {
     t: f64,
     yaw: f64,
     pitch: f64,
+    vyaw: f64,
+    vpitch: f64,
+    zoom: f64,
+    /// Frames since the last drag input (suppresses auto-rotate while dragging).
+    since_drag: u32,
     fold: f64,
     amp: f64,
     col_t: f64,
     mesh: f64,
+    /// Last-frame projected node screen positions (x, y, front?).
+    node_screen: Vec<(f64, f64, bool)>,
+    /// Currently selected node (info popup), if any.
+    sel: Option<usize>,
 }
 
 impl PlanetSkin {
@@ -124,17 +138,27 @@ impl PlanetSkin {
             }
         }
 
-        let nodes_raw = [
-            ("RU", 55.75, 37.62),
-            ("RU", 59.93, 30.34),
-            ("TR", 41.01, 28.98),
-            ("NL", 52.37, 4.90),
-            ("NL", 51.92, 4.48),
-            ("CH", 47.37, 8.54),
+        const ROLES: &str = "monitor · node · sentry · mshd · db-worker";
+        // reg, city, ip, id, provider, roles, lat, lon
+        let nodes_raw: [(&str, &str, &str, &str, &str, &str, f64, f64); 6] = [
+            ("RU", "Moscow", "193.187.94.74", "ru-hostkey-094.74", "HostKey", ROLES, 55.75, 37.62),
+            ("RU", "St Petersburg", "91.218.245.247", "ru-hostkey-245.247", "HostKey", ROLES, 59.93, 30.34),
+            ("TR", "Istanbul", "82.26.94.247", "tr-hostkey-094.247", "HostKey", ROLES, 41.01, 28.98),
+            ("NL", "Amsterdam", "45.12.212.226", "nl-hosthatch-212.226", "Omro", "monitor · node · sentry · mshd · db-worker · standalone", 52.37, 4.90),
+            ("NL", "Rotterdam", "151.243.173.104", "nl-hostkey-173.104", "HostKey", ROLES, 51.92, 4.48),
+            ("CH", "Zurich", "45.59.119.139", "ch-cloudzy-119.139", "Cloudzy", "monitor · node · sentry · mshd · db-worker · standalone", 47.37, 8.54),
         ];
         let nodes = nodes_raw
             .iter()
-            .map(|&(reg, lat, lon)| Node { p: geo(lat, lon), reg })
+            .map(|&(reg, city, ip, id, prov, roles, lat, lon)| Node {
+                p: geo(lat, lon),
+                reg,
+                city,
+                ip,
+                id,
+                prov,
+                roles,
+            })
             .collect();
         let links = vec![(0, 2), (2, 5), (1, 3), (3, 5), (0, 1), (4, 2)];
 
@@ -145,10 +169,16 @@ impl PlanetSkin {
             t: 0.0,
             yaw: 0.5,
             pitch: 0.38,
+            vyaw: 0.0,
+            vpitch: 0.0,
+            zoom: 1.0,
+            since_drag: 999,
             fold: 0.0,
             amp: 0.16,
             col_t: 0.0,
             mesh: 0.0,
+            node_screen: vec![(0.0, 0.0, false); 6],
+            sel: None,
         }
     }
 
@@ -204,7 +234,17 @@ impl Skin for PlanetSkin {
         self.amp = ez(self.amp, ta, 2.4, dt);
         self.col_t = ez(self.col_t, tc, 3.0, dt);
         self.mesh = ez(self.mesh, tm, 3.6, dt);
-        self.yaw += 0.12 * dt;
+
+        // Rotation: drag() moves yaw/pitch directly (since_drag = 0 that frame);
+        // otherwise coast on inertia + a gentle idle auto-rotate.
+        if self.since_drag == 0 {
+            self.since_drag = 1;
+        } else {
+            self.yaw += self.vyaw + 0.12 * dt;
+            self.pitch = clamp(self.pitch + self.vpitch, -1.35, 1.35);
+            self.vyaw *= 0.92;
+            self.vpitch *= 0.92;
+        }
 
         let fe = smooth(clamp(self.fold, 0.0, 1.0));
         let mesh_a = self.mesh * clamp((self.fold - 0.9) / 0.08, 0.0, 1.0);
@@ -213,7 +253,7 @@ impl Skin for PlanetSkin {
 
         let cx = rect.cx();
         let cy = rect.y + rect.h * 0.5;
-        let r_globe = rect.w.min(rect.h) * 0.40;
+        let r_globe = rect.w.min(rect.h) * 0.40 * self.zoom;
 
         // ── Background ─────────────────────────────────────────────────────────
         ctx.set_fill_color("#0B0B0E");
@@ -332,27 +372,141 @@ impl Skin for PlanetSkin {
                 ctx.stroke();
             }
 
-            // Nodes.
+            // Nodes — project, record screen positions, draw.
+            let mut screens = vec![(0.0_f64, 0.0_f64, false); self.nodes.len()];
             ctx.set_global_alpha(mesh_a);
-            for n in &self.nodes {
+            for (ni, n) in self.nodes.iter().enumerate() {
                 let r = self.rot(n.p);
-                let s = [cx + r[0] * r_globe, cy - r[1] * r_globe];
-                if r[2] < -0.02 {
+                let s = (cx + r[0] * r_globe, cy - r[1] * r_globe);
+                let front = r[2] >= -0.02;
+                screens[ni] = (s.0, s.1, front);
+                if !front {
                     continue;
+                }
+                if self.sel == Some(ni) {
+                    ctx.set_stroke_color(&format!("rgba(251,178,106,{:.3})", 0.8 * mesh_a));
+                    ctx.set_stroke_width(1.3);
+                    ctx.set_line_dash(&[]);
+                    ctx.begin_path();
+                    ctx.arc(s.0, s.1, 9.0, 0.0, TAU);
+                    ctx.stroke();
                 }
                 ctx.set_fill_color("#F4F4F5");
                 ctx.begin_path();
-                ctx.arc(s[0], s[1], 4.6, 0.0, TAU);
+                ctx.arc(s.0, s.1, 4.6, 0.0, TAU);
                 ctx.fill();
                 ctx.set_fill_color("#FBB26A");
                 ctx.begin_path();
-                ctx.arc(s[0], s[1], 2.8, 0.0, TAU);
+                ctx.arc(s.0, s.1, 2.8, 0.0, TAU);
                 ctx.fill();
                 ctx.set_fill_color("#FBB26A");
                 ctx.set_font("9px monospace");
-                ctx.fill_text(n.reg, s[0] + 9.0, s[1] - 3.0);
+                ctx.fill_text(n.reg, s.0 + 9.0, s.1 - 3.0);
             }
             ctx.set_global_alpha(1.0);
+            self.node_screen = screens;
+
+            // Node info popup.
+            if let Some(si) = self.sel {
+                if let Some(&(sx, sy, front)) = self.node_screen.get(si) {
+                    if front && mesh_a > 0.5 {
+                        self.draw_popup(ctx, &self.nodes[si], sx, sy, rect);
+                    }
+                }
+            }
+        } else {
+            self.sel = None;
         }
+    }
+
+    fn drag(&mut self, dx: f64, dy: f64) {
+        self.yaw += dx * 0.008;
+        self.pitch = clamp(self.pitch + dy * 0.008, -1.35, 1.35);
+        self.vyaw = dx * 0.008;
+        self.vpitch = dy * 0.008;
+        self.since_drag = 0;
+    }
+
+    fn zoom(&mut self, dy: f64) {
+        let f = if dy > 0.0 { 1.08 } else { 0.926 };
+        self.zoom = clamp(self.zoom * f, 0.6, 3.2);
+    }
+
+    fn tap(&mut self, x: f64, y: f64) -> bool {
+        let mut best: Option<usize> = None;
+        let mut best_d = 16.0 * 16.0;
+        for (i, &(sx, sy, front)) in self.node_screen.iter().enumerate() {
+            if !front {
+                continue;
+            }
+            let d = (sx - x) * (sx - x) + (sy - y) * (sy - y);
+            if d < best_d {
+                best_d = d;
+                best = Some(i);
+            }
+        }
+        match best {
+            Some(i) => {
+                self.sel = if self.sel == Some(i) { None } else { Some(i) };
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.sel = None;
+    }
+}
+
+impl PlanetSkin {
+    /// Draw the floating node-info popup near `(sx, sy)`, clamped to the rect.
+    fn draw_popup(&self, ctx: &mut dyn RenderContext, n: &Node, sx: f64, sy: f64, rect: SkinRect) {
+        const PW: f64 = 196.0;
+        let rows = ["IP", "ID", "PROVIDER"];
+        let vals = [n.ip, n.id, n.prov];
+        let header_h = 30.0;
+        let row_h = 18.0;
+        let roles_h = 30.0;
+        let ph = header_h + row_h * rows.len() as f64 + roles_h + 10.0;
+
+        let px = (sx + 14.0).clamp(rect.x + 4.0, rect.x + rect.w - PW - 4.0);
+        let py = (sy - 12.0).clamp(rect.y + 4.0, rect.y + rect.h - ph - 4.0);
+
+        // Panel.
+        ctx.set_fill_color("rgba(20,21,26,0.96)");
+        ctx.fill_rect(px, py, PW, ph);
+        ctx.set_fill_color("#FBB26A");
+        ctx.fill_rect(px, py, 2.0, ph);
+
+        // Header: REG · City.
+        ctx.set_fill_color("#FBB26A");
+        ctx.set_font("11px monospace");
+        ctx.set_text_align(uzor::render::TextAlign::Left);
+        ctx.set_text_baseline(uzor::render::TextBaseline::Middle);
+        ctx.fill_text(&format!("{} · {}", n.reg, n.city), px + 12.0, py + 16.0);
+        ctx.set_fill_color("rgba(255,255,255,0.12)");
+        ctx.fill_rect(px + 12.0, py + header_h - 4.0, PW - 24.0, 1.0);
+
+        // Rows.
+        let mut ry = py + header_h + row_h / 2.0;
+        for (k, v) in rows.iter().zip(vals.iter()) {
+            ctx.set_fill_color("#878B91");
+            ctx.set_font("10px monospace");
+            ctx.set_text_align(uzor::render::TextAlign::Left);
+            ctx.fill_text(k, px + 12.0, ry);
+            ctx.set_fill_color("#C9CCD1");
+            ctx.set_text_align(uzor::render::TextAlign::Right);
+            ctx.fill_text(v, px + PW - 12.0, ry);
+            ry += row_h;
+        }
+
+        // Roles.
+        ctx.set_fill_color("#878B91");
+        ctx.set_font("9px monospace");
+        ctx.set_text_align(uzor::render::TextAlign::Left);
+        ctx.fill_text("ROLES", px + 12.0, ry + 2.0);
+        ctx.set_fill_color("#C9CCD1");
+        ctx.fill_text(n.roles, px + 12.0, ry + 16.0);
     }
 }
