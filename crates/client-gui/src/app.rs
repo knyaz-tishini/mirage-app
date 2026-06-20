@@ -231,6 +231,14 @@ impl App<NoPanel> for MirageClientApp {
             None
         };
 
+        // Profiling readout (backend + fps + frame time).
+        let stats = format!(
+            "{}  {:.0}fps  {:.1}ms",
+            win.render_control.active_backend().label(),
+            win.render_control.measured_fps(),
+            win.render_control.last_frame_time_ms(),
+        );
+
         // ── Process layout clicks BEFORE painting ─────────────────────────────
         // was_clicked() reads the previous frame's click state from the
         // coordinator — must be queried before build() registers new nodes.
@@ -380,6 +388,16 @@ impl App<NoPanel> for MirageClientApp {
             render.set_text_align(TextAlign::Center);
             render.set_text_baseline(TextBaseline::Middle);
             render.fill_text("M", SLOT_W / 2.0, CHROME_H / 2.0 - 1.0);
+        }
+
+        // ── Profiling overlay (top-right, under chrome) ───────────────────────
+        {
+            let render = &mut *win.render;
+            render.set_fill_color("#6B6F7A");
+            render.set_font("11px monospace");
+            render.set_text_align(TextAlign::Right);
+            render.set_text_baseline(TextBaseline::Top);
+            render.fill_text(&stats, w - 8.0, CHROME_H + 5.0);
         }
     }
 

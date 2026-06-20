@@ -12,7 +12,7 @@ mod shell;
 
 use uzor::framework::builder::AppBuilder;
 use uzor::framework::multi_window::{WindowKey, WindowSpec};
-use uzor::platform::types::CornerStyle;
+use uzor::platform::types::{CornerStyle, RenderBackend};
 use uzor_desktop::AppRun as _;
 
 use app::MirageClientApp;
@@ -56,11 +56,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let connected = args.iter().any(|a| a == "--connected");
 
-    AppBuilder::new(MirageClientApp::with_skin(skin, connected))
+    // --backend <name> for A/B profiling; absent → autodetect (VelloGpu).
+    let backend = args
+        .iter()
+        .position(|a| a == "--backend")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| match s.as_str() {
+            "vello_gpu" => Some(RenderBackend::VelloGpu),
+            "vello_hybrid" => Some(RenderBackend::VelloHybrid),
+            "vello_cpu" => Some(RenderBackend::VelloCpu),
+            "instanced_wgpu" => Some(RenderBackend::InstancedWgpu),
+            "urx_wgpu" => Some(RenderBackend::UrxWgpu),
+            "urx_wgpu_full" => Some(RenderBackend::UrxWgpuFull),
+            "urx_hybrid" => Some(RenderBackend::UrxHybrid),
+            "urx_cpu" => Some(RenderBackend::UrxCpu),
+            "tiny_skia" => Some(RenderBackend::TinySkia),
+            _ => None,
+        });
+
+    let mut builder = AppBuilder::new(MirageClientApp::with_skin(skin, connected))
         .agent_api(17471)
         // render-hub builds vello area-only AA; default msaa_samples=8 would
         // request the absent Msaa8 shader and panic on the first frame.
-        .msaa(0)
+        .msaa(0);
+    if let Some(b) = backend {
+        builder = builder.backend(b);
+    }
+    builder
         .window(
             WindowSpec::new(WindowKey::new("main"), "Mirage")
                 .size(380, 540)
