@@ -255,7 +255,7 @@ fn ensure_client_template_cli2() {
     let worker_bin = format!("{dir_str}/mirage-chain-worker{exe}");
 
     let content = format!(
-        "{{\n  \"client_id\": \"mirage-desktop\",\n  \"mesh_id\": \"staging-v2\",\n  \
+        "{{\n  \"client_id\": \"mirage-desktop\",\n  \"mesh_id\": \"v3-staging\",\n  \
          \"chains\": [],\n  \"routing\": {{}},\n  \"psk\": null,\n  \
          \"supervisor\": {{\n    \"worker_binary\": \"{worker_bin}\",\n    \
          \"reload_poll_secs\": 5\n  }}\n}}\n"
@@ -276,7 +276,15 @@ fn reap_orphans() {
         // launcher run.  These are user-owned, so plain pkill works.  Tun runs
         // as root and is killed via sudo (already cached if user just OK'd it
         // this session; harmless prompt if not).
-        for name in &["mirage-l0-sentinel", "mirage-client-cli"] {
+        // cli1 (mirage-client-cli) retired 2026-06-14; the cli2 data-plane is
+        // supervisor + workers — reap those too so a crashed run's orphans don't
+        // hold the SOCKS/utun ports (AddrInUse on the next connect).
+        for name in &[
+            "mirage-l0-sentinel",
+            "mirage-client-cli",
+            "mirage-chain-supervisor",
+            "mirage-chain-worker",
+        ] {
             let _ = Command::new("pkill").arg("-9").arg("-x").arg(name).status();
         }
         // Tun (root) — try sudo -n (cached), don't prompt; if no cache, skip.
