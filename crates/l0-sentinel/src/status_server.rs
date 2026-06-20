@@ -190,20 +190,40 @@ fn spawn_tun_macos(binary: &std::path::Path, tun_args: &[String]) -> anyhow::Res
         cmd_parts.join(" ")
     );
 
-    // Escape double-quotes inside the shell command for the AppleScript string.
-    let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("do shell script \"{}\" with administrator privileges", escaped);
-
-    tracing::info!("[sentinel] tun macOS elevate: osascript prompt");
-
-    let child = tokio::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| "failed to spawn osascript for tun elevation")?;
+    // Headless / agent-driven path: when `MIRAGE_TUN_SUDO_PASS` is set, elevate
+    // via non-interactive `sudo -S` (password piped on stdin) instead of the
+    // osascript Aqua prompt — so the tun can come up over SSH or an agent-API
+    // run (no desktop session to type the password into). Same mechanism the
+    // opbox /test/edge harness uses. Default (env unset) keeps the GUI prompt.
+    let child = if let Ok(pass) = std::env::var("MIRAGE_TUN_SUDO_PASS") {
+        let inner = format!(
+            "echo {} | sudo -S -p '' {}",
+            sh_quote(&pass),
+            shell_cmd
+        );
+        tracing::info!("[sentinel] tun macOS elevate: sudo -S (headless)");
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&inner)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| "failed to spawn sh for sudo -S tun elevation")?
+    } else {
+        // Escape double-quotes inside the shell command for the AppleScript string.
+        let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("do shell script \"{}\" with administrator privileges", escaped);
+        tracing::info!("[sentinel] tun macOS elevate: osascript prompt");
+        tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| "failed to spawn osascript for tun elevation")?
+    };
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
