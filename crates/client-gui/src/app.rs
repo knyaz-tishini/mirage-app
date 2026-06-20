@@ -124,6 +124,8 @@ pub struct MirageClientApp {
     selected_node: Option<usize>,
     /// Transient menu feedback line (e.g. stubbed actions).
     menu_note: Option<String>,
+    /// Raw JSON of the last successfully imported ClientConfig.
+    imported: Option<String>,
 
     // Pointer gesture state (drag-rotate / tap / double-tap / wheel).
     /// Left button currently held (tracked from raw on_event).
@@ -170,6 +172,7 @@ impl MirageClientApp {
             prev_pointer_down: false,
             selected_node: None,
             menu_note: None,
+            imported: None,
             pointer_down: false,
             last_phys: None,
             drag_moved: 0.0,
@@ -203,6 +206,19 @@ impl MirageClientApp {
         if matches!(self.current_phase, ConnPhase::Disconnected) {
             self.current_phase = ConnPhase::Connecting;
             self.pending_connect_at = Some(Instant::now());
+        }
+    }
+
+    /// Apply a config-import result: stash the raw config + show a summary/error.
+    fn import_config(&mut self, res: Result<crate::config_import::Imported, String>) {
+        match res {
+            Ok(imp) => {
+                self.menu_note = Some(format!("импорт ок · {}", imp.summary));
+                self.imported = Some(imp.raw);
+            }
+            Err(e) => {
+                self.menu_note = Some(format!("импорт: {e}"));
+            }
         }
     }
 
@@ -349,11 +365,20 @@ impl App<NoPanel> for MirageClientApp {
                         self.menu_open = false;
                         self.menu_note = None;
                     }
-                    MenuRow::Action(MenuAction::ImportConfig) => {
-                        self.menu_note = Some("импорт конфига (QR/файл) — в разработке".into());
+                    MenuRow::Action(MenuAction::ImportFile) => {
+                        self.import_config(crate::config_import::from_file());
+                    }
+                    MenuRow::Action(MenuAction::ImportText) => {
+                        self.import_config(crate::config_import::from_clipboard_text());
+                    }
+                    MenuRow::Action(MenuAction::ImportQrClip) => {
+                        self.menu_note = Some("QR из буфера — скоро".into());
+                    }
+                    MenuRow::Action(MenuAction::ImportCamera) => {
+                        self.menu_note = Some("скан камерой — скоро".into());
                     }
                     MenuRow::Action(MenuAction::Login) => {
-                        self.menu_note = Some("вход на zengeld.com — в разработке".into());
+                        self.menu_note = Some("вход на zengeld.com — скоро".into());
                     }
                     _ => {}
                 }

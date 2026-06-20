@@ -8,6 +8,7 @@
 
 mod app;
 mod centerpiece;
+mod config_import;
 mod nodes;
 mod prof;
 mod shell;

@@ -64,7 +64,10 @@ pub enum MenuRow {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
-    ImportConfig,
+    ImportFile,
+    ImportText,
+    ImportQrClip,
+    ImportCamera,
     Login,
 }
 
@@ -101,7 +104,10 @@ pub fn tab_rows(tab: MenuTab) -> Vec<MenuRow> {
             .map(MenuRow::Skin)
             .collect(),
         MenuTab::Setup => vec![
-            MenuRow::Action(MenuAction::ImportConfig),
+            MenuRow::Action(MenuAction::ImportFile),
+            MenuRow::Action(MenuAction::ImportText),
+            MenuRow::Action(MenuAction::ImportQrClip),
+            MenuRow::Action(MenuAction::ImportCamera),
             MenuRow::Action(MenuAction::Login),
         ],
     }
@@ -325,7 +331,10 @@ fn draw_row(
         }
         MenuRow::Action(a) => {
             let label = match a {
-                MenuAction::ImportConfig => "Import config  ·  QR / file",
+                MenuAction::ImportFile => "Import  ·  from file",
+                MenuAction::ImportText => "Import  ·  paste text",
+                MenuAction::ImportQrClip => "Import  ·  paste QR",
+                MenuAction::ImportCamera => "Import  ·  scan camera",
                 MenuAction::Login => "Log in to zengeld.com",
             };
             ctx.set_fill_color(AMBER);

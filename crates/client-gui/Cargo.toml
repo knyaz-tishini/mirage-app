@@ -30,3 +30,8 @@ uzor-desktop  = { path = "../../../uzor/uzor-desktop" }
 tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 tracing                 = "0.1"
 tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
+
+# Config import: parse/validate, file picker, clipboard.
+serde_json              = "1"
+rfd                     = "0.14"
+arboard                 = "3"
