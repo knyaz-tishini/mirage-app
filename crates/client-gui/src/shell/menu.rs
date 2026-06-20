@@ -21,8 +21,8 @@ pub const MENU_TITLE_H: f64 = 46.0;
 pub const MENU_ROW_H: f64 = 44.0;
 /// Number of skin rows.
 pub const MENU_ROW_COUNT: usize = 3;
-/// Footer block height ("tap M to close").
-pub const MENU_FOOT_H: f64 = 32.0;
+/// Bottom padding below the last row.
+pub const MENU_FOOT_H: f64 = 16.0;
 
 /// Y where the first skin row starts.
 pub const fn menu_rows_start() -> f64 {
@@ -40,7 +40,6 @@ const SCRIM: &str = "rgba(0,0,0,0.45)";
 const AMBER: &str = "#FBB26A";
 const LINE: &str = "rgba(255,255,255,0.08)";
 const LINE2: &str = "rgba(255,255,255,0.14)";
-const MUTED: &str = "#878B91";
 const FG: &str = "#F4F4F5";
 
 /// Draw the scrim + top overlay with skin-switcher rows.
@@ -78,14 +77,6 @@ pub fn draw_menu_overlay(ctx: &mut dyn RenderContext, w: f64, h: f64, active: Sk
     draw_skin_row(ctx, w, rows_start,                    "Bloom",  active == SkinKind::Bloom);
     draw_skin_row(ctx, w, rows_start + MENU_ROW_H,       "Planet", active == SkinKind::Planet);
     draw_skin_row(ctx, w, rows_start + MENU_ROW_H * 2.0, "Radar",  active == SkinKind::Radar);
-
-    // ── Footer ──────────────────────────────────────────────────────────────────
-    let foot_y = rows_start + MENU_ROW_H * MENU_ROW_COUNT as f64 + MENU_FOOT_H / 2.0;
-    ctx.set_fill_color(MUTED);
-    ctx.set_font("9px monospace");
-    ctx.set_text_align(TextAlign::Right);
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.fill_text("tap M to close", w - 22.0, foot_y);
 }
 
 /// Draw a single labelled skin row.
