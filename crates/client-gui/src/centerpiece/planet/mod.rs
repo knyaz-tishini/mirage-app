@@ -138,29 +138,20 @@ impl PlanetSkin {
             }
         }
 
-        const ROLES: &str = "monitor · node · sentry · mshd · db-worker";
-        // reg, city, ip, id, provider, roles, lat, lon
-        let nodes_raw: [(&str, &str, &str, &str, &str, &str, f64, f64); 6] = [
-            ("RU", "Moscow", "193.187.94.74", "ru-hostkey-094.74", "HostKey", ROLES, 55.75, 37.62),
-            ("RU", "St Petersburg", "91.218.245.247", "ru-hostkey-245.247", "HostKey", ROLES, 59.93, 30.34),
-            ("TR", "Istanbul", "82.26.94.247", "tr-hostkey-094.247", "HostKey", ROLES, 41.01, 28.98),
-            ("NL", "Amsterdam", "45.12.212.226", "nl-hosthatch-212.226", "Omro", "monitor · node · sentry · mshd · db-worker · standalone", 52.37, 4.90),
-            ("NL", "Rotterdam", "151.243.173.104", "nl-hostkey-173.104", "HostKey", ROLES, 51.92, 4.48),
-            ("CH", "Zurich", "45.59.119.139", "ch-cloudzy-119.139", "Cloudzy", "monitor · node · sentry · mshd · db-worker · standalone", 47.37, 8.54),
-        ];
-        let nodes = nodes_raw
+        // Shared fleet inventory (single source — see crate::nodes).
+        let nodes = crate::nodes::FLEET
             .iter()
-            .map(|&(reg, city, ip, id, prov, roles, lat, lon)| Node {
-                p: geo(lat, lon),
-                reg,
-                city,
-                ip,
-                id,
-                prov,
-                roles,
+            .map(|f| Node {
+                p: geo(f.lat, f.lon),
+                reg: f.reg,
+                city: f.city,
+                ip: f.ip,
+                id: f.id,
+                prov: f.prov,
+                roles: f.roles,
             })
             .collect();
-        let links = vec![(0, 2), (2, 5), (1, 3), (3, 5), (0, 1), (4, 2)];
+        let links = crate::nodes::LINKS.to_vec();
 
         Self {
             pts,

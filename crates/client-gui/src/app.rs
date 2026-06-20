@@ -26,7 +26,7 @@ use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
 use crate::prof::{parse_backend, ProfHandle};
-use crate::shell::menu::{draw_menu_overlay, menu_height, menu_rows_start, MENU_ROW_H};
+use crate::shell::menu::{self, MenuAction, MenuRow};
 
 // ── Chrome strip height ────────────────────────────────────────────────────────
 // Matches DefaultChromeStyle::chrome_height() == 32.0.  The skin rect starts
@@ -85,18 +85,9 @@ fn register_hit(layout: &mut LayoutManager<NoPanel>, id: uzor::types::WidgetId, 
         .register_atomic(id, WidgetKind::Button, rect, Sense::CLICK, &layer);
 }
 
-/// Skin-row hit-zone ids.
-fn id_skin_bloom() -> uzor::types::WidgetId {
-    unsafe_widget_id("mirage:skin:bloom")
-}
-fn id_skin_planet() -> uzor::types::WidgetId {
-    unsafe_widget_id("mirage:skin:planet")
-}
-fn id_skin_radar() -> uzor::types::WidgetId {
-    unsafe_widget_id("mirage:skin:radar")
-}
-fn id_skin_aurora() -> uzor::types::WidgetId {
-    unsafe_widget_id("mirage:skin:aurora")
+/// Per-menu-row hit-zone id (data-driven menu).
+fn id_menu_row(i: usize) -> uzor::types::WidgetId {
+    unsafe_widget_id(&format!("mirage:menu:row:{i}"))
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -113,6 +104,10 @@ pub struct MirageClientApp {
 
     // Shell state.
     menu_open: bool,
+    /// Chosen exit node (index into nodes::FLEET), if any.
+    selected_node: Option<usize>,
+    /// Transient menu feedback line (e.g. stubbed actions).
+    menu_note: Option<String>,
 
     // Pointer gesture state (drag-rotate / tap / double-tap / wheel).
     /// Left button currently held (tracked from raw on_event).
@@ -151,6 +146,8 @@ impl MirageClientApp {
             pending_connect_at: None,
             pending_disconnect_at: None,
             menu_open: false,
+            selected_node: None,
+            menu_note: None,
             pointer_down: false,
             last_phys: None,
             drag_moved: 0.0,
@@ -256,33 +253,50 @@ impl App<NoPanel> for MirageClientApp {
             }
         }
 
+        // Data-driven menu layout (built once per frame while open).
+        let menu_laid = if self.menu_open {
+            Some(menu::layout(&menu::build_rows()).0)
+        } else {
+            None
+        };
+
         // ── Process layout clicks BEFORE painting ─────────────────────────────
         // was_clicked() reads the previous frame's click state from the
         // coordinator — must be queried before build() registers new nodes.
 
-        if self.menu_open {
+        if let Some(laid) = &menu_laid {
             // Scrim click → close menu.
             if win.layout.was_clicked(&id_scrim()) {
                 self.menu_open = false;
+                self.menu_note = None;
             }
-            // Skin-row clicks — switch skin and close menu.
-            if win.layout.was_clicked(&id_skin_bloom()) {
-                self.switch_skin(SkinKind::Bloom);
-                self.menu_open = false;
+            // Row clicks — dispatch by row kind.
+            for (i, lr) in laid.iter().enumerate() {
+                if !lr.clickable || !win.layout.was_clicked(&id_menu_row(i)) {
+                    continue;
+                }
+                match lr.row {
+                    MenuRow::Node(n) => {
+                        self.selected_node =
+                            if self.selected_node == Some(n) { None } else { Some(n) };
+                    }
+                    MenuRow::Skin(s) => {
+                        self.switch_skin(s);
+                        self.menu_open = false;
+                        self.menu_note = None;
+                    }
+                    MenuRow::Action(MenuAction::ImportConfig) => {
+                        self.menu_note = Some("импорт конфига (QR/файл) — в разработке".into());
+                    }
+                    MenuRow::Action(MenuAction::Login) => {
+                        self.menu_note = Some("вход на zengeld.com — в разработке".into());
+                    }
+                    _ => {}
+                }
             }
-            if win.layout.was_clicked(&id_skin_planet()) {
-                self.switch_skin(SkinKind::Planet);
-                self.menu_open = false;
-            }
-            if win.layout.was_clicked(&id_skin_radar()) {
-                self.switch_skin(SkinKind::Radar);
-                self.menu_open = false;
-            }
-            if win.layout.was_clicked(&id_skin_aurora()) {
-                self.switch_skin(SkinKind::Aurora);
-                self.menu_open = false;
-            }
-        } else {
+        }
+
+        if !self.menu_open {
             // ── Tap / double-tap on the centerpiece (menu closed) ──────────────
             // Drag-rotate and wheel-zoom are handled in `on_event` (raw pointer
             // stream); here we only resolve discrete taps via the layout. A tap
@@ -333,9 +347,18 @@ impl App<NoPanel> for MirageClientApp {
         };
         self.skin.render(render, state);
 
-        // ── Top overlay menu (when open) ──────────────────────────────────────
-        if self.menu_open {
-            draw_menu_overlay(render, w, h, self.skin_kind);
+        // ── Menu overlay (when open) ──────────────────────────────────────────
+        if let Some(laid) = &menu_laid {
+            menu::draw_menu(
+                render,
+                w,
+                h,
+                laid,
+                self.skin_kind,
+                self.selected_node,
+                self.current_phase,
+                self.menu_note.as_deref(),
+            );
         }
 
         // ── Chrome strip ──────────────────────────────────────────────────────
@@ -354,12 +377,10 @@ impl App<NoPanel> for MirageClientApp {
                 .theme(Box::new(DarkChromeTheme))
                 .build(layout, render);
 
-            if self.menu_open {
-                // ── Menu open: scrim → panel → skin rows ──────────────────────
-                // Hit priority follows registration order (later wins). Scrim
-                // first (dismiss fallback), then the panel body (absorbs taps
-                // on the overlay background), then the skin rows on top.
-                // All invisible — the sheet itself is painted in draw_menu_overlay.
+            if let Some(laid) = &menu_laid {
+                // ── Menu open: scrim → panel → row hit-zones ──────────────────
+                // Hit priority follows registration order (later wins): scrim
+                // (dismiss fallback), panel body (absorbs gaps), then rows.
                 register_hit(layout, id_scrim(), Rect {
                     x: 0.0,
                     y: CHROME_H,
@@ -370,15 +391,13 @@ impl App<NoPanel> for MirageClientApp {
                     x: 0.0,
                     y: CHROME_H,
                     width: w,
-                    height: menu_height(),
+                    height: (h - CHROME_H).max(0.0),
                 });
-
-                let row_h = MENU_ROW_H;
-                let rows_start = menu_rows_start();
-                register_hit(layout, id_skin_bloom(), Rect { x: 0.0, y: rows_start, width: w, height: row_h });
-                register_hit(layout, id_skin_planet(), Rect { x: 0.0, y: rows_start + row_h, width: w, height: row_h });
-                register_hit(layout, id_skin_radar(), Rect { x: 0.0, y: rows_start + row_h * 2.0, width: w, height: row_h });
-                register_hit(layout, id_skin_aurora(), Rect { x: 0.0, y: rows_start + row_h * 3.0, width: w, height: row_h });
+                for (i, lr) in laid.iter().enumerate() {
+                    if lr.clickable {
+                        register_hit(layout, id_menu_row(i), Rect { x: 0.0, y: lr.y, width: w, height: lr.h });
+                    }
+                }
             } else {
                 // ── Menu closed: invisible centerpiece hit-zone ───────────────
                 register_hit(layout, id_centerpiece(), Rect {
@@ -428,6 +447,9 @@ impl App<NoPanel> for MirageClientApp {
         match control {
             ChromeWindowControl::Menu => {
                 self.menu_open = !self.menu_open;
+                if !self.menu_open {
+                    self.menu_note = None;
+                }
             }
             ChromeWindowControl::CloseApp => {
                 std::process::exit(0);

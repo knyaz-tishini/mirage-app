@@ -1,109 +1,219 @@
-//! Top overlay menu with skin switcher.
+//! The menu — the client's control plane (not just a skin switcher).
 //!
-//! Faithful to the JS reference `mirage-desktop-client.html`: the menu drops
-//! from the top (immediately below the 32 px chrome strip), spans the full
-//! width, has a dark translucent fill with a 2 px amber left accent, a mono
-//! section title, labelled rows, and a "tap M to close" footer.
-//!
-//! `M` (chrome menu button) opens / closes it. The scrim below catches clicks
-//! to dismiss. Hit-zones for the scrim, panel, and skin rows are registered
-//! separately in `app.rs` — keep the geometry constants here in sync.
+//! A full-height top overlay with sections: CONNECTION (phase + chosen exit),
+//! EXIT NODE (the fleet list, selectable — this is where radar/aurora/bloom get
+//! their node picker since they don't draw nodes in-scene), APPEARANCE (skins),
+//! SETUP (config import / QR, log in to the site). The model is data-driven:
+//! `build_rows` + `layout` produce rows the shell both draws and hit-tests.
 
 use uzor::render::{RenderContext, TextAlign, TextBaseline};
 
-use crate::centerpiece::SkinKind;
+use crate::centerpiece::{ConnPhase, SkinKind};
+use crate::nodes::FLEET;
 
-/// Y where the overlay begins — immediately below the chrome strip.
+/// Y where the overlay begins (below the chrome strip).
 pub const MENU_TOP: f64 = 32.0;
-/// Height of the title block (mono section header) above the rows.
-pub const MENU_TITLE_H: f64 = 46.0;
-/// Height of one skin row.
-pub const MENU_ROW_H: f64 = 44.0;
-/// Number of skin rows.
-pub const MENU_ROW_COUNT: usize = 4;
-/// Bottom padding below the last row.
-pub const MENU_FOOT_H: f64 = 16.0;
 
-/// Y where the first skin row starts.
-pub const fn menu_rows_start() -> f64 {
-    MENU_TOP + MENU_TITLE_H
-}
-
-/// Total overlay height (title + rows + footer).
-pub const fn menu_height() -> f64 {
-    MENU_TITLE_H + MENU_ROW_H * MENU_ROW_COUNT as f64 + MENU_FOOT_H
-}
-
-// ── palette (mirrors the reference :root tokens) ────────────────────────────────
-const BG: &str = "rgba(14,14,17,0.97)";
-const SCRIM: &str = "rgba(0,0,0,0.45)";
+// ── Palette ──────────────────────────────────────────────────────────────────────
+const BG: &str = "rgba(14,14,17,0.98)";
+const SCRIM: &str = "rgba(0,0,0,0.5)";
 const AMBER: &str = "#FBB26A";
-const LINE: &str = "rgba(255,255,255,0.08)";
-const LINE2: &str = "rgba(255,255,255,0.14)";
 const FG: &str = "#F4F4F5";
+const MUTED: &str = "#878B91";
+const DIMC: &str = "#6B6F7A";
+const GREEN: &str = "#7FD6A0";
+const LINE: &str = "rgba(255,255,255,0.07)";
 
-/// Draw the scrim + top overlay with skin-switcher rows.
-///
-/// Call AFTER the centerpiece is painted (so the overlay sits on top) and
-/// BEFORE the chrome strip (so the chrome stays clickable above it).
-pub fn draw_menu_overlay(ctx: &mut dyn RenderContext, w: f64, h: f64, active: SkinKind) {
-    // ── Scrim (below the chrome strip) ──────────────────────────────────────────
+// ── Rows ───────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub enum MenuRow {
+    Header(&'static str),
+    Status,
+    Node(usize),
+    Skin(SkinKind),
+    Action(MenuAction),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    ImportConfig,
+    Login,
+}
+
+pub struct LaidRow {
+    pub row: MenuRow,
+    pub y: f64,
+    pub h: f64,
+    pub clickable: bool,
+}
+
+fn metrics(row: &MenuRow) -> (f64, bool) {
+    match row {
+        MenuRow::Header(_) => (24.0, false),
+        MenuRow::Status => (40.0, false),
+        MenuRow::Node(_) => (30.0, true),
+        MenuRow::Skin(_) => (32.0, true),
+        MenuRow::Action(_) => (34.0, true),
+    }
+}
+
+/// Build the section row list.
+pub fn build_rows() -> Vec<MenuRow> {
+    let mut v = vec![MenuRow::Header("CONNECTION"), MenuRow::Status, MenuRow::Header("EXIT NODE")];
+    for i in 0..FLEET.len() {
+        v.push(MenuRow::Node(i));
+    }
+    v.push(MenuRow::Header("APPEARANCE"));
+    for s in [SkinKind::Bloom, SkinKind::Planet, SkinKind::Radar, SkinKind::Aurora] {
+        v.push(MenuRow::Skin(s));
+    }
+    v.push(MenuRow::Header("SETUP"));
+    v.push(MenuRow::Action(MenuAction::ImportConfig));
+    v.push(MenuRow::Action(MenuAction::Login));
+    v
+}
+
+/// Lay out rows top-to-bottom; returns the laid rows + total content height.
+pub fn layout(rows: &[MenuRow]) -> (Vec<LaidRow>, f64) {
+    let mut y = MENU_TOP + 8.0;
+    let mut out = Vec::with_capacity(rows.len());
+    for &row in rows {
+        let (h, clickable) = metrics(&row);
+        out.push(LaidRow { row, y, h, clickable });
+        y += h;
+    }
+    (out, y + 8.0)
+}
+
+// ── Draw ───────────────────────────────────────────────────────────────────────
+
+fn phase_label(p: ConnPhase) -> (&'static str, &'static str) {
+    match p {
+        ConnPhase::Disconnected => ("OFF", DIMC),
+        ConnPhase::Connecting => ("CONNECTING", AMBER),
+        ConnPhase::Connected => ("CONNECTED", GREEN),
+        ConnPhase::Disconnecting => ("DISCONNECTING", AMBER),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_menu(
+    ctx: &mut dyn RenderContext,
+    w: f64,
+    h: f64,
+    laid: &[LaidRow],
+    skin: SkinKind,
+    selected: Option<usize>,
+    phase: ConnPhase,
+    note: Option<&str>,
+) {
+    // Scrim + full-height panel with amber left accent.
     ctx.set_fill_color(SCRIM);
     ctx.fill_rect(0.0, MENU_TOP, w, (h - MENU_TOP).max(0.0));
-
-    let menu_h = menu_height();
-
-    // ── Panel background ────────────────────────────────────────────────────────
     ctx.set_fill_color(BG);
-    ctx.fill_rect(0.0, MENU_TOP, w, menu_h);
-
-    // 2 px amber left accent.
+    ctx.fill_rect(0.0, MENU_TOP, w, (h - MENU_TOP).max(0.0));
     ctx.set_fill_color(AMBER);
-    ctx.fill_rect(0.0, MENU_TOP, 2.0, menu_h);
+    ctx.fill_rect(0.0, MENU_TOP, 2.0, (h - MENU_TOP).max(0.0));
 
-    // Bottom hairline.
-    ctx.set_fill_color(LINE2);
-    ctx.fill_rect(0.0, MENU_TOP + menu_h - 1.0, w, 1.0);
+    for lr in laid {
+        match lr.row {
+            MenuRow::Header(t) => {
+                ctx.set_fill_color(AMBER);
+                ctx.set_font("10px monospace");
+                ctx.set_text_align(TextAlign::Left);
+                ctx.set_text_baseline(TextBaseline::Middle);
+                ctx.fill_text(t, 16.0, lr.y + lr.h - 9.0);
+                ctx.set_fill_color(LINE);
+                ctx.fill_rect(16.0, lr.y + lr.h - 1.0, w - 32.0, 1.0);
+            }
+            MenuRow::Status => {
+                let (lbl, col) = phase_label(phase);
+                ctx.set_fill_color(MUTED);
+                ctx.set_font("11px monospace");
+                ctx.set_text_align(TextAlign::Left);
+                ctx.set_text_baseline(TextBaseline::Middle);
+                ctx.fill_text("status", 18.0, lr.y + 13.0);
+                ctx.set_fill_color(col);
+                ctx.set_text_align(TextAlign::Right);
+                ctx.fill_text(lbl, w - 18.0, lr.y + 13.0);
 
-    // ── Section title ───────────────────────────────────────────────────────────
-    ctx.set_fill_color(AMBER);
-    ctx.set_font("11px monospace");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.fill_text("SKIN", 22.0, MENU_TOP + 24.0);
-
-    // ── Skin rows ───────────────────────────────────────────────────────────────
-    let rows_start = menu_rows_start();
-    draw_skin_row(ctx, w, rows_start,                    "Bloom",  active == SkinKind::Bloom);
-    draw_skin_row(ctx, w, rows_start + MENU_ROW_H,       "Planet", active == SkinKind::Planet);
-    draw_skin_row(ctx, w, rows_start + MENU_ROW_H * 2.0, "Radar",  active == SkinKind::Radar);
-    draw_skin_row(ctx, w, rows_start + MENU_ROW_H * 3.0, "Aurora", active == SkinKind::Aurora);
-}
-
-/// Draw a single labelled skin row.
-fn draw_skin_row(ctx: &mut dyn RenderContext, w: f64, y: f64, label: &str, is_active: bool) {
-    // Active highlight fill.
-    if is_active {
-        ctx.set_fill_color("rgba(251,178,106,0.10)");
-        ctx.fill_rect(2.0, y, w - 2.0, MENU_ROW_H);
+                ctx.set_fill_color(MUTED);
+                ctx.set_text_align(TextAlign::Left);
+                ctx.fill_text("exit", 18.0, lr.y + 29.0);
+                let exit = selected.map(|i| {
+                    let n = &FLEET[i];
+                    format!("{} · {}", n.reg, n.city)
+                });
+                ctx.set_fill_color(FG);
+                ctx.set_text_align(TextAlign::Right);
+                ctx.fill_text(exit.as_deref().unwrap_or("auto"), w - 18.0, lr.y + 29.0);
+            }
+            MenuRow::Node(i) => {
+                let n = &FLEET[i];
+                let sel = selected == Some(i);
+                if sel {
+                    ctx.set_fill_color("rgba(251,178,106,0.10)");
+                    ctx.fill_rect(2.0, lr.y, w - 2.0, lr.h);
+                }
+                ctx.set_fill_color(if sel { AMBER } else { FG });
+                ctx.set_font("12px sans-serif");
+                ctx.set_text_align(TextAlign::Left);
+                ctx.set_text_baseline(TextBaseline::Middle);
+                ctx.fill_text(&format!("{} · {}", n.reg, n.city), 20.0, lr.y + lr.h / 2.0);
+                ctx.set_fill_color(DIMC);
+                ctx.set_font("10px monospace");
+                ctx.set_text_align(TextAlign::Right);
+                ctx.fill_text(n.ip, w - 20.0, lr.y + lr.h / 2.0);
+            }
+            MenuRow::Skin(s) => {
+                let active = s == skin;
+                if active {
+                    ctx.set_fill_color("rgba(251,178,106,0.10)");
+                    ctx.fill_rect(2.0, lr.y, w - 2.0, lr.h);
+                }
+                ctx.set_fill_color(if active { AMBER } else { FG });
+                ctx.set_font("13px sans-serif");
+                ctx.set_text_align(TextAlign::Left);
+                ctx.set_text_baseline(TextBaseline::Middle);
+                let name = match s {
+                    SkinKind::Bloom => "Bloom",
+                    SkinKind::Planet => "Planet",
+                    SkinKind::Radar => "Radar",
+                    SkinKind::Aurora => "Aurora",
+                };
+                ctx.fill_text(name, 20.0, lr.y + lr.h / 2.0);
+                if active {
+                    ctx.set_fill_color(AMBER);
+                    ctx.begin_path();
+                    ctx.arc(w - 22.0, lr.y + lr.h / 2.0, 3.5, 0.0, std::f64::consts::TAU);
+                    ctx.fill();
+                }
+            }
+            MenuRow::Action(a) => {
+                let label = match a {
+                    MenuAction::ImportConfig => "Import config  ·  QR / file",
+                    MenuAction::Login => "Log in to zengeld.com",
+                };
+                ctx.set_fill_color(AMBER);
+                ctx.set_font("13px sans-serif");
+                ctx.set_text_align(TextAlign::Left);
+                ctx.set_text_baseline(TextBaseline::Middle);
+                ctx.fill_text(label, 20.0, lr.y + lr.h / 2.0);
+                ctx.set_fill_color(DIMC);
+                ctx.set_text_align(TextAlign::Right);
+                ctx.set_font("14px sans-serif");
+                ctx.fill_text("›", w - 18.0, lr.y + lr.h / 2.0);
+            }
+        }
     }
 
-    // Row bottom divider.
-    ctx.set_fill_color(LINE);
-    ctx.fill_rect(22.0, y + MENU_ROW_H - 1.0, w - 44.0, 1.0);
-
-    // Label.
-    ctx.set_fill_color(if is_active { AMBER } else { FG });
-    ctx.set_font("14px sans-serif");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.fill_text(label, 22.0, y + MENU_ROW_H / 2.0);
-
-    // Active indicator dot on the right.
-    if is_active {
-        ctx.set_fill_color(AMBER);
-        ctx.begin_path();
-        ctx.arc(w - 24.0, y + MENU_ROW_H / 2.0, 4.0, 0.0, std::f64::consts::TAU);
-        ctx.fill();
+    // Transient note (e.g. stub feedback for not-yet-built actions).
+    if let Some(n) = note {
+        ctx.set_fill_color(MUTED);
+        ctx.set_font("11px monospace");
+        ctx.set_text_align(TextAlign::Center);
+        ctx.set_text_baseline(TextBaseline::Bottom);
+        ctx.fill_text(n, w / 2.0, h - 10.0);
     }
 }
