@@ -42,6 +42,22 @@ pub struct NodeOffer {
     pub price: &'static str,
 }
 
+/// A mesh member — shown in the admin-only Admin tab. (Mock until the backend
+/// returns the real roster; the family mesh has one admin + invited members.)
+#[derive(Clone, Copy)]
+pub struct Member {
+    pub name: &'static str,
+    pub role: &'static str,
+}
+
+/// The family mesh roster (admin pays for everything; members are invited).
+pub static MEMBERS: &[Member] = &[
+    Member { name: "admin@family", role: "admin" },
+    Member { name: "alice",        role: "member" },
+    Member { name: "bob",          role: "member" },
+    Member { name: "carol",        role: "member" },
+];
+
 /// Catalog of nodes the admin can buy into the mesh.
 pub static OFFERS: &[NodeOffer] = &[
     NodeOffer { region: "EU", label: "Amsterdam · NL", specs: "2 vCPU · 4 GB · 1 Gbps", prov: "HostKey",  price: "€7/mo" },

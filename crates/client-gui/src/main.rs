@@ -61,6 +61,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => centerpiece::SkinKind::Bloom,
     };
     let connected = args.iter().any(|a| a == "--connected");
+    // --admin reveals the admin-only mesh-settings tab (UI gate; the monitor
+    // re-checks the account role server-side regardless).
+    let is_admin = args.iter().any(|a| a == "--admin");
+    // Initial mesh policy (later supplied by the mesh; these flags simulate a
+    // restricted member for testing the member-side enforcement).
+    let allow_manual_exit = !args.iter().any(|a| a == "--no-manual-exit");
+    let members_can_buy = !args.iter().any(|a| a == "--no-buy");
 
     // --backend <name> for the initial backend; absent → autodetect (VelloGpu).
     let backend = args
@@ -73,7 +80,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prof_state = Arc::new(Mutex::new(prof::ProfState::default()));
     prof::serve(prof_state.clone(), 17472);
 
-    let mut builder = AppBuilder::new(MirageClientApp::with_skin(skin, connected, prof_state))
+    let mut builder = AppBuilder::new(MirageClientApp::with_skin(
+        skin,
+        connected,
+        is_admin,
+        allow_manual_exit,
+        members_can_buy,
+        prof_state,
+    ))
         .agent_api(17471)
         // render-hub builds vello area-only AA; default msaa_samples=8 would
         // request the absent Msaa8 shader and panic on the first frame.

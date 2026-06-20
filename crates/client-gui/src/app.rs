@@ -131,6 +131,16 @@ pub struct MirageClientApp {
     /// Exit-node selection mode. Auto (default) lets the mesh pick; Manual
     /// exposes the fleet picker and honors `selected_node`.
     exit_auto: bool,
+
+    /// Whether this account is the mesh admin. Sourced from `--admin` for now;
+    /// later from the authenticated account claim. Gates the Admin tab's
+    /// VISIBILITY only — the monitor is the authoritative policy enforcer
+    /// (a local bool can be flipped; server-side re-check is mandatory).
+    is_admin: bool,
+    /// Mesh policy: members may pick a manual exit (admin-controlled).
+    allow_manual_exit: bool,
+    /// Mesh policy: members may buy nodes into the mesh (admin-controlled).
+    members_can_buy: bool,
     /// Transient menu feedback line (e.g. stubbed actions).
     menu_note: Option<String>,
     /// Raw JSON of the last successfully imported ClientConfig.
@@ -169,11 +179,21 @@ pub struct MirageClientApp {
 impl MirageClientApp {
     /// Construct with an explicit initial skin + connection state (used by the
     /// `--skin` / `--connected` CLI flags for deterministic screenshot capture).
-    pub fn with_skin(skin_kind: SkinKind, connected: bool, prof: ProfHandle) -> Self {
+    pub fn with_skin(
+        skin_kind: SkinKind,
+        connected: bool,
+        is_admin: bool,
+        allow_manual_exit: bool,
+        members_can_buy: bool,
+        prof: ProfHandle,
+    ) -> Self {
         Self {
             skin: make_skin(skin_kind),
             prof,
             skin_kind,
+            is_admin,
+            allow_manual_exit,
+            members_can_buy,
             current_phase: if connected { ConnPhase::Connected } else { ConnPhase::Disconnected },
             pending_connect_at: None,
             pending_disconnect_at: None,
@@ -328,20 +348,29 @@ impl App<NoPanel> for MirageClientApp {
 
         // ── Menu container (resizable / scrollable / tabbed) ──────────────────
         // Compute geometry + active-tab rows once per frame while open.
+        let policy = menu::MeshPolicy {
+            allow_manual_exit: self.allow_manual_exit,
+            members_can_buy: self.members_can_buy,
+        };
         let menu = if self.menu_open {
+            let tabs = menu::MenuTab::visible(self.is_admin);
+            // Never leave the active tab on one the account can't see.
+            if !tabs.contains(&self.menu_tab) {
+                self.menu_tab = menu::MenuTab::Connection;
+            }
             let area = (h - CHROME_H).max(1.0);
             let panel_h = (area * self.menu_frac)
                 .clamp(area * menu::MIN_FRAC, area * menu::MAX_FRAC);
-            let g = menu::geom(w, h, panel_h);
-            let rows = menu::tab_rows(self.menu_tab, self.exit_auto);
+            let g = menu::geom(w, h, panel_h, tabs.len());
+            let rows = menu::tab_rows(self.menu_tab, self.exit_auto, policy);
             let (laid, content_h) = menu::layout_rows(&rows);
-            Some((g, laid, content_h))
+            Some((g, tabs, laid, content_h))
         } else {
             None
         };
 
         // ── Process layout clicks / resize / scroll BEFORE painting ────────────
-        if let Some((g, laid, content_h)) = &menu {
+        if let Some((g, tabs, laid, content_h)) = &menu {
             let area = (h - CHROME_H).max(1.0);
 
             // Bottom separator drag → resize the panel.
@@ -373,7 +402,7 @@ impl App<NoPanel> for MirageClientApp {
                 self.menu_note = None;
             }
             // Tabs.
-            for (i, t) in MenuTab::ALL.iter().enumerate() {
+            for (i, t) in tabs.iter().enumerate() {
                 if win.layout.was_clicked(&id_menu_tab(i)) {
                     self.menu_tab = *t;
                     self.menu_scroll = 0.0;
@@ -397,9 +426,15 @@ impl App<NoPanel> for MirageClientApp {
                         let pill_w = 140.0;
                         let px = w - 18.0 - pill_w;
                         let half = pill_w / 2.0;
-                        match pointer {
-                            Some((cxp, _)) if cxp >= px => self.exit_auto = cxp < px + half,
-                            _ => self.exit_auto = !self.exit_auto,
+                        let want_auto = match pointer {
+                            Some((cxp, _)) if cxp >= px => cxp < px + half,
+                            _ => !self.exit_auto,
+                        };
+                        // Policy: members can't go manual when the admin forbade it.
+                        if !want_auto && !self.is_admin && !self.allow_manual_exit {
+                            self.menu_note = Some("ручной exit отключён админом".into());
+                        } else {
+                            self.exit_auto = want_auto;
                         }
                     }
                     MenuRow::Node(n) => {
@@ -407,9 +442,30 @@ impl App<NoPanel> for MirageClientApp {
                             if self.selected_node == Some(n) { None } else { Some(n) };
                     }
                     MenuRow::Offer(n) => {
-                        let o = &crate::nodes::OFFERS[n];
-                        self.menu_note =
-                            Some(format!("покупка {} {} · {} — скоро", o.region, o.label, o.price));
+                        // Policy: members can't buy unless the admin allows it.
+                        if !self.is_admin && !self.members_can_buy {
+                            self.menu_note = Some("покупка нод доступна только админу".into());
+                        } else {
+                            let o = &crate::nodes::OFFERS[n];
+                            self.menu_note = Some(format!(
+                                "покупка {} {} · {} — скоро",
+                                o.region, o.label, o.price
+                            ));
+                        }
+                    }
+                    MenuRow::Toggle(key, _) => {
+                        // Defense in depth: only the admin can flip policy, even
+                        // though non-admins never see this tab.
+                        if self.is_admin {
+                            match key {
+                                menu::PolicyKey::ManualExit => {
+                                    self.allow_manual_exit = !self.allow_manual_exit
+                                }
+                                menu::PolicyKey::MembersBuy => {
+                                    self.members_can_buy = !self.members_can_buy
+                                }
+                            }
+                        }
                     }
                     MenuRow::Skin(s) => {
                         self.switch_skin(s);
@@ -498,19 +554,22 @@ impl App<NoPanel> for MirageClientApp {
         self.skin.render(render, state);
 
         // ── Menu overlay (when open) ──────────────────────────────────────────
-        if let Some((g, laid, content_h)) = &menu {
+        if let Some((g, tabs, laid, content_h)) = &menu {
             menu::draw_menu(
                 render,
                 w,
                 h,
                 g,
                 self.menu_tab,
+                tabs,
                 laid,
                 *content_h,
                 self.menu_scroll,
                 self.skin_kind,
                 self.selected_node,
                 self.exit_auto,
+                self.is_admin,
+                policy,
                 self.current_phase,
                 self.anim,
                 self.menu_note.as_deref(),
@@ -538,7 +597,7 @@ impl App<NoPanel> for MirageClientApp {
                 .theme(Box::new(DarkChromeTheme))
                 .build(layout, render);
 
-            if let Some((g, laid, _)) = &menu {
+            if let Some((g, tabs, laid, _)) = &menu {
                 // ── Menu open: scrim → panel → tabs → visible rows ────────────
                 // Hit priority follows registration order (later wins).
                 register_hit(layout, id_scrim(), Rect {
@@ -553,7 +612,7 @@ impl App<NoPanel> for MirageClientApp {
                     width: w,
                     height: g.panel.height,
                 });
-                for i in 0..MenuTab::ALL.len() {
+                for i in 0..tabs.len() {
                     let r = g.tabs[i];
                     register_hit(layout, id_menu_tab(i), Rect { x: r.x, y: r.y, width: r.width, height: r.height });
                 }

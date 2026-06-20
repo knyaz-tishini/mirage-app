@@ -37,16 +37,60 @@ pub enum MenuTab {
     Nodes,
     Style,
     Setup,
+    /// Mesh administration — admin-account ONLY (hard policy gate).
+    Admin,
 }
 
 impl MenuTab {
-    pub const ALL: [MenuTab; 4] = [MenuTab::Connection, MenuTab::Nodes, MenuTab::Style, MenuTab::Setup];
+    /// Tabs every member sees.
+    pub const BASE: [MenuTab; 4] = [MenuTab::Connection, MenuTab::Nodes, MenuTab::Style, MenuTab::Setup];
+
+    /// Tabs visible to this account. The Admin tab is appended ONLY for the
+    /// admin account — non-admins never get it in the bar, so they can't even
+    /// navigate to it. (The authoritative check is server-side: the monitor
+    /// rejects admin operations from non-admin identities regardless of UI.)
+    pub fn visible(is_admin: bool) -> Vec<MenuTab> {
+        let mut v = Self::BASE.to_vec();
+        if is_admin {
+            v.push(MenuTab::Admin);
+        }
+        v
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             MenuTab::Connection => "Connect",
             MenuTab::Nodes => "Nodes",
             MenuTab::Style => "Style",
             MenuTab::Setup => "Setup",
+            MenuTab::Admin => "Admin",
+        }
+    }
+}
+
+/// Admin-controlled mesh policy. Members receive it from the mesh and cannot
+/// change it; only the admin account's Admin tab can flip it. (Mock state until
+/// the backend syncs it; server-side is authoritative.)
+#[derive(Clone, Copy)]
+pub struct MeshPolicy {
+    /// Members may manually pick an exit node (else exit is forced auto).
+    pub allow_manual_exit: bool,
+    /// Members may buy nodes into the mesh (else admin-only).
+    pub members_can_buy: bool,
+}
+
+/// Which policy a toggle row controls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PolicyKey {
+    ManualExit,
+    MembersBuy,
+}
+
+impl PolicyKey {
+    fn label(self) -> &'static str {
+        match self {
+            PolicyKey::ManualExit => "Ручной выбор exit",
+            PolicyKey::MembersBuy => "Покупка нод участниками",
         }
     }
 }
@@ -89,6 +133,10 @@ pub enum MenuRow {
     Node(usize),
     /// A catalog node offering (index into nodes::OFFERS).
     Offer(usize),
+    /// Admin policy toggle (key + current value).
+    Toggle(PolicyKey, bool),
+    /// Mesh member row (index into nodes::MEMBERS).
+    Member(usize),
     Skin(SkinKind),
     Action(MenuAction),
     Info(&'static str, &'static str),
@@ -119,6 +167,8 @@ fn metrics(row: &MenuRow) -> (f64, bool) {
         MenuRow::ExitMode => (46.0, true),
         MenuRow::Node(_) => (34.0, true),
         MenuRow::Offer(_) => (48.0, true),
+        MenuRow::Toggle(..) => (42.0, true),
+        MenuRow::Member(_) => (34.0, false),
         MenuRow::Skin(_) => (38.0, true),
         MenuRow::Action(_) => (40.0, true),
         MenuRow::Info(..) => (26.0, false),
@@ -126,8 +176,8 @@ fn metrics(row: &MenuRow) -> (f64, bool) {
 }
 
 /// Rows for the active tab. `exit_auto` controls whether the Nodes tab shows
-/// the manual exit-node picker.
-pub fn tab_rows(tab: MenuTab, exit_auto: bool) -> Vec<MenuRow> {
+/// the manual exit-node picker; `policy` populates the Admin toggles.
+pub fn tab_rows(tab: MenuTab, exit_auto: bool, policy: MeshPolicy) -> Vec<MenuRow> {
     match tab {
         MenuTab::Connection => vec![
             MenuRow::Status,
@@ -157,6 +207,16 @@ pub fn tab_rows(tab: MenuTab, exit_auto: bool) -> Vec<MenuRow> {
             MenuRow::Action(MenuAction::ImportCamera),
             MenuRow::Action(MenuAction::Login),
         ],
+        MenuTab::Admin => {
+            let mut rows = vec![
+                MenuRow::Header("Политика меша"),
+                MenuRow::Toggle(PolicyKey::ManualExit, policy.allow_manual_exit),
+                MenuRow::Toggle(PolicyKey::MembersBuy, policy.members_can_buy),
+                MenuRow::Header("Участники"),
+            ];
+            rows.extend((0..crate::nodes::MEMBERS.len()).map(MenuRow::Member));
+            rows
+        }
     }
 }
 
@@ -179,11 +239,12 @@ pub struct Geom {
     pub tabbar: Rect,
     pub content: Rect,
     pub sep: Rect,
-    pub tabs: [Rect; 4],
+    pub tabs: Vec<Rect>,
 }
 
-/// Compute container rects for a panel of height `panel_h` (px, below chrome).
-pub fn geom(w: f64, h: f64, panel_h: f64) -> Geom {
+/// Compute container rects for a panel of height `panel_h` (px, below chrome)
+/// with `ntabs` equal-width tab columns.
+pub fn geom(w: f64, h: f64, panel_h: f64, ntabs: usize) -> Geom {
     let panel = Rect::new(0.0, MENU_TOP, w, panel_h);
     let tabbar = Rect::new(0.0, MENU_TOP, w, TABBAR_H);
     let content = Rect::new(
@@ -193,13 +254,11 @@ pub fn geom(w: f64, h: f64, panel_h: f64) -> Geom {
         (panel_h - TABBAR_H - SEP_H).max(0.0),
     );
     let sep = Rect::new(0.0, MENU_TOP + panel_h - SEP_H, w, SEP_H);
-    let tw = w / 4.0;
-    let tabs = [
-        Rect::new(0.0, MENU_TOP, tw, TABBAR_H),
-        Rect::new(tw, MENU_TOP, tw, TABBAR_H),
-        Rect::new(tw * 2.0, MENU_TOP, tw, TABBAR_H),
-        Rect::new(tw * 3.0, MENU_TOP, tw, TABBAR_H),
-    ];
+    let n = ntabs.max(1);
+    let tw = w / n as f64;
+    let tabs = (0..n)
+        .map(|i| Rect::new(tw * i as f64, MENU_TOP, tw, TABBAR_H))
+        .collect();
     let _ = h;
     Geom { panel, tabbar, content, sep, tabs }
 }
@@ -222,12 +281,15 @@ pub fn draw_menu(
     h: f64,
     g: &Geom,
     tab: MenuTab,
+    tabs: &[MenuTab],
     laid: &[LaidRow],
     content_h: f64,
     scroll: f64,
     skin: SkinKind,
     selected: Option<usize>,
     exit_auto: bool,
+    is_admin: bool,
+    policy: MeshPolicy,
     phase: ConnPhase,
     t: f64,
     note: Option<&str>,
@@ -243,9 +305,9 @@ pub fn draw_menu(
     ctx.fill_rect(g.panel.x, g.panel.y, 2.0, g.panel.height);
 
     // ── Tab bar ──────────────────────────────────────────────────────────────
-    for (i, t) in MenuTab::ALL.iter().enumerate() {
+    for (i, tb) in tabs.iter().enumerate() {
         let r = g.tabs[i];
-        let active = *t == tab;
+        let active = *tb == tab;
         if active {
             ctx.set_fill_color("rgba(251,178,106,0.12)");
             ctx.fill_rect(r.x, r.y, r.width, r.height);
@@ -256,7 +318,7 @@ pub fn draw_menu(
         ctx.set_font("12px sans-serif");
         ctx.set_text_align(TextAlign::Center);
         ctx.set_text_baseline(TextBaseline::Middle);
-        ctx.fill_text(t.label(), r.x + r.width / 2.0, r.y + r.height / 2.0);
+        ctx.fill_text(tb.label(), r.x + r.width / 2.0, r.y + r.height / 2.0);
     }
     ctx.set_fill_color(LINE);
     ctx.fill_rect(0.0, g.tabbar.y + g.tabbar.height - 1.0, w, 1.0);
@@ -270,7 +332,7 @@ pub fn draw_menu(
         if ry + lr.h < g.content.y || ry > g.content.y + g.content.height {
             continue; // culled
         }
-        draw_row(ctx, w, lr, ry, skin, selected, exit_auto, phase, t);
+        draw_row(ctx, w, lr, ry, skin, selected, exit_auto, is_admin, policy, phase, t);
     }
     ctx.restore();
 
@@ -308,6 +370,8 @@ fn draw_row(
     skin: SkinKind,
     selected: Option<usize>,
     exit_auto: bool,
+    is_admin: bool,
+    policy: MeshPolicy,
     phase: ConnPhase,
     t: f64,
 ) {
@@ -370,7 +434,16 @@ fn draw_row(
             ctx.set_text_align(TextAlign::Center);
             ctx.set_fill_color(if exit_auto { AMBER } else { MUTED });
             ctx.fill_text("Auto", px + half / 2.0, py + pill_h / 2.0);
-            ctx.set_fill_color(if exit_auto { MUTED } else { AMBER });
+            // Manual is locked off for members when policy forbids it.
+            let manual_locked = !is_admin && !policy.allow_manual_exit;
+            let manual_col = if manual_locked {
+                "#4A4D55"
+            } else if exit_auto {
+                MUTED
+            } else {
+                AMBER
+            };
+            ctx.set_fill_color(manual_col);
             ctx.fill_text("Manual", px + half + half / 2.0, py + pill_h / 2.0);
         }
         MenuRow::Offer(i) => {
@@ -392,6 +465,39 @@ fn draw_row(
             ctx.set_fill_color(DIMC);
             ctx.set_font("16px sans-serif");
             ctx.fill_text("+", w - 20.0, ry + lr.h / 2.0);
+        }
+        MenuRow::Toggle(key, on) => {
+            ctx.set_fill_color(FG);
+            ctx.set_font("13px sans-serif");
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_text_baseline(TextBaseline::Middle);
+            ctx.fill_text(key.label(), 20.0, ry + lr.h / 2.0);
+            // iOS-style switch on the right.
+            let sw_w = 40.0;
+            let sw_h = 22.0;
+            let sx = w - 20.0 - sw_w;
+            let sy = ry + (lr.h - sw_h) / 2.0;
+            ctx.set_fill_color(if on { "rgba(251,178,106,0.85)" } else { "rgba(255,255,255,0.10)" });
+            ctx.fill_rounded_rect(sx, sy, sw_w, sw_h, sw_h / 2.0);
+            let knob = sw_h - 6.0;
+            let kx = if on { sx + sw_w - knob - 3.0 } else { sx + 3.0 };
+            ctx.set_fill_color("#0B0B0E");
+            ctx.begin_path();
+            ctx.arc(kx + knob / 2.0, sy + sw_h / 2.0, knob / 2.0, 0.0, std::f64::consts::TAU);
+            ctx.fill();
+        }
+        MenuRow::Member(i) => {
+            let m = &crate::nodes::MEMBERS[i];
+            let is_admin_row = m.role == "admin";
+            ctx.set_fill_color(FG);
+            ctx.set_font("13px sans-serif");
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_text_baseline(TextBaseline::Middle);
+            ctx.fill_text(m.name, 20.0, ry + lr.h / 2.0);
+            ctx.set_fill_color(if is_admin_row { AMBER } else { DIMC });
+            ctx.set_font("10px monospace");
+            ctx.set_text_align(TextAlign::Right);
+            ctx.fill_text(m.role, w - 20.0, ry + lr.h / 2.0);
         }
         MenuRow::Info(k, v) => {
             ctx.set_fill_color(MUTED);
