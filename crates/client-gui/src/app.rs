@@ -23,7 +23,7 @@ use uzor::ui::widgets::composite::chrome::theme::ChromeTheme;
 use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
-use crate::shell::menu::{draw_menu_sheet, SHEET_HEIGHT};
+use crate::shell::menu::{draw_menu_overlay, menu_height, menu_rows_start, MENU_ROW_H};
 
 // ── Chrome strip height ────────────────────────────────────────────────────────
 // Matches DefaultChromeStyle::chrome_height() == 32.0.  The skin rect starts
@@ -61,9 +61,14 @@ fn id_centerpiece() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:centerpiece")
 }
 
-/// Full-window scrim behind the bottom sheet (click closes the menu).
+/// Scrim behind the overlay (click closes the menu).
 fn id_scrim() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:scrim")
+}
+
+/// Menu panel body — absorbs clicks so panel-background taps don't dismiss.
+fn id_menu_panel() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:menu_panel")
 }
 
 /// Skin-row hit-zone ids.
@@ -219,9 +224,9 @@ impl App<NoPanel> for MirageClientApp {
         };
         self.skin.render(render, state);
 
-        // ── Bottom-sheet menu overlay (when open) ─────────────────────────────
+        // ── Top overlay menu (when open) ──────────────────────────────────────
         if self.menu_open {
-            draw_menu_sheet(render, w, h, self.skin_kind);
+            draw_menu_overlay(render, w, h, self.skin_kind);
         }
 
         // ── Chrome strip ──────────────────────────────────────────────────────
@@ -241,42 +246,44 @@ impl App<NoPanel> for MirageClientApp {
                 .build(layout, render);
 
             if self.menu_open {
-                // ── Menu open: scrim + sheet rows ─────────────────────────────
-                // Register scrim FIRST (bottom z-order in the hit stack).
-                // The sheet skin-row buttons are registered AFTER so they win.
-                let scrim_rect = Rect {
+                // ── Menu open: scrim → panel → skin rows ──────────────────────
+                // Hit priority follows registration order (later wins). Scrim
+                // first (dismiss fallback), then the panel body (absorbs taps
+                // on the overlay background), then the skin rows on top.
+                lm::button(id_scrim(), Rect {
                     x: 0.0,
-                    y: 0.0,
+                    y: CHROME_H,
                     width: w,
-                    height: h,
-                };
-                lm::button(id_scrim(), scrim_rect)
-                    .build(layout, render);
+                    height: (h - CHROME_H).max(0.0),
+                }).build(layout, render);
 
-                // Sheet occupies the bottom SHEET_HEIGHT pixels.
-                let sheet_y = h - SHEET_HEIGHT;
-                // Row layout: skip a header area of 40 px, then 3 rows × 48 px.
-                let row_x = 0.0;
+                lm::button(id_menu_panel(), Rect {
+                    x: 0.0,
+                    y: CHROME_H,
+                    width: w,
+                    height: menu_height(),
+                }).build(layout, render);
+
                 let row_w = w;
-                let row_h = 48.0;
-                let rows_start = sheet_y + 40.0;
+                let row_h = MENU_ROW_H;
+                let rows_start = menu_rows_start();
 
                 lm::button(id_skin_bloom(), Rect {
-                    x: row_x,
+                    x: 0.0,
                     y: rows_start,
                     width: row_w,
                     height: row_h,
                 }).build(layout, render);
 
                 lm::button(id_skin_planet(), Rect {
-                    x: row_x,
+                    x: 0.0,
                     y: rows_start + row_h,
                     width: row_w,
                     height: row_h,
                 }).build(layout, render);
 
                 lm::button(id_skin_radar(), Rect {
-                    x: row_x,
+                    x: 0.0,
                     y: rows_start + row_h * 2.0,
                     width: row_w,
                     height: row_h,

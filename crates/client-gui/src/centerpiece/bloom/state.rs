@@ -151,8 +151,12 @@ impl BloomState {
         self.e_norm = ((self.spd - 60.0) / 300.0).clamp(0.0, 1.0);
 
         self.glow_i = ez(self.glow_i, if connected { 1.0 } else { 0.0 }, 3.0, dt);
-        self.stem_t = ez(self.stem_t, 1.0, 1.8, dt);
-        self.trem = ez(self.trem, 0.0, 3.0, dt);
+        // Stem grows once leaving the off state (reference: stemT → state>=1).
+        let has_stem = !matches!(phase, ConnPhase::Disconnected);
+        self.stem_t = ez(self.stem_t, if has_stem { 1.0 } else { 0.0 }, 1.8, dt);
+        // Bud tremble during the connecting handshake (reference: trem → state===1).
+        let tremble = matches!(phase, ConnPhase::Connecting);
+        self.trem = ez(self.trem, if tremble { 1.0 } else { 0.0 }, 3.0, dt);
     }
 }
 
