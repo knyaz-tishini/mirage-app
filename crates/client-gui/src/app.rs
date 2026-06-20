@@ -162,6 +162,8 @@ pub struct MirageClientApp {
 
     // Frame timing.
     last_frame: Instant,
+    /// Monotonic seconds accumulator driving menu graph animation.
+    anim: f64,
 }
 
 impl MirageClientApp {
@@ -194,6 +196,7 @@ impl MirageClientApp {
             pointer_in_window: true,
             scan: None,
             last_frame: Instant::now(),
+            anim: 0.0,
         }
     }
 
@@ -260,6 +263,7 @@ impl App<NoPanel> for MirageClientApp {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64().min(0.1);
         self.last_frame = now;
+        self.anim += dt;
 
         // ── Advance mock phase transitions ────────────────────────────────────
         if let Some(at) = self.pending_connect_at {
@@ -508,6 +512,7 @@ impl App<NoPanel> for MirageClientApp {
                 self.selected_node,
                 self.exit_auto,
                 self.current_phase,
+                self.anim,
                 self.menu_note.as_deref(),
             );
         }

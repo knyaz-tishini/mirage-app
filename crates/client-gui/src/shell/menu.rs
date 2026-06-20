@@ -53,9 +53,35 @@ impl MenuTab {
 
 // ── Content rows ─────────────────────────────────────────────────────────────────
 
+/// A live metric sparkline kind.
+#[derive(Clone, Copy)]
+pub enum GraphKind {
+    Latency,
+    Throughput,
+}
+
+impl GraphKind {
+    /// (label, unit, low, high) for the value axis.
+    fn axis(self) -> (&'static str, &'static str, f64, f64) {
+        match self {
+            GraphKind::Latency => ("latency", "ms", 12.0, 48.0),
+            GraphKind::Throughput => ("throughput", "Mbps", 6.0, 38.0),
+        }
+    }
+    /// Seed offset so the two graphs animate independently.
+    fn seed(self) -> i64 {
+        match self {
+            GraphKind::Latency => 0,
+            GraphKind::Throughput => 9973,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum MenuRow {
     Status,
+    /// Live metric sparkline (synthetic until the backend is wired).
+    Graph(GraphKind),
     /// Section header (non-clickable label).
     Header(&'static str),
     /// Exit-node mode segmented control: Auto | Manual.
@@ -88,6 +114,7 @@ pub struct LaidRow {
 fn metrics(row: &MenuRow) -> (f64, bool) {
     match row {
         MenuRow::Status => (52.0, false),
+        MenuRow::Graph(_) => (66.0, false),
         MenuRow::Header(_) => (30.0, false),
         MenuRow::ExitMode => (46.0, true),
         MenuRow::Node(_) => (34.0, true),
@@ -104,6 +131,8 @@ pub fn tab_rows(tab: MenuTab, exit_auto: bool) -> Vec<MenuRow> {
     match tab {
         MenuTab::Connection => vec![
             MenuRow::Status,
+            MenuRow::Graph(GraphKind::Latency),
+            MenuRow::Graph(GraphKind::Throughput),
             MenuRow::Info("data-plane", "cli2"),
             MenuRow::Info("credential", "RingMembership"),
             MenuRow::Info("mesh", "staging-v2"),
@@ -200,6 +229,7 @@ pub fn draw_menu(
     selected: Option<usize>,
     exit_auto: bool,
     phase: ConnPhase,
+    t: f64,
     note: Option<&str>,
 ) {
     // Scrim over the rest of the app.
@@ -240,7 +270,7 @@ pub fn draw_menu(
         if ry + lr.h < g.content.y || ry > g.content.y + g.content.height {
             continue; // culled
         }
-        draw_row(ctx, w, lr, ry, skin, selected, exit_auto, phase);
+        draw_row(ctx, w, lr, ry, skin, selected, exit_auto, phase, t);
     }
     ctx.restore();
 
@@ -279,8 +309,10 @@ fn draw_row(
     selected: Option<usize>,
     exit_auto: bool,
     phase: ConnPhase,
+    t: f64,
 ) {
     match lr.row {
+        MenuRow::Graph(kind) => draw_graph(ctx, w, lr, ry, kind, t),
         MenuRow::Status => {
             let (lbl, col) = phase_label(phase);
             ctx.set_fill_color(MUTED);
@@ -306,12 +338,12 @@ fn draw_row(
             ctx.set_text_align(TextAlign::Right);
             ctx.fill_text(&exit, w - 18.0, ry + 36.0);
         }
-        MenuRow::Header(t) => {
+        MenuRow::Header(ht) => {
             ctx.set_fill_color(DIMC);
             ctx.set_font("10px sans-serif");
             ctx.set_text_align(TextAlign::Left);
             ctx.set_text_baseline(TextBaseline::Bottom);
-            ctx.fill_text(&t.to_uppercase(), 18.0, ry + lr.h - 8.0);
+            ctx.fill_text(&ht.to_uppercase(), 18.0, ry + lr.h - 8.0);
             ctx.set_fill_color(LINE);
             ctx.fill_rect(18.0, ry + lr.h - 3.0, w - 36.0, 1.0);
         }
@@ -431,4 +463,76 @@ fn draw_row(
             ctx.fill_text("›", w - 18.0, ry + lr.h / 2.0);
         }
     }
+}
+
+// ── Live metric sparklines ───────────────────────────────────────────────────────
+
+/// Deterministic pseudo-noise in 0..1 for a sample index (no RNG — `Math.random`
+/// equivalents are unavailable; this keeps the graph reproducible per frame).
+fn pnoise(i: i64) -> f64 {
+    let x = (i.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9) as u64;
+    ((x >> 17) & 0xffff) as f64 / 65535.0
+}
+
+/// Normalized (0..1) sample for a graph at integer index — a slow wave plus two
+/// noise octaves for an organic-looking trace.
+fn gsample(kind: GraphKind, idx: i64) -> f64 {
+    let i = idx + kind.seed();
+    let wave = 0.5 + 0.5 * ((i as f64) * 0.45).sin();
+    let n = 0.5 * pnoise(i) + 0.5 * pnoise(i.div_euclid(2));
+    (0.45 * wave + 0.55 * n).clamp(0.0, 1.0)
+}
+
+/// Draw a scrolling sparkline (filled area + amber curve) with label + current
+/// value. `t` (seconds) drives the scroll; data is synthetic until the backend
+/// is wired.
+fn draw_graph(ctx: &mut dyn RenderContext, w: f64, lr: &LaidRow, ry: f64, kind: GraphKind, t: f64) {
+    let (label, unit, lo, hi) = kind.axis();
+    const N: usize = 56;
+    let rate = 6.0; // samples per second
+    let idx0 = (t * rate) as i64;
+
+    let x0 = 18.0;
+    let x1 = w - 18.0;
+    let plot_w = (x1 - x0).max(1.0);
+    let top = ry + 22.0;
+    let bottom = ry + lr.h - 8.0;
+    let plot_h = (bottom - top).max(1.0);
+
+    let mut pts = Vec::with_capacity(N);
+    let mut cur_n = 0.0;
+    for x in 0..N {
+        let idx = idx0 - (N as i64 - 1 - x as i64);
+        let n = gsample(kind, idx);
+        if x == N - 1 {
+            cur_n = n;
+        }
+        let px = x0 + plot_w * (x as f64 / (N as f64 - 1.0));
+        let py = bottom - n * plot_h;
+        pts.push((px, py));
+    }
+
+    // Filled area under the curve.
+    ctx.begin_path();
+    ctx.move_to(x0, bottom);
+    for &(px, py) in &pts {
+        ctx.line_to(px, py);
+    }
+    ctx.line_to(x1, bottom);
+    ctx.close_path();
+    ctx.set_fill_color("rgba(251,178,106,0.08)");
+    ctx.fill();
+    // Curve.
+    ctx.stroke_polyline(&pts, AMBER, 1.5);
+
+    // Label + current value.
+    ctx.set_fill_color(MUTED);
+    ctx.set_font("10px monospace");
+    ctx.set_text_align(TextAlign::Left);
+    ctx.set_text_baseline(TextBaseline::Top);
+    ctx.fill_text(label, x0, ry + 6.0);
+    let cur = lo + cur_n * (hi - lo);
+    ctx.set_fill_color(AMBER);
+    ctx.set_text_align(TextAlign::Right);
+    ctx.fill_text(&format!("{:.0} {}", cur, unit), x1, ry + 6.0);
 }
