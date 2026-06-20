@@ -25,6 +25,7 @@ use uzor::ui::widgets::composite::chrome::theme::ChromeTheme;
 use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
+use crate::prof::{parse_backend, ProfHandle};
 use crate::shell::menu::{draw_menu_overlay, menu_height, menu_rows_start, MENU_ROW_H};
 
 // ── Chrome strip height ────────────────────────────────────────────────────────
@@ -131,6 +132,9 @@ pub struct MirageClientApp {
     /// cursor-reactive skins freeze a warp spot at the exit point.
     pointer_in_window: bool,
 
+    /// Runtime profiling control (hot-switch backend + scrape fps over HTTP).
+    prof: ProfHandle,
+
     // Frame timing.
     last_frame: Instant,
 }
@@ -138,9 +142,10 @@ pub struct MirageClientApp {
 impl MirageClientApp {
     /// Construct with an explicit initial skin + connection state (used by the
     /// `--skin` / `--connected` CLI flags for deterministic screenshot capture).
-    pub fn with_skin(skin_kind: SkinKind, connected: bool) -> Self {
+    pub fn with_skin(skin_kind: SkinKind, connected: bool, prof: ProfHandle) -> Self {
         Self {
             skin: make_skin(skin_kind),
+            prof,
             skin_kind,
             current_phase: if connected { ConnPhase::Connected } else { ConnPhase::Disconnected },
             pending_connect_at: None,
@@ -231,13 +236,25 @@ impl App<NoPanel> for MirageClientApp {
             None
         };
 
-        // Profiling readout (backend + fps + frame time).
+        // Profiling readout (backend + fps + frame time) + runtime backend
+        // hot-switch requested over the prof HTTP control.
         let stats = format!(
             "{}  {:.0}fps  {:.1}ms",
             win.render_control.active_backend().label(),
             win.render_control.measured_fps(),
             win.render_control.last_frame_time_ms(),
         );
+        {
+            let mut p = self.prof.lock().unwrap();
+            p.fps = win.render_control.measured_fps();
+            p.frame_ms = win.render_control.last_frame_time_ms();
+            p.backend = win.render_control.active_backend().label().to_string();
+            if let Some(name) = p.requested.take() {
+                if let Some(b) = parse_backend(&name) {
+                    win.render_control.set_backend(b);
+                }
+            }
+        }
 
         // ── Process layout clicks BEFORE painting ─────────────────────────────
         // was_clicked() reads the previous frame's click state from the

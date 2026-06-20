@@ -37,9 +37,6 @@ impl SkinRect {
     pub fn cx(&self) -> f64 {
         self.x + self.w * 0.5
     }
-    pub fn cy(&self) -> f64 {
-        self.y + self.h * 0.5
-    }
 }
 
 // ── Per-frame context ─────────────────────────────────────────────────────────

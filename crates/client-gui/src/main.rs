@@ -8,11 +8,14 @@
 
 mod app;
 mod centerpiece;
+mod prof;
 mod shell;
+
+use std::sync::{Arc, Mutex};
 
 use uzor::framework::builder::AppBuilder;
 use uzor::framework::multi_window::{WindowKey, WindowSpec};
-use uzor::platform::types::{CornerStyle, RenderBackend};
+use uzor::platform::types::CornerStyle;
 use uzor_desktop::AppRun as _;
 
 use app::MirageClientApp;
@@ -56,25 +59,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let connected = args.iter().any(|a| a == "--connected");
 
-    // --backend <name> for A/B profiling; absent → autodetect (VelloGpu).
+    // --backend <name> for the initial backend; absent → autodetect (VelloGpu).
     let backend = args
         .iter()
         .position(|a| a == "--backend")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| match s.as_str() {
-            "vello_gpu" => Some(RenderBackend::VelloGpu),
-            "vello_hybrid" => Some(RenderBackend::VelloHybrid),
-            "vello_cpu" => Some(RenderBackend::VelloCpu),
-            "instanced_wgpu" => Some(RenderBackend::InstancedWgpu),
-            "urx_wgpu" => Some(RenderBackend::UrxWgpu),
-            "urx_wgpu_full" => Some(RenderBackend::UrxWgpuFull),
-            "urx_hybrid" => Some(RenderBackend::UrxHybrid),
-            "urx_cpu" => Some(RenderBackend::UrxCpu),
-            "tiny_skia" => Some(RenderBackend::TinySkia),
-            _ => None,
-        });
+        .and_then(|s| prof::parse_backend(s));
 
-    let mut builder = AppBuilder::new(MirageClientApp::with_skin(skin, connected))
+    // Runtime profiling control: hot-switch backend + scrape fps over HTTP.
+    let prof_state = Arc::new(Mutex::new(prof::ProfState::default()));
+    prof::serve(prof_state.clone(), 17472);
+
+    let mut builder = AppBuilder::new(MirageClientApp::with_skin(skin, connected, prof_state))
         .agent_api(17471)
         // render-hub builds vello area-only AA; default msaa_samples=8 would
         // request the absent Msaa8 shader and panic on the first frame.
