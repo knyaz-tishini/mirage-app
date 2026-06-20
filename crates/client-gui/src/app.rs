@@ -26,7 +26,7 @@ use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
 use crate::prof::{parse_backend, ProfHandle};
-use crate::shell::menu::{self, MenuAction, MenuRow};
+use crate::shell::menu::{self, MenuAction, MenuRow, MenuTab};
 
 // ── Chrome strip height ────────────────────────────────────────────────────────
 // Matches DefaultChromeStyle::chrome_height() == 32.0.  The skin rect starts
@@ -89,6 +89,10 @@ fn register_hit(layout: &mut LayoutManager<NoPanel>, id: uzor::types::WidgetId, 
 fn id_menu_row(i: usize) -> uzor::types::WidgetId {
     unsafe_widget_id(&format!("mirage:menu:row:{i}"))
 }
+/// Per-menu-tab hit-zone id.
+fn id_menu_tab(i: usize) -> uzor::types::WidgetId {
+    unsafe_widget_id(&format!("mirage:menu:tab:{i}"))
+}
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -104,6 +108,18 @@ pub struct MirageClientApp {
 
     // Shell state.
     menu_open: bool,
+    /// Active menu tab.
+    menu_tab: MenuTab,
+    /// Menu panel height as a fraction of the area below chrome (resizable).
+    menu_frac: f64,
+    /// Content scroll offset (px) within the active tab.
+    menu_scroll: f64,
+    /// Whether the bottom separator is being dragged.
+    menu_drag_sep: bool,
+    /// Last pointer Y (logical) for separator-drag deltas.
+    menu_last_y: f64,
+    /// Pointer-down state at the previous frame (for press-edge detection).
+    prev_pointer_down: bool,
     /// Chosen exit node (index into nodes::FLEET), if any.
     selected_node: Option<usize>,
     /// Transient menu feedback line (e.g. stubbed actions).
@@ -146,6 +162,12 @@ impl MirageClientApp {
             pending_connect_at: None,
             pending_disconnect_at: None,
             menu_open: false,
+            menu_tab: MenuTab::Connection,
+            menu_frac: menu::DEFAULT_FRAC,
+            menu_scroll: 0.0,
+            menu_drag_sep: false,
+            menu_last_y: 0.0,
+            prev_pointer_down: false,
             selected_node: None,
             menu_note: None,
             pointer_down: false,
@@ -253,26 +275,68 @@ impl App<NoPanel> for MirageClientApp {
             }
         }
 
-        // Data-driven menu layout (built once per frame while open).
-        let menu_laid = if self.menu_open {
-            Some(menu::layout(&menu::build_rows()).0)
+        // ── Menu container (resizable / scrollable / tabbed) ──────────────────
+        // Compute geometry + active-tab rows once per frame while open.
+        let menu = if self.menu_open {
+            let area = (h - CHROME_H).max(1.0);
+            let panel_h = (area * self.menu_frac)
+                .clamp(area * menu::MIN_FRAC, area * menu::MAX_FRAC);
+            let g = menu::geom(w, h, panel_h);
+            let rows = menu::tab_rows(self.menu_tab);
+            let (laid, content_h) = menu::layout_rows(&rows);
+            Some((g, laid, content_h))
         } else {
             None
         };
 
-        // ── Process layout clicks BEFORE painting ─────────────────────────────
-        // was_clicked() reads the previous frame's click state from the
-        // coordinator — must be queried before build() registers new nodes.
+        // ── Process layout clicks / resize / scroll BEFORE painting ────────────
+        if let Some((g, laid, content_h)) = &menu {
+            let area = (h - CHROME_H).max(1.0);
 
-        if let Some(laid) = &menu_laid {
-            // Scrim click → close menu.
+            // Bottom separator drag → resize the panel.
+            let over_sep = pointer
+                .map(|(_, py)| py >= g.sep.y - 3.0 && py <= g.sep.y + g.sep.height + 3.0)
+                .unwrap_or(false);
+            if self.pointer_down && !self.prev_pointer_down && over_sep {
+                self.menu_drag_sep = true;
+                self.menu_last_y = pointer.map(|(_, py)| py).unwrap_or(0.0);
+            }
+            if self.menu_drag_sep && self.pointer_down {
+                if let Some((_, py)) = pointer {
+                    self.menu_frac =
+                        (self.menu_frac + (py - self.menu_last_y) / area).clamp(menu::MIN_FRAC, menu::MAX_FRAC);
+                    self.menu_last_y = py;
+                }
+            }
+            if !self.pointer_down {
+                self.menu_drag_sep = false;
+            }
+
+            // Clamp scroll to content.
+            let max_scroll = (content_h - g.content.height).max(0.0);
+            self.menu_scroll = self.menu_scroll.clamp(0.0, max_scroll);
+
+            // Scrim → close.
             if win.layout.was_clicked(&id_scrim()) {
                 self.menu_open = false;
                 self.menu_note = None;
             }
-            // Row clicks — dispatch by row kind.
+            // Tabs.
+            for (i, t) in MenuTab::ALL.iter().enumerate() {
+                if win.layout.was_clicked(&id_menu_tab(i)) {
+                    self.menu_tab = *t;
+                    self.menu_scroll = 0.0;
+                }
+            }
+            // Visible content rows (same cull as draw/registration).
+            let cy = g.content.y - self.menu_scroll;
             for (i, lr) in laid.iter().enumerate() {
-                if !lr.clickable || !win.layout.was_clicked(&id_menu_row(i)) {
+                if !lr.clickable {
+                    continue;
+                }
+                let ry = cy + lr.y;
+                let visible = ry >= g.content.y && ry + lr.h <= g.content.y + g.content.height;
+                if !visible || !win.layout.was_clicked(&id_menu_row(i)) {
                     continue;
                 }
                 match lr.row {
@@ -295,6 +359,7 @@ impl App<NoPanel> for MirageClientApp {
                 }
             }
         }
+        self.prev_pointer_down = self.pointer_down;
 
         if !self.menu_open {
             // ── Tap / double-tap on the centerpiece (menu closed) ──────────────
@@ -348,12 +413,16 @@ impl App<NoPanel> for MirageClientApp {
         self.skin.render(render, state);
 
         // ── Menu overlay (when open) ──────────────────────────────────────────
-        if let Some(laid) = &menu_laid {
+        if let Some((g, laid, content_h)) = &menu {
             menu::draw_menu(
                 render,
                 w,
                 h,
+                g,
+                self.menu_tab,
                 laid,
+                *content_h,
+                self.menu_scroll,
                 self.skin_kind,
                 self.selected_node,
                 self.current_phase,
@@ -377,10 +446,9 @@ impl App<NoPanel> for MirageClientApp {
                 .theme(Box::new(DarkChromeTheme))
                 .build(layout, render);
 
-            if let Some(laid) = &menu_laid {
-                // ── Menu open: scrim → panel → row hit-zones ──────────────────
-                // Hit priority follows registration order (later wins): scrim
-                // (dismiss fallback), panel body (absorbs gaps), then rows.
+            if let Some((g, laid, _)) = &menu {
+                // ── Menu open: scrim → panel → tabs → visible rows ────────────
+                // Hit priority follows registration order (later wins).
                 register_hit(layout, id_scrim(), Rect {
                     x: 0.0,
                     y: CHROME_H,
@@ -391,11 +459,20 @@ impl App<NoPanel> for MirageClientApp {
                     x: 0.0,
                     y: CHROME_H,
                     width: w,
-                    height: (h - CHROME_H).max(0.0),
+                    height: g.panel.height,
                 });
+                for i in 0..MenuTab::ALL.len() {
+                    let r = g.tabs[i];
+                    register_hit(layout, id_menu_tab(i), Rect { x: r.x, y: r.y, width: r.width, height: r.height });
+                }
+                let cy = g.content.y - self.menu_scroll;
                 for (i, lr) in laid.iter().enumerate() {
-                    if lr.clickable {
-                        register_hit(layout, id_menu_row(i), Rect { x: 0.0, y: lr.y, width: w, height: lr.h });
+                    if !lr.clickable {
+                        continue;
+                    }
+                    let ry = cy + lr.y;
+                    if ry >= g.content.y && ry + lr.h <= g.content.y + g.content.height {
+                        register_hit(layout, id_menu_row(i), Rect { x: 0.0, y: ry, width: w, height: lr.h });
                     }
                 }
             } else {
@@ -426,8 +503,8 @@ impl App<NoPanel> for MirageClientApp {
             render.fill_text("M", SLOT_W / 2.0, CHROME_H / 2.0 - 1.0);
         }
 
-        // ── Profiling overlay (top-right, under chrome) ───────────────────────
-        {
+        // ── Profiling overlay (top-right, under chrome; hidden when menu open) ─
+        if !self.menu_open {
             let render = &mut *win.render;
             render.set_fill_color("#6B6F7A");
             render.set_font("11px monospace");
@@ -497,9 +574,11 @@ impl App<NoPanel> for MirageClientApp {
                 self.last_phys = Some((*x, *y));
                 false
             }
-            // Wheel → zoom (planet).
+            // Wheel → scroll the menu when open, else zoom the skin (planet).
             PlatformEvent::Scroll { dy, .. } => {
-                if !self.menu_open {
+                if self.menu_open {
+                    self.menu_scroll = (self.menu_scroll - *dy).max(0.0);
+                } else {
                     self.skin.zoom(*dy);
                 }
                 false
