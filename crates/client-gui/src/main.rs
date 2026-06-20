@@ -8,9 +8,7 @@
 
 mod app;
 mod centerpiece;
-mod gesture;
 mod shell;
-mod toast;
 
 use uzor::framework::builder::AppBuilder;
 use uzor::framework::multi_window::{WindowKey, WindowSpec};

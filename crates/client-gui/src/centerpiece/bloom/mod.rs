@@ -5,7 +5,7 @@ pub mod state;
 
 use uzor::render::RenderContext;
 
-use super::{CenterpieceState, Skin, SkinRect};
+use super::{CenterpieceState, Skin};
 use state::BloomState;
 
 /// Bloom skin: 6-ring petal flower, radial glow, stem, sparkles.
@@ -45,9 +45,4 @@ impl Skin for BloomSkin {
         paint::render_bloom(ctx, &self.state, st);
     }
 
-    fn hit_center(&self, x: f64, y: f64, rect: SkinRect) -> bool {
-        let dx = x - rect.cx();
-        let dy = y - rect.cy();
-        dx.hypot(dy) < rect.radius() * 0.38
-    }
 }

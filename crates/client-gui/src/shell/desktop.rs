@@ -15,12 +15,10 @@ pub struct TitlebarHover {
     pub menu: bool,
 }
 
-/// Returns `true` if `(x, y)` is within the M-menu button.
-pub fn is_menu_btn(x: f64, y: f64) -> bool {
-    x >= 4.0 && x < 48.0 && y >= 0.0 && y < TITLEBAR_H
-}
-
 /// Draw the desktop titlebar chrome.
+///
+/// Paints: background, bottom border, M-menu glyph, minimize/close controls.
+/// No text wordmarks or status labels — those were removed.
 pub fn draw_titlebar(
     ctx: &mut dyn RenderContext,
     hover: TitlebarHover,
@@ -49,15 +47,6 @@ pub fn draw_titlebar(
     ctx.set_text_align(TextAlign::Center);
     ctx.set_text_baseline(TextBaseline::Middle);
     ctx.fill_text("M", 26.0, TITLEBAR_H / 2.0);
-
-    // "MIRAGE · client" title.
-    ctx.set_fill_color("#878B91");
-    ctx.set_font("11px DM Mono");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.fill_text("mirage · ", 58.0, TITLEBAR_H / 2.0);
-    ctx.set_fill_color("#FBB26A");
-    ctx.fill_text("client", 108.0, TITLEBAR_H / 2.0);
 
     // Minimize button.
     let min_x = w - BTN_W * 2.0;

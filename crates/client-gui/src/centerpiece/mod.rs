@@ -1,8 +1,8 @@
 //! Centerpiece: pluggable skin abstraction for the Mirage client GUI.
 //!
 //! The shell calls `Skin::render` every frame and routes single-tap events
-//! through `Skin::hit_center`. No skin-specific code lives outside this
-//! module tree or the shell dispatcher.
+//! via `App::on_event`. No skin-specific code lives outside this module tree
+//! or the shell dispatcher.
 
 pub mod bloom;
 pub mod planet;
@@ -39,10 +39,6 @@ impl SkinRect {
     pub fn cy(&self) -> f64 {
         self.y + self.h * 0.5
     }
-    /// Radius of the skin's center hit area (38 % of the smaller dimension).
-    pub fn radius(&self) -> f64 {
-        self.w.min(self.h) * 0.34
-    }
 }
 
 // ── Per-frame context ─────────────────────────────────────────────────────────
@@ -68,16 +64,6 @@ pub struct CenterpieceState {
 pub trait Skin: Send + 'static {
     /// Called every frame. Draw to `ctx` using `st`.
     fn render(&mut self, ctx: &mut dyn RenderContext, st: CenterpieceState);
-
-    /// Returns `true` if `(x, y)` (logical pixels) falls within the skin's
-    /// center hit area — the connect/disconnect toggle zone.
-    ///
-    /// Default: circular hit area at `rect.radius() * 0.38`.
-    fn hit_center(&self, x: f64, y: f64, rect: SkinRect) -> bool {
-        let dx = x - rect.cx();
-        let dy = y - rect.cy();
-        dx.hypot(dy) < rect.radius() * 0.38
-    }
 }
 
 // ── Skin kind + registry ──────────────────────────────────────────────────────
