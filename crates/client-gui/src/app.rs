@@ -125,8 +125,12 @@ pub struct MirageClientApp {
     menu_last_y: f64,
     /// Pointer-down state at the previous frame (for press-edge detection).
     prev_pointer_down: bool,
-    /// Chosen exit node (index into nodes::FLEET), if any.
+    /// Chosen exit node (index into nodes::FLEET), if any. Honored only when
+    /// `exit_auto` is false.
     selected_node: Option<usize>,
+    /// Exit-node selection mode. Auto (default) lets the mesh pick; Manual
+    /// exposes the fleet picker and honors `selected_node`.
+    exit_auto: bool,
     /// Transient menu feedback line (e.g. stubbed actions).
     menu_note: Option<String>,
     /// Raw JSON of the last successfully imported ClientConfig.
@@ -179,6 +183,7 @@ impl MirageClientApp {
             menu_last_y: 0.0,
             prev_pointer_down: false,
             selected_node: None,
+            exit_auto: true,
             menu_note: None,
             imported: None,
             pointer_down: false,
@@ -324,7 +329,7 @@ impl App<NoPanel> for MirageClientApp {
             let panel_h = (area * self.menu_frac)
                 .clamp(area * menu::MIN_FRAC, area * menu::MAX_FRAC);
             let g = menu::geom(w, h, panel_h);
-            let rows = menu::tab_rows(self.menu_tab);
+            let rows = menu::tab_rows(self.menu_tab, self.exit_auto);
             let (laid, content_h) = menu::layout_rows(&rows);
             Some((g, laid, content_h))
         } else {
@@ -382,9 +387,25 @@ impl App<NoPanel> for MirageClientApp {
                     continue;
                 }
                 match lr.row {
+                    MenuRow::ExitMode => {
+                        // Click within the right-aligned pill → pick by half;
+                        // a click on the label just toggles.
+                        let pill_w = 140.0;
+                        let px = w - 18.0 - pill_w;
+                        let half = pill_w / 2.0;
+                        match pointer {
+                            Some((cxp, _)) if cxp >= px => self.exit_auto = cxp < px + half,
+                            _ => self.exit_auto = !self.exit_auto,
+                        }
+                    }
                     MenuRow::Node(n) => {
                         self.selected_node =
                             if self.selected_node == Some(n) { None } else { Some(n) };
+                    }
+                    MenuRow::Offer(n) => {
+                        let o = &crate::nodes::OFFERS[n];
+                        self.menu_note =
+                            Some(format!("покупка {} {} · {} — скоро", o.region, o.label, o.price));
                     }
                     MenuRow::Skin(s) => {
                         self.switch_skin(s);
@@ -485,6 +506,7 @@ impl App<NoPanel> for MirageClientApp {
                 self.menu_scroll,
                 self.skin_kind,
                 self.selected_node,
+                self.exit_auto,
                 self.current_phase,
                 self.menu_note.as_deref(),
             );

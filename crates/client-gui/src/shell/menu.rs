@@ -56,7 +56,13 @@ impl MenuTab {
 #[derive(Clone, Copy)]
 pub enum MenuRow {
     Status,
+    /// Section header (non-clickable label).
+    Header(&'static str),
+    /// Exit-node mode segmented control: Auto | Manual.
+    ExitMode,
     Node(usize),
+    /// A catalog node offering (index into nodes::OFFERS).
+    Offer(usize),
     Skin(SkinKind),
     Action(MenuAction),
     Info(&'static str, &'static str),
@@ -82,15 +88,19 @@ pub struct LaidRow {
 fn metrics(row: &MenuRow) -> (f64, bool) {
     match row {
         MenuRow::Status => (52.0, false),
+        MenuRow::Header(_) => (30.0, false),
+        MenuRow::ExitMode => (46.0, true),
         MenuRow::Node(_) => (34.0, true),
+        MenuRow::Offer(_) => (48.0, true),
         MenuRow::Skin(_) => (38.0, true),
         MenuRow::Action(_) => (40.0, true),
         MenuRow::Info(..) => (26.0, false),
     }
 }
 
-/// Rows for the active tab.
-pub fn tab_rows(tab: MenuTab) -> Vec<MenuRow> {
+/// Rows for the active tab. `exit_auto` controls whether the Nodes tab shows
+/// the manual exit-node picker.
+pub fn tab_rows(tab: MenuTab, exit_auto: bool) -> Vec<MenuRow> {
     match tab {
         MenuTab::Connection => vec![
             MenuRow::Status,
@@ -98,7 +108,15 @@ pub fn tab_rows(tab: MenuTab) -> Vec<MenuRow> {
             MenuRow::Info("credential", "RingMembership"),
             MenuRow::Info("mesh", "staging-v2"),
         ],
-        MenuTab::Nodes => (0..FLEET.len()).map(MenuRow::Node).collect(),
+        MenuTab::Nodes => {
+            let mut rows = vec![MenuRow::ExitMode];
+            if !exit_auto {
+                rows.extend((0..FLEET.len()).map(MenuRow::Node));
+            }
+            rows.push(MenuRow::Header("Купить ноду в мэш"));
+            rows.extend((0..crate::nodes::OFFERS.len()).map(MenuRow::Offer));
+            rows
+        }
         MenuTab::Style => [SkinKind::Bloom, SkinKind::Planet, SkinKind::Radar, SkinKind::Aurora]
             .into_iter()
             .map(MenuRow::Skin)
@@ -180,6 +198,7 @@ pub fn draw_menu(
     scroll: f64,
     skin: SkinKind,
     selected: Option<usize>,
+    exit_auto: bool,
     phase: ConnPhase,
     note: Option<&str>,
 ) {
@@ -221,7 +240,7 @@ pub fn draw_menu(
         if ry + lr.h < g.content.y || ry > g.content.y + g.content.height {
             continue; // culled
         }
-        draw_row(ctx, w, lr, ry, skin, selected, phase);
+        draw_row(ctx, w, lr, ry, skin, selected, exit_auto, phase);
     }
     ctx.restore();
 
@@ -250,6 +269,7 @@ pub fn draw_menu(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     ctx: &mut dyn RenderContext,
     w: f64,
@@ -257,6 +277,7 @@ fn draw_row(
     ry: f64,
     skin: SkinKind,
     selected: Option<usize>,
+    exit_auto: bool,
     phase: ConnPhase,
 ) {
     match lr.row {
@@ -273,10 +294,72 @@ fn draw_row(
             ctx.set_fill_color(MUTED);
             ctx.set_text_align(TextAlign::Left);
             ctx.fill_text("exit", 18.0, ry + 36.0);
-            let exit = selected.map(|i| format!("{} · {}", FLEET[i].reg, FLEET[i].city));
+            // Auto mode wins regardless of any stale manual pick.
+            let exit = if exit_auto {
+                "auto".to_string()
+            } else {
+                selected
+                    .map(|i| format!("{} · {}", FLEET[i].reg, FLEET[i].city))
+                    .unwrap_or_else(|| "manual · не выбрана".to_string())
+            };
             ctx.set_fill_color(FG);
             ctx.set_text_align(TextAlign::Right);
-            ctx.fill_text(exit.as_deref().unwrap_or("auto"), w - 18.0, ry + 36.0);
+            ctx.fill_text(&exit, w - 18.0, ry + 36.0);
+        }
+        MenuRow::Header(t) => {
+            ctx.set_fill_color(DIMC);
+            ctx.set_font("10px sans-serif");
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_text_baseline(TextBaseline::Bottom);
+            ctx.fill_text(&t.to_uppercase(), 18.0, ry + lr.h - 8.0);
+            ctx.set_fill_color(LINE);
+            ctx.fill_rect(18.0, ry + lr.h - 3.0, w - 36.0, 1.0);
+        }
+        MenuRow::ExitMode => {
+            ctx.set_fill_color(MUTED);
+            ctx.set_font("12px sans-serif");
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_text_baseline(TextBaseline::Middle);
+            ctx.fill_text("exit node", 18.0, ry + lr.h / 2.0);
+            // Segmented pill: [ Auto | Manual ] right-aligned.
+            let pill_w = 140.0;
+            let pill_h = 26.0;
+            let px = w - 18.0 - pill_w;
+            let py = ry + (lr.h - pill_h) / 2.0;
+            ctx.set_fill_color("rgba(255,255,255,0.05)");
+            ctx.fill_rect(px, py, pill_w, pill_h);
+            let half = pill_w / 2.0;
+            let active_x = if exit_auto { px } else { px + half };
+            ctx.set_fill_color("rgba(251,178,106,0.16)");
+            ctx.fill_rect(active_x, py, half, pill_h);
+            ctx.set_fill_color(AMBER);
+            ctx.fill_rect(active_x, py + pill_h - 2.0, half, 2.0);
+            ctx.set_font("11px sans-serif");
+            ctx.set_text_align(TextAlign::Center);
+            ctx.set_fill_color(if exit_auto { AMBER } else { MUTED });
+            ctx.fill_text("Auto", px + half / 2.0, py + pill_h / 2.0);
+            ctx.set_fill_color(if exit_auto { MUTED } else { AMBER });
+            ctx.fill_text("Manual", px + half + half / 2.0, py + pill_h / 2.0);
+        }
+        MenuRow::Offer(i) => {
+            let o = &crate::nodes::OFFERS[i];
+            ctx.set_fill_color(FG);
+            ctx.set_font("13px sans-serif");
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_text_baseline(TextBaseline::Top);
+            ctx.fill_text(&format!("{} · {}", o.region, o.label), 20.0, ry + 8.0);
+            ctx.set_fill_color(DIMC);
+            ctx.set_font("10px monospace");
+            ctx.set_text_baseline(TextBaseline::Bottom);
+            ctx.fill_text(&format!("{} · {}", o.specs, o.prov), 20.0, ry + lr.h - 7.0);
+            ctx.set_fill_color(AMBER);
+            ctx.set_font("12px sans-serif");
+            ctx.set_text_align(TextAlign::Right);
+            ctx.set_text_baseline(TextBaseline::Middle);
+            ctx.fill_text(o.price, w - 38.0, ry + lr.h / 2.0);
+            ctx.set_fill_color(DIMC);
+            ctx.set_font("16px sans-serif");
+            ctx.fill_text("+", w - 20.0, ry + lr.h / 2.0);
         }
         MenuRow::Info(k, v) => {
             ctx.set_fill_color(MUTED);

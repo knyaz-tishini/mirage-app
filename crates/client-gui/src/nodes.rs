@@ -30,3 +30,24 @@ pub static FLEET: &[FleetNode] = &[
 
 /// Links between fleet nodes (indices) — used by the planet mesh.
 pub static LINKS: &[(usize, usize)] = &[(0, 2), (2, 5), (1, 3), (3, 5), (0, 1), (4, 2)];
+
+/// A purchasable node offering — the "buy a node into the mesh" catalog.
+/// (Demo pricing; later fed from hoster APIs → issue → pay → auto-join mesh.)
+#[derive(Clone, Copy)]
+pub struct NodeOffer {
+    pub region: &'static str,
+    pub label: &'static str,
+    pub specs: &'static str,
+    pub prov: &'static str,
+    pub price: &'static str,
+}
+
+/// Catalog of nodes the admin can buy into the mesh.
+pub static OFFERS: &[NodeOffer] = &[
+    NodeOffer { region: "EU", label: "Amsterdam · NL", specs: "2 vCPU · 4 GB · 1 Gbps", prov: "HostKey",  price: "€7/mo" },
+    NodeOffer { region: "EU", label: "Frankfurt · DE",  specs: "4 vCPU · 8 GB · 2 Gbps", prov: "HostKey",  price: "€13/mo" },
+    NodeOffer { region: "RU", label: "Moscow · RU",     specs: "2 vCPU · 4 GB · 1 Gbps", prov: "HostKey",  price: "₽590/mo" },
+    NodeOffer { region: "TR", label: "Istanbul · TR",   specs: "2 vCPU · 4 GB · 1 Gbps", prov: "HostKey",  price: "$9/mo" },
+    NodeOffer { region: "US", label: "New York · US",   specs: "2 vCPU · 4 GB · 1 Gbps", prov: "Cloudzy",  price: "$11/mo" },
+    NodeOffer { region: "CH", label: "Zurich · CH",     specs: "4 vCPU · 8 GB · 2 Gbps", prov: "Cloudzy",  price: "$18/mo" },
+];
