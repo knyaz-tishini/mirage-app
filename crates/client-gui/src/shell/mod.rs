@@ -1,4 +1,3 @@
-//! Window chrome (titlebar, close/minimize buttons, M-button) and menu sheet.
+//! Window chrome and menu sheet.
 
-pub mod desktop;
 pub mod menu;

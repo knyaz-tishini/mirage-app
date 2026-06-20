@@ -6,9 +6,9 @@
 //!   Key 3  → Radar
 //!   Tab    → cycle (Bloom → Planet → Radar → Bloom)
 //!
-//! Center-tap → toggle connect / disconnect (entire area below titlebar).
-//! Menu (M button or keyboard M) → bottom-sheet overlay with skin switcher.
-//! Click routing goes through the uzor LayoutManager so `/input/click` works.
+//! Center-tap → toggle connect / disconnect (entire area below chrome strip).
+//! Menu (chrome M button or keyboard M) → bottom-sheet overlay with skin switcher.
+//! Drag / minimize / close → handled by the uzor chrome path (WindowHost).
 
 use std::time::Instant;
 
@@ -18,22 +18,47 @@ use uzor::framework::multi_window::WindowCtx;
 use uzor::framework::widgets::lm;
 use uzor::input::core::event_processor::PlatformEvent;
 use uzor::input::keyboard::events::KeyCode;
+use uzor::layout::{ChromeWindowControl, LayoutManager};
+use uzor::ui::widgets::composite::chrome::theme::ChromeTheme;
 use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
-use crate::shell::desktop::{draw_titlebar, TitlebarHover, TITLEBAR_H};
 use crate::shell::menu::{draw_menu_sheet, SHEET_HEIGHT};
+
+// ── Chrome strip height ────────────────────────────────────────────────────────
+// Matches DefaultChromeStyle::chrome_height() == 32.0.  The skin rect starts
+// immediately below this strip.
+const CHROME_H: f64 = 32.0;
+
+// ── Dark chrome theme ──────────────────────────────────────────────────────────
+
+/// Minimal dark theme that matches the app's #0B0B0E background.
+struct DarkChromeTheme;
+
+impl ChromeTheme for DarkChromeTheme {
+    fn background(&self)      -> &str { "#0C0C10" }
+    fn icon_normal(&self)     -> &str { "#555860" }
+    fn icon_hover(&self)      -> &str { "#F4F4F5" }
+    fn button_hover(&self)    -> &str { "rgba(255,255,255,0.07)" }
+    fn close_hover(&self)     -> &str { "rgba(224,86,86,0.6)" }
+    fn separator(&self)       -> &str { "rgba(255,255,255,0.08)" }
+    fn tab_bg_normal(&self)   -> &str { "transparent" }
+    fn tab_bg_hover(&self)    -> &str { "rgba(255,255,255,0.07)" }
+    fn tab_bg_active(&self)   -> &str { "#0C0C10" }
+    fn tab_text_normal(&self) -> &str { "#555860" }
+    fn tab_text_hover(&self)  -> &str { "#F4F4F5" }
+    fn tab_text_active(&self) -> &str { "#F4F4F5" }
+    fn tab_accent(&self)      -> &str { "#FBB26A" }
+    fn drag_zone_bg(&self)    -> &str { "transparent" }
+    fn tooltip_bg(&self)      -> &str { "#1A1A22" }
+    fn tooltip_text(&self)    -> &str { "#F4F4F5" }
+}
 
 // ── Widget ids ─────────────────────────────────────────────────────────────────
 
 /// Hit-zone covering the entire centerpiece area (connect/disconnect toggle).
 fn id_centerpiece() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:centerpiece")
-}
-
-/// Hit-zone over the M glyph in the titlebar.
-fn id_menu_btn() -> uzor::types::WidgetId {
-    unsafe_widget_id("mirage:menu_btn")
 }
 
 /// Full-window scrim behind the bottom sheet (click closes the menu).
@@ -66,7 +91,6 @@ pub struct MirageClientApp {
 
     // Shell state.
     menu_open: bool,
-    hover: TitlebarHover,
 
     // Frame timing.
     last_frame: Instant,
@@ -83,7 +107,6 @@ impl MirageClientApp {
             pending_connect_at: None,
             pending_disconnect_at: None,
             menu_open: false,
-            hover: TitlebarHover::default(),
             last_frame: Instant::now(),
         }
     }
@@ -151,11 +174,6 @@ impl App<NoPanel> for MirageClientApp {
         // was_clicked() reads the previous frame's click state from the
         // coordinator — must be queried before build() registers new nodes.
 
-        // Menu button always processes (opens/closes the sheet).
-        if win.layout.was_clicked(&id_menu_btn()) {
-            self.menu_open = !self.menu_open;
-        }
-
         if self.menu_open {
             // Scrim click → close menu.
             if win.layout.was_clicked(&id_scrim()) {
@@ -190,9 +208,9 @@ impl App<NoPanel> for MirageClientApp {
         // ── Skin (centerpiece) ────────────────────────────────────────────────
         let skin_rect = SkinRect {
             x: 0.0,
-            y: TITLEBAR_H,
+            y: CHROME_H,
             w,
-            h: h - TITLEBAR_H,
+            h: h - CHROME_H,
         };
         let state = CenterpieceState {
             dt,
@@ -201,20 +219,26 @@ impl App<NoPanel> for MirageClientApp {
         };
         self.skin.render(render, state);
 
-        // ── Titlebar chrome ───────────────────────────────────────────────────
-        draw_titlebar(render, self.hover, w, self.menu_open);
-
         // ── Bottom-sheet menu overlay (when open) ─────────────────────────────
         if self.menu_open {
             draw_menu_sheet(render, w, h, self.skin_kind);
         }
 
-        // ── Register hit-zones with the LayoutManager ─────────────────────────
-        // Hit-zones are transparent buttons that register CLICK sense so both
-        // real mouse events and `/input/click` agent commands reach them.
+        // ── Chrome strip ──────────────────────────────────────────────────────
+        // Renders last so it paints on top of the centerpiece and menu sheet.
+        // Registering the chrome slot enables handle_chrome_press → WindowHost
+        // for drag, minimize, and close automatically.
         {
             let layout = &mut *win.layout;
             let render = &mut *win.render;
+
+            lm::chrome()
+                .show_menu_btn(true)
+                .menu_left(true)        // M on the left edge
+                .show_maximize(false)   // minimize + close only (no maximize)
+                .tabs(&[])
+                .theme(Box::new(DarkChromeTheme))
+                .build(layout, render);
 
             if self.menu_open {
                 // ── Menu open: scrim + sheet rows ─────────────────────────────
@@ -258,29 +282,37 @@ impl App<NoPanel> for MirageClientApp {
                     height: row_h,
                 }).build(layout, render);
             } else {
-                // ── Menu closed: normal centerpiece + menu button ─────────────
-
-                // Centerpiece hit-zone: full area below the titlebar.
+                // ── Menu closed: normal centerpiece ───────────────────────────
                 let centerpiece_rect = Rect {
                     x: 0.0,
-                    y: TITLEBAR_H,
+                    y: CHROME_H,
                     width: w,
-                    height: (h - TITLEBAR_H).max(0.0),
+                    height: (h - CHROME_H).max(0.0),
                 };
                 lm::button(id_centerpiece(), centerpiece_rect)
                     .build(layout, render);
             }
+        }
+    }
 
-            // Menu-button hit-zone always registered (opens/closes the sheet).
-            // Registered last so it wins over the centerpiece below it.
-            let menu_rect = Rect {
-                x: 4.0,
-                y: 0.0,
-                width: 44.0,
-                height: TITLEBAR_H,
-            };
-            lm::button(id_menu_btn(), menu_rect)
-                .build(layout, render);
+    /// Chrome control buttons (menu / minimize / close-app) dispatched here
+    /// by the framework after `route_click` processes the chrome hit.
+    fn on_chrome_control(
+        &mut self,
+        _layout: &mut LayoutManager<NoPanel>,
+        control: ChromeWindowControl,
+    ) {
+        match control {
+            ChromeWindowControl::Menu => {
+                self.menu_open = !self.menu_open;
+            }
+            ChromeWindowControl::CloseApp => {
+                std::process::exit(0);
+            }
+            // Minimize and MaximizeRestore are handled directly by
+            // handle_chrome_press → WindowHost (set_minimized / set_maximized).
+            // CloseWindow is a no-op for a single-window app.
+            _ => {}
         }
     }
 
