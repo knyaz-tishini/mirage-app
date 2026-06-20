@@ -37,4 +37,7 @@ rfd                     = "0.14"
 arboard                 = "3"            # image-data feature is on by default → get_image()
 # QR decode (pure Rust, no platform deps — safe for the isolated workspace).
 rqrr                    = "0.7"
+# Live backend link (loopback HTTP to sentinel :19420). rustls (no OpenSSL),
+# same as mirage-launcher; co-resolves fine with vello's windows-core 0.62.
+reqwest                 = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 nokhwa = { version = "0.10.11", features = ["input-native"] }

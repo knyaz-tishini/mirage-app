@@ -170,6 +170,10 @@ pub struct MirageClientApp {
     /// Runtime profiling control (hot-switch backend + scrape fps over HTTP).
     prof: ProfHandle,
 
+    /// Live backend link (Some when `--live`): owns the L0 tree + drives
+    /// connect/disconnect over sentinel HTTP. None = mock mode (pure UI).
+    engine: Option<Box<dyn crate::backend::EngineLink>>,
+
     // Frame timing.
     last_frame: Instant,
     /// Monotonic seconds accumulator driving menu graph animation.
@@ -185,11 +189,13 @@ impl MirageClientApp {
         is_admin: bool,
         allow_manual_exit: bool,
         members_can_buy: bool,
+        engine: Option<Box<dyn crate::backend::EngineLink>>,
         prof: ProfHandle,
     ) -> Self {
         Self {
             skin: make_skin(skin_kind),
             prof,
+            engine,
             skin_kind,
             is_admin,
             allow_manual_exit,
@@ -241,6 +247,9 @@ impl MirageClientApp {
     /// state). Grid → planet, off → bloom, etc.
     fn request_connect(&mut self) {
         if matches!(self.current_phase, ConnPhase::Disconnected) {
+            if let Some(e) = &self.engine {
+                e.connect();
+            }
             self.current_phase = ConnPhase::Connecting;
             self.pending_connect_at = Some(Instant::now());
         }
@@ -262,6 +271,9 @@ impl MirageClientApp {
     /// Double tap → disconnect (only when connected). Planet → grid.
     fn request_disconnect(&mut self) {
         if matches!(self.current_phase, ConnPhase::Connected) {
+            if let Some(e) = &self.engine {
+                e.disconnect();
+            }
             self.current_phase = ConnPhase::Disconnecting;
             self.pending_disconnect_at = Some(Instant::now());
             self.skin.clear_selection();
@@ -285,17 +297,45 @@ impl App<NoPanel> for MirageClientApp {
         self.last_frame = now;
         self.anim += dt;
 
-        // ── Advance mock phase transitions ────────────────────────────────────
-        if let Some(at) = self.pending_connect_at {
-            if at.elapsed().as_millis() >= 700 {
+        // ── Phase: live backend (tun.alive) drives it; else mock timers ───────
+        let live_status = self.engine.as_ref().map(|e| e.status());
+        if let Some(es) = live_status {
+            if es.tun_alive {
                 self.current_phase = ConnPhase::Connected;
                 self.pending_connect_at = None;
-            }
-        }
-        if let Some(at) = self.pending_disconnect_at {
-            if at.elapsed().as_millis() >= 400 {
-                self.current_phase = ConnPhase::Disconnected;
                 self.pending_disconnect_at = None;
+            } else {
+                match self.current_phase {
+                    // Hold the optimistic "Connecting" until tun comes up, but
+                    // give up after a generous window (mirrors launcher).
+                    ConnPhase::Connecting => {
+                        if self.pending_connect_at.map_or(true, |at| at.elapsed().as_millis() > 12_000) {
+                            self.current_phase = ConnPhase::Disconnected;
+                            self.pending_connect_at = None;
+                        }
+                    }
+                    ConnPhase::Disconnecting => {
+                        self.current_phase = ConnPhase::Disconnected;
+                        self.pending_disconnect_at = None;
+                    }
+                    // tun went down underneath us.
+                    ConnPhase::Connected => self.current_phase = ConnPhase::Disconnected,
+                    ConnPhase::Disconnected => {}
+                }
+            }
+        } else {
+            // Mock (no backend): fixed timers.
+            if let Some(at) = self.pending_connect_at {
+                if at.elapsed().as_millis() >= 700 {
+                    self.current_phase = ConnPhase::Connected;
+                    self.pending_connect_at = None;
+                }
+            }
+            if let Some(at) = self.pending_disconnect_at {
+                if at.elapsed().as_millis() >= 400 {
+                    self.current_phase = ConnPhase::Disconnected;
+                    self.pending_disconnect_at = None;
+                }
             }
         }
 

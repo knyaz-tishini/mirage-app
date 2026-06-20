@@ -7,6 +7,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod backend;
 mod camera;
 mod centerpiece;
 mod config_import;
@@ -69,6 +70,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allow_manual_exit = !args.iter().any(|a| a == "--no-manual-exit");
     let members_can_buy = !args.iter().any(|a| a == "--no-buy");
 
+    // --live owns + drives the real L0 backend (spawns the orchestrator tree,
+    // polls sentinel :19420). Absent → pure UI (no spawn, no sockets) for
+    // UI-development on the main box.
+    let engine: Option<Box<dyn backend::EngineLink>> = if args.iter().any(|a| a == "--live") {
+        Some(Box::new(backend::LocalHttp::start()))
+    } else {
+        None
+    };
+
     // --backend <name> for the initial backend; absent → autodetect (VelloGpu).
     let backend = args
         .iter()
@@ -86,6 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         is_admin,
         allow_manual_exit,
         members_can_buy,
+        engine,
         prof_state,
     ))
         .agent_api(17471)
