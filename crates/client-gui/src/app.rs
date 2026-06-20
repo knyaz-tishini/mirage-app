@@ -15,14 +15,13 @@ use std::time::Instant;
 use uzor::core::types::Rect;
 use uzor::framework::app::{App, NoPanel};
 use uzor::framework::multi_window::WindowCtx;
-use uzor::render::{TextAlign, TextBaseline};
 use uzor::framework::widgets::lm;
 use uzor::input::core::event_processor::PlatformEvent;
 use uzor::input::keyboard::events::KeyCode;
 use uzor::input::{Sense, WidgetKind};
 use uzor::layout::{ChromeWindowControl, LayoutManager, LayoutNodeId};
 use uzor::ui::widgets::composite::chrome::theme::ChromeTheme;
-use uzor::ui::effects::text::{GlitchGlyph, GlitchStyle};
+use uzor::ui::effects::text::{AsciiGrid, Cursor, GlitchLetter};
 use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
@@ -124,9 +123,10 @@ pub struct MirageClientApp {
     /// Timestamp (ms) of the last empty tap, for double-click discrimination.
     last_tap_ms: f64,
 
-    // Glitchy ASCII "M" menu glyph.
-    menu_glyph: GlitchGlyph,
-    menu_style: GlitchStyle,
+    // Glitchy ASCII "M" menu glyph — driven by the cell-shader engine.
+    menu_grid: AsciiGrid,
+    menu_shader: GlitchLetter,
+    menu_time: f64,
     /// Eased glitch intensity (hover) + a decaying click pulse.
     menu_glitch: f64,
     menu_pulse: f64,
@@ -151,8 +151,9 @@ impl MirageClientApp {
             drag_moved: 0.0,
             pending_tap_at: None,
             last_tap_ms: -1.0e9,
-            menu_glyph: GlitchGlyph::letter_m(),
-            menu_style: GlitchStyle::default(),
+            menu_grid: AsciiGrid::new(5, 7), // matches GlitchLetter::letter_m() dims
+            menu_shader: GlitchLetter::letter_m(),
+            menu_time: 0.0,
             menu_glitch: 0.0,
             menu_pulse: 0.0,
             last_frame: Instant::now(),
@@ -237,7 +238,9 @@ impl App<NoPanel> for MirageClientApp {
         self.menu_glitch += (target - self.menu_glitch) * (8.0 * dt).min(1.0);
         self.menu_pulse = (self.menu_pulse - dt * 2.5).max(0.0);
         let glitch_amt = self.menu_glitch.max(self.menu_pulse);
-        self.menu_glyph.update(dt, glitch_amt, &self.menu_style);
+        self.menu_time += dt;
+        self.menu_grid.set_cursor(Cursor { intensity: glitch_amt, ..Default::default() });
+        self.menu_grid.step(&self.menu_shader, self.menu_time, 1.0);
 
         // ── Process layout clicks BEFORE painting ─────────────────────────────
         // was_clicked() reads the previous frame's click state from the
@@ -369,39 +372,18 @@ impl App<NoPanel> for MirageClientApp {
 
         // ── Glitchy ASCII "M" over the menu button slot ───────────────────────
         // Painted last, over the chrome's default hamburger (covered first).
+        // The grid + GlitchLetter shader drive it (uzor cell-shader engine).
         {
             let render = &mut *win.render;
             const SLOT_W: f64 = 36.0;
             render.set_fill_color("#0C0C10");
             render.fill_rect(0.0, 0.0, SLOT_W, CHROME_H);
 
-            let cols = self.menu_glyph.cols();
-            let rows = self.menu_glyph.rows();
             let pad_x = 8.0;
             let pad_y = 5.0;
-            let cw = (SLOT_W - pad_x * 2.0) / cols as f64;
-            let ch = (CHROME_H - pad_y * 2.0) / rows as f64;
-            let fs = (ch + 1.5).max(5.0);
-            render.set_font(&format!("{}px monospace", fs as i32));
-            render.set_text_align(TextAlign::Left);
-            render.set_text_baseline(TextBaseline::Top);
-            for r in 0..rows {
-                for c in 0..cols {
-                    let cell = self.menu_glyph.cell(c, r);
-                    if !cell.on {
-                        continue;
-                    }
-                    render.set_fill_color(&format!(
-                        "rgb({},{},{})",
-                        cell.color[0], cell.color[1], cell.color[2]
-                    ));
-                    render.fill_text(
-                        &cell.ch.to_string(),
-                        pad_x + c as f64 * cw,
-                        pad_y + r as f64 * ch,
-                    );
-                }
-            }
+            let cw = (SLOT_W - pad_x * 2.0) / self.menu_grid.cols() as f64;
+            let ch = (CHROME_H - pad_y * 2.0) / self.menu_grid.rows() as f64;
+            self.menu_grid.render(render, pad_x, pad_y, cw, ch);
         }
     }
 
