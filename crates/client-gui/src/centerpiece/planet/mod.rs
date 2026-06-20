@@ -238,12 +238,18 @@ impl Skin for PlanetSkin {
         // Rotation: drag() moves yaw/pitch directly (since_drag = 0 that frame);
         // otherwise coast on inertia + a gentle idle auto-rotate.
         if self.since_drag == 0 {
+            // Dragged this frame — drag() already moved yaw/pitch.
             self.since_drag = 1;
-        } else {
+        } else if self.sel.is_none() {
+            // Idle: coast on inertia + a gentle auto-rotate.
             self.yaw += self.vyaw + 0.12 * dt;
             self.pitch = clamp(self.pitch + self.vpitch, -1.35, 1.35);
             self.vyaw *= 0.92;
             self.vpitch *= 0.92;
+        } else {
+            // Node popup open — hold the globe still so it can be read.
+            self.vyaw = 0.0;
+            self.vpitch = 0.0;
         }
 
         let fe = smooth(clamp(self.fold, 0.0, 1.0));
