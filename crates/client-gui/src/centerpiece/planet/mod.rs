@@ -468,7 +468,6 @@ impl Skin for PlanetSkin {
 impl PlanetSkin {
     /// Draw the floating node-info popup near `(sx, sy)`, clamped to the rect.
     fn draw_popup(&self, ctx: &mut dyn RenderContext, n: &Node, sx: f64, sy: f64, rect: SkinRect) {
-        const PW: f64 = 196.0;
         let rows = ["IP", "ID", "PROVIDER"];
         let vals = [n.ip, n.id, n.prov];
         let header_h = 30.0;
@@ -476,12 +475,18 @@ impl PlanetSkin {
         let roles_h = 30.0;
         let ph = header_h + row_h * rows.len() as f64 + roles_h + 10.0;
 
-        let px = (sx + 14.0).clamp(rect.x + 4.0, rect.x + rect.w - PW - 4.0);
+        // Width sized to the longest content line (ROLES) so nothing overflows.
+        ctx.set_font("9px monospace");
+        let roles_w = ctx.measure_text(n.roles);
+        let roles_w = if roles_w > 1.0 { roles_w } else { n.roles.len() as f64 * 5.4 };
+        let pw = (roles_w + 24.0).max(196.0).min(rect.w - 8.0);
+
+        let px = (sx + 14.0).clamp(rect.x + 4.0, rect.x + rect.w - pw - 4.0);
         let py = (sy - 12.0).clamp(rect.y + 4.0, rect.y + rect.h - ph - 4.0);
 
         // Panel.
         ctx.set_fill_color("rgba(20,21,26,0.96)");
-        ctx.fill_rect(px, py, PW, ph);
+        ctx.fill_rect(px, py, pw, ph);
         ctx.set_fill_color("#FBB26A");
         ctx.fill_rect(px, py, 2.0, ph);
 
@@ -492,7 +497,7 @@ impl PlanetSkin {
         ctx.set_text_baseline(uzor::render::TextBaseline::Middle);
         ctx.fill_text(&format!("{} · {}", n.reg, n.city), px + 12.0, py + 16.0);
         ctx.set_fill_color("rgba(255,255,255,0.12)");
-        ctx.fill_rect(px + 12.0, py + header_h - 4.0, PW - 24.0, 1.0);
+        ctx.fill_rect(px + 12.0, py + header_h - 4.0, pw - 24.0, 1.0);
 
         // Rows.
         let mut ry = py + header_h + row_h / 2.0;
@@ -503,7 +508,7 @@ impl PlanetSkin {
             ctx.fill_text(k, px + 12.0, ry);
             ctx.set_fill_color("#C9CCD1");
             ctx.set_text_align(uzor::render::TextAlign::Right);
-            ctx.fill_text(v, px + PW - 12.0, ry);
+            ctx.fill_text(v, px + pw - 12.0, ry);
             ry += row_h;
         }
 
