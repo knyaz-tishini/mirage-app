@@ -7,6 +7,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod camera;
 mod centerpiece;
 mod config_import;
 mod nodes;

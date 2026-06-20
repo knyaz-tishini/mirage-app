@@ -74,6 +74,11 @@ fn id_menu_panel() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:menu_panel")
 }
 
+/// Full-window scrim during a camera scan — any click cancels it.
+fn id_scan() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:scan")
+}
+
 /// Register an INVISIBLE click hit-zone (no paint). Unlike `lm::button` — which
 /// paints a hover background over its whole rect — this only adds the rect to
 /// the input coordinator so `was_clicked` resolves, leaving the scene untouched.
@@ -145,6 +150,9 @@ pub struct MirageClientApp {
     /// cursor-reactive skins freeze a warp spot at the exit point.
     pointer_in_window: bool,
 
+    /// Active camera QR scan (background thread + ASCII preview), if any.
+    scan: Option<crate::camera::CameraScan>,
+
     /// Runtime profiling control (hot-switch backend + scrape fps over HTTP).
     prof: ProfHandle,
 
@@ -179,6 +187,7 @@ impl MirageClientApp {
             pending_tap_at: None,
             last_tap_ms: -1.0e9,
             pointer_in_window: true,
+            scan: None,
             last_frame: Instant::now(),
         }
     }
@@ -258,6 +267,23 @@ impl App<NoPanel> for MirageClientApp {
             if at.elapsed().as_millis() >= 400 {
                 self.current_phase = ConnPhase::Disconnected;
                 self.pending_disconnect_at = None;
+            }
+        }
+
+        // ── Camera scan: poll the background thread's outcome ──────────────────
+        // (clone the outcome first so the import borrow doesn't overlap `scan`)
+        if let Some(oc) = self.scan.as_ref().map(crate::camera::CameraScan::outcome) {
+            match oc {
+                crate::camera::ScanOutcome::Done(payload) => {
+                    let res = crate::config_import::parse(&payload);
+                    self.import_config(res);
+                    self.scan = None;
+                }
+                crate::camera::ScanOutcome::Failed(e) => {
+                    self.menu_note = Some(format!("камера: {e}"));
+                    self.scan = None;
+                }
+                crate::camera::ScanOutcome::Scanning => {}
             }
         }
 
@@ -375,7 +401,8 @@ impl App<NoPanel> for MirageClientApp {
                         self.import_config(crate::config_import::from_clipboard_qr());
                     }
                     MenuRow::Action(MenuAction::ImportCamera) => {
-                        self.menu_note = Some("скан камерой — скоро".into());
+                        self.scan = Some(crate::camera::CameraScan::start());
+                        self.menu_note = Some("запускаю камеру…".into());
                     }
                     MenuRow::Action(MenuAction::Login) => {
                         self.menu_note = Some("вход на zengeld.com — скоро".into());
@@ -416,6 +443,14 @@ impl App<NoPanel> for MirageClientApp {
             }
         }
 
+        // Camera scan overlay → any click below the chrome cancels the scan.
+        if self.scan.is_some() && win.layout.was_clicked(&id_scan()) {
+            if let Some(s) = self.scan.take() {
+                s.cancel();
+            }
+            self.menu_note = Some("скан отменён".into());
+        }
+
         let render = &mut *win.render;
 
         // ── Background ────────────────────────────────────────────────────────
@@ -453,6 +488,11 @@ impl App<NoPanel> for MirageClientApp {
                 self.current_phase,
                 self.menu_note.as_deref(),
             );
+        }
+
+        // ── Camera scan overlay (ASCII preview; above skin + menu) ─────────────
+        if let Some(scan) = &self.scan {
+            crate::camera::draw_overlay(render, w, h, CHROME_H, scan);
         }
 
         // ── Chrome strip ──────────────────────────────────────────────────────
@@ -503,6 +543,17 @@ impl App<NoPanel> for MirageClientApp {
             } else {
                 // ── Menu closed: invisible centerpiece hit-zone ───────────────
                 register_hit(layout, id_centerpiece(), Rect {
+                    x: 0.0,
+                    y: CHROME_H,
+                    width: w,
+                    height: (h - CHROME_H).max(0.0),
+                });
+            }
+
+            // Camera-scan scrim — registered last so it wins over everything
+            // below the chrome; any click cancels the scan.
+            if self.scan.is_some() {
+                register_hit(layout, id_scan(), Rect {
                     x: 0.0,
                     y: CHROME_H,
                     width: w,
