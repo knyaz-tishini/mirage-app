@@ -20,7 +20,7 @@ pub const MENU_TITLE_H: f64 = 46.0;
 /// Height of one skin row.
 pub const MENU_ROW_H: f64 = 44.0;
 /// Number of skin rows.
-pub const MENU_ROW_COUNT: usize = 3;
+pub const MENU_ROW_COUNT: usize = 4;
 /// Bottom padding below the last row.
 pub const MENU_FOOT_H: f64 = 16.0;
 
@@ -77,6 +77,7 @@ pub fn draw_menu_overlay(ctx: &mut dyn RenderContext, w: f64, h: f64, active: Sk
     draw_skin_row(ctx, w, rows_start,                    "Bloom",  active == SkinKind::Bloom);
     draw_skin_row(ctx, w, rows_start + MENU_ROW_H,       "Planet", active == SkinKind::Planet);
     draw_skin_row(ctx, w, rows_start + MENU_ROW_H * 2.0, "Radar",  active == SkinKind::Radar);
+    draw_skin_row(ctx, w, rows_start + MENU_ROW_H * 3.0, "Aurora", active == SkinKind::Aurora);
 }
 
 /// Draw a single labelled skin row.

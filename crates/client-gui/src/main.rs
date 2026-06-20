@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Some("planet") => centerpiece::SkinKind::Planet,
         Some("radar") => centerpiece::SkinKind::Radar,
+        Some("aurora") => centerpiece::SkinKind::Aurora,
         _ => centerpiece::SkinKind::Bloom,
     };
     let connected = args.iter().any(|a| a == "--connected");

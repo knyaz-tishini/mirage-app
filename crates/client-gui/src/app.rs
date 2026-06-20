@@ -94,6 +94,9 @@ fn id_skin_planet() -> uzor::types::WidgetId {
 fn id_skin_radar() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:skin:radar")
 }
+fn id_skin_aurora() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:skin:aurora")
+}
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -123,6 +126,11 @@ pub struct MirageClientApp {
     /// Timestamp (ms) of the last empty tap, for double-click discrimination.
     last_tap_ms: f64,
 
+    /// Whether the pointer is currently inside the window. `pointer_pos()`
+    /// keeps the last position after the cursor leaves, so without this the
+    /// cursor-reactive skins freeze a warp spot at the exit point.
+    pointer_in_window: bool,
+
     // Frame timing.
     last_frame: Instant,
 }
@@ -143,6 +151,7 @@ impl MirageClientApp {
             drag_moved: 0.0,
             pending_tap_at: None,
             last_tap_ms: -1.0e9,
+            pointer_in_window: true,
             last_frame: Instant::now(),
         }
     }
@@ -214,7 +223,13 @@ impl App<NoPanel> for MirageClientApp {
 
         let w = win.rect.width;
         let h = win.rect.height;
-        let pointer = win.layout.pointer_pos();
+        // None when the cursor is outside the window so cursor-reactive skins
+        // heal instead of freezing the warp at the last position.
+        let pointer = if self.pointer_in_window {
+            win.layout.pointer_pos()
+        } else {
+            None
+        };
 
         // ── Process layout clicks BEFORE painting ─────────────────────────────
         // was_clicked() reads the previous frame's click state from the
@@ -236,6 +251,10 @@ impl App<NoPanel> for MirageClientApp {
             }
             if win.layout.was_clicked(&id_skin_radar()) {
                 self.switch_skin(SkinKind::Radar);
+                self.menu_open = false;
+            }
+            if win.layout.was_clicked(&id_skin_aurora()) {
+                self.switch_skin(SkinKind::Aurora);
                 self.menu_open = false;
             }
         } else {
@@ -334,6 +353,7 @@ impl App<NoPanel> for MirageClientApp {
                 register_hit(layout, id_skin_bloom(), Rect { x: 0.0, y: rows_start, width: w, height: row_h });
                 register_hit(layout, id_skin_planet(), Rect { x: 0.0, y: rows_start + row_h, width: w, height: row_h });
                 register_hit(layout, id_skin_radar(), Rect { x: 0.0, y: rows_start + row_h * 2.0, width: w, height: row_h });
+                register_hit(layout, id_skin_aurora(), Rect { x: 0.0, y: rows_start + row_h * 3.0, width: w, height: row_h });
             } else {
                 // ── Menu closed: invisible centerpiece hit-zone ───────────────
                 register_hit(layout, id_centerpiece(), Rect {
@@ -425,6 +445,15 @@ impl App<NoPanel> for MirageClientApp {
                 if !self.menu_open {
                     self.skin.zoom(*dy);
                 }
+                false
+            }
+            // Track cursor entering/leaving the window so reactive skins heal.
+            PlatformEvent::PointerEntered => {
+                self.pointer_in_window = true;
+                false
+            }
+            PlatformEvent::PointerLeft => {
+                self.pointer_in_window = false;
                 false
             }
             _ => false,

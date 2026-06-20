@@ -4,6 +4,7 @@
 //! via `App::on_event`. No skin-specific code lives outside this module tree
 //! or the shell dispatcher.
 
+pub mod aurora;
 pub mod bloom;
 pub mod planet;
 pub mod radar;
@@ -94,15 +95,17 @@ pub enum SkinKind {
     Bloom,
     Planet,
     Radar,
+    Aurora,
 }
 
 impl SkinKind {
-    /// Cycle to the next skin (Bloom → Planet → Radar → Bloom).
+    /// Cycle to the next skin (Bloom → Planet → Radar → Aurora → Bloom).
     pub fn next(self) -> Self {
         match self {
             Self::Bloom  => Self::Planet,
             Self::Planet => Self::Radar,
-            Self::Radar  => Self::Bloom,
+            Self::Radar  => Self::Aurora,
+            Self::Aurora => Self::Bloom,
         }
     }
 }
@@ -113,5 +116,6 @@ pub fn make_skin(kind: SkinKind) -> Box<dyn Skin> {
         SkinKind::Bloom  => Box::new(bloom::BloomSkin::new()),
         SkinKind::Planet => Box::new(planet::PlanetSkin::new()),
         SkinKind::Radar  => Box::new(radar::RadarSkin::new()),
+        SkinKind::Aurora => Box::new(aurora::AuroraSkin::new()),
     }
 }
