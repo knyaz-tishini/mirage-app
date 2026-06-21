@@ -237,10 +237,15 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(PeerTable::empty);
     let peer_table: Arc<ArcSwap<PeerTable>> = Arc::new(ArcSwap::from_pointee(initial_pt));
 
-    // Shared credential params arc — updated by MonitorLink on CredentialParams WS frames.
-    // Pools snapshot this on each dial to mint a fresh per-dial EpochHmac token.
+    // Shared credential params arc — pre-armed from config (sentinel injects the signed
+    // CredentialParams into client-config.json at materialise time so the gate clears
+    // immediately on first dial, without waiting for the worker's own MonitorLink).
     let credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>> =
-        Arc::new(ArcSwap::from_pointee(None));
+        Arc::new(ArcSwap::from_pointee(client_config.credential_params.clone()));
+    if let Some(ref cp) = client_config.credential_params {
+        let scheme = cp.authorities.first().map(|a| format!("{:?}", a.scheme)).unwrap_or_default();
+        info!(chain_id = %chain_id, scheme = %scheme, "worker: credential_params loaded from config");
+    }
 
     // Shared blind-token pool arc (Phase 4 spend).  MonitorLink fills it; pools drain it.
     let token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>> =

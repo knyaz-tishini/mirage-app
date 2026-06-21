@@ -297,6 +297,7 @@ pub(crate) fn materialise(
     ring_member_sk_hex: Option<&str>,
     ring_path: Option<&[mirage_core::config::RingPathStep]>,
     ring_epoch_id: Option<u32>,
+    credential_params: Option<&mirage_core::crypto::credential::CredentialParams>,
 ) -> Result<String> {
     let mut obj: serde_json::Value =
         serde_json::from_str(template_raw).context("failed to parse client-template.json")?;
@@ -351,6 +352,12 @@ pub(crate) fn materialise(
             serde_json::Value::Number(serde_json::Number::from(eid)),
         );
     }
+    if let Some(cp) = credential_params {
+        match serde_json::to_value(cp) {
+            Ok(v) => { map.insert("credential_params".to_owned(), v); }
+            Err(e) => warn!("materialise: failed to serialise credential_params: {e}"),
+        }
+    }
     serde_json::to_string_pretty(&obj).context("failed to serialise materialised config")
 }
 
@@ -374,6 +381,10 @@ pub(crate) struct MaterialiseCtx {
     pub ring_member_sk_hex: Option<String>,
     pub ring_path: Option<Vec<mirage_core::config::RingPathStep>>,
     pub ring_epoch_id: Option<u32>,
+    /// Live arc from MonitorLink; snapshot at each rewrite() call so the config
+    /// always carries the latest accepted CredentialParams without requiring a
+    /// struct mutation.
+    pub credential_params_arc: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
 }
 
 impl MaterialiseCtx {
@@ -383,6 +394,8 @@ impl MaterialiseCtx {
         &self,
         chains: Vec<mirage_core::config::ChainConfig>,
     ) -> Result<()> {
+        let cp_guard = self.credential_params_arc.load();
+        let cp_ref = cp_guard.as_ref().as_ref();
         let json = materialise(
             &self.template_raw,
             chains,
@@ -393,6 +406,7 @@ impl MaterialiseCtx {
             self.ring_member_sk_hex.as_deref(),
             self.ring_path.as_deref(),
             self.ring_epoch_id,
+            cp_ref,
         )?;
         write_atomic(&self.client_config_path, &json)
     }
@@ -792,6 +806,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         ring_member_sk_hex: cfg.ring_member_sk_hex.clone(),
         ring_path: cfg.ring_path.clone(),
         ring_epoch_id: cfg.ring_epoch_id,
+        credential_params_arc: link.credential_params(),
     });
     spawn_frame_watcher(
         Arc::clone(&link),
@@ -849,7 +864,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     info!("[sentinel] first config: version={} chains={}", first_cfg.version, first_cfg.chains.len());
 
     let chains: Vec<_> = first_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
+    let cp_arc = link.credential_params();
+    let cp_guard = cp_arc.load();
+    let cp_ref = cp_guard.as_ref().as_ref();
+    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -1111,7 +1129,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
                 info!("[sentinel] config updated: v={} chains={}", new_cfg.version, new_cfg.chains.len());
                 let chains: Vec<_> = new_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
+                let cp_arc = link.credential_params();
+                let cp_guard = cp_arc.load();
+                let cp_ref = cp_guard.as_ref().as_ref();
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
@@ -1506,18 +1527,26 @@ fn spawn_frame_watcher(
                     }
                 }
                 WsServerFrame::CredentialParams(_) => {
-                    // Anon-credential epoch secrets are consumed inside MonitorLink
-                    // (stored in its credential_params ArcSwap, shared with the
-                    // cli's TunnelPool/MuxPool for per-dial token minting).
-                    // Sentinel itself does not dial, so nothing to do here.
-                    // However, we do update client-state.json so the GUI sees the
-                    // new credential scheme/generation without waiting for the next
-                    // Config frame.
-                    tracing::debug!(
-                        "[sentinel] CredentialParams frame observed (handled by MonitorLink)"
-                    );
+                    // MonitorLink has already stored the params in its credential_params
+                    // ArcSwap (which mat_ctx.credential_params_arc aliases).
+                    // Re-materialise the supervisor config so the new credential_params
+                    // field is written to disk immediately — the cli2 worker's next
+                    // restart will load them and clear the credential gate from config.
                     let chains_snapshot = link.subscribe().borrow().clone();
                     if let Some(cfg_snap) = chains_snapshot {
+                        let chains: Vec<_> = cfg_snap
+                            .chains
+                            .iter()
+                            .map(|c| c.chain.clone())
+                            .collect();
+                        match mat_ctx.rewrite(chains) {
+                            Ok(()) => info!(
+                                "[sentinel] CredentialParams: supervisor config rewritten"
+                            ),
+                            Err(e) => warn!(
+                                "[sentinel] CredentialParams: config rewrite failed: {}", e
+                            ),
+                        }
                         write_client_state(&state_dir, &cfg_snap.chains, &link);
                     }
                 }

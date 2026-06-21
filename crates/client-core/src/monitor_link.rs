@@ -978,6 +978,9 @@ impl MonitorLink {
             transport = transport_label,
             "monitor_link: CredentialParams updated"
         );
+        // Notify the sentinel frame watcher so it re-materialises the supervisor
+        // config with the new params (sentinel's CredentialParams arm calls rewrite).
+        let _ = self.frame_tx.send(Some(WsServerFrame::CredentialParams(params.clone())));
 
         // Step 5: ring-epoch change detection.
         // Find the RingMembership authority in the new params and extract its epoch_id.
