@@ -291,8 +291,6 @@ pub(crate) fn materialise(
     template_raw: &str,
     chains: Vec<mirage_core::config::ChainConfig>,
     operator_pub_hex: Option<&str>,
-    monitor_wire_addr: Option<&str>,
-    monitor_wire_pubkey_hex: Option<&str>,
     enrol_token: Option<&str>,
     ring_member_sk_hex: Option<&str>,
     ring_path: Option<&[mirage_core::config::RingPathStep]>,
@@ -323,12 +321,6 @@ pub(crate) fn materialise(
     // they are static per deployment and survive materialisation untouched.
     if let Some(op) = operator_pub_hex {
         map.insert("operator_pub_hex".to_owned(), serde_json::Value::String(op.to_owned()));
-    }
-    if let Some(addr) = monitor_wire_addr {
-        map.insert("monitor_wire_addr".to_owned(), serde_json::Value::String(addr.to_owned()));
-    }
-    if let Some(pk) = monitor_wire_pubkey_hex {
-        map.insert("monitor_wire_pubkey_hex".to_owned(), serde_json::Value::String(pk.to_owned()));
     }
     if let Some(tok) = enrol_token {
         map.insert("enrol_token".to_owned(), serde_json::Value::String(tok.to_owned()));
@@ -368,8 +360,6 @@ pub(crate) struct MaterialiseCtx {
     pub template_raw: String,
     pub client_config_path: PathBuf,
     pub operator_pub_hex: Option<String>,
-    pub monitor_wire_addr: Option<String>,
-    pub monitor_wire_pubkey_hex: Option<String>,
     pub enrol_token: Option<String>,
     pub ring_member_sk_hex: Option<String>,
     pub ring_path: Option<Vec<mirage_core::config::RingPathStep>>,
@@ -387,8 +377,6 @@ impl MaterialiseCtx {
             &self.template_raw,
             chains,
             self.operator_pub_hex.as_deref(),
-            self.monitor_wire_addr.as_deref(),
-            self.monitor_wire_pubkey_hex.as_deref(),
             self.enrol_token.as_deref(),
             self.ring_member_sk_hex.as_deref(),
             self.ring_path.as_deref(),
@@ -786,8 +774,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         template_raw: template_raw.clone(),
         client_config_path: cfg.client_config_path.clone(),
         operator_pub_hex: cfg.operator_pub_hex.clone(),
-        monitor_wire_addr: cfg.monitor_wire_addr.clone(),
-        monitor_wire_pubkey_hex: cfg.monitor_wire_pubkey_hex.clone(),
         enrol_token: cfg.enrol_token.clone(),
         ring_member_sk_hex: cfg.ring_member_sk_hex.clone(),
         ring_path: cfg.ring_path.clone(),
@@ -849,7 +835,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     info!("[sentinel] first config: version={} chains={}", first_cfg.version, first_cfg.chains.len());
 
     let chains: Vec<_> = first_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
+    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -1111,7 +1097,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
                 info!("[sentinel] config updated: v={} chains={}", new_cfg.version, new_cfg.chains.len());
                 let chains: Vec<_> = new_cfg.chains.iter().map(|c| c.chain.clone()).collect();
-                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
