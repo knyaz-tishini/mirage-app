@@ -1379,6 +1379,17 @@ impl MonitorLink {
             slot_index,
             "monitor_link: ring credential hot-swapped (epoch rotated)"
         );
+
+        // Nudge the sentinel's frame-watcher to re-materialise the supervisor
+        // config so the data-plane worker (a pure config consumer with no
+        // MonitorLink of its own in orchestrator mode) picks up this fresh ring
+        // credential on its next reload. Re-emitting the current CredentialParams
+        // drives the existing rewrite path, which now reads the live ring cell.
+        if let Some(params) = self.credential_params.load().as_ref().as_ref() {
+            let _ = self
+                .frame_tx
+                .send(Some(WsServerFrame::CredentialParams(params.clone())));
+        }
     }
 
     /// Handle a `RingEnrolError` frame: log, clear in-flight flag so the next

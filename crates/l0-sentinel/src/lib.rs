@@ -378,6 +378,9 @@ pub(crate) struct MaterialiseCtx {
     pub monitor_wire_addr: Option<String>,
     pub monitor_wire_pubkey_hex: Option<String>,
     pub enrol_token: Option<String>,
+    /// Ring credential seeded from `sentinel.toml` (the first/registration
+    /// artifact). Used as the FALLBACK when the live cell below is still empty
+    /// (cold boot before the first re-enrol completes).
     pub ring_member_sk_hex: Option<String>,
     pub ring_path: Option<Vec<mirage_core::config::RingPathStep>>,
     pub ring_epoch_id: Option<u32>,
@@ -385,6 +388,14 @@ pub(crate) struct MaterialiseCtx {
     /// always carries the latest accepted CredentialParams without requiring a
     /// struct mutation.
     pub credential_params_arc: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
+    /// Live ring-membership credential cell from MonitorLink. When the sentinel
+    /// re-enrols on epoch rotation, MonitorLink hot-swaps the fresh credential
+    /// here; rewrite() prefers it over the static `ring_*` fields above so the
+    /// data-plane worker (a pure config consumer) picks up the new credential on
+    /// its next config reload — without this, the worker would keep dialing a
+    /// stale epoch after its seeded one ages out of the declared set and the exit
+    /// would reject it as a "no-credential dial".
+    pub ring_cell: mirage_client_core::token_pool::RingCredentialCell,
 }
 
 impl MaterialiseCtx {
@@ -396,6 +407,37 @@ impl MaterialiseCtx {
     ) -> Result<()> {
         let cp_guard = self.credential_params_arc.load();
         let cp_ref = cp_guard.as_ref().as_ref();
+
+        // Prefer the LIVE ring credential (refreshed by MonitorLink's ring
+        // re-enrol on epoch rotation) over the static one seeded from
+        // sentinel.toml. This is the data-plane worker's only path to a fresh
+        // ring credential: it consumes the materialised config and rebuilds its
+        // 0x04 token from these fields, so a stale seed here = worker stuck on an
+        // aged-out epoch = exit rejects "no-credential dial".
+        let live_ring = self.ring_cell.load();
+        let (live_sk_hex, live_path) = match live_ring.as_ref().as_ref() {
+            Some(rc) => (
+                Some(hex::encode(rc.member_sk.to_bytes())),
+                Some(
+                    rc.path
+                        .iter()
+                        .map(|(sib, is_right)| mirage_core::config::RingPathStep {
+                            sibling_hex: hex::encode(sib),
+                            is_right: *is_right,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            None => (None, None),
+        };
+        let ring_epoch = live_ring
+            .as_ref()
+            .as_ref()
+            .map(|rc| rc.epoch_id)
+            .or(self.ring_epoch_id);
+        let sk_hex = live_sk_hex.as_deref().or(self.ring_member_sk_hex.as_deref());
+        let path = live_path.as_deref().or(self.ring_path.as_deref());
+
         let json = materialise(
             &self.template_raw,
             chains,
@@ -403,9 +445,9 @@ impl MaterialiseCtx {
             self.monitor_wire_addr.as_deref(),
             self.monitor_wire_pubkey_hex.as_deref(),
             self.enrol_token.as_deref(),
-            self.ring_member_sk_hex.as_deref(),
-            self.ring_path.as_deref(),
-            self.ring_epoch_id,
+            sk_hex,
+            path,
+            ring_epoch,
             cp_ref,
         )?;
         write_atomic(&self.client_config_path, &json)
@@ -807,6 +849,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         ring_path: cfg.ring_path.clone(),
         ring_epoch_id: cfg.ring_epoch_id,
         credential_params_arc: link.credential_params(),
+        ring_cell: link.ring_credential_cell(),
     });
     spawn_frame_watcher(
         Arc::clone(&link),
