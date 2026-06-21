@@ -32,6 +32,7 @@ mirage-mesh-client   = { workspace = true }
 mirage-ringmember    = { workspace = true }
 hex                  = "0.4"
 ed25519-dalek        = { workspace = true }
+blake3 = "1"
 
 # Linux-only: transparent.rs uses libc::getsockopt for SO_ORIGINAL_DST.
 # Windows/macOS builds compile this module out via cfg(target_os="linux").

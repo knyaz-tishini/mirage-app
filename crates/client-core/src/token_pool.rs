@@ -159,35 +159,194 @@ pub fn absorb_issue_result(
 /// membership is not configured).
 pub type RingCredentialCell = std::sync::Arc<arc_swap::ArcSwap<Option<RingCredential>>>;
 
+// ── NfCounter ─────────────────────────────────────────────────────────────────
+
+/// Monotonic nullifier-index counter for ring-membership (scheme 0x04) dials.
+///
+/// Two variants:
+/// - `Memory`: in-process only; resets to 0 on every worker spawn — suitable
+///   for tests and fallback paths where no shared directory is available.
+/// - `Persisted`: file-backed counter shared across all concurrent/restarted
+///   workers for the same client. A per-(member, epoch) file under `counter_dir`
+///   is exclusively locked on each claim so concurrent workers never race, and
+///   the counter survives process death without losing its position in the
+///   monotonic sequence.
+pub enum NfCounter {
+    /// In-process only (tests, or when no persistence dir is configured).
+    Memory(std::sync::atomic::AtomicU32),
+    /// File-backed, exclusively locked per claim, shared across processes.
+    Persisted { path: std::path::PathBuf },
+}
+
+impl NfCounter {
+    /// Claim the next nullifier index, atomically incrementing the counter.
+    ///
+    /// Returns the index to USE (the value before increment); the next call
+    /// returns that value plus one.
+    ///
+    /// Returns `None` on a filesystem error in the `Persisted` variant — the
+    /// caller must then mint NO credential for this dial (fail-safe: never risk
+    /// a nullifier replay by guessing or wrapping).
+    pub fn claim(&self) -> Option<u32> {
+        match self {
+            NfCounter::Memory(atom) => {
+                Some(atom.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            }
+            NfCounter::Persisted { path } => {
+                use std::io::{Read, Seek, SeekFrom, Write};
+
+                // Open (or create) the counter file; open both readable and
+                // writable so we can both read the current value and overwrite it.
+                let mut file = match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(path)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "nf_counter: failed to open counter file: {e}"
+                        );
+                        return None;
+                    }
+                };
+
+                // Acquire exclusive advisory lock — blocks until any concurrent
+                // worker releases it.  Released automatically when `file` drops
+                // or by the explicit `unlock()` call below.
+                if let Err(e) = file.lock() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "nf_counter: failed to lock counter file: {e}"
+                    );
+                    return None;
+                }
+
+                // Read up to 4 bytes from the start; treat empty/short as 0.
+                let mut buf = [0u8; 4];
+                let n = file.read(&mut buf).unwrap_or(0);
+                let cur = if n == 4 {
+                    u32::from_le_bytes(buf)
+                } else {
+                    0u32
+                };
+                let next = cur.wrapping_add(1);
+
+                // Seek back to the start and write the incremented value.
+                let write_ok = file
+                    .seek(SeekFrom::Start(0))
+                    .and_then(|_| file.write_all(&next.to_le_bytes()))
+                    .and_then(|_| file.flush())
+                    .and_then(|_| file.sync_data())
+                    .is_ok();
+
+                // Always attempt to release the lock before returning.
+                let _ = file.unlock();
+
+                if write_ok {
+                    Some(cur)
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "nf_counter: failed to write incremented value"
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
 // ── RingCredential (scheme 0x04) ──────────────────────────────────────────────
 
 /// Static ring-membership credential material (scheme 0x04). The member secret
 /// + Merkle path + the epoch_id whose tree the path matches are fixed for the
-/// process lifetime; only `next_nf` mutates. At dial time the client derives a
-/// fresh proof from this WHEN a RingMembership authority is currently published
-/// in the gossiped credential params.
+/// credential's lifetime; only the nullifier counter mutates. At dial time the
+/// client derives a fresh proof from this WHEN a RingMembership authority is
+/// currently published in the gossiped credential params.
 ///
-/// `next_nf` is a monotonic per-process nullifier-index counter. Every dial
-/// (initial connection AND each reconnect) consumes the next index so no two
-/// live dials present the same nullifier (which the node SpentSet would reject
-/// as a replay). The epoch's published `max_dials` bounds it; once exhausted the
-/// member must wait for an epoch rotation. Shared across the whole connection
-/// pool via the enclosing `Arc<Option<RingCredential>>`.
+/// The nullifier counter (`nf`) is a persistent, cross-process, per-(member,
+/// epoch) monotonic sequence. Every dial (initial connection AND each reconnect)
+/// claims the next index so no two live dials — including those from concurrent
+/// or restarted worker processes for the same client — present the same nullifier
+/// to the exit node's SpentSet. Once the epoch's published `max_dials` budget is
+/// exhausted the member must wait for an epoch rotation (new epoch → counter
+/// resets to 0 because the exit's SpentSet for that epoch is empty).
+///
+/// Shared across the whole connection pool via the enclosing
+/// `Arc<Option<RingCredential>>`.
 pub struct RingCredential {
     pub member_sk: mirage_ringmember::MemberSecret,
     pub path: Vec<mirage_ringmember::PathStep>,
     pub epoch_id: u32,
-    pub next_nf: std::sync::atomic::AtomicU32,
+    pub nf: NfCounter,
 }
 
 impl RingCredential {
-    /// Construct from decoded material; the nullifier counter starts at 0.
+    /// Construct from decoded material with an in-process nullifier counter
+    /// starting at 0.  Suitable for tests and call sites where no shared
+    /// directory is available.
     pub fn new(
         member_sk: mirage_ringmember::MemberSecret,
         path: Vec<mirage_ringmember::PathStep>,
         epoch_id: u32,
     ) -> Self {
-        Self { member_sk, path, epoch_id, next_nf: std::sync::atomic::AtomicU32::new(0) }
+        Self {
+            member_sk,
+            path,
+            epoch_id,
+            nf: NfCounter::Memory(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    /// Construct with a file-backed nullifier counter shared across processes.
+    ///
+    /// The counter file is placed in `counter_dir` and named
+    /// `ring-nf-e{epoch_id}-{member8}.ctr`, where `member8` is the first 8 hex
+    /// characters of `blake3::hash(member_sk.to_bytes())`. Keying by both epoch
+    /// and member ensures distinct (member, epoch) pairs never share a counter,
+    /// and a fresh epoch automatically starts at 0 (the exit's SpentSet for a
+    /// new epoch is empty).
+    ///
+    /// `counter_dir` is created (including all parents) if it does not exist.
+    /// On a creation error the constructor falls back to `Memory` with a `warn!`
+    /// rather than failing — it is always better to dial with a potentially
+    /// replayed nullifier detection at the exit than to drop all dials.
+    pub fn new_persisted(
+        member_sk: mirage_ringmember::MemberSecret,
+        path: Vec<mirage_ringmember::PathStep>,
+        epoch_id: u32,
+        counter_dir: &std::path::Path,
+    ) -> Self {
+        // Derive an 8-hex-char member fingerprint for the filename.
+        let member_bytes = member_sk.to_bytes();
+        let hash = blake3::hash(&member_bytes);
+        let member8 = hex::encode(&hash.as_bytes()[..4]); // 4 bytes → 8 hex chars
+        let filename = format!("ring-nf-e{epoch_id}-{member8}.ctr");
+        let counter_path = counter_dir.join(&filename);
+
+        // Ensure the directory exists; if creation fails, fall back to memory.
+        if let Err(e) = std::fs::create_dir_all(counter_dir) {
+            tracing::warn!(
+                dir = %counter_dir.display(),
+                "ring_credential: failed to create counter dir ({e}) — using in-process counter"
+            );
+            return Self {
+                member_sk,
+                path,
+                epoch_id,
+                nf: NfCounter::Memory(std::sync::atomic::AtomicU32::new(0)),
+            };
+        }
+
+        Self {
+            member_sk,
+            path,
+            epoch_id,
+            nf: NfCounter::Persisted { path: counter_path },
+        }
     }
 }
 
@@ -196,9 +355,11 @@ impl RingCredential {
 /// member's per-epoch dial budget is not exhausted. Returns `None` otherwise —
 /// caller then falls back to the blind 0x03 token / EpochHmac.
 ///
-/// Each call consumes the next nullifier index from `ring.next_nf`, so a pool of
-/// N connections (and their reconnects) presents N distinct nullifiers rather
-/// than replaying one. `max_dials` is read from the epoch's published
+/// Each call claims the next nullifier index from `ring.nf` (persisted per
+/// (member, epoch) across processes), so a pool of N connections (and their
+/// reconnects), plus any concurrent or restarted workers for the same client,
+/// each present a distinct nullifier rather than replaying one. `max_dials` is
+/// read from the epoch's published
 /// `verify_material` (root || max_dials_le); a bare 32-byte root means strict
 /// single-use (1).
 /// Per-dial context bytes a ring proof binds to: the EXIT hop's node_id (the
@@ -234,10 +395,22 @@ pub(crate) fn build_ring_credential(
     } else {
         1
     };
-    // Claim the next nullifier index. Once the budget is spent, stop minting —
-    // dialing without a credential under require=true then fails fast, the
-    // correct signal that the epoch's budget is exhausted (rotate / raise it).
-    let nf_index = ring.next_nf.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Claim the next nullifier index from the persistent cross-process counter.
+    // Returns None on a filesystem error — fail safe: no credential minted for
+    // this dial rather than risking a replay.
+    let nf_index = match ring.nf.claim() {
+        Some(i) => i,
+        None => {
+            tracing::warn!(
+                epoch_id = ring.epoch_id,
+                "ring credential: nullifier counter claim failed — no 0x04 minted for this dial"
+            );
+            return None;
+        }
+    };
+    // Once the per-epoch dial budget is spent, stop minting — dialing without a
+    // credential under require=true then fails fast, the correct signal that the
+    // epoch's budget is exhausted (rotate / raise it).
     if nf_index >= max_dials {
         tracing::warn!(
             nf_index,

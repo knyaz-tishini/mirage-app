@@ -251,13 +251,29 @@ async fn main() -> anyhow::Result<()> {
     let token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>> =
         Arc::new(ArcSwap::from_pointee(mirage_client_core::token_pool::TokenPool::default()));
 
+    // Derive the per-client shared counter directory from the config file path.
+    // All workers for the same client read the same config file, so its parent
+    // directory is a natural shared location for cross-process counter files.
+    let nf_counter_dir = std::path::Path::new(&config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+
     // Ring-membership credential (scheme 0x04). Parsed once at startup; wrapped
     // in a RingCredentialCell so MonitorLink can hot-swap it on epoch rotation.
+    // The persisted counter ensures concurrent/restarted workers continue the
+    // monotonic nullifier sequence and never replay an index the exit has seen.
+    info!(
+        chain_id = %chain_id,
+        counter_dir = %nf_counter_dir.display(),
+        "ring credential: wiring persisted nullifier counter"
+    );
     let ring_credential: mirage_client_core::token_pool::RingCredentialCell =
         Arc::new(ArcSwap::from_pointee(ring_credential_from_config(
             ring_member_sk_hex_str.as_deref(),
             ring_path_str.as_deref(),
             ring_epoch_id_str,
+            &nf_counter_dir,
         )));
 
     // Gate initial dials when the operator key is configured: credential-gated
@@ -398,6 +414,7 @@ async fn main() -> anyhow::Result<()> {
         wire_pubkey_str,
         operator_pub_hex_str,
         enrol_token_str,
+        nf_counter_dir,
     )
     .await;
 
@@ -440,6 +457,7 @@ async fn supervisor_loop(
     wire_pubkey: Option<String>,
     operator_pub_hex: Option<String>,
     enrol_token: Option<String>,
+    nf_counter_dir: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     let mut ipc = initial_ipc;
 
@@ -465,6 +483,7 @@ async fn supervisor_loop(
             wire_pubkey.clone(),
             operator_pub_hex.clone(),
             enrol_token.clone(),
+            nf_counter_dir.clone(),
         )
         .await;
 
@@ -575,6 +594,7 @@ async fn handle_session(
     wire_pubkey: Option<String>,
     operator_pub_hex: Option<String>,
     enrol_token: Option<String>,
+    nf_counter_dir: std::path::PathBuf,
 ) -> SessionEnd {
     loop {
         tokio::select! {
@@ -648,6 +668,7 @@ async fn handle_session(
                     wire_pubkey.clone(),
                     operator_pub_hex.clone(),
                     enrol_token.clone(),
+                    nf_counter_dir.clone(),
                 );
             }
             Ok(Some(SupervisorMsg::Drain { timeout_secs })) => {
@@ -755,6 +776,7 @@ fn spawn_monitor_link_in_worker(
     wire_pubkey: Option<String>,
     operator_pub_hex: Option<String>,
     enrol_token: Option<String>,
+    nf_counter_dir: std::path::PathBuf,
 ) {
     // Parse transport specs from JSON.
     let transport_specs: Vec<MonitorTransportSpec> = match serde_json::from_str(&transports_json) {
@@ -874,6 +896,7 @@ fn spawn_monitor_link_in_worker(
         operator_pub,
     );
     monitor_link.set_enrol_token(enrol_token);
+    monitor_link.set_nf_counter_dir(nf_counter_dir);
     monitor_link.spawn();
 
     let chain_id_owned = chain_id.to_string();
@@ -997,10 +1020,15 @@ async fn wait_for_start(
 /// Parse ring-membership credential material from config fields, if present
 /// and well-formed. Returns None (with a warn) if any field is missing/invalid —
 /// the worker then dials without a 0x04 credential.
+///
+/// `counter_dir` is the directory where the per-(member, epoch) nullifier
+/// counter file is stored. Using the config file's parent ensures all concurrent
+/// and restarted workers for the same client share a single monotonic counter.
 fn ring_credential_from_config(
     sk_hex: Option<&str>,
     path_cfg: Option<&[mirage_core::config::RingPathStep]>,
     epoch_id: Option<u32>,
+    counter_dir: &std::path::Path,
 ) -> Option<mirage_client_core::RingCredential> {
     let sk_hex = sk_hex?;
     let path_cfg = path_cfg?;
@@ -1021,5 +1049,5 @@ fn ring_credential_from_config(
             .ok()?;
         path.push((sib, step.is_right));
     }
-    Some(mirage_client_core::RingCredential::new(member_sk, path, epoch_id))
+    Some(mirage_client_core::RingCredential::new_persisted(member_sk, path, epoch_id, counter_dir))
 }

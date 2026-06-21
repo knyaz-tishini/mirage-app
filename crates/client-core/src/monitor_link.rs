@@ -684,6 +684,14 @@ pub struct MonitorLink {
     /// can use a single atomic without needing a sentinel value that collides
     /// with real epoch_ids.
     last_ring_epoch_requested: AtomicU64,
+    /// Directory for persisted nullifier counter files.
+    ///
+    /// When `Some`, `handle_ring_slot` uses `RingCredential::new_persisted`
+    /// so the hot-swapped credential inherits the cross-process counter.
+    /// When `None`, falls back to `RingCredential::new` (in-process counter).
+    /// Workers pass the config-file parent dir here; the sentinel leaves it
+    /// `None` because the sentinel does not dial the data-plane directly.
+    nf_counter_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl MonitorLink {
@@ -846,9 +854,26 @@ impl MonitorLink {
             ring_cell,
             ring_enrol_in_flight: AtomicBool::new(false),
             last_ring_epoch_requested: AtomicU64::new(0),
+            nf_counter_dir: std::sync::Mutex::new(None),
         });
 
         (link, config_rx)
+    }
+
+    /// Set the directory used for persisted nullifier counter files on
+    /// ring-credential hot-swap (`handle_ring_slot`).
+    ///
+    /// Call this after construction and before `spawn()` when the MonitorLink
+    /// is hosted in a data-plane worker process that dials exit nodes. Pass the
+    /// parent directory of the worker's config file so all concurrent/restarted
+    /// workers for the same client share a single monotonic counter.
+    ///
+    /// Leave unset (default `None`) in sentinel or non-dialing processes — they
+    /// fall back to the in-process counter which is correct for their roles.
+    pub fn set_nf_counter_dir(&self, dir: std::path::PathBuf) {
+        if let Ok(mut guard) = self.nf_counter_dir.lock() {
+            *guard = Some(dir);
+        }
     }
 
     /// Return the shared ring-credential cell.
@@ -1370,7 +1395,23 @@ impl MonitorLink {
             decoded_path.push((sib, step.is_right));
         }
 
-        let rc = crate::token_pool::RingCredential::new(member_sk, decoded_path, epoch_id);
+        let rc = {
+            let dir_guard = self.nf_counter_dir.lock().ok();
+            let dir_opt = dir_guard.as_ref().and_then(|g| g.as_ref());
+            match dir_opt {
+                Some(dir) => {
+                    crate::token_pool::RingCredential::new_persisted(
+                        member_sk,
+                        decoded_path,
+                        epoch_id,
+                        dir,
+                    )
+                }
+                None => {
+                    crate::token_pool::RingCredential::new(member_sk, decoded_path, epoch_id)
+                }
+            }
+        };
         self.ring_cell.store(Arc::new(Some(rc)));
         self.ring_enrol_in_flight.store(false, Ordering::Release);
         info!(
