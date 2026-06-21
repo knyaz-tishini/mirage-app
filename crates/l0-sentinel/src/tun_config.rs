@@ -1,4 +1,9 @@
-//! Auto-generation of tun.json `relay_addrs` from materialised chain config.
+//! Auto-generation of tun.json from materialised chain config.
+//!
+//! Writes a complete macOS tun `BinConfig`-compatible JSON file. Managed fields
+//! (`relay_addrs`, `chains`) are always overwritten from live chain data.
+//! Defaults (`tun_addr`, `mtu`, etc.) are inserted only when absent so a user
+//! template can override them.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -10,13 +15,19 @@ use tracing::{info, warn};
 
 use crate::MANAGED_BY_VALUE;
 
+/// Private/LAN ranges that must egress DIRECT (real NIC), never the tunnel —
+/// so SSH and local services survive when the tun default-routes everything.
+const LAN_BYPASS_CIDRS: &[&str] =
+    &["192.168.0.0/16", "172.16.0.0/12", "10.0.0.0/8", "169.254.0.0/16"];
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Write (or update) the tun.json at `path`.
 ///
-/// - Collects every v4/v6 IP from `l1`, `l2`, and `hops[*].addr` across all chains.
-/// - Loads the template from `template_path` (or uses a minimal stub when `None`).
-/// - Injects `relay_addrs` + `_managed_by` marker.
+/// Produces a complete macOS tun `BinConfig`-compatible JSON:
+/// - Always managed: `relay_addrs`, `chains`, `_managed_by`.
+/// - Insert-if-absent (template overrides): `tun_addr`, `mtu`, `kill_switch`,
+///   `chain_dns`, `dns_upstream`, `api_bind`, `bypass`.
 /// - Atomic write (tmp + rename).
 ///
 /// `respect_user_config`: when `true`, skips writing if the file exists without
@@ -53,25 +64,77 @@ pub fn write_tun_config(
         .as_object_mut()
         .context("tun template must be a JSON object")?;
 
-    // Collect relay IPs.
+    // ── Managed: always overwritten from live chain data ──────────────────────
+
+    // Collect relay IPs (host part of every hop addr, deduped).
     let (v4_addrs, v6_addrs) = extract_relay_addrs(chains);
     let n_v4 = v4_addrs.len();
     let n_v6 = v6_addrs.len();
 
-    let mut all: Vec<serde_json::Value> = v4_addrs
+    let mut relay_vals: Vec<serde_json::Value> = v4_addrs
         .into_iter()
         .chain(v6_addrs)
         .map(|ip| serde_json::Value::String(ip.to_string()))
         .collect();
-    // Sort for deterministic output.
-    all.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    relay_vals.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
 
-    // Always overwrite relay_addrs (even if template had hardcoded ones).
-    map.insert("relay_addrs".to_owned(), serde_json::Value::Array(all));
+    map.insert("relay_addrs".to_owned(), serde_json::Value::Array(relay_vals));
+
+    // Build chains array: one entry per ChainConfig with a deterministic
+    // socks5_addr (127.0.0.1:{19480 + index}). Uses socks5_bind when present
+    // so the value matches what materialise() injected into client-config.json.
+    let chains_val: Vec<serde_json::Value> = chains
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let socks5_addr = c
+                .socks5_bind
+                .clone()
+                .unwrap_or_else(|| format!("127.0.0.1:{}", 19480u16 + i as u16));
+            serde_json::json!({
+                "name": c.chain_id,
+                "socks5_addr": socks5_addr,
+            })
+        })
+        .collect();
+    let n_chains = chains_val.len();
+    map.insert("chains".to_owned(), serde_json::Value::Array(chains_val));
+
     map.insert(
         "_managed_by".to_owned(),
         serde_json::Value::String(MANAGED_BY_VALUE.to_owned()),
     );
+
+    // ── Insert-if-absent: template can override these ─────────────────────────
+
+    if !map.contains_key("tun_addr") {
+        map.insert("tun_addr".to_owned(), serde_json::json!("10.255.0.2/24"));
+    }
+    if !map.contains_key("mtu") {
+        map.insert("mtu".to_owned(), serde_json::json!(1280u16));
+    }
+    if !map.contains_key("kill_switch") {
+        map.insert("kill_switch".to_owned(), serde_json::json!(false));
+    }
+    if !map.contains_key("chain_dns") {
+        map.insert("chain_dns".to_owned(), serde_json::json!([]));
+    }
+    if !map.contains_key("dns_upstream") {
+        map.insert("dns_upstream".to_owned(), serde_json::json!("8.8.8.8:53"));
+    }
+    if !map.contains_key("api_bind") {
+        map.insert("api_bind".to_owned(), serde_json::json!("127.0.0.1:19485"));
+    }
+    if !map.contains_key("bypass") {
+        let cidrs: Vec<serde_json::Value> = LAN_BYPASS_CIDRS
+            .iter()
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .collect();
+        map.insert(
+            "bypass".to_owned(),
+            serde_json::json!({"cidrs": cidrs, "domains": []}),
+        );
+    }
 
     let content =
         serde_json::to_string_pretty(&obj).context("failed to serialise tun config")?;
@@ -79,8 +142,8 @@ pub fn write_tun_config(
         .with_context(|| format!("failed to write tun config {:?}", path))?;
 
     info!(
-        "[sentinel] wrote tun config {:?} (relay_addrs: {} v4, {} v6)",
-        path, n_v4, n_v6
+        "[sentinel] wrote tun config {:?} (chains: {}, relay_addrs: {} v4, {} v6)",
+        path, n_chains, n_v4, n_v6
     );
     Ok(())
 }
@@ -261,6 +324,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tpl_path = dir.path().join("tun-template.json");
         // Template has hardcoded relay_addrs — they should be replaced.
+        // socks5_addr is a top-level template key (not inside chains[]) so it must
+        // be preserved by the insert-if-absent logic.
         std::fs::write(
             &tpl_path,
             r#"{"relay_addrs":["100.100.100.100"],"socks5_addr":"127.0.0.1:19480"}"#,
@@ -285,7 +350,7 @@ mod tests {
         );
         // Must contain actual chain IPs.
         assert_eq!(addrs.len(), 2);
-        // socks5_addr from template must be preserved.
+        // socks5_addr from template must be preserved (top-level key, not managed).
         assert_eq!(v["socks5_addr"].as_str(), Some("127.0.0.1:19480"));
     }
 
@@ -304,5 +369,40 @@ mod tests {
         let result = write_tun_config(&[chain], &out_path, Some(tpl_path.as_path()), true);
         assert!(result.is_err(), "malformed template must return error");
         assert!(!out_path.exists(), "output file must not be created on template error");
+    }
+
+    #[test]
+    fn tun_config_complete_binconfig_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tun.json").to_path_buf();
+
+        // Single chain with socks5_bind: None — defaults to 127.0.0.1:19480.
+        let mut chain = make_chain_hops(vec![make_hop("1.2.3.4:8443", HopRole::Entry)]);
+        chain.chain_id = "chain-abc".into();
+        chain.socks5_bind = None;
+
+        write_tun_config(&[chain], &path, None, true).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(v["tun_addr"].as_str(), Some("10.255.0.2/24"));
+        assert_eq!(v["mtu"].as_u64(), Some(1280));
+        assert_eq!(v["kill_switch"].as_bool(), Some(false));
+        assert_eq!(v["dns_upstream"].as_str(), Some("8.8.8.8:53"));
+        assert_eq!(v["api_bind"].as_str(), Some("127.0.0.1:19485"));
+
+        let chains = v["chains"].as_array().unwrap();
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0]["name"].as_str(), Some("chain-abc"));
+        assert_eq!(chains[0]["socks5_addr"].as_str(), Some("127.0.0.1:19480"));
+
+        let bypass = &v["bypass"];
+        assert!(bypass.is_object(), "bypass must be an object");
+        let cidrs = bypass["cidrs"].as_array().unwrap();
+        assert!(
+            cidrs.iter().any(|c| c.as_str() == Some("192.168.0.0/16")),
+            "bypass must contain LAN CIDR"
+        );
     }
 }

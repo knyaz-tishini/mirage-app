@@ -257,6 +257,17 @@ pub(crate) fn default_mesh_id() -> String { "v3-staging".into() }
 pub(crate) fn default_role() -> String { "sentry-client".into() }
 pub(crate) fn default_spawn_cli() -> bool { true }
 
+/// Extract the path following a `--config <path>` pair in tun args.
+/// macOS tun uses `--config <tun.json>`; when `tun_config_path` is unset we
+/// derive the write target from these args so a single `tun_args_macos`
+/// setting is enough to enable tun.json generation.
+pub(crate) fn extract_config_arg(args: &[String]) -> Option<std::path::PathBuf> {
+    args.iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+}
+
 // ── Managed marker ────────────────────────────────────────────────────────────
 
 pub(crate) const MANAGED_BY_VALUE: &str = "mirage-l0-sentinel";
@@ -289,6 +300,15 @@ pub(crate) fn materialise(
         serde_json::from_str(template_raw).context("failed to parse client-template.json")?;
     let map = obj.as_object_mut().context("client-template.json must be a JSON object")?;
     map.remove("chains");
+    // cli2's from_client_config hard-errors on any chain whose socks5_bind is
+    // None — the monitor pushes chains without socks5_bind set, so we inject a
+    // deterministic default here. Port scheme: 127.0.0.1:{19480 + index}.
+    let mut chains = chains;
+    for (i, chain) in chains.iter_mut().enumerate() {
+        if chain.socks5_bind.is_none() {
+            chain.socks5_bind = Some(format!("127.0.0.1:{}", 19480u16 + i as u16));
+        }
+    }
     let chains_val = serde_json::to_value(&chains).context("failed to serialise chains")?;
     map.insert("chains".to_owned(), chains_val);
     map.insert("_managed_by".to_owned(), serde_json::Value::String(MANAGED_BY_VALUE.to_owned()));
@@ -397,6 +417,15 @@ pub(crate) fn resolve_cli_binary_and_args(cfg: &SentinelConfig) -> (PathBuf, Vec
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: SentinelConfig) -> Result<()> {
+    // Derive the effective tun config write path: explicit `tun_config_path`
+    // wins; otherwise auto-extract from `--config <path>` in the macOS tun
+    // args. This lets a single `tun_args_macos = ["--config", ".../tun.json"]`
+    // setting enable tun.json generation without also setting `tun_config_path`.
+    let effective_tun_config_path: Option<std::path::PathBuf> = cfg
+        .tun_config_path
+        .clone()
+        .or_else(|| extract_config_arg(&cfg.effective_tun_args()));
+
     // Bootstrap order: persisted dynamic list (monitor_urls.json) wins over
     // static sentinel.toml. This lets a fresh cluster member that joined via
     // peer-mesh keep its current monitor list across restarts even when the
@@ -816,7 +845,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
     info!("[sentinel] wrote {:?}", cfg.client_config_path);
     write_client_state(&state_dir, &first_cfg.chains, &link);
-    if let Some(ref tun_path) = cfg.tun_config_path {
+    if let Some(ref tun_path) = effective_tun_config_path {
         if let Err(e) = tun_config::write_tun_config(
             &chains,
             tun_path,
@@ -1073,7 +1102,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
                             write_client_state(&state_dir, &new_cfg.chains, &link);
-                            if let Some(ref tun_path) = cfg.tun_config_path {
+                            if let Some(ref tun_path) = effective_tun_config_path {
                                 if let Err(e) = tun_config::write_tun_config(
                                     &chains,
                                     tun_path,

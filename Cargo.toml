@@ -14,6 +14,7 @@ members = [
     "crates/runtime-guard",
     "crates/debug-shell",
     "crates/launcher",
+    # "crates/client-gui",  # uses vello-gpu + wgpu 29; windows-core version conflicts with launcher workspace — own workspace root
     "crates/awg-share-gen",
     "crates/v2ray-share-gen",
     "crates/foreign-probe",
