@@ -474,51 +474,30 @@ async fn restart_self_handler(State(_state): State<ServerState>) -> impl IntoRes
 
 // ── Tun readiness polling ─────────────────────────────────────────────────────
 
-/// Poll `GET 127.0.0.1:19420/status` until the tun child reports `alive==true`
-/// or the timeout expires.  Uses a short-lived reqwest client to avoid
-/// dependency on the global state; returns `true` when tun is alive.
+/// Poll the tun's own control/metrics API listener (`127.0.0.1:19485`, the
+/// `api_bind` from tun.json) until it accepts a TCP connection or the timeout
+/// expires.  The tun binds this listener LAST, after the utun interface is up
+/// and the default route is captured, so a successful connect means the tun is
+/// fully ready to intercept traffic.
 ///
-/// This is the readiness signal for the data-plane re-establish: the tun has
-/// captured the default route and is ready to intercept traffic.
+/// (The sentinel `/status` `tun.alive` field is unreliable for a sudo-spawned
+/// tun child, so we probe the tun's listener directly.)
 async fn wait_for_tun_alive(timeout: std::time::Duration) -> bool {
-    #[derive(Deserialize)]
-    struct StatusSnap {
-        #[serde(default)]
-        tun: Option<TunAliveSnap>,
-    }
-    #[derive(Deserialize)]
-    struct TunAliveSnap {
-        alive: bool,
-    }
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("[sentinel] wait_for_tun_alive: client build failed: {}", e);
-            return false;
-        }
-    };
-
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        let alive = client
-            .get("http://127.0.0.1:19420/status")
-            .send()
-            .await
-            .ok()
-            .and_then(|r| if r.status().is_success() { Some(r) } else { None });
-        if let Some(resp) = alive {
-            if let Ok(snap) = resp.json::<StatusSnap>().await {
-                if snap.tun.map(|t| t.alive).unwrap_or(false) {
-                    return true;
-                }
-            }
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect("127.0.0.1:19485"),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_some();
+        if connected {
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
