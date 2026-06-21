@@ -362,10 +362,55 @@ pub(crate) fn materialise(
 }
 
 pub(crate) fn write_atomic(path: &PathBuf, content: &str) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // Unique tmp name per call: the sentinel fires several config-rewrite tasks
+    // (Config snapshot / ChainAvailable / CredentialParams) that can run nearly
+    // concurrently. A fixed `<name>.tmp` made them race — two writers truncating
+    // the same tmp, one rename hitting a half-written/already-renamed file →
+    // "rename failed" and a stale config left on disk. A per-call suffix removes
+    // the collision so every rewrite lands atomically.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
     std::fs::write(&tmp, content).with_context(|| format!("write tmp file {:?}", tmp))?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename {:?} -> {:?}", tmp, path))?;
     Ok(())
+}
+
+/// Prefer the LIVE hot-swapped ring credential (from MonitorLink's cell) over
+/// the static seed from `sentinel.toml`. EVERY config-materialisation path must
+/// route ring fields through this — `MaterialiseCtx::rewrite` (the credential /
+/// ChainAvailable fast-paths) AND the main config-snapshot handler. If the
+/// snapshot handler materialises from the static seed instead, each (frequent)
+/// snapshot push clobbers the fresh epoch the credential path just wrote,
+/// pinning the data-plane worker to the stale seed epoch — which, once it ages
+/// out or its exit SpentSet is spent, the exit rejects forever (CREDENTIAL_REJECTED).
+pub(crate) fn resolve_ring_fields(
+    ring_cell: &mirage_client_core::token_pool::RingCredentialCell,
+    static_sk_hex: Option<String>,
+    static_path: Option<Vec<mirage_core::config::RingPathStep>>,
+    static_epoch: Option<u32>,
+) -> (
+    Option<String>,
+    Option<Vec<mirage_core::config::RingPathStep>>,
+    Option<u32>,
+) {
+    let live = ring_cell.load();
+    match live.as_ref().as_ref() {
+        Some(rc) => (
+            Some(hex::encode(rc.member_sk.to_bytes())),
+            Some(
+                rc.path
+                    .iter()
+                    .map(|(sib, is_right)| mirage_core::config::RingPathStep {
+                        sibling_hex: hex::encode(sib),
+                        is_right: *is_right,
+                    })
+                    .collect(),
+            ),
+            Some(rc.epoch_id),
+        ),
+        None => (static_sk_hex, static_path, static_epoch),
+    }
 }
 
 /// Captures the inputs required to re-materialise and atomically write the
@@ -410,33 +455,14 @@ impl MaterialiseCtx {
 
         // Prefer the LIVE ring credential (refreshed by MonitorLink's ring
         // re-enrol on epoch rotation) over the static one seeded from
-        // sentinel.toml. This is the data-plane worker's only path to a fresh
-        // ring credential: it consumes the materialised config and rebuilds its
-        // 0x04 token from these fields, so a stale seed here = worker stuck on an
-        // aged-out epoch = exit rejects "no-credential dial".
-        let live_ring = self.ring_cell.load();
-        let (live_sk_hex, live_path) = match live_ring.as_ref().as_ref() {
-            Some(rc) => (
-                Some(hex::encode(rc.member_sk.to_bytes())),
-                Some(
-                    rc.path
-                        .iter()
-                        .map(|(sib, is_right)| mirage_core::config::RingPathStep {
-                            sibling_hex: hex::encode(sib),
-                            is_right: *is_right,
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-            ),
-            None => (None, None),
-        };
-        let ring_epoch = live_ring
-            .as_ref()
-            .as_ref()
-            .map(|rc| rc.epoch_id)
-            .or(self.ring_epoch_id);
-        let sk_hex = live_sk_hex.as_deref().or(self.ring_member_sk_hex.as_deref());
-        let path = live_path.as_deref().or(self.ring_path.as_deref());
+        // sentinel.toml. Shared with the main config-snapshot handler via
+        // `resolve_ring_fields` so neither path can clobber the other.
+        let (sk_owned, path_owned, ring_epoch) = resolve_ring_fields(
+            &self.ring_cell,
+            self.ring_member_sk_hex.clone(),
+            self.ring_path.clone(),
+            self.ring_epoch_id,
+        );
 
         let json = materialise(
             &self.template_raw,
@@ -445,8 +471,8 @@ impl MaterialiseCtx {
             self.monitor_wire_addr.as_deref(),
             self.monitor_wire_pubkey_hex.as_deref(),
             self.enrol_token.as_deref(),
-            sk_hex,
-            path,
+            sk_owned.as_deref(),
+            path_owned.as_deref(),
             ring_epoch,
             cp_ref,
         )?;
@@ -1188,7 +1214,17 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                 let cp_arc = link.credential_params();
                 let cp_guard = cp_arc.load();
                 let cp_ref = cp_guard.as_ref().as_ref();
-                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref) {
+                // Prefer the live hot-swapped ring credential over the static
+                // seed — otherwise this (frequent) snapshot rewrite clobbers the
+                // fresh epoch the credential path wrote, pinning the worker to the
+                // stale seed epoch (the CREDENTIAL_REJECTED root cause).
+                let (ring_sk_owned, ring_path_owned, ring_epoch_owned) = resolve_ring_fields(
+                    &link.ring_credential_cell(),
+                    cfg.ring_member_sk_hex.clone(),
+                    cfg.ring_path.clone(),
+                    cfg.ring_epoch_id,
+                );
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), ring_sk_owned.as_deref(), ring_path_owned.as_deref(), ring_epoch_owned, cp_ref) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
