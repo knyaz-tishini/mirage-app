@@ -1,6 +1,7 @@
 //! mirage-l0-sentinel library — embeddable sentinel logic.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -298,6 +299,7 @@ pub(crate) fn materialise(
     ring_path: Option<&[mirage_core::config::RingPathStep]>,
     ring_epoch_id: Option<u32>,
     credential_params: Option<&mirage_core::crypto::credential::CredentialParams>,
+    connect_generation: u64,
 ) -> Result<String> {
     let mut obj: serde_json::Value =
         serde_json::from_str(template_raw).context("failed to parse client-template.json")?;
@@ -315,6 +317,18 @@ pub(crate) fn materialise(
     let chains_val = serde_json::to_value(&chains).context("failed to serialise chains")?;
     map.insert("chains".to_owned(), chains_val);
     map.insert("_managed_by".to_owned(), serde_json::Value::String(MANAGED_BY_VALUE.to_owned()));
+    // Monotonic counter that changes on every connect/disconnect.  The cli2
+    // supervisor hashes client-config.json content to detect changes; embedding
+    // this counter ensures a connect/disconnect always produces a different
+    // fingerprint and triggers a drain+respawn of the worker, which forces fresh
+    // carrier establishment under the new routing (tun up or direct).
+    // The field is present in EVERY materialise call with the SAME value unless
+    // connect/disconnect bumps it — so routine monitor-push rewrites do NOT
+    // change the fingerprint and cause spurious respawns.
+    map.insert(
+        "_connect_generation".to_owned(),
+        serde_json::Value::Number(serde_json::Number::from(connect_generation)),
+    );
     // Inject blind-token credentials so the spawned cli's own MonitorLink can
     // request a batch and spend one token per dial under a require=true fleet.
     // `enrol_token` is one-time and operator-delivered via sentinel.toml (it
@@ -416,7 +430,7 @@ pub(crate) fn resolve_ring_fields(
 /// Captures the inputs required to re-materialise and atomically write the
 /// supervisor config on demand (e.g. from `ChainAvailable` fast-path nudge).
 /// All fields are immutable after construction; shared via `Arc`.
-pub(crate) struct MaterialiseCtx {
+pub struct MaterialiseCtx {
     pub template_raw: String,
     pub client_config_path: PathBuf,
     pub operator_pub_hex: Option<String>,
@@ -441,14 +455,35 @@ pub(crate) struct MaterialiseCtx {
     /// stale epoch after its seeded one ages out of the declared set and the exit
     /// would reject it as a "no-credential dial".
     pub ring_cell: mirage_client_core::token_pool::RingCredentialCell,
+    /// Monotonic counter shared with the status server.  Bumped on connect and
+    /// disconnect; embedded in every materialised config as `_connect_generation`
+    /// so that a bump always changes the file's content fingerprint and triggers
+    /// a cli2 supervisor drain+respawn.  Routine monitor-push rewrites read the
+    /// current value without incrementing it — no spurious respawns.
+    pub connect_generation: Arc<AtomicU64>,
 }
 
 impl MaterialiseCtx {
     /// Materialise using the supplied chain list and atomically write
-    /// `client_config_path`.  Returns the written path on success.
+    /// `client_config_path`.  Reads the current `connect_generation` without
+    /// incrementing it — routine monitor-push rewrites preserve the same
+    /// generation value and therefore do not change the content fingerprint,
+    /// preventing spurious cli2 worker respawns.
     pub(crate) fn rewrite(
         &self,
         chains: Vec<mirage_core::config::ChainConfig>,
+    ) -> Result<()> {
+        let gen = self.connect_generation.load(Ordering::Relaxed);
+        self.rewrite_with_generation(chains, gen)
+    }
+
+    /// Materialise with an explicitly supplied `generation` value.  Used by
+    /// the connect/disconnect handlers to inject a freshly incremented counter
+    /// without racing against a concurrent `rewrite()` that reads the atomic.
+    pub(crate) fn rewrite_with_generation(
+        &self,
+        chains: Vec<mirage_core::config::ChainConfig>,
+        generation: u64,
     ) -> Result<()> {
         let cp_guard = self.credential_params_arc.load();
         let cp_ref = cp_guard.as_ref().as_ref();
@@ -475,6 +510,7 @@ impl MaterialiseCtx {
             path_owned.as_deref(),
             ring_epoch,
             cp_ref,
+            generation,
         )?;
         write_atomic(&self.client_config_path, &json)
     }
@@ -556,6 +592,13 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         monitor_reachable: false,
     }));
 
+    // Shared monotonic counter for connect/disconnect re-establish.  Bumped by
+    // the status-server /connect and /disconnect handlers; read (not bumped) by
+    // every routine materialise() call.  Embedded in client-config.json as
+    // `_connect_generation` so a bump always changes the file fingerprint and
+    // triggers a cli2 supervisor drain+respawn.
+    let connect_generation = Arc::new(AtomicU64::new(0));
+
     let (monitor_reachable_tx, monitor_reachable_rx) = watch::channel(false);
     let monitor_reachable_tx = Arc::new(monitor_reachable_tx);
     let (tun_alive_tx, tun_alive_rx) = watch::channel(false);
@@ -567,6 +610,20 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
     let (phase_tx, phase_rx) = status_server::phase_channel();
     let (reboot_tx, mut reboot_rx) = reboot_channel();
+    // Proxy watch for the MonitorConfig chain snapshot.  MonitorLink is not
+    // built yet at this point, so we create a standalone proxy channel here and
+    // forward link updates into it once the link exists (see forwarder task below
+    // after MonitorLink::new_with_operator_pub).  The status server reads from
+    // this proxy receiver to get the current chain list on /connect and /disconnect.
+    let (config_proxy_tx, config_proxy_rx) =
+        tokio::sync::watch::channel::<Option<mirage_client_core::monitor_link::MonitorConfig>>(None);
+    let config_proxy_tx = Arc::new(config_proxy_tx);
+    // Shared latch for the materialise context — populated after MonitorLink is
+    // built.  The status server spawns before the link, so this cell starts
+    // empty and is filled in below.
+    let mat_ctx_latch: Arc<std::sync::Mutex<Option<Arc<MaterialiseCtx>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
     let publisher = status_server::spawn(
         phase_rx,
         phase_tx,
@@ -580,6 +637,9 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         Arc::clone(&monitor_info),
         Arc::clone(&reboot_tx),
         cfg.cli_variant.clone(),
+        Arc::clone(&connect_generation),
+        config_proxy_rx,
+        Arc::clone(&mat_ctx_latch),
     );
     publisher.set(SentinelPhase::Starting);
 
@@ -876,7 +936,32 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         ring_epoch_id: cfg.ring_epoch_id,
         credential_params_arc: link.credential_params(),
         ring_cell: link.ring_credential_cell(),
+        connect_generation: Arc::clone(&connect_generation),
     });
+
+    // Populate the status-server latch so connect/disconnect handlers can
+    // trigger re-materialise with the updated connect_generation.
+    {
+        let mut latch = mat_ctx_latch.lock().unwrap_or_else(|e| e.into_inner());
+        *latch = Some(Arc::clone(&mat_ctx));
+    }
+
+    // Forward MonitorLink config updates to the proxy watch channel so the
+    // status server's connect/disconnect handlers always see the current chain
+    // snapshot when they trigger a generation-bump rewrite.
+    {
+        let mut link_rx = link.subscribe();
+        let proxy_tx = Arc::clone(&config_proxy_tx);
+        tokio::spawn(async move {
+            loop {
+                if link_rx.changed().await.is_err() {
+                    break;
+                }
+                let snap = link_rx.borrow().clone();
+                let _ = proxy_tx.send(snap);
+            }
+        });
+    }
     spawn_frame_watcher(
         Arc::clone(&link),
         debug_mgr.clone(),
@@ -949,7 +1034,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let cp_arc = link.credential_params();
     let cp_guard = cp_arc.load();
     let cp_ref = cp_guard.as_ref().as_ref();
-    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref) {
+    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref, connect_generation.load(Ordering::Relaxed)) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -1224,7 +1309,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                     cfg.ring_path.clone(),
                     cfg.ring_epoch_id,
                 );
-                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), ring_sk_owned.as_deref(), ring_path_owned.as_deref(), ring_epoch_owned, cp_ref) {
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), ring_sk_owned.as_deref(), ring_path_owned.as_deref(), ring_epoch_owned, cp_ref, connect_generation.load(Ordering::Relaxed)) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");

@@ -13,6 +13,7 @@
 //!                              signal re-bootstrap
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use mirage_client_core::monitor_link::MonitorConfig;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
@@ -50,6 +52,19 @@ pub struct ServerState {
     pub reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
     /// Which cli variant is currently active (`"cli1"` or `"cli2"`).
     pub cli_variant: String,
+    /// Monotonic counter bumped on connect/disconnect to force a content-change
+    /// in client-config.json, triggering the cli2 supervisor fingerprint-based
+    /// drain+respawn so the worker re-establishes carriers under the new routing.
+    pub connect_generation: Arc<AtomicU64>,
+    /// Current chain snapshot from MonitorLink — needed by connect/disconnect to
+    /// re-materialise client-config.json with the bumped generation.
+    pub config_rx: watch::Receiver<Option<MonitorConfig>>,
+    /// Materialise context — populated after MonitorLink is built.  The
+    /// connect/disconnect handlers check whether it is set before calling
+    /// rewrite_with_generation; if unset (cold-boot before first monitor
+    /// config), the bump still increments the generation counter so the next
+    /// routine materialise() will carry the updated value.
+    pub mat_ctx: Arc<std::sync::Mutex<Option<Arc<crate::MaterialiseCtx>>>>,
 }
 
 #[derive(Clone)]
@@ -298,6 +313,32 @@ async fn connect(State(state): State<ServerState>) -> impl IntoResponse {
                 }
             }
             children.tun = Some(handle);
+            drop(children);
+
+            // Step 3: wait for tun to signal readiness (tun.alive in /status),
+            // then bump connect_generation and re-materialise client-config.json.
+            // This forces a content change that the cli2 supervisor detects as a
+            // fingerprint flip and responds with a graceful drain+respawn of the
+            // worker, so the fresh worker establishes carriers under the tun routing
+            // rather than getting stuck on the pre-tun dead pool.
+            let gen_arc = Arc::clone(&state.connect_generation);
+            let mat_ctx = Arc::clone(&state.mat_ctx);
+            let config_rx = state.config_rx.clone();
+            tokio::spawn(async move {
+                // Poll /status until tun.alive==true (up to 15s, 200ms interval).
+                if wait_for_tun_alive(std::time::Duration::from_secs(15)).await {
+                    info!("[sentinel] /connect: tun alive — bumping connect_generation");
+                } else {
+                    warn!("[sentinel] /connect: tun readiness timeout — bumping connect_generation anyway");
+                }
+                let gen = gen_arc.fetch_add(1, Ordering::Relaxed) + 1;
+                info!("[sentinel] connect_generation -> {}", gen);
+                let ctx_opt = mat_ctx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some(ctx) = ctx_opt {
+                    trigger_generation_rewrite(&ctx, &config_rx, gen);
+                }
+            });
+
             (StatusCode::OK, "cli + tun started").into_response()
         }
         Err(e) => {
@@ -315,6 +356,18 @@ async fn disconnect(State(state): State<ServerState>) -> impl IntoResponse {
         }
         if let Some(path) = pid_file::tun_pid_path() { pid_file::remove(&path); }
         info!("[sentinel] tun disconnected");
+        drop(children);
+
+        // Bump connect_generation and re-materialise client-config.json so the
+        // cli2 supervisor detects a content change and drains+respawns the
+        // worker.  The fresh worker re-establishes carriers under the restored
+        // direct routing (no tun interception).
+        let gen = state.connect_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        info!("[sentinel] connect_generation -> {} (disconnect)", gen);
+        let ctx_opt = state.mat_ctx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(ctx) = ctx_opt {
+            trigger_generation_rewrite(&ctx, &state.config_rx, gen);
+        }
     }
     (StatusCode::OK, "ok").into_response()
 }
@@ -419,6 +472,94 @@ async fn restart_self_handler(State(_state): State<ServerState>) -> impl IntoRes
     (StatusCode::ACCEPTED, "restarting").into_response()
 }
 
+// ── Tun readiness polling ─────────────────────────────────────────────────────
+
+/// Poll `GET 127.0.0.1:19420/status` until the tun child reports `alive==true`
+/// or the timeout expires.  Uses a short-lived reqwest client to avoid
+/// dependency on the global state; returns `true` when tun is alive.
+///
+/// This is the readiness signal for the data-plane re-establish: the tun has
+/// captured the default route and is ready to intercept traffic.
+async fn wait_for_tun_alive(timeout: std::time::Duration) -> bool {
+    #[derive(Deserialize)]
+    struct StatusSnap {
+        #[serde(default)]
+        tun: Option<TunAliveSnap>,
+    }
+    #[derive(Deserialize)]
+    struct TunAliveSnap {
+        alive: bool,
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("[sentinel] wait_for_tun_alive: client build failed: {}", e);
+            return false;
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        let alive = client
+            .get("http://127.0.0.1:19420/status")
+            .send()
+            .await
+            .ok()
+            .and_then(|r| if r.status().is_success() { Some(r) } else { None });
+        if let Some(resp) = alive {
+            if let Ok(snap) = resp.json::<StatusSnap>().await {
+                if snap.tun.map(|t| t.alive).unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Re-materialise client-config.json with the updated `connect_generation` so
+/// the cli2 supervisor detects a content change and drains+respawns the worker.
+///
+/// Uses the current chain snapshot from MonitorLink (via `config_rx`).  If no
+/// snapshot is available yet, logs a warning — the next Config frame from the
+/// monitor will include the current generation anyway.
+fn trigger_generation_rewrite(
+    mat_ctx: &crate::MaterialiseCtx,
+    config_rx: &watch::Receiver<Option<MonitorConfig>>,
+    generation: u64,
+) {
+    let snapshot = config_rx.borrow().clone();
+    match snapshot {
+        Some(cfg_snap) => {
+            let chains: Vec<_> = cfg_snap.chains.iter().map(|c| c.chain.clone()).collect();
+            match mat_ctx.rewrite_with_generation(chains, generation) {
+                Ok(()) => info!(
+                    "[sentinel] client-config.json rewritten (connect_generation={})",
+                    generation
+                ),
+                Err(e) => warn!(
+                    "[sentinel] generation rewrite failed (gen={}): {}",
+                    generation, e
+                ),
+            }
+        }
+        None => {
+            warn!(
+                "[sentinel] no config snapshot for generation rewrite (gen={}) \
+                 — next monitor Config push will carry updated generation",
+                generation
+            );
+        }
+    }
+}
+
 // ── Phase watch ───────────────────────────────────────────────────────────────
 
 /// Create a watch channel seeded with [`SentinelPhase::Starting`].
@@ -446,6 +587,9 @@ pub fn spawn(
     monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
     reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
     cli_variant: String,
+    connect_generation: Arc<AtomicU64>,
+    config_rx: watch::Receiver<Option<MonitorConfig>>,
+    mat_ctx: Arc<std::sync::Mutex<Option<Arc<crate::MaterialiseCtx>>>>,
 ) -> PhasePublisher {
     let started_at_ms = unix_now_ms();
     let last_update = Arc::new(std::sync::Mutex::new(started_at_ms));
@@ -460,6 +604,9 @@ pub fn spawn(
         monitor_info,
         reboot_tx,
         cli_variant,
+        connect_generation,
+        config_rx,
+        mat_ctx: mat_ctx.clone(),
     };
 
     let app = Router::new()
