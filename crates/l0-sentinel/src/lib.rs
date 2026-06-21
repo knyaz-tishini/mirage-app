@@ -783,7 +783,11 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let managed = config_exists && is_managed(&cfg.client_config_path);
     if config_exists && !managed && cfg.respect_user_config {
         warn!("[sentinel] unmanaged config exists — skipping overwrite");
-        return run_client_passthrough(&cfg, children, &publisher, monitor_info, tun_alive_tx).await;
+        if !cfg.spawn_cli {
+            warn!("[sentinel] spawn_cli=false — suppressing passthrough spawn for unmanaged config; orchestrator owns cli");
+        } else {
+            return run_client_passthrough(&cfg, children, &publisher, monitor_info, tun_alive_tx).await;
+        }
     }
 
     let template_raw = std::fs::read_to_string(&cfg.client_template)
@@ -1146,6 +1150,12 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         }
     } else {
         info!("[sentinel] spawn_cli=false — cli lifecycle managed externally (orchestrator)");
+        // Defensive: if some code path above adopted or spawned a cli despite spawn_cli=false,
+        // warn loudly.  The main loop will skip supervision unconditionally, so this child
+        // would be a leak -- it will never be waited on or killed by this sentinel.
+        if children.lock().await.cli.is_some() {
+            warn!("[sentinel] BUG: children.cli is Some despite spawn_cli=false -- something spawned/adopted a cli; not supervising it");
+        }
     }
 
     // Task 5: telemetry push over the native wire (0 = disabled by default)
@@ -1183,98 +1193,102 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     const FAILURE_THRESHOLD: u32 = 3;
 
     loop {
-        // Poll cli exit
-        let cli_exited = {
-            let mut ch = children.lock().await;
-            if let Some(ref mut h) = ch.cli {
-                match h.process.try_wait() {
-                    Ok(Some(s)) => Some(s),
-                    Ok(None) => None,
-                    Err(e) => { error!("[sentinel] cli try_wait: {}", e); None }
-                }
-            } else { None }
-        };
-
-        if let Some(exit_status) = cli_exited {
-            let report = {
-                let ch = children.lock().await;
-                if let Some(ref h) = ch.cli {
-                    Some(build_crash_report("cli", exit_status, h).await)
+        // Poll cli exit + crash-handle + respawn.
+        // Only when spawn_cli=true: orchestrator owns the data-plane when false,
+        // and we must never try_wait/respawn/exit on its behalf.
+        if cfg.spawn_cli {
+            let cli_exited = {
+                let mut ch = children.lock().await;
+                if let Some(ref mut h) = ch.cli {
+                    match h.process.try_wait() {
+                        Ok(Some(s)) => Some(s),
+                        Ok(None) => None,
+                        Err(e) => { error!("[sentinel] cli try_wait: {}", e); None }
+                    }
                 } else { None }
             };
 
-            if let Some(report) = report {
-                log_crash(&report);
-                let kind_str = format!("{:?}", report.kind);
-                let exit_code = report.exit_code.unwrap_or(-1);
-
-                // Task 1: send crash report over the native wire (disk fallback
-                // when wire coords are not yet available).
-                // Clone the WireCoords out of the watch guard BEFORE the await: a
-                // `watch::Ref` holds a non-Send `RwLockReadGuard`, and holding it
-                // across `.await` makes the whole `run()` future non-Send — which
-                // breaks l0-orchestrator task-mode (`tokio::spawn`). The owned
-                // Option<WireCoords> is cheap to clone.
-                let wire_coords_now = wire_coords_rx.borrow().clone();
-                report_crash(
-                    &report,
-                    wire_coords_now.as_ref(),
-                    Some(&client_id),
-                ).await;
-
-                // Task 3: Error phase immediately
-                publisher.set(SentinelPhase::Error {
-                    message: format!("cli crashed: {} (code {})", kind_str, exit_code),
-                });
-
-                let may_respawn = {
-                    let mut ch = children.lock().await;
-                    ch.cli = None;
-                    cli_may_respawn(&mut ch)
+            if let Some(exit_status) = cli_exited {
+                let report = {
+                    let ch = children.lock().await;
+                    if let Some(ref h) = ch.cli {
+                        Some(build_crash_report("cli", exit_status, h).await)
+                    } else { None }
                 };
 
-                if may_respawn {
-                    info!("[sentinel] respawning cli...");
-                    // Remove stale PID file before spawning fresh child.
-                    if let Some(path) = pid_file::cli_pid_path() { pid_file::remove(&path); }
-                    let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
-                    match crate::supervisor::spawn_child_with_flags_and_mirror(
-                        &cli_binary,
-                        &child_args,
-                        flags,
-                        crate::supervisor::unified_log_path(),
-                    ) {
-                        Ok(new_handle) => {
-                            let new_pid = new_handle.process.id();
-                            if let Some(pid) = new_pid {
-                                if let Some(path) = pid_file::cli_pid_path() {
-                                    pid_file::write(&path, pid);
+                if let Some(report) = report {
+                    log_crash(&report);
+                    let kind_str = format!("{:?}", report.kind);
+                    let exit_code = report.exit_code.unwrap_or(-1);
+
+                    // Task 1: send crash report over the native wire (disk fallback
+                    // when wire coords are not yet available).
+                    // Clone the WireCoords out of the watch guard BEFORE the await: a
+                    // `watch::Ref` holds a non-Send `RwLockReadGuard`, and holding it
+                    // across `.await` makes the whole `run()` future non-Send -- which
+                    // breaks l0-orchestrator task-mode (`tokio::spawn`). The owned
+                    // Option<WireCoords> is cheap to clone.
+                    let wire_coords_now = wire_coords_rx.borrow().clone();
+                    report_crash(
+                        &report,
+                        wire_coords_now.as_ref(),
+                        Some(&client_id),
+                    ).await;
+
+                    // Task 3: Error phase immediately
+                    publisher.set(SentinelPhase::Error {
+                        message: format!("cli crashed: {} (code {})", kind_str, exit_code),
+                    });
+
+                    let may_respawn = {
+                        let mut ch = children.lock().await;
+                        ch.cli = None;
+                        cli_may_respawn(&mut ch)
+                    };
+
+                    if may_respawn {
+                        info!("[sentinel] respawning cli...");
+                        // Remove stale PID file before spawning fresh child.
+                        if let Some(path) = pid_file::cli_pid_path() { pid_file::remove(&path); }
+                        let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+                        match crate::supervisor::spawn_child_with_flags_and_mirror(
+                            &cli_binary,
+                            &child_args,
+                            flags,
+                            crate::supervisor::unified_log_path(),
+                        ) {
+                            Ok(new_handle) => {
+                                let new_pid = new_handle.process.id();
+                                if let Some(pid) = new_pid {
+                                    if let Some(path) = pid_file::cli_pid_path() {
+                                        pid_file::write(&path, pid);
+                                    }
                                 }
+                                {
+                                    let mut ch = children.lock().await;
+                                    record_cli_respawn(&mut ch);
+                                    ch.cli = Some(new_handle);
+                                }
+                                // Task 3: cool-down then ChildRunning
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                publisher.set(SentinelPhase::ChildRunning { pid: new_pid });
+                                info!("[sentinel] cli respawned pid={:?}", new_pid);
                             }
-                            {
-                                let mut ch = children.lock().await;
-                                record_cli_respawn(&mut ch);
-                                ch.cli = Some(new_handle);
+                            Err(e) => {
+                                error!("[sentinel] cli respawn failed: {}", e);
+                                publisher.set(SentinelPhase::Error {
+                                    message: format!("cli respawn failed: {}", e),
+                                });
+                                std::process::exit(1);
                             }
-                            // Task 3: cool-down then ChildRunning
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            publisher.set(SentinelPhase::ChildRunning { pid: new_pid });
-                            info!("[sentinel] cli respawned pid={:?}", new_pid);
                         }
-                        Err(e) => {
-                            error!("[sentinel] cli respawn failed: {}", e);
-                            publisher.set(SentinelPhase::Error {
-                                message: format!("cli respawn failed: {}", e),
-                            });
-                            std::process::exit(1);
-                        }
+                    } else {
+                        error!("[sentinel] cli exceeded respawn limit -- exiting");
+                        std::process::exit(1);
                     }
-                } else {
-                    error!("[sentinel] cli exceeded respawn limit — exiting");
-                    std::process::exit(1);
                 }
             }
-        }
+        } // end if cfg.spawn_cli (cli polling / crash / respawn)
 
         // Monitor config update + Task 4
         if config_rx.has_changed().unwrap_or(false) {
