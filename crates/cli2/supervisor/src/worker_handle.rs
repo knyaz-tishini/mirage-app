@@ -9,6 +9,7 @@ use mirage_chain_ipc::{
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    io::Read as _,
     path::Path,
     time::Instant,
 };
@@ -17,6 +18,17 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::ChainConfig;
+
+/// Max bytes read from the chain JSON file when computing the fingerprint.
+/// Ring-credential fields (ring_epoch_id, ring_member_sk_hex, ring_path) are
+/// top-level so any credential rotation touches the first few hundred bytes.
+/// 64 KiB is large enough to capture the full typical config and keep I/O cheap.
+const CONTENT_SAMPLE_BYTES: usize = 65_536;
+
+/// Sentinel mixed into the fingerprint when the config file cannot be read.
+/// Using a non-zero value means that once the file becomes readable the hash
+/// changes, triggering a respawn to pick up the real content.
+const FILE_UNREADABLE_SENTINEL: u64 = 0xDEAD_C0DE_DEAD_C0DE;
 
 /// Max restarts in RESTART_WINDOW_SECS before giving up.
 const MAX_RESTARTS_IN_WINDOW: u32 = 5;
@@ -77,16 +89,41 @@ impl RestartTracker {
     }
 }
 
-/// Compute a fingerprint of `chain` by serializing to JSON and hashing with
-/// `DefaultHasher`.  Two `ChainConfig` values that serialize identically will
-/// produce the same fingerprint; any field change produces a different value.
+/// Compute a fingerprint of `chain` that covers both the supervisor-level
+/// `ChainConfig` struct (id, socks5_bind, config_path, monitor_link_host) AND
+/// the content of the JSON file at `chain.config_path`.
 ///
-/// `DefaultHasher` is not stable across Rust releases but is sufficient here:
-/// we only compare fingerprints within a single process lifetime.
+/// The ring credential fields (ring_epoch_id, ring_member_sk_hex, ring_path)
+/// live inside that JSON file, not in `ChainConfig`, so a plain struct hash
+/// would miss a credential-only rotation and leave the worker running with a
+/// stale epoch baked into its in-memory `ClientConfig`.
+///
+/// Reading up to `CONTENT_SAMPLE_BYTES` is sufficient because ring fields are
+/// top-level and any byte change in the file produces a different hash.
+///
+/// If the file cannot be read, `FILE_UNREADABLE_SENTINEL` is mixed into the
+/// hash so that the fingerprint changes once the file becomes readable again,
+/// causing a respawn that picks up the real content.
+///
+/// `DefaultHasher` is not stable across Rust releases but is fine here: we
+/// only compare fingerprints within a single process lifetime.
 pub fn chain_fingerprint(chain: &crate::config::ChainConfig) -> u64 {
     let json = serde_json::to_string(chain).unwrap_or_default();
     let mut h = DefaultHasher::new();
     json.hash(&mut h);
+
+    // Mix in the content of the config file so credential rotations are detected.
+    match std::fs::File::open(&chain.config_path) {
+        Ok(mut f) => {
+            let mut buf = vec![0u8; CONTENT_SAMPLE_BYTES];
+            match f.read(&mut buf) {
+                Ok(n) => buf[..n].hash(&mut h),
+                Err(_) => FILE_UNREADABLE_SENTINEL.hash(&mut h),
+            }
+        }
+        Err(_) => FILE_UNREADABLE_SENTINEL.hash(&mut h),
+    }
+
     h.finish()
 }
 
