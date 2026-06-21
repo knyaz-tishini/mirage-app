@@ -818,10 +818,23 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         mat_ctx,
     );
 
-    // Disk-first: if a managed config from a prior session is on disk, run cli
-    // immediately and let MonitorLink keep working in the background.  Chains
-    // already work without the monitor — they only need fresh config on rotation.
-    if cfg.client_config_path.exists() && is_managed(&cfg.client_config_path) {
+    // Disk-first: if a managed config from a prior session is on disk AND this
+    // sentinel owns the cli, run it immediately and keep MonitorLink working in
+    // the background. Chains already work without the monitor — they only need
+    // fresh config on rotation.
+    //
+    // When `spawn_cli=false` the orchestrator owns the data-plane: it spawns the
+    // chain-supervisor itself from the SAME disk config (orchestrator.toml
+    // data-plane component, `wait_for_file`). The sentinel must NOT take the
+    // passthrough here — `run_client_passthrough` spawns the cli unconditionally,
+    // a SECOND supervisor races the orchestrator's one for the worker IPC pipes,
+    // exits 1 on the conflict, and the sentinel treats that child exit as fatal →
+    // exits 1 → orchestrator restarts it every 30s. That restart storm means the
+    // MonitorLink never lives long enough to receive a ring-enrol RingSlot, so the
+    // credential auto-refresh is permanently dead. Fall through to the persistent
+    // monitor-link loop instead (link stays up, config re-materialises on push,
+    // no cli spawned — §spawn_cli=false branch below).
+    if cfg.spawn_cli && cfg.client_config_path.exists() && is_managed(&cfg.client_config_path) {
         info!("[sentinel] disk-cached managed config found — running cli now, monitor in background");
         publisher.set(SentinelPhase::ConfigStale { since_ms: 0 });
         return run_client_passthrough(
