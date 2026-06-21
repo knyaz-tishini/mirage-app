@@ -982,46 +982,62 @@ impl MonitorLink {
         // config with the new params (sentinel's CredentialParams arm calls rewrite).
         let _ = self.frame_tx.send(Some(WsServerFrame::CredentialParams(params.clone())));
 
-        // Step 5: ring-epoch change detection.
-        // Find the RingMembership authority in the new params and extract its epoch_id.
-        let ring_epoch_in_params: Option<u32> = params
+        // Step 5: ring-epoch refresh detection (accumulate-aware).
+        //
+        // `params.authorities[ring].epochs` carries the FULL overlapping set the
+        // issuer currently honours (e.g. `[4,5,6]` after epoch accumulation —
+        // JWKS-style key rotation). The client's live credential stays valid as
+        // long as its epoch is STILL a member of that set, so we re-enrol ONLY
+        // when the live epoch has aged out of the set entirely (or we hold none
+        // yet). Comparing against a single epoch (the old `epochs.first()` →
+        // OLDEST in the window) spuriously re-enrolled every client whose valid
+        // epoch differed from the oldest — bricking a correctly-credentialed
+        // client the instant the issuer accumulated a second epoch.
+        let ring_auth = params
             .authorities
             .iter()
-            .find(|a| a.scheme == CredentialScheme::RingMembership)
-            .and_then(|auth| auth.epochs.first())
-            .map(|ep| ep.epoch_id);
+            .find(|a| a.scheme == CredentialScheme::RingMembership);
+        if let Some(auth) = ring_auth {
+            let declared_epochs: Vec<u32> = auth.epochs.iter().map(|e| e.epoch_id).collect();
+            // Newest declared epoch is the re-enrol target (and the dedup key).
+            if let Some(&newest_epoch) = declared_epochs.iter().max() {
+                let live_epoch: Option<u32> = self
+                    .ring_cell
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .map(|rc| rc.epoch_id);
 
-        if let Some(params_epoch) = ring_epoch_in_params {
-            // Compare against the live credential in the cell.
-            let live_epoch: Option<u32> = self.ring_cell.load()
-                .as_ref()
-                .as_ref()
-                .map(|rc| rc.epoch_id);
+                let still_valid =
+                    matches!(live_epoch, Some(live) if declared_epochs.contains(&live));
 
-            let needs_enrol = match live_epoch {
-                None => true,
-                Some(live) => live != params_epoch,
-            };
-
-            if needs_enrol {
-                // Dedupe: only send if we haven't already requested this epoch.
-                let last_requested = self.last_ring_epoch_requested.load(Ordering::Acquire);
-                // We encode epoch_id as (epoch_id as u64) + 1 so that 0 means "not sent yet".
-                let sentinel_value = (params_epoch as u64) + 1;
-                if last_requested != sentinel_value
-                    && !self.ring_enrol_in_flight.load(Ordering::Acquire)
-                {
-                    // Clear the stale credential immediately so dials fail-fast
-                    // rather than presenting a known-bad token.
-                    self.ring_cell.store(Arc::new(None));
-                    info!(
-                        params_epoch,
-                        live_epoch = live_epoch.unwrap_or(0),
-                        transport = transport_label,
-                        "monitor_link: ring epoch changed — requesting re-enrol"
-                    );
-                    self.last_ring_epoch_requested.store(sentinel_value, Ordering::Release);
-                    self.ring_enrol_in_flight.store(true, Ordering::Release);
+                if !still_valid {
+                    // Dedupe on the newest epoch so we don't spam enrol requests.
+                    // Encode as (epoch_id as u64) + 1 so 0 means "not sent yet".
+                    let sentinel_value = (newest_epoch as u64) + 1;
+                    let last_requested = self.last_ring_epoch_requested.load(Ordering::Acquire);
+                    if last_requested != sentinel_value
+                        && !self.ring_enrol_in_flight.load(Ordering::Acquire)
+                    {
+                        // ZT durability: do NOT clear the live credential here.
+                        // Keep presenting whatever token we already hold until the
+                        // RingSlot response swaps in a fresh one. Pre-clearing to
+                        // `None` creates a self-inflicted no-credential window —
+                        // dials go out with scheme 0x00, the exit rejects them as
+                        // "no-credential dial", and the outage becomes PERMANENT
+                        // if the re-enrol response is ever lost. An aged-out token
+                        // fails the same dial either way, so holding it costs
+                        // nothing and an in-window token keeps carrying traffic.
+                        info!(
+                            newest_epoch,
+                            live_epoch = live_epoch.unwrap_or(0),
+                            declared = ?declared_epochs,
+                            transport = transport_label,
+                            "monitor_link: live ring epoch not in declared set — requesting re-enrol (keeping current credential until slot arrives)"
+                        );
+                        self.last_ring_epoch_requested.store(sentinel_value, Ordering::Release);
+                        self.ring_enrol_in_flight.store(true, Ordering::Release);
+                    }
                 }
             }
         }
