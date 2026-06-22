@@ -1336,6 +1336,49 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                                     cfg.respect_user_config,
                                 ) {
                                     error!("[sentinel] tun config rewrite failed: {}", e);
+                                } else {
+                                    // Hot-reload the live tun's in-RAM ChainRegistry.
+                                    // Read the just-written tun.json to get the exact
+                                    // body shape and api_bind/api_key the tun expects.
+                                    let tun_path_owned = tun_path.clone();
+                                    tokio::spawn(async move {
+                                        let http = reqwest::Client::builder()
+                                            .timeout(std::time::Duration::from_secs(3))
+                                            .build()
+                                            .unwrap_or_default();
+                                        let raw = match std::fs::read_to_string(&tun_path_owned) {
+                                            Ok(s) => s,
+                                            Err(e) => { debug!("[sentinel] tun runtime refresh: read tun.json: {e}"); return; }
+                                        };
+                                        let doc: serde_json::Value = match serde_json::from_str(&raw) {
+                                            Ok(v) => v,
+                                            Err(e) => { debug!("[sentinel] tun runtime refresh: parse tun.json: {e}"); return; }
+                                        };
+                                        let chains_val = match doc.get("chains") {
+                                            Some(v) => v.clone(),
+                                            None => { debug!("[sentinel] tun runtime refresh: no 'chains' key in tun.json"); return; }
+                                        };
+                                        let api_bind = doc.get("api_bind")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("127.0.0.1:19485");
+                                        let port = api_bind.rsplit(':').next().unwrap_or("19485");
+                                        let url = format!("http://{api_bind}/chains/update");
+                                        let body = serde_json::json!({ "chains": chains_val });
+                                        let mut req = http
+                                            .post(&url)
+                                            .json(&body);
+                                        if let Some(key) = doc.get("api_key").and_then(|v| v.as_str()) {
+                                            req = req.header("Authorization", format!("Bearer {key}"));
+                                        }
+                                        match req.send().await {
+                                            Ok(r) if r.status().is_success() => {
+                                                let n = chains_val.as_array().map(|a| a.len()).unwrap_or(0);
+                                                info!("[sentinel] pushed {n} chains to live tun :{port}/chains/update");
+                                            }
+                                            Ok(r) => warn!("[sentinel] tun runtime chains refresh: HTTP {}", r.status()),
+                                            Err(e) => debug!("[sentinel] tun runtime chains refresh skipped: {e}"),
+                                        }
+                                    });
                                 }
                             }
                         }
