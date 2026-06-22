@@ -22,6 +22,14 @@ edition = "2021"
 name = "mirage-client-gui"
 path = "src/main.rs"
 
+# Win-only: embeds an application manifest that asks UAC for admin elevation
+# on launch. Required so the orchestrator → sentinel → cli2 → tun tree the
+# GUI spawns inherits the elevated token (Wintun needs admin). Without it the
+# client connects + registers but the data-plane never comes up — no internet.
+# No-op on non-Windows targets. Mirrors mirage2mshd/crates/mshd/build.rs.
+[build-dependencies]
+embed-manifest = "1"
+
 # ── uzor desktop runtime (AppBuilder + agent-API + screenshot) ────────────────
 [dependencies]
 uzor          = { path = "../../../uzor/uzor" }
