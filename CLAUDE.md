@@ -186,6 +186,25 @@ respect_user_config = true
 
 Для **onion chains** mux работает с `onion_reply_mode=onion` (variant 2 — live с Apr 2026, see `mirage2node/CLAUDE.md`). Forward path raw post-RELAY, reply path layered AEAD.
 
+### Data-plane carry: legacy (raw) vs modern (mux) boundary
+
+ОДНА развилка решает путь несущей — `ChainConfig.reply` (worker `main.rs`:
+`chain_wants_mux = use_mux && reply==Onion && !udp`):
+
+- **`reply=Onion` → MuxPool** (modern, ДЕФОЛТ). Долгоживущие multiplexed
+  carriers + circuit-breaker failover. Клиент шлёт `MUX\0`, exit апгрейдится
+  в mux acceptor (etap-G, Variant 2). Monitor auto-provision выдаёт этот путь
+  по умолчанию (`default_auto_axis_spec` → `reply_mode=Onion`, 2026-06-22).
+- **`reply=Raw` → run_simple → TunnelPool** (LEGACY, явный opt-in). Single-use
+  carriers, БЕЗ mux, БЕЗ failover — это ровно carry-семантика ретайрнутого
+  cli1. Только UDP / debug. Никогда не дефолт.
+
+cli1 retired в `_deprecated/`, но его carry-семантика выживает ИМЕННО как явный
+`reply=Raw`. Регрессия 2026-06: monitor auto-chains дефолтили в `reply=Raw` →
+cli2-клиент молча шёл по legacy `TunnelPool` (handshake green, carry flappy под
+нагрузкой). Worker теперь логирует выбранный путь (`data-plane: MUX path` /
+`LEGACY non-mux path` + reason) — boundary видно в логе, не угадывается.
+
 `pool_size = 3` принудительно когда `use_mux=true` (3 TCP-несущих под mux достаточно для неограниченного числа streams).
 
 ## cli2 split-arch
@@ -354,4 +373,4 @@ caused HTTP/0.9 + TLS alert + UDP timeout across all 10 camouflages — all clos
 
 - Не ходить в монитор напрямую из cli/cli2/tun — только через sentinel. Прямая связь — fallback.
 - Не использовать stdin/stdout для cli2 IPC — это v0, переехали на named pipes для reattach.
-- Не запускать onion chain в mux mode без `onion_reply_mode=raw` на всех hops.
+- НЕ ставить `onion_reply_mode=raw` "чтобы включить mux" — это НАОБОРОТ legacy путь. Variant 2 (live Apr 2026, см. выше) mux'ит при `reply_mode=onion`; нода детектит mux по magic `MUX\0`, no per-hop flag. `reply=raw` уводит клиента на legacy single-use `TunnelPool` (`run_simple`, без mux/failover). См. "Data-plane carry" ниже.
