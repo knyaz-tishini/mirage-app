@@ -311,6 +311,27 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Make the data-plane path explicit in the log. MUX = modern carry
+    // (long-lived multiplexed carriers + circuit-breaker failover). run_simple =
+    // legacy single-use TunnelPool, no mux, no failover — the cli1-era path. A
+    // worker silently on the legacy path under steady load was the 2026-06 carry
+    // regression (auto-chains defaulted to reply=raw); surface the boundary so it
+    // can never hide again.
+    if mux_pool_opt.is_some() {
+        info!(chain_id = %chain_id, "data-plane: MUX path (reply=onion, use_mux=true) — multiplexed long-lived carriers");
+    } else {
+        let reason = if is_udp_chain {
+            "udp chain (mux requires a reliable ordered stream)"
+        } else if !client_config.use_mux {
+            "use_mux=false in client config"
+        } else if chain.reply != ReplyMode::Onion {
+            "reply=raw chain — LEGACY single-use TunnelPool, no mux, no failover (flip the chain to reply=onion for the modern carry)"
+        } else {
+            "mux pool init failed (see prior warn) — degraded to TunnelPool-only"
+        };
+        warn!(chain_id = %chain_id, %reason, "data-plane: LEGACY non-mux path (run_simple) selected");
+    }
+
     let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), credential_gated)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
