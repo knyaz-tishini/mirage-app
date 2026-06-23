@@ -545,7 +545,8 @@ impl TunnelPool {
                 let max_idle = std::time::Duration::from_secs(guard.config.idle_timeout_secs);
                 for (idx, slot) in guard.slots.iter_mut().enumerate() {
                     if let Slot::Idle { last_used, .. } = slot {
-                        if last_used.elapsed() >= max_idle {
+                        // idle_timeout_secs == 0 means "never evict" (mux fallback pool).
+                        if max_idle.as_secs() > 0 && last_used.elapsed() >= max_idle {
                             // Tunnel has been idle too long — it is likely stale.
                             // Poison it so the maintenance loop reconnects it.
                             warn!(
@@ -866,7 +867,8 @@ async fn maintenance_loop(pool_weak: std::sync::Weak<TunnelPool>) {
 
             for (idx, slot) in guard.slots.iter_mut().enumerate() {
                 if let Slot::Idle { last_used, .. } = slot {
-                    if last_used.elapsed() >= idle_timeout {
+                    // idle_timeout_secs == 0 means "never evict" (mux fallback pool).
+                    if idle_timeout.as_secs() > 0 && last_used.elapsed() >= idle_timeout {
                         debug!(chain_id = %pool.chain_id, slot = idx, "idle timeout expired, reconnecting");
                         *slot = Slot::Reconnecting;
                         indices.push(idx);

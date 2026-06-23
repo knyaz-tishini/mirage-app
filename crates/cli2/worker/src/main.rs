@@ -29,7 +29,7 @@ use mirage_client_core::{
     wire_health::WireHealthMap,
 };
 use mirage_core::{
-    config::{ClientConfig, ProtocolId, ReplyMode, TcpProtocolId},
+    config::{ClientConfig, ProtocolId, ReplyMode, TcpProtocolId, TunnelPoolConfig},
     mirage::mesh::PeerTable,
     routing::RoutingTable,
 };
@@ -332,7 +332,18 @@ async fn main() -> anyhow::Result<()> {
         warn!(chain_id = %chain_id, %reason, "data-plane: LEGACY non-mux path (run_simple) selected");
     }
 
-    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), credential_gated)
+    // On mux chains the warm TunnelPool is fallback-only (degraded-mode pool.lease in
+    // socks5.rs); its spares are never leased by the mux data-plane, so the 120s
+    // idle-eviction would churn-redial them in lockstep every ~120s (DPI-visible).
+    // Disable idle eviction for the mux carrier pool; MuxPool owns its carriers'
+    // lifetime via its own 600s reaper.  When MuxPool init failed (mux_pool_opt is
+    // None), TunnelPool is the primary data-plane — keep the configured eviction.
+    let pool_cfg_for_tunnel = if mux_pool_opt.is_some() {
+        TunnelPoolConfig { idle_timeout_secs: 0, ..pool_cfg.clone() }
+    } else {
+        pool_cfg.clone()
+    };
+    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg_for_tunnel, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), credential_gated)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 
