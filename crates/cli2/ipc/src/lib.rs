@@ -111,6 +111,14 @@ pub enum SupervisorMsg {
         /// JSON-serialized `Vec<MonitorTransportConfig>` from supervisor.toml.
         /// The worker deserializes and converts to `MonitorTransport` variants.
         transports_json: String,
+        /// Base URL of the local TUN process (`http://127.0.0.1:<port>`).
+        ///
+        /// When present the ML-host worker spawns a policy-push task that
+        /// POSTs every monitor-pushed `SplitPolicyConfig` to
+        /// `{tun_api_url}/policy/set`.  When absent (SOCKS-only mode) the
+        /// task is not started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tun_api_url: Option<String>,
     },
 }
 

@@ -43,6 +43,9 @@ struct MlSetup {
     monitor_urls: Vec<String>,
     monitor_api_key: Option<String>,
     transports_json: String,
+    /// Forwarded from `Config.tun_api_url` so the worker can push split
+    /// policies to the local TUN daemon.
+    tun_api_url: Option<String>,
 }
 
 /// Build the `MlSetup` struct from the current `Config`.
@@ -128,6 +131,7 @@ fn build_ml_setup(config: &Config) -> Option<MlSetup> {
         monitor_urls: vec![config.monitor_url.clone()],
         monitor_api_key: config.monitor_api_key.clone(),
         transports_json,
+        tun_api_url: config.tun_api_url.clone(),
     })
 }
 
@@ -451,6 +455,7 @@ async fn main() -> anyhow::Result<()> {
                     setup.monitor_urls.clone(),
                     setup.monitor_api_key.clone(),
                     setup.transports_json.clone(),
+                    setup.tun_api_url.clone(),
                 ).await {
                     warn!(
                         chain_id = %setup.host_chain_id,
@@ -655,6 +660,7 @@ async fn main() -> anyhow::Result<()> {
                                 setup.monitor_urls.clone(),
                                 setup.monitor_api_key.clone(),
                                 setup.transports_json.clone(),
+                                setup.tun_api_url.clone(),
                             ).await {
                                 warn!(
                                     chain_id = %chain_id,

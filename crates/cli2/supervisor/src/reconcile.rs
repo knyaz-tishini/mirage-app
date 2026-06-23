@@ -182,6 +182,7 @@ pub async fn reconcile(
                             vec![config.monitor_url.clone()],
                             config.monitor_api_key.clone(),
                             transports_json,
+                            config.tun_api_url.clone(),
                         )
                         .await
                     {

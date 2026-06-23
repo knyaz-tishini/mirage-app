@@ -679,6 +679,7 @@ async fn handle_session(
                 monitor_urls,
                 monitor_api_key,
                 transports_json,
+                tun_api_url,
             })) => {
                 info!(chain_id, "worker: SetupMonitorLink received — spawning MonitorLink");
                 spawn_monitor_link_in_worker(
@@ -686,6 +687,7 @@ async fn handle_session(
                     monitor_urls,
                     monitor_api_key,
                     transports_json,
+                    tun_api_url,
                     mesh_id.to_string(),
                     node_client_id.to_string(),
                     Arc::clone(&peer_table),
@@ -794,6 +796,7 @@ fn spawn_monitor_link_in_worker(
     monitor_urls: Vec<String>,
     monitor_api_key: Option<String>,
     transports_json: String,
+    tun_api_url: Option<String>,
     mesh_id: String,
     node_client_id: String,
     peer_table: Arc<ArcSwap<PeerTable>>,
@@ -930,6 +933,15 @@ fn spawn_monitor_link_in_worker(
     monitor_link.set_enrol_token(enrol_token);
     monitor_link.set_nf_counter_dir(nf_counter_dir);
     monitor_link.spawn();
+
+    // Policy-push task: forward monitor-pushed SplitPolicyConfig to the local
+    // TUN daemon on every config version bump.  Only spawned when tun_api_url
+    // is set (SOCKS-only mode has no TUN to push to).
+    if let Some(u) = tun_api_url {
+        tokio::spawn(mirage_client_core::policy_push::run_policy_pusher(config_rx.clone(), u));
+    } else {
+        info!(chain_id, "worker: no tun_api_url — policy-push task not started (SOCKS-only mode)");
+    }
 
     let chain_id_owned = chain_id.to_string();
     // Watcher task: on each new MonitorLink config with a new peer_table
