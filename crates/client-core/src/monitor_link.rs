@@ -256,21 +256,10 @@ pub enum WsServerFrame {
 }
 
 /// Traffic policy received from the monitor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitorPolicy {
-    pub rules: Vec<MonitorPolicyRule>,
-    pub default_action: String,
-}
-
-/// A single rule within a [`MonitorPolicy`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitorPolicyRule {
-    #[serde(rename = "type")]
-    pub rule_type: String,
-    #[serde(flatten)]
-    pub params: serde_json::Value,
-    pub action: String,
-}
+///
+/// Re-exported from `mirage_core::split_policy` — the JSON wire shape is
+/// directly compatible with what the TUN's `POST /policy/set` expects.
+pub use mirage_core::split_policy::SplitPolicyConfig as MonitorPolicy;
 
 /// A single chain entry from the monitor config response.
 #[derive(Debug, Clone)]

@@ -100,10 +100,8 @@ pub async fn run_health_watcher(
         if cfg.version != last_policy_version {
             if let (Some(ref policy), Some(ref tun_url)) = (&cfg.policy, &tun_api_url) {
                 let url = format!("{}/policy/set", tun_url);
-                let body = serde_json::json!({
-                    "rules": policy.rules,
-                    "default_action": policy.default_action,
-                });
+                let body = serde_json::to_value(policy)
+                    .expect("SplitPolicyConfig is always serializable");
                 match http
                     .post(&url)
                     .header("Content-Type", "application/json")
