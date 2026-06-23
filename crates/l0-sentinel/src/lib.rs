@@ -68,9 +68,6 @@ pub struct SentinelConfig {
     #[serde(default)]
     pub client_id: Option<String>,
     pub client_config_path: PathBuf,
-    pub client_binary: PathBuf,
-    #[serde(default = "default_client_args")]
-    pub client_args: Vec<String>,
     pub client_template: PathBuf,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
@@ -98,16 +95,9 @@ pub struct SentinelConfig {
     /// Set to 0 to disable. Default: 60.
     #[serde(default = "default_logs_upload_interval")]
     pub logs_upload_interval_secs: u64,
-    /// Which cli variant to spawn:
-    /// - `"cli1"` (default) — legacy single-process `mirage-client-cli`.
-    /// - `"cli2"` — new split-arch `mirage-chain-supervisor` (supervisor +
-    ///   workers per chain).  Required for soft-restart capability and
-    ///   per-chain OTA.
-    #[serde(default = "default_cli_variant")]
-    pub cli_variant: String,
-    /// Path to the chain-supervisor binary (cli2).  Defaults to
+    /// Path to the chain-supervisor binary.  Defaults to
     /// `<exe_dir>/mirage-chain-supervisor.exe` on Windows (or without .exe on
-    /// other platforms) when `cli_variant = "cli2"` and this field is `None`.
+    /// other platforms) when this field is `None`.
     #[serde(default)]
     pub supervisor_binary: Option<PathBuf>,
     /// Args passed to the supervisor.  The `{client_config_path}` token is
@@ -220,9 +210,6 @@ pub struct SentinelConfig {
     pub spawn_cli: bool,
 }
 
-pub(crate) fn default_client_args() -> Vec<String> {
-    vec!["--config".to_owned(), "{client_config_path}".to_owned()]
-}
 pub(crate) fn default_poll_interval() -> u64 { 30 }
 pub(crate) fn default_respect_user_config() -> bool { true }
 pub(crate) fn default_install_panic_hook() -> bool { true }
@@ -250,7 +237,6 @@ impl SentinelConfig {
 }
 pub(crate) fn default_telemetry_interval() -> u64 { 0 }
 pub(crate) fn default_logs_upload_interval() -> u64 { 0 }
-pub(crate) fn default_cli_variant() -> String { "cli1".into() }
 pub(crate) fn default_supervisor_args() -> Vec<String> {
     vec!["{client_config_path}".to_owned()]
 }
@@ -521,27 +507,16 @@ pub(crate) fn build_child_args(template_args: &[String], config_path: &PathBuf) 
     template_args.iter().map(|a| a.replace("{client_config_path}", &path_str)).collect()
 }
 
-/// Resolve the binary path and expanded args for whichever cli variant is
-/// configured.  Falls back to cli1 on unknown variant (with a warning).
+/// Resolve the binary path and expanded args for the cli2 supervisor.
 pub(crate) fn resolve_cli_binary_and_args(cfg: &SentinelConfig) -> (PathBuf, Vec<String>) {
-    match cfg.cli_variant.as_str() {
-        "cli2" => {
-            let binary = resolve_supervisor_binary(cfg.supervisor_binary.as_ref())
-                .unwrap_or_else(|| cfg.client_binary.clone());
-            let args = build_child_args(&cfg.supervisor_args, &cfg.client_config_path);
-            (binary, args)
-        }
-        variant => {
-            if variant != "cli1" {
-                warn!(
-                    "[sentinel] unknown cli_variant {:?} — falling back to cli1",
-                    variant
-                );
-            }
-            let args = build_child_args(&cfg.client_args, &cfg.client_config_path);
-            (cfg.client_binary.clone(), args)
-        }
-    }
+    let binary = resolve_supervisor_binary(cfg.supervisor_binary.as_ref())
+        .unwrap_or_else(|| {
+            warn!("[sentinel] supervisor binary not found via auto-detect; using fallback name");
+            let exe = std::env::consts::EXE_SUFFIX;
+            PathBuf::from(format!("mirage-chain-supervisor{exe}"))
+        });
+    let args = build_child_args(&cfg.supervisor_args, &cfg.client_config_path);
+    (binary, args)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -636,7 +611,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         },
         Arc::clone(&monitor_info),
         Arc::clone(&reboot_tx),
-        cfg.cli_variant.clone(),
         Arc::clone(&connect_generation),
         config_proxy_rx,
         Arc::clone(&mat_ctx_latch),
@@ -770,11 +744,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
 
     info!(
-        "[sentinel] monitor_urls={:?} active={} client_id={} client_binary={:?}",
+        "[sentinel] monitor_urls={:?} active={} client_id={}",
         effective_urls,
         active_monitor_url,
         client_id_resolved,
-        cfg.client_binary,
     );
     drop(http_client);
     drop(bootstrap_bearer);
@@ -1455,7 +1428,7 @@ async fn run_client_passthrough(
     tun_alive_tx: Arc<watch::Sender<bool>>,
 ) -> Result<()> {
     let (cli_binary, child_args) = resolve_cli_binary_and_args(cfg);
-    info!("[sentinel][passthrough] spawning ({}) {:?}", cfg.cli_variant, cli_binary);
+    info!("[sentinel][passthrough] spawning {:?}", cli_binary);
 
     let handle = spawn_child(&cli_binary, &child_args)
         .with_context(|| format!("failed to spawn {:?}", cli_binary))?;

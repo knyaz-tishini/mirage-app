@@ -15,18 +15,6 @@ binary  = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2app/target/release/mirag
 args    = ["--config", "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2app/sentinel.toml"]
 restart = "always"
 
-# ── cli: SOCKS5/HTTP proxy + TunnelPool/MuxPool ──────────────────────────────
-# In the legacy desktop layout, sentinel itself spawns cli — so the orchestrator
-# does NOT need to manage cli directly. Uncomment this block only if you want
-# the orchestrator to own the cli child instead of letting sentinel spawn it.
-#
-# [[component]]
-# name    = "cli"
-# kind    = "cli"
-# binary  = "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2app/target/release/mirage-client-cli.exe"
-# args    = ["--config", "C:/Users/VA PC/CODING/ML_TRADING/nemo/mirage2tun/client-config.json"]
-# restart = "on-failure"
-
 # ── Mobile (task mode) example ───────────────────────────────────────────────
 # Same components, no `binary = ...` needed because orchestrator dispatches by
 # kind to the embedded `run()` function in the linked crate.
@@ -40,8 +28,3 @@ restart = "always"
 # args    = ["--config", "/data/data/com.mirage/files/sentinel.toml"]
 # restart = "always"
 #
-# [[component]]
-# name    = "cli"
-# kind    = "cli"
-# args    = ["--config", "/data/data/com.mirage/files/client-config.json"]
-# restart = "on-failure"

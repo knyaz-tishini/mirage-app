@@ -50,8 +50,6 @@ pub struct ServerState {
     pub monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
     /// Signal re-bootstrap on successful /onboard.
     pub reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
-    /// Which cli variant is currently active (`"cli1"` or `"cli2"`).
-    pub cli_variant: String,
     /// Monotonic counter bumped on connect/disconnect to force a content-change
     /// in client-config.json, triggering the cli2 supervisor fingerprint-based
     /// drain+respawn so the worker re-establishes carriers under the new routing.
@@ -71,7 +69,7 @@ pub struct ServerState {
 pub struct TunSpawnCfg {
     pub tun_binary: Option<PathBuf>,
     pub tun_args: Vec<String>,
-    /// Cli binary (resolved at startup — could be cli1 or cli2 supervisor).
+    /// Cli2 supervisor binary (resolved at startup).
     pub cli_binary: PathBuf,
     /// Cli args with `{client_config_path}` already substituted.
     pub cli_args: Vec<String>,
@@ -103,8 +101,6 @@ struct StatusResponse {
     tun: ChildStatus,
     monitor_url: String,
     monitor_reachable: bool,
-    /// Which cli variant is running: `"cli1"` (legacy) or `"cli2"` (split-arch).
-    cli_variant: String,
 }
 
 // ── Query params ──────────────────────────────────────────────────────────────
@@ -134,7 +130,6 @@ async fn status_handler(State(state): State<ServerState>) -> impl IntoResponse {
         tun: children.tun_status(),
         monitor_url: info.monitor_url,
         monitor_reachable: info.monitor_reachable,
-        cli_variant: state.cli_variant.clone(),
     };
     Json(body)
 }
@@ -565,7 +560,6 @@ pub fn spawn(
     spawn_cfg: TunSpawnCfg,
     monitor_info: Arc<std::sync::Mutex<MonitorInfo>>,
     reboot_tx: Arc<watch::Sender<Option<RebootPayload>>>,
-    cli_variant: String,
     connect_generation: Arc<AtomicU64>,
     config_rx: watch::Receiver<Option<MonitorConfig>>,
     mat_ctx: Arc<std::sync::Mutex<Option<Arc<crate::MaterialiseCtx>>>>,
@@ -582,7 +576,6 @@ pub fn spawn(
         spawn_cfg: Arc::new(spawn_cfg),
         monitor_info,
         reboot_tx,
-        cli_variant,
         connect_generation,
         config_rx,
         mat_ctx: mat_ctx.clone(),

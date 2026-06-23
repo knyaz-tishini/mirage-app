@@ -30,9 +30,9 @@ state_dir = "C:/ProgramData/mirage/state"
 # ─── client-config materialisation + spawning ─────────────────────────────────
 client_template    = "client-template.json"
 client_config_path = "client-config.json"
-client_binary      = "mirage-client-cli.exe"
-client_args        = ["-c", "{client_config_path}"]
 respect_user_config = true
 
-# Set to "cli2" to spawn `mirage-chain-supervisor` instead of cli1.
-cli_variant = "cli1"
+# Path to the chain-supervisor binary.  Defaults to
+# <exe_dir>/mirage-chain-supervisor[.exe] when omitted.
+# supervisor_binary = "C:/Program Files/Mirage/mirage-chain-supervisor.exe"
+# supervisor_args   = ["{client_config_path}"]

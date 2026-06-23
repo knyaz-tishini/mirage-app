@@ -146,11 +146,6 @@ fn ensure_sentinel_toml() {
     let dir_str = dir.to_string_lossy().replace('\\', "/");
     let client_config = format!("{dir_str}/client-config.json");
     let exe = std::env::consts::EXE_SUFFIX;
-    // `client_binary` is a required SentinelConfig field but MOOT here: spawn_cli
-    // is false, so the orchestrator (not the sentinel) owns the data-plane. We
-    // still point it at the cli2 supervisor so no cli1 name lingers. (cli1 retired
-    // 2026-06-14.)
-    let cli_bin = format!("{dir_str}/mirage-chain-supervisor{exe}");
     let tun_bin = format!("{dir_str}/mirage2tun{exe}");
 
     let content = format!(
@@ -165,9 +160,6 @@ client_config_path = "{client_config}"
 # Where the existing client-config.json template lives — sentinel uses this
 # as the base and overlays chains[] from monitor.
 client_template = "{client_config}"
-
-client_binary = "{cli_bin}"
-client_args   = ["--config", "{{client_config_path}}"]
 
 tun_binary = "{tun_bin}"
 tun_args   = ["debug-run"]
@@ -281,7 +273,6 @@ fn reap_orphans() {
         // hold the SOCKS/utun ports (AddrInUse on the next connect).
         for name in &[
             "mirage-l0-sentinel",
-            "mirage-client-cli",
             "mirage-chain-supervisor",
             "mirage-chain-worker",
         ] {
@@ -297,7 +288,6 @@ fn reap_orphans() {
         for name in &[
             "mirage-l0-orchestrator.exe",
             "mirage-l0-sentinel.exe",
-            "mirage-client-cli.exe",
             "mirage2tun.exe",
             "mirage-chain-supervisor.exe",
             "mirage-chain-worker.exe",
@@ -1048,7 +1038,7 @@ fn draw_menu_overlay(ctx: &mut TinySkiaCpuRenderContext, model: &model::ClientSt
         let req = if cr.require { "require" } else { "open" };
         line(ctx, &format!("cred     {} g{} {}", cr.scheme, cr.generation, req), FG1, 10.0, 15.0);
     }
-    line(ctx, &format!("data     {}", c.cli_variant), FG3, 10.0, 18.0);
+    line(ctx, "data     cli2", FG3, 10.0, 18.0);
 
     // Chains.
     line(ctx, &format!("CHAINS ({})", model.chains.len()), ACCENT, 11.0, 18.0);

@@ -60,8 +60,6 @@ pub struct ConnState {
     pub phase_detail: PhaseDetail,
     pub monitor_url: String,
     pub monitor_reachable: bool,
-    /// `"cli1"` or `"cli2"`.
-    pub cli_variant: String,
     pub uptime_ms: u64,
     pub tun_alive: bool,
     pub tun_pid: Option<u32>,
@@ -194,7 +192,6 @@ struct RawStatus {
     tun: Option<RawChildStatus>,
     monitor_url: Option<String>,
     monitor_reachable: Option<bool>,
-    cli_variant: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -536,7 +533,6 @@ pub fn spawn_model_poller(
                 phase_detail,
                 monitor_url: raw_status.monitor_url.unwrap_or_default(),
                 monitor_reachable: raw_status.monitor_reachable.unwrap_or(false),
-                cli_variant: raw_status.cli_variant.unwrap_or_default(),
                 uptime_ms: raw_status.uptime_ms.unwrap_or(0),
                 tun_alive: raw_status.tun.as_ref().map(|t| t.alive).unwrap_or(false),
                 tun_pid: raw_status.tun.as_ref().and_then(|t| t.pid),
@@ -761,7 +757,6 @@ impl ClientState {
                 },
                 monitor_url: "https://lm-nl.zen-geldmaschine.net:19443".to_string(),
                 monitor_reachable: true,
-                cli_variant: "cli2".to_string(),
                 uptime_ms: 120_000,
                 tun_alive: true,
                 tun_pid: Some(12346),
