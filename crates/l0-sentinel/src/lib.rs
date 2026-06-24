@@ -285,6 +285,7 @@ pub(crate) fn materialise(
     ring_path: Option<&[mirage_core::config::RingPathStep]>,
     ring_epoch_id: Option<u32>,
     credential_params: Option<&mirage_core::crypto::credential::CredentialParams>,
+    tun_api_bind: Option<&str>,
     connect_generation: u64,
 ) -> Result<String> {
     let mut obj: serde_json::Value =
@@ -356,6 +357,17 @@ pub(crate) fn materialise(
         match serde_json::to_value(cp) {
             Ok(v) => { map.insert("credential_params".to_owned(), v); }
             Err(e) => warn!("materialise: failed to serialise credential_params: {e}"),
+        }
+    }
+    // Derive tun_api_url from the TUN's api_bind so cli2's split-policy pusher
+    // can reach the TUN control API without operator hand-setting it in the
+    // client-template. Template's explicit tun_api_url still takes precedence.
+    if !map.contains_key("tun_api_url") {
+        if let Some(bind) = tun_api_bind {
+            map.insert(
+                "tun_api_url".to_owned(),
+                serde_json::Value::String(format!("http://{bind}")),
+            );
         }
     }
     serde_json::to_string_pretty(&obj).context("failed to serialise materialised config")
@@ -441,6 +453,10 @@ pub struct MaterialiseCtx {
     /// stale epoch after its seeded one ages out of the declared set and the exit
     /// would reject it as a "no-credential dial".
     pub ring_cell: mirage_client_core::token_pool::RingCredentialCell,
+    /// Path to the tun config template (tun-template.json). Used to read the
+    /// effective `api_bind` so that `tun_api_url` can be derived and injected
+    /// into the materialised client-config without operator hand-configuration.
+    pub tun_template_path: Option<PathBuf>,
     /// Monotonic counter shared with the status server.  Bumped on connect and
     /// disconnect; embedded in every materialised config as `_connect_generation`
     /// so that a bump always changes the file's content fingerprint and triggers
@@ -485,6 +501,8 @@ impl MaterialiseCtx {
             self.ring_epoch_id,
         );
 
+        let tun_api_bind =
+            crate::tun_config::effective_api_bind(self.tun_template_path.as_deref());
         let json = materialise(
             &self.template_raw,
             chains,
@@ -496,6 +514,7 @@ impl MaterialiseCtx {
             path_owned.as_deref(),
             ring_epoch,
             cp_ref,
+            Some(tun_api_bind.as_str()),
             generation,
         )?;
         write_atomic(&self.client_config_path, &json)
@@ -913,6 +932,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         ring_epoch_id: cfg.ring_epoch_id,
         credential_params_arc: link.credential_params(),
         ring_cell: link.ring_credential_cell(),
+        tun_template_path: cfg.tun_template_path.clone(),
         connect_generation: Arc::clone(&connect_generation),
     });
 
@@ -1011,7 +1031,8 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let cp_arc = link.credential_params();
     let cp_guard = cp_arc.load();
     let cp_ref = cp_guard.as_ref().as_ref();
-    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref, connect_generation.load(Ordering::Relaxed)) {
+    let tun_api_bind = crate::tun_config::effective_api_bind(cfg.tun_template_path.as_deref());
+    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref, Some(tun_api_bind.as_str()), connect_generation.load(Ordering::Relaxed)) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -1296,7 +1317,8 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                     cfg.ring_path.clone(),
                     cfg.ring_epoch_id,
                 );
-                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), ring_sk_owned.as_deref(), ring_path_owned.as_deref(), ring_epoch_owned, cp_ref, connect_generation.load(Ordering::Relaxed)) {
+                let tun_api_bind_update = crate::tun_config::effective_api_bind(cfg.tun_template_path.as_deref());
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), ring_sk_owned.as_deref(), ring_path_owned.as_deref(), ring_epoch_owned, cp_ref, Some(tun_api_bind_update.as_str()), connect_generation.load(Ordering::Relaxed)) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");

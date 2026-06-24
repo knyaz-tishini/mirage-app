@@ -15,6 +15,9 @@ use tracing::{info, warn};
 
 use crate::MANAGED_BY_VALUE;
 
+/// Default TUN control-API bind address written into tun.json.
+pub(crate) const DEFAULT_API_BIND: &str = "127.0.0.1:19485";
+
 /// Private/LAN ranges that must egress DIRECT (real NIC), never the tunnel —
 /// so SSH and local services survive when the tun default-routes everything.
 const LAN_BYPASS_CIDRS: &[&str] =
@@ -123,7 +126,7 @@ pub fn write_tun_config(
         map.insert("dns_upstream".to_owned(), serde_json::json!("8.8.8.8:53"));
     }
     if !map.contains_key("api_bind") {
-        map.insert("api_bind".to_owned(), serde_json::json!("127.0.0.1:19485"));
+        map.insert("api_bind".to_owned(), serde_json::json!(DEFAULT_API_BIND));
     }
     if !map.contains_key("bypass") {
         let cidrs: Vec<serde_json::Value> = LAN_BYPASS_CIDRS
@@ -157,6 +160,22 @@ fn is_tun_managed(path: &PathBuf) -> bool {
         return v.get("_managed_by").and_then(|v| v.as_str()) == Some(MANAGED_BY_VALUE);
     }
     false
+}
+
+/// The TUN control-API bind the sentinel writes into tun.json: the template's
+/// `api_bind` if present, else [`DEFAULT_API_BIND`]. Exposed so the
+/// client-config materialiser can derive `tun_api_url` from the same value.
+pub(crate) fn effective_api_bind(template_path: Option<&std::path::Path>) -> String {
+    if let Some(tmpl) = template_path {
+        if let Ok(raw) = std::fs::read_to_string(tmpl) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(b) = v.get("api_bind").and_then(|x| x.as_str()) {
+                    return b.to_owned();
+                }
+            }
+        }
+    }
+    DEFAULT_API_BIND.to_owned()
 }
 
 // ── Relay-addr extraction ─────────────────────────────────────────────────────
