@@ -1159,6 +1159,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         client_id.clone(),
         cfg.telemetry_interval_secs,
         tun_alive_rx.clone(),
+        link.subscribe(),
     );
 
     // Periodic log-tail upload over the native wire (0 = disabled by default)

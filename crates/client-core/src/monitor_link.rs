@@ -169,6 +169,14 @@ pub struct MonitorConfig {
     /// Dynamic monitor URL list pushed by the monitor (peers + self_public_url).
     /// Sentinel persists this and uses it as bootstrap on next start.
     pub peer_lm_urls: Vec<String>,
+    /// Operator directive for flow-metadata collection and upload.
+    ///
+    /// `None` (absent or `collect: false`) means the client collects nothing.
+    /// When `Some(p)` with `p.collect == true` the telemetry task aggregates
+    /// flow observations from the TUN `/connections` endpoint and POSTs a
+    /// [`mirage_core::metadata::ClientMetadataReport`] to
+    /// `/relay/clients/{id}/metadata` over the same Mirage wire.
+    pub metadata_policy: Option<mirage_core::metadata::MetadataPolicy>,
 }
 
 /// Operator-triggered debug tunnel open command.
@@ -299,6 +307,10 @@ struct ConfigResponse {
     /// and the client will use only chains with hardcoded `hop.public_key`.
     #[serde(default)]
     peer_table: Option<PeerTable>,
+    /// Operator directive for flow-metadata collection (transmitted down).
+    /// Absent on old monitors — treated as `None` (collect nothing).
+    #[serde(default)]
+    metadata_policy: Option<mirage_core::metadata::MetadataPolicy>,
 }
 
 /// One step of a ring-membership Merkle inclusion path as received from the
@@ -2340,6 +2352,7 @@ impl MonitorLink {
             camouflage: cfg.camouflage,
             shaping: cfg.shaping,
             peer_lm_urls: cfg.peer_lm_urls,
+            metadata_policy: cfg.metadata_policy,
         };
         let _ = self.config_tx.send(Some(monitor_cfg.clone()));
         let _ = self.frame_tx.send(Some(WsServerFrame::Config(monitor_cfg)));
