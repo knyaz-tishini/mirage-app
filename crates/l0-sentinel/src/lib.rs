@@ -683,18 +683,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         .context("ensure_sentinel_id failed")?;
     info!(sentinel_id = %sentinel, "[sentinel] stable sentinel_id resolved");
 
-    // Build a plain reqwest client for the Stage 3 HTTP endpoints. We do NOT
-    // pin certs here — sentinel runs on user boxes where the monitor's
-    // cert is the public TLS chain anyway.
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .danger_accept_invalid_certs(
-            std::env::var("MIRAGE_SENTINEL_INSECURE").as_deref() == Ok("1"),
-        )
-        .build()
-        .context("build sentinel reqwest client")?;
-
-    let bootstrap_bearer = cfg.monitor_api_key.clone().unwrap_or_default();
     let shortname_owned = cfg
         .shortname
         .clone()
@@ -730,9 +718,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
 
     let (active_monitor_url, registered_client_id, registered_client_token) =
         match chain_request::register_with_failover(
-            &http_client,
-            &effective_urls,
-            &bootstrap_bearer,
             &reg_body,
             wire_reg_coords_ref.as_ref(),
         )
@@ -768,9 +753,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         active_monitor_url,
         client_id_resolved,
     );
-    drop(http_client);
-    drop(bootstrap_bearer);
-
     let config_exists = cfg.client_config_path.exists();
     let managed = config_exists && is_managed(&cfg.client_config_path);
     if config_exists && !managed && cfg.respect_user_config {

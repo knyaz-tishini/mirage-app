@@ -8,8 +8,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Wire coordinates for register-over-wire (R1).
 ///
@@ -33,98 +32,44 @@ pub struct RegisterBody<'a> {
     pub supported_transports: Vec<&'a str>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct RegisterResponse {
-    pub client_id: String,
-    #[serde(default)]
-    pub monitor_poll_interval_secs: Option<u64>,
-    /// Per-client token issued once at registration (Phase 2 monitor feature).
-    /// Present only when the monitor supports `require_client_token`.
-    /// Old monitors return `None` — callers must treat absence as backward-compat.
-    #[serde(default)]
-    pub client_token: Option<String>,
-}
-
-/// Try every URL in `monitor_urls` in order, return the first one that
-/// accepts our registration. On every success the returned `client_id`
-/// should match `sentinel_id` (post May-2026 monitor accepts caller id
-/// verbatim). On every failure we move on to the next URL.
+/// Register the sentinel with the mesh over the Mirage **native wire**
+/// (`:19444`, V9, mutual-auth + AEAD).  `wire_coords` MUST be present: the
+/// legacy HTTPS register path (`POST /relay/clients` on the monitor's :19451
+/// sidecar) was retired when the full HTTPS sidecar was closed
+/// (`bind_tls_sidecar = false`).  opbox now bakes `monitor_wire_addr` +
+/// `monitor_wire_pubkey_hex` into every issued client config (`/client/issue`),
+/// and the sentinel self-heals fresh coords from the peer_table over the live
+/// WS — so there is nothing left for an HTTPS fallback to do.
 ///
-/// Returns `(active_url, client_id, client_token)`. `client_token` is
-/// `None` on older monitors that do not issue tokens yet — callers must
-/// treat absence as backward-compat (no token in subscribe params).
-///
-/// When `wire_coords` is `Some`, the function tries `POST /relay/clients`
-/// over the Mirage native wire (`:19444`, V9, no bearer) **first** (R1).
-/// On wire success the HTTPS URL loop is skipped entirely.  On wire
-/// failure the code falls through to the HTTPS URL loop unchanged —
-/// backward-compatible cold-bootstrap path.
+/// Returns `(active_url, client_id, client_token)`.  `active_url` is a
+/// `wire://<addr>` marker (MonitorLink uses the Wire transport for every
+/// subsequent call).  `client_token` is `None` on monitors that do not issue
+/// tokens — callers treat absence as backward-compat (no token in subscribe).
 pub async fn register_with_failover(
-    http: &Client,
-    monitor_urls: &[String],
-    bearer: &str,
     body: &RegisterBody<'_>,
     wire_coords: Option<&WireRegisterCoords<'_>>,
 ) -> Result<(String, String, Option<String>)> {
-    // R1: Wire-preferred register.
-    if let Some(wc) = wire_coords {
-        let body_json = match serde_json::to_vec(body) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("[sentinel] register: serialize body for wire: {e}");
-                vec![]
-            }
-        };
-        if !body_json.is_empty() {
-            match mirage_client_core::monitor_link::register_post_over_wire(
-                wc.monitor_addr,
-                wc.monitor_pubkey_hex,
-                wc.mesh_id,
-                &body_json,
-            )
-            .await
-            {
-                Ok((client_id, _poll_secs, client_token)) => {
-                    tracing::info!(
-                        "[sentinel] registered over wire (R1): client_id={client_id}"
-                    );
-                    // Use the wire addr as the active "URL" so callers have a
-                    // non-empty string.  The actual HTTPS URL is irrelevant once
-                    // MonitorLink uses Wire transport for all subsequent calls.
-                    let wire_url =
-                        format!("wire://{}", wc.monitor_addr);
-                    return Ok((wire_url, client_id, client_token));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[sentinel] register wire failed ({e}) — falling back to HTTPS"
-                    );
-                }
-            }
-        }
-    }
+    let wc = wire_coords.ok_or_else(|| {
+        anyhow::anyhow!(
+            "register: no monitor wire coords in config — reissue the client \
+             config from opbox (legacy HTTPS register retired)"
+        )
+    })?;
 
-    // HTTPS failover (unchanged original path).
-    let mut last_err: Option<anyhow::Error> = None;
-    for url in monitor_urls {
-        let endpoint = format!("{}/relay/clients", url.trim_end_matches('/'));
-        let req = http.post(&endpoint).bearer_auth(bearer).json(body);
-        match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json::<RegisterResponse>().await {
-                Ok(resp) => return Ok((url.clone(), resp.client_id, resp.client_token)),
-                Err(e) => last_err = Some(anyhow::anyhow!("decode {url}: {e}")),
-            },
-            Ok(r) => {
-                last_err = Some(anyhow::anyhow!(
-                    "register at {url} returned HTTP {}: {}",
-                    r.status(),
-                    r.text().await.unwrap_or_default()
-                ));
-            }
-            Err(e) => last_err = Some(anyhow::anyhow!("send to {url}: {e}")),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no monitor URLs configured")))
+    let body_json = serde_json::to_vec(body).context("serialize register body for wire")?;
+
+    let (client_id, _poll_secs, client_token) =
+        mirage_client_core::monitor_link::register_post_over_wire(
+            wc.monitor_addr,
+            wc.monitor_pubkey_hex,
+            wc.mesh_id,
+            &body_json,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("register over wire (:19444): {e}"))?;
+
+    tracing::info!("[sentinel] registered over wire: client_id={client_id}");
+    Ok((format!("wire://{}", wc.monitor_addr), client_id, client_token))
 }
 
 /// Persist `client_id` under `${state_dir}/client-id.txt` so a restart can
