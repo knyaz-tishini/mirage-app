@@ -19,6 +19,7 @@ members = [
     "crates/v2ray-share-gen",
     "crates/foreign-probe",
     # "crates/mobile",  # cdylib — skip on Windows build
+    "crates/mirage-pt-adapter",
 ]
 
 [workspace.package]
