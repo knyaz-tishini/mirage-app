@@ -162,6 +162,17 @@ pub struct ChainConfig {
     /// supervisor logs a WARN and runs without MonitorLink (legacy mode).
     #[serde(default)]
     pub monitor_link_host: bool,
+    /// Mirrors `mirage_core::config::ChainConfig::kill_switch`. Forwarded at
+    /// `from_client_config` lowering time so the router-level gate applies
+    /// the same FailClosed/Failover{group} contract as the worker gate.
+    #[serde(default)]
+    pub kill_switch: Option<mirage_core::config::KillSwitchMode>,
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Mirrors `ChainConfig::effective_nature()` (already resolved by the
+    /// time it lands here — see `from_client_config` below).
+    #[serde(default)]
+    pub nature: mirage_core::config::WireNature,
 }
 
 /// TOML-serialisable mirror of `client_core::monitor_link::MonitorTransport`.
@@ -250,6 +261,9 @@ impl Config {
             )
         })?;
 
+        mirage_core::config::ChainConfig::validate_group_natures(&cc.chains)
+            .with_context(|| format!("client config {config_path} failed nature validation"))?;
+
         // MonitorLink-host designation: explicit chain_id, else the first chain.
         let ml_host: Option<String> = sup
             .monitor_link_host_chain
@@ -273,6 +287,9 @@ impl Config {
                 socks5_bind,
                 config_path: config_path.to_string(),
                 monitor_link_host: ml_host.as_deref() == Some(c.chain_id.as_str()),
+                kill_switch: c.kill_switch.clone(),
+                group: c.group.clone(),
+                nature: c.effective_nature(),
             });
         }
 

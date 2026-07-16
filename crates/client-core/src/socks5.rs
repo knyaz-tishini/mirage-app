@@ -29,7 +29,7 @@
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use mirage_core::{config::{ClientConfig, KillSwitchMode}, error::MirageError, routing::RouteDecision, routing::RoutingTable};
+use mirage_core::{config::{ClientConfig, KillSwitchMode, WireNature}, error::MirageError, routing::RouteDecision, routing::RoutingTable};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -158,6 +158,10 @@ pub struct Socks5Server {
     /// Per-chain kill-switch failure policies (chain_id → policy).
     /// Absent entry → `SocksFailurePolicy::Default` (legacy behavior).
     chain_policies: Arc<HashMap<String, SocksFailurePolicy>>,
+    /// Per-chain wire nature (chain_id → WireNature). Absent entry →
+    /// WireNature::Direct (conservative default, matches the field's own
+    /// default). Populated alongside `chain_policies` by the same caller.
+    chain_natures: Arc<HashMap<String, WireNature>>,
     /// Per-wire liveness map.  Shared across all connection handlers spawned
     /// by this server so a dead wire is detected instantly without waiting for
     /// pool-lease timeouts.
@@ -175,6 +179,7 @@ impl Socks5Server {
             chain_router: None,
             all_pools: Arc::new(HashMap::new()),
             chain_policies: Arc::new(HashMap::new()),
+            chain_natures: Arc::new(HashMap::new()),
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
         }
@@ -192,6 +197,7 @@ impl Socks5Server {
             chain_router: None,
             all_pools: Arc::new(HashMap::new()),
             chain_policies: Arc::new(HashMap::new()),
+            chain_natures: Arc::new(HashMap::new()),
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
         }
@@ -203,14 +209,18 @@ impl Socks5Server {
     /// [`SocksFailurePolicy`].  Chains absent from the map retain
     /// `SocksFailurePolicy::Default`.  `primary_chain_id` identifies which
     /// chain is the primary for this server instance so the handler can look
-    /// up its own policy without ambiguity.
+    /// up its own policy without ambiguity.  `natures` maps every chain_id
+    /// to its [`WireNature`]; chains absent from the map default to
+    /// `WireNature::Direct` for the same-nature failover gate.
     pub fn with_kill_switch(
         mut self,
         primary_chain_id: String,
         policies: HashMap<String, SocksFailurePolicy>,
+        natures: HashMap<String, WireNature>,
     ) -> Self {
         self.primary_chain_id = primary_chain_id;
         self.chain_policies = Arc::new(policies);
+        self.chain_natures = Arc::new(natures);
         self
     }
 
@@ -237,6 +247,7 @@ impl Socks5Server {
             chain_router: Some(chain_router),
             all_pools: Arc::new(all_pools),
             chain_policies: Arc::new(HashMap::new()),
+            chain_natures: Arc::new(HashMap::new()),
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
         }
@@ -257,6 +268,7 @@ impl Socks5Server {
         let chain_router = self.chain_router.clone();
         let all_pools = Arc::clone(&self.all_pools);
         let chain_policies = Arc::clone(&self.chain_policies);
+        let chain_natures = Arc::clone(&self.chain_natures);
         let wire_health = Arc::clone(&self.wire_health);
         let primary_chain_id = Arc::new(self.primary_chain_id.clone());
 
@@ -271,6 +283,7 @@ impl Socks5Server {
             let chain_router = chain_router.clone();
             let all_pools = Arc::clone(&all_pools);
             let chain_policies = Arc::clone(&chain_policies);
+            let chain_natures = Arc::clone(&chain_natures);
             let wire_health = Arc::clone(&wire_health);
             let primary_chain_id = Arc::clone(&primary_chain_id);
 
@@ -286,7 +299,7 @@ impl Socks5Server {
                     };
                     match kind {
                         ConnectionKind::Socks5 => {
-                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await
+                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id).await
                         }
                         ConnectionKind::Transparent => {
                             handle_transparent_connection(stream, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await
@@ -295,7 +308,7 @@ impl Socks5Server {
                 };
 
                 #[cfg(not(target_os = "linux"))]
-                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await;
+                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id).await;
 
                 if let Err(e) = result {
                     error!(%peer, "connection error: {e}");
@@ -610,6 +623,7 @@ async fn handle_socks5_connection(
     chain_router: Option<Arc<dyn Router>>,
     all_pools: Arc<HashMap<ChainId, Arc<TunnelPool>>>,
     chain_policies: Arc<HashMap<String, SocksFailurePolicy>>,
+    chain_natures: Arc<HashMap<String, WireNature>>,
     wire_health: Arc<WireHealthMap>,
     primary_chain_id: Arc<String>,
 ) -> Result<(), MirageError> {
@@ -731,6 +745,7 @@ async fn handle_socks5_connection(
                                         &policy,
                                         &wire_health,
                                         &chain_policies,
+                                        &chain_natures,
                                     ).await
                                 }
                                 Err(e) => {
@@ -744,6 +759,7 @@ async fn handle_socks5_connection(
                                         &policy,
                                         &wire_health,
                                         &chain_policies,
+                                        &chain_natures,
                                     ).await
                                 }
                             }
@@ -757,6 +773,7 @@ async fn handle_socks5_connection(
                                 &policy,
                                 &wire_health,
                                 &chain_policies,
+                                &chain_natures,
                             ).await
                         }
                     }
@@ -882,6 +899,7 @@ async fn route_via_pool_with_failover(
     policy: &SocksFailurePolicy,
     wire_health: &Arc<WireHealthMap>,
     chain_policies: &HashMap<String, SocksFailurePolicy>,
+    chain_natures: &HashMap<String, WireNature>,
 ) -> Result<(), MirageError> {
     // ── S3: consult wire health before attempting primary ─────────────────────
     if !wire_health.is_healthy(primary_chain_id) {
@@ -930,6 +948,7 @@ async fn route_via_pool_with_failover(
                     );
                     let mut last_err = primary_err;
                     let mut found: Option<crate::pool::TunnelLease> = None;
+                    let primary_nature = chain_natures.get(primary_chain_id).copied().unwrap_or_default();
 
                     for (chain_id, fo_pool) in failover {
                         // Only try chains that are members of the same group.
@@ -947,6 +966,18 @@ async fn route_via_pool_with_failover(
                                 group = %group,
                                 // INVARIANT 3: chain not in this group — skip.
                                 "kill-switch Failover: skipping chain not in group"
+                            );
+                            continue;
+                        }
+                        // Same-nature invariant: never substitute a candidate whose
+                        // structural wire nature differs from the primary chain's.
+                        let candidate_nature = chain_natures.get(chain_id).copied().unwrap_or_default();
+                        if candidate_nature != primary_nature {
+                            debug!(
+                                chain = %chain_id,
+                                primary_nature = ?primary_nature,
+                                candidate_nature = ?candidate_nature,
+                                "kill-switch Failover: skipping candidate — nature mismatch (same-nature invariant)"
                             );
                             continue;
                         }

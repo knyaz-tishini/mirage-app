@@ -97,6 +97,8 @@ pub fn write_tun_config(
             serde_json::json!({
                 "name": c.chain_id,
                 "socks5_addr": socks5_addr,
+                "group": c.group,
+                "nature": c.effective_nature(),
             })
         })
         .collect();
@@ -252,6 +254,7 @@ mod tests {
             aead_suite: mirage_core::crypto::AeadSuite::ChaCha20Poly1305,
             kill_switch: None,
             group: None,
+            nature: None,
         }
     }
 

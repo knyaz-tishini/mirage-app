@@ -29,7 +29,7 @@ use mirage_client_core::{
     wire_health::WireHealthMap,
 };
 use mirage_core::{
-    config::{ClientConfig, ProtocolId, ReplyMode, TcpProtocolId, TunnelPoolConfig},
+    config::{ClientConfig, ProtocolId, ReplyMode, TcpProtocolId, TunnelPoolConfig, WireNature},
     mirage::mesh::PeerTable,
     routing::RoutingTable,
 };
@@ -378,10 +378,12 @@ async fn main() -> anyhow::Result<()> {
     );
     let chain_policies: HashMap<String, SocksFailurePolicy> =
         [(chain_id.clone(), worker_policy)].into();
+    let chain_natures: HashMap<String, WireNature> =
+        [(chain_id.clone(), chain.effective_nature())].into();
 
     // Spawn SOCKS5 server.
     let server = Socks5Server::new_with_failover(addr, vec![])
-        .with_kill_switch(chain_id.clone(), chain_policies)
+        .with_kill_switch(chain_id.clone(), chain_policies, chain_natures)
         .with_shared_wire_health(Arc::clone(&shared_wire_health));
     // Clone for supervisor_loop; original moves into server closure below.
     let mux_pool_for_loop = mux_pool_opt.as_ref().map(Arc::clone);

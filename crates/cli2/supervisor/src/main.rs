@@ -336,6 +336,12 @@ async fn main() -> anyhow::Result<()> {
                             router_listener::RouterChain {
                                 chain_id: c.id.clone(),
                                 socks5_addr: addr,
+                                policy: mirage_client_core::socks5::SocksFailurePolicy::from_chain_config(
+                                    c.kill_switch.as_ref(),
+                                    c.group.as_deref(),
+                                    &c.id,
+                                ),
+                                nature: c.nature,
                             }
                         })
                     })

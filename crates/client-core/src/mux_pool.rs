@@ -1007,6 +1007,7 @@ mod tests {
             aead_suite: mirage_core::crypto::AeadSuite::ChaCha20Poly1305,
             kill_switch: None,
             group: None,
+            nature: None,
         };
 
         // Build a minimal ProtocolChain (unused for the 2-hop onion path — onion
@@ -1111,6 +1112,7 @@ mod tests {
             aead_suite: mirage_core::crypto::AeadSuite::ChaCha20Poly1305,
             kill_switch: None,
             group: None,
+            nature: None,
         }
     }
 

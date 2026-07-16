@@ -17,6 +17,8 @@ use std::{
     },
 };
 
+use mirage_client_core::{socks5::SocksFailurePolicy, wire_health::WireHealthMap};
+use mirage_core::config::WireNature;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -42,6 +44,12 @@ const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub struct RouterChain {
     pub chain_id: String,
     pub socks5_addr: SocketAddr,
+    /// Kill-switch failure policy for this chain (mirrors the per-worker
+    /// gate in `client-core::socks5`). `Default` = legacy passthrough
+    /// (unconditional round-robin, unchanged behavior).
+    pub policy: SocksFailurePolicy,
+    /// Structural wire nature (mirrors `mirage_core::config::ChainConfig::effective_nature()`).
+    pub nature: WireNature,
 }
 
 // ── SupervisorRouter ─────────────────────────────────────────────────────────
@@ -52,17 +60,44 @@ pub struct RouterChain {
 /// `pick()` call it returns chains ordered starting from the current cursor
 /// position (wrapping around). The caller iterates in order, trying each
 /// worker's SOCKS5 until one succeeds.
+///
+/// `kill_switch = Strict` chains are excluded from the rotation pool at
+/// construction — a Strict chain's entire point is reachability only via its
+/// own dedicated `socks5_bind` port; mixing it into the shared rotation pool
+/// would defeat that pinning contract for every other flow that might
+/// round-robin onto it.
 pub struct SupervisorRouter {
     chains: Vec<RouterChain>,
     cursor: AtomicU64,
+    /// Router-level per-wire liveness map, shared across all router
+    /// connection handlers so a dead worker is detected instantly instead of
+    /// waiting for the per-attempt handshake timeout on every connection.
+    pub health: Arc<WireHealthMap>,
 }
 
 impl SupervisorRouter {
-    /// Build from config chains list.
+    /// Build from config chains list. `Strict`-policy chains are filtered out
+    /// of the rotation pool (with a `warn!` per exclusion) — they remain
+    /// reachable only via their own dedicated worker `socks5_bind`.
     pub fn new(chains: Vec<RouterChain>) -> Arc<Self> {
+        let pool: Vec<RouterChain> = chains
+            .into_iter()
+            .filter(|c| {
+                let strict = matches!(c.policy, SocksFailurePolicy::FailClosed);
+                if strict {
+                    warn!(
+                        chain = %c.chain_id,
+                        "router: excluding Strict-policy chain from shared rotation pool \
+                         — reachable only via its own dedicated socks5_bind"
+                    );
+                }
+                !strict
+            })
+            .collect();
         Arc::new(Self {
-            chains,
+            chains: pool,
             cursor: AtomicU64::new(0),
+            health: WireHealthMap::new(),
         })
     }
 
@@ -159,11 +194,44 @@ async fn handle_router_connection(
         return Err(std::io::Error::other("no workers available"));
     }
 
+    // The round-robin start candidate anchors the group/nature gate for every
+    // subsequent retry candidate — see §5/§6 of the same-nature killswitch plan.
+    let first = candidates[0];
+    let first_group: Option<&str> = match &first.policy {
+        SocksFailurePolicy::Failover { group } => Some(group.as_str()),
+        _ => None,
+    };
+
     for chain in &candidates {
+        let eligible = match &chain.policy {
+            // `Default` (kill_switch unset): legacy passthrough, unconditional —
+            // preserves today's behavior exactly for undeclared chains.
+            SocksFailurePolicy::Default => true,
+            // `General{group}`: only a same-group, same-nature candidate may
+            // stand in for the round-robin start candidate.
+            SocksFailurePolicy::Failover { group } => {
+                first_group == Some(group.as_str()) && chain.nature == first.nature
+            }
+            // `Strict` chains never reach the pool — already filtered out at
+            // `SupervisorRouter::new` construction time.
+            SocksFailurePolicy::FailClosed => false,
+        };
+        if !eligible {
+            debug!(
+                chain = %chain.chain_id,
+                "router: skipping candidate — kill-switch group/nature gate"
+            );
+            continue;
+        }
+
         debug!(chain = %chain.chain_id, worker = %chain.socks5_addr, "router: trying worker");
         match forward_via_worker(&mut client, chain.socks5_addr, &target_host, target_port).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                router.health.record_success(&chain.chain_id);
+                return Ok(());
+            }
             Err(e) => {
+                router.health.record_failure(&chain.chain_id);
                 warn!(chain = %chain.chain_id, error = %e, "router: worker failed — trying next");
             }
         }
