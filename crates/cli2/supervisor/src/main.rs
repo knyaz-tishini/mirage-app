@@ -447,6 +447,12 @@ async fn main() -> anyhow::Result<()> {
     // the main loop for broadcast to all other workers.
     let (pt_tx, mut pt_rx) = mpsc::channel::<String>(8);
 
+    // Channel: CredentialParams JSON forwarded from the MonitorLink host
+    // worker to the main loop for broadcast to all other workers. Mirrors
+    // `pt_tx`/`pt_rx` exactly — non-host chains have no MonitorLink of their
+    // own and would otherwise dial with credential_scheme=0x00 forever.
+    let (cred_tx, mut cred_rx) = mpsc::channel::<String>(8);
+
     // Build the resolved SetupMonitorLink params once and store them so the
     // respawn path (B2b) can re-send without reconstructing from config.
     let ml_setup: Option<MlSetup> = build_ml_setup(&config);
@@ -570,6 +576,18 @@ async fn main() -> anyhow::Result<()> {
                         warn!("supervisor: failed to persist peer_table snapshot: {e}");
                     }
                     let _ = pt_tx.try_send(peer_table_json.clone());
+                }
+                if let WorkerMsg::CredentialParamsSnapshot {
+                    generation,
+                    ref credential_params_json,
+                } = event.msg
+                {
+                    debug!(
+                        source_chain = %chain_id,
+                        generation,
+                        "supervisor: CredentialParamsSnapshot from MonitorLink host worker — broadcasting"
+                    );
+                    let _ = cred_tx.try_send(credential_params_json.clone());
                 }
                 handle.apply_msg(&event.msg);
                 log_worker_event(chain_id, &event.msg);
@@ -711,6 +729,33 @@ async fn main() -> anyhow::Result<()> {
                         }
                         if let Err(e) = handle.send_peer_table_update(json.clone()).await {
                             warn!(chain_id = %chain_id, "send PeerTableUpdate failed: {e:#}");
+                        }
+                    }
+                }
+            }
+
+            cred_json = cred_rx.recv() => {
+                if let Some(json) = cred_json {
+                    // Broadcast CredentialParamsUpdate to all live workers EXCEPT
+                    // the MonitorLink host (it already has the data via its own
+                    // ArcSwap). Mirrors the PeerTableUpdate broadcast above —
+                    // multi-wire siblings have no MonitorLink of their own and
+                    // need the host-relayed params to present a 0x04
+                    // ring-membership credential on dial (arc3
+                    // multi-wire-cred-client fix).
+                    let host_id = config.chains.iter()
+                        .find(|c| c.monitor_link_host)
+                        .map(|c| c.id.as_str());
+                    for (chain_id, handle) in handles.iter_mut() {
+                        if handle.state == HandleState::Exited {
+                            continue;
+                        }
+                        if Some(chain_id.as_str()) == host_id {
+                            // Source worker — skip (it owns MonitorLink's ArcSwap).
+                            continue;
+                        }
+                        if let Err(e) = handle.send_credential_params_update(json.clone()).await {
+                            warn!(chain_id = %chain_id, "send CredentialParamsUpdate failed: {e:#}");
                         }
                     }
                 }
@@ -883,6 +928,10 @@ fn log_worker_event(chain_id: &str, msg: &WorkerMsg) {
         WorkerMsg::PeerTableSnapshot { generation, .. } => {
             // Routed to pt_tx before reaching this function; logged there.
             debug!(chain_id, generation, "worker PeerTableSnapshot");
+        }
+        WorkerMsg::CredentialParamsSnapshot { generation, .. } => {
+            // Routed to cred_tx before reaching this function; logged there.
+            debug!(chain_id, generation, "worker CredentialParamsSnapshot");
         }
     }
 }

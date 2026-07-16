@@ -94,6 +94,18 @@ pub enum SupervisorMsg {
         /// JSON-serialized `mirage_core::mirage::mesh::PeerTable`.
         peer_table_json: String,
     },
+    /// Live `CredentialParams` update relayed from the MonitorLink host worker.
+    ///
+    /// Only ONE worker per client ever opens a `MonitorLink` (the
+    /// `monitor_link_host` chain), so sibling workers have no direct path to
+    /// the operator-signed authority/epoch descriptor and dial with
+    /// `credential_scheme=0x00` unless it is relayed to them. Mirrors
+    /// `PeerTableUpdate` exactly: worker deserializes and stores into its own
+    /// `Arc<ArcSwap<Option<CredentialParams>>>`.
+    CredentialParamsUpdate {
+        /// JSON-serialized `mirage_core::crypto::credential::CredentialParams`.
+        credential_params_json: String,
+    },
     /// Sent by supervisor to the designated `monitor_link_host = true` worker
     /// after all workers are Ready.
     ///
@@ -162,6 +174,20 @@ pub enum WorkerMsg {
         generation: u64,
         /// JSON-serialized `mirage_core::mirage::mesh::PeerTable`.
         peer_table_json: String,
+    },
+    /// `CredentialParams` snapshot from the designated MonitorLink host worker.
+    ///
+    /// Sent whenever the host worker's `MonitorLink` applies a new
+    /// `CredentialParams` frame (higher `generation`). Supervisor broadcasts
+    /// `CredentialParamsUpdate` to all other (non-host) workers on receipt —
+    /// the exact `WorkerMsg::PeerTableSnapshot` / `SupervisorMsg::PeerTableUpdate`
+    /// fan-out pattern, applied to the credential authority set instead of the
+    /// mesh peer table.
+    CredentialParamsSnapshot {
+        /// `CredentialParams::generation` — monotonic, discards stale/replayed frames.
+        generation: u64,
+        /// JSON-serialized `mirage_core::crypto::credential::CredentialParams`.
+        credential_params_json: String,
     },
 }
 
@@ -268,6 +294,57 @@ mod tests {
                 assert_eq!(got, pt_json);
             }
             other => panic!("expected PeerTableUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_params_update_round_trip() {
+        let cp_json = r#"{"generation":3,"require":true,"authorities":[],"operator_sig":null}"#;
+        let msg = SupervisorMsg::CredentialParamsUpdate {
+            credential_params_json: cp_json.to_string(),
+        };
+        let serialized =
+            serde_json::to_string(&msg).expect("serialize CredentialParamsUpdate");
+        assert!(
+            serialized.contains(r#""type":"credential_params_update""#),
+            "expected tag in: {serialized}"
+        );
+        let deserialized: SupervisorMsg =
+            serde_json::from_str(&serialized).expect("deserialize CredentialParamsUpdate");
+        match deserialized {
+            SupervisorMsg::CredentialParamsUpdate {
+                credential_params_json: got,
+            } => {
+                assert_eq!(got, cp_json);
+            }
+            other => panic!("expected CredentialParamsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_params_snapshot_round_trip() {
+        let cp_json = r#"{"generation":5,"require":false,"authorities":[],"operator_sig":null}"#;
+        let msg = WorkerMsg::CredentialParamsSnapshot {
+            generation: 5,
+            credential_params_json: cp_json.to_string(),
+        };
+        let serialized =
+            serde_json::to_string(&msg).expect("serialize CredentialParamsSnapshot");
+        assert!(
+            serialized.contains(r#""type":"credential_params_snapshot""#),
+            "expected tag in: {serialized}"
+        );
+        let deserialized: WorkerMsg =
+            serde_json::from_str(&serialized).expect("deserialize CredentialParamsSnapshot");
+        match deserialized {
+            WorkerMsg::CredentialParamsSnapshot {
+                generation,
+                credential_params_json: got,
+            } => {
+                assert_eq!(generation, 5);
+                assert_eq!(got, cp_json);
+            }
+            other => panic!("expected CredentialParamsSnapshot, got {other:?}"),
         }
     }
 

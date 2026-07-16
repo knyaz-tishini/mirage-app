@@ -22,7 +22,7 @@ use mirage_chain_ipc::{
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use mirage_client_core::{
     ChainHandle, ChainId, ChainMetrics, ChainSet, ChainState, HealthProbeConfig, PrewarmStrategy,
-    monitor_link::{MonitorLink, MonitorTransport},
+    monitor_link::{MonitorLink, MonitorTransport, WsServerFrame},
     mux_pool::MuxPool,
     pool::TunnelPool,
     socks5::{Socks5Server, SocksFailurePolicy},
@@ -677,6 +677,27 @@ async fn handle_session(
                     }
                 }
             }
+            Ok(Some(SupervisorMsg::CredentialParamsUpdate { credential_params_json })) => {
+                // Relayed from the MonitorLink host worker via the supervisor
+                // (this worker has no MonitorLink of its own — see
+                // `spawn_monitor_link_in_worker`'s CredentialParamsSnapshot
+                // watcher). Mirrors the PeerTableUpdate arm above.
+                match serde_json::from_str::<mirage_core::crypto::credential::CredentialParams>(
+                    &credential_params_json,
+                ) {
+                    Ok(cp) => {
+                        info!(
+                            chain_id,
+                            generation = cp.generation,
+                            "worker: CredentialParamsUpdate applied"
+                        );
+                        credential_params.store(Arc::new(Some(cp)));
+                    }
+                    Err(e) => {
+                        warn!(chain_id, "worker: CredentialParamsUpdate parse error: {e}");
+                    }
+                }
+            }
             Ok(Some(SupervisorMsg::SetupMonitorLink {
                 monitor_urls,
                 monitor_api_key,
@@ -943,6 +964,69 @@ fn spawn_monitor_link_in_worker(
         tokio::spawn(mirage_client_core::policy_push::run_policy_pusher(config_rx.clone(), u));
     } else {
         info!(chain_id, "worker: no tun_api_url — policy-push task not started (SOCKS-only mode)");
+    }
+
+    // Watcher task: on each pushed `CredentialParams` frame, forward the
+    // current authority set to the supervisor via `outgoing_tx` as
+    // `WorkerMsg::CredentialParamsSnapshot`.
+    //
+    // WHY a separate watcher (not the peer_table `config_rx` one below):
+    // `apply_credential_params` (monitor_link.rs) only pushes through
+    // `frame_tx`, never `config_tx`, so `config_rx.changed()` never fires
+    // for a credential-only push. Multi-wire clients run N sibling workers
+    // but only ONE ever hosts a MonitorLink (`monitor_link_host=true`);
+    // without this relay, sibling workers never see CredentialParams and
+    // dial with credential_scheme=0x00 forever. Mirrors the peer_table
+    // broadcast path (`WorkerMsg::PeerTableSnapshot` /
+    // `SupervisorMsg::PeerTableUpdate`) 1:1, applied to the credential
+    // authority set instead of the mesh peer table.
+    {
+        let mut cred_frame_rx = monitor_link.subscribe_frames();
+        let credential_params_for_watch = Arc::clone(&credential_params);
+        let outgoing_tx_cred = Arc::clone(&outgoing_tx);
+        let chain_id_owned_cred = chain_id.to_string();
+        tokio::spawn(async move {
+            let mut last_generation: u64 = 0;
+            loop {
+                if cred_frame_rx.changed().await.is_err() {
+                    // MonitorLink dropped — watcher exits.
+                    break;
+                }
+                let frame = cred_frame_rx.borrow().clone();
+                if !matches!(frame, Some(WsServerFrame::CredentialParams(_))) {
+                    continue;
+                }
+                // Read the current params directly from the ArcSwap (already
+                // updated by MonitorLink::apply_credential_params before the
+                // watch fires) — same pattern as the peer_table watcher below.
+                let snapshot = credential_params_for_watch.load();
+                let Some(ref params) = **snapshot else { continue };
+                let generation = params.generation;
+                if generation <= last_generation && last_generation != 0 {
+                    continue;
+                }
+                last_generation = generation;
+                match serde_json::to_string(params) {
+                    Ok(json) => {
+                        debug!(
+                            chain_id = %chain_id_owned_cred,
+                            generation,
+                            "worker: sending CredentialParamsSnapshot to supervisor"
+                        );
+                        let msg = WorkerMsg::CredentialParamsSnapshot {
+                            generation,
+                            credential_params_json: json,
+                        };
+                        if outgoing_tx_cred.send(msg).await.is_err() {
+                            break; // supervisor disconnected — stop
+                        }
+                    }
+                    Err(e) => {
+                        warn!(chain_id = %chain_id_owned_cred, "worker: credential_params serialize error: {e}");
+                    }
+                }
+            }
+        });
     }
 
     let chain_id_owned = chain_id.to_string();

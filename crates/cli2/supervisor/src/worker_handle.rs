@@ -370,6 +370,19 @@ impl WorkerHandle {
             .await
     }
 
+    /// Push a live `CredentialParams` update to the worker.
+    ///
+    /// Mirrors [`send_peer_table_update`] — relays the MonitorLink host
+    /// worker's operator-signed authority set to a sibling worker that has no
+    /// `MonitorLink` of its own (see `WorkerMsg::CredentialParamsSnapshot`).
+    pub async fn send_credential_params_update(
+        &mut self,
+        credential_params_json: String,
+    ) -> anyhow::Result<()> {
+        self.send(SupervisorMsg::CredentialParamsUpdate { credential_params_json })
+            .await
+    }
+
     /// Tell the designated MonitorLink host worker to spawn its MonitorLink.
     ///
     /// `tun_api_url` is forwarded to the worker so it can push split-tunnel
@@ -438,8 +451,9 @@ impl WorkerHandle {
 
     /// Process a received WorkerMsg and update handle state.
     ///
-    /// `PeerTableSnapshot` is intentionally NOT handled here — the main loop
-    /// routes it to `pt_tx` before calling `apply_msg`.
+    /// `PeerTableSnapshot` / `CredentialParamsSnapshot` are intentionally NOT
+    /// routed here — the main loop forwards them to `pt_tx` / `cred_tx`
+    /// before calling `apply_msg`.
     pub fn apply_msg(&mut self, msg: &WorkerMsg) {
         match msg {
             WorkerMsg::Ready { pid, .. } => {
@@ -467,6 +481,9 @@ impl WorkerHandle {
             }
             WorkerMsg::PeerTableSnapshot { generation, .. } => {
                 debug!(chain_id = %self.chain_id, generation, "worker sent PeerTableSnapshot");
+            }
+            WorkerMsg::CredentialParamsSnapshot { generation, .. } => {
+                debug!(chain_id = %self.chain_id, generation, "worker sent CredentialParamsSnapshot");
             }
         }
     }
