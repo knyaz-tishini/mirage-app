@@ -1,4 +1,4 @@
-//! AuroraSkin — a full-screen ASCII cell-shader scene (uzor `ui::effects::text`).
+//! AuroraSkin — a full-screen ASCII cell-shader scene (`uzor_text::ascii`).
 //!
 //! An interference / flow field (layered sines) drawn as a character field and
 //! coloured iridescent (hsl). The cursor domain-warps it like the radar, but the
@@ -7,7 +7,7 @@
 //! laps tightly around. Velocity is smoothed so the wake trails and settles.
 
 use uzor::render::RenderContext;
-use uzor::ui::effects::text::{density_char, hsl, AsciiGrid, Cell, CellShader, Coord, Cursor, GridContext};
+use uzor_text::ascii::{density_char, hsl, AsciiGrid, Cell, CellShader, Coord, Cursor, GridContext};
 
 use crate::centerpiece::{CenterpieceState, Skin, SkinRect};
 

@@ -2775,6 +2775,7 @@ dependencies = [
  "tracing-subscriber",
  "uzor",
  "uzor-desktop",
+ "uzor-text",
 ]
 
 [[package]]
@@ -5319,7 +5320,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uzor"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "ahash 0.8.12",
  "bitflags 2.13.0",
@@ -5339,7 +5340,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-agent-api"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "axum",
  "serde",
@@ -5350,7 +5351,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-desktop"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "image",
  "objc2 0.5.2",
@@ -5372,11 +5373,11 @@ dependencies = [
 
 [[package]]
 name = "uzor-fonts"
-version = "1.4.15"
+version = "1.4.18"
 
 [[package]]
 name = "uzor-render-canvas2d"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "js-sys",
  "uzor",
@@ -5386,7 +5387,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-hub"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "js-sys",
  "metrics",
@@ -5421,7 +5422,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-tiny-skia"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -5430,7 +5431,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-urx"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "kurbo",
  "peniko",
@@ -5440,7 +5441,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-cpu"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -5449,7 +5450,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-gpu"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -5458,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-hybrid"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "glifo",
  "skrifa 0.42.1",
@@ -5470,7 +5471,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-wgpu-instanced"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -5483,8 +5484,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "uzor-text"
+version = "1.4.18"
+dependencies = [
+ "fastrand",
+ "uzor",
+]
+
+[[package]]
 name = "uzor-urx-3d"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "bytemuck",
  "glam",
@@ -5494,7 +5503,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-core"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "kurbo",
  "metrics",
@@ -5504,7 +5513,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-cpu"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "bumpalo",
  "bytemuck",
@@ -5518,7 +5527,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-engine"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "metrics",
  "uzor-urx-core",
@@ -5531,7 +5540,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-hybrid"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "bytemuck",
  "etagere",
@@ -5544,14 +5553,14 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-physics"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "glam",
 ]
 
 [[package]]
 name = "uzor-urx-wgpu"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "kurbo",
  "metrics",
@@ -5564,7 +5573,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-wgpu-full"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "bytemuck",
  "kurbo",
@@ -5576,7 +5585,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-desktop"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "arboard",
  "dark-light",
@@ -5587,7 +5596,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-web"
-version = "1.4.15"
+version = "1.4.18"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

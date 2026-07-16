@@ -34,6 +34,7 @@ embed-manifest = "1"
 [dependencies]
 uzor          = { path = "../../../uzor/uzor" }
 uzor-desktop  = { path = "../../../uzor/uzor-desktop" }
+uzor-text     = { path = "../../../uzor/uzor-text" }
 
 tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 tracing                 = "0.1"

@@ -1,4 +1,4 @@
-//! RadarSkin — an ASCII cell-shader scene (uzor `ui::effects::text` engine).
+//! RadarSkin — an ASCII cell-shader scene (`uzor_text::ascii` engine).
 //!
 //! The radar (moving rings + rotating sweep) is rendered as a character field
 //! by a per-cell shader. The cursor domain-warps the field: cells near the
@@ -9,7 +9,7 @@
 use std::f64::consts::TAU;
 
 use uzor::render::RenderContext;
-use uzor::ui::effects::text::{density_char, AsciiGrid, Cell, CellShader, Coord, Cursor, GridContext};
+use uzor_text::ascii::{density_char, AsciiGrid, Cell, CellShader, Coord, Cursor, GridContext};
 
 use crate::centerpiece::{CenterpieceState, Skin, SkinRect};
 
