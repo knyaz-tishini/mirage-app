@@ -334,7 +334,8 @@ enum TaggedServerFrame {
     /// Phase 1.14 (memory wave): graceful chain migration hint.
     ChainAvailable(ChainAvailable),
     /// Operator pushes epoch secrets for per-dial anonymous credential minting.
-    /// Wire JSON: `{"kind":"credential_params","generation":N,"scheme":1,"epochs":[...],"require":false}`.
+    /// Wire JSON: `{"kind":"credential_params","generation":N,"scheme":1,"epochs":[...]}`.
+    /// Credential enforcement is unconditional — there is no `require` field.
     CredentialParams(CredentialParams),
     /// App-level Pong echoing a client-sent Ping nonce.
     #[serde(rename = "pong")]
@@ -533,8 +534,12 @@ struct InflightBatch {
 ///
 /// Derived from the live [`CredentialParams`] stored in
 /// [`MonitorLink::credential_params`].  Intended for GUI / polling consumers that
-/// need to display the scheme name, generation counter, and enforce-mode flag
-/// without exposing epoch secrets or internal crypto state.
+/// need to display the scheme name and generation counter without exposing
+/// epoch secrets or internal crypto state.
+///
+/// Credential enforcement is unconditional (no `require` toggle, arc3
+/// mandatory-credentials excision) — credential-less (legacy) dials are
+/// always rejected on the data plane once params are configured.
 #[derive(Debug, Clone, Serialize)]
 pub struct CredentialSummary {
     /// Snake-case scheme name matching the JSON serialisation of
@@ -542,8 +547,6 @@ pub struct CredentialSummary {
     pub scheme: String,
     /// Monotonic generation counter from the latest accepted [`CredentialParams`].
     pub generation: u64,
-    /// When `true`, credential-less (legacy) dials are REJECTED on the data plane.
-    pub require: bool,
 }
 
 // ── MonitorLink ───────────────────────────────────────────────────────────────
@@ -938,7 +941,6 @@ impl MonitorLink {
         Some(CredentialSummary {
             scheme: params.primary_scheme().as_str().to_owned(),
             generation: params.generation,
-            require: params.require,
         })
     }
 

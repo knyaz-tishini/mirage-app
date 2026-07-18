@@ -1429,12 +1429,13 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
                     // picks up the hot-swapped RingCredential from the cell.
                     //
                     // B4b: same effective_credential_gated derivation as pool.rs --
-                    // gate on CredentialParams.require (explicit server-side signal)
-                    // not on operator_pub_hex.is_some() (construction-time heuristic).
+                    // gate on CredentialParams presence (credential enforcement is
+                    // unconditional, no `require` toggle) not on
+                    // operator_pub_hex.is_some() (construction-time heuristic).
                     let effective_credential_gated = cred_snap
                         .as_ref()
                         .as_ref()
-                        .map(|p| p.require)
+                        .map(|_p| true)
                         .unwrap_or(credential_gated);
                     if effective_credential_gated && crate::pool::is_credential_rejected(&e) {
                         debug!(

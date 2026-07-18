@@ -89,7 +89,6 @@ pub struct PhaseDetail {
 pub struct CredentialState {
     pub scheme: String,
     pub generation: u64,
-    pub require: bool,
 }
 
 /// Per-chain merged view: topology from config + health from client-state.json
@@ -225,7 +224,6 @@ struct RawClientStateChain {
 struct RawCredentialSummary {
     scheme: String,
     generation: u64,
-    require: bool,
 }
 
 // ── Raw JSON shapes from last-peer-table.json ─────────────────────────────────
@@ -544,7 +542,6 @@ pub fn spawn_model_poller(
             let credential = client_state_file.credential.map(|c| CredentialState {
                 scheme: c.scheme,
                 generation: c.generation,
-                require: c.require,
             });
 
             // ── Health index from client-state.json ────────────────────────────
@@ -766,7 +763,6 @@ impl ClientState {
             credential: Some(CredentialState {
                 scheme: "ring_membership".to_string(),
                 generation: 7,
-                require: true,
             }),
             chains: vec![
                 ChainState {

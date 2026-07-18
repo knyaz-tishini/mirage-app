@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn credential_params_update_round_trip() {
-        let cp_json = r#"{"generation":3,"require":true,"authorities":[],"operator_sig":null}"#;
+        let cp_json = r#"{"generation":3,"authorities":[],"operator_sig":null}"#;
         let msg = SupervisorMsg::CredentialParamsUpdate {
             credential_params_json: cp_json.to_string(),
         };
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn credential_params_snapshot_round_trip() {
-        let cp_json = r#"{"generation":5,"require":false,"authorities":[],"operator_sig":null}"#;
+        let cp_json = r#"{"generation":5,"authorities":[],"operator_sig":null}"#;
         let msg = WorkerMsg::CredentialParamsSnapshot {
             generation: 5,
             credential_params_json: cp_json.to_string(),

@@ -1370,21 +1370,22 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
                     // fires for credential delivery.  Retry at the capped interval
                     // so the next attempt picks up the hot-swapped RingCredential.
                     //
-                    // B4b: derive the gate from CredentialParams.require (the
-                    // explicit server-side policy flag, monitor-pushed) rather than
-                    // from operator_pub_hex.is_some() (the construction-time
+                    // B4b: derive the gate from CredentialParams presence rather
+                    // than from operator_pub_hex.is_some() (the construction-time
                     // heuristic).  operator_pub_hex is a WIRE key, not a
                     // requirement signal: a wire can carry an operator key while
-                    // the target node has require=false, and vice versa — both
+                    // the target node's posture differs, and vice versa — both
                     // cases create a livelock variant under the old heuristic.
-                    // When CredentialParams have not arrived yet (None), fall back
-                    // to the construction-time flag and rely on the
-                    // CREDENTIAL_REJECTED-transient retry path (3be78a3) to
-                    // converge once the server does reject.
+                    // Credential enforcement is unconditional (no `require` toggle,
+                    // arc3 mandatory-credentials excision): once CredentialParams
+                    // have arrived, gating is definitely active. When they have not
+                    // arrived yet (None), fall back to the construction-time flag
+                    // and rely on the CREDENTIAL_REJECTED-transient retry path
+                    // (3be78a3) to converge once the server does reject.
                     let effective_credential_gated = cred_snap
                         .as_ref()
                         .as_ref()
-                        .map(|p| p.require)
+                        .map(|_p| true)
                         .unwrap_or(credential_gated);
                     if effective_credential_gated && is_credential_rejected(&e) {
                         debug!(

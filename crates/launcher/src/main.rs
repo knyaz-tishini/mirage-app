@@ -1035,8 +1035,7 @@ fn draw_menu_overlay(ctx: &mut TinySkiaCpuRenderContext, model: &model::ClientSt
     line(ctx, &format!("phase    {}", c.phase), FG0, 10.0, 15.0);
     line(ctx, &format!("monitor  {}", if c.monitor_reachable { "reachable" } else { "—" }), FG1, 10.0, 15.0);
     if let Some(cr) = &model.credential {
-        let req = if cr.require { "require" } else { "open" };
-        line(ctx, &format!("cred     {} g{} {}", cr.scheme, cr.generation, req), FG1, 10.0, 15.0);
+        line(ctx, &format!("cred     {} g{}", cr.scheme, cr.generation), FG1, 10.0, 15.0);
     }
     line(ctx, "data     cli2", FG3, 10.0, 18.0);
 
