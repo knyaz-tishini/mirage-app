@@ -1,29 +1,27 @@
 # mirage-l0-sentinel — minimal client config.
 #
 # Sentinel is passive: on boot it generates a stable sentinel_id, registers
-# with one of `monitor_urls`, and waits for the monitor to push chains
-# over the WebSocket subscription. The monitor decides which chains the
-# client gets based on policy. Operators/debug UIs can also call
-# `/relay/clients/{id}/chains/request` directly with an axis-spec — that
-# is NOT sentinel's job and there is no `[axis_request]` block here.
+# over the Mirage native wire (`monitor_wire_addr` + `monitor_wire_pubkey_hex`
+# below), and waits for the monitor to push chains over the same wire
+# subscription. The monitor decides which chains the client gets based on
+# policy. Operators/debug UIs can also call `/relay/clients/{id}/chains/request`
+# directly with an axis-spec — that is NOT sentinel's job and there is no
+# `[axis_request]` block here.
 
 # ─── Mesh + identity ──────────────────────────────────────────────────────────
 mesh_id   = "v3-staging"
 shortname = "tester1"             # surfaces in /relay/clients
 role      = "sentry-client"
 
-# ─── Monitor endpoints + bearer ───────────────────────────────────────────────
-# Bootstrap fallback. Once registered, the monitor pushes the live
-# `peer_lm_urls` list via WS Config; sentinel persists it under
-# `${state_dir}/monitor_urls.json` and prefers it on subsequent boots.
-monitor_urls = [
-  "https://lm-ru-1.zen-geldmaschine.net:19451",
-  "https://lm-nl-1.zen-geldmaschine.net:19451",
-  "https://lm-ch-1.zen-geldmaschine.net:19451",
-]
-monitor_api_key = "<paste Client-role bearer here>"
+# ─── Monitor wire coordinates + bearer ─────────────────────────────────────────
+# Required bootstrap: the monitor's Mirage-native wire listener (`:19444`).
+# opbox bakes these into every issued client config; obtain from opbox
+# inventory or `GET <monitor>/relay/me` on first boot.
+monitor_wire_addr        = "103.231.75.144:19444"
+monitor_wire_pubkey_hex  = "<64-char hex — monitor's static X25519 pubkey>"
+monitor_api_key          = "<paste Client-role bearer here>"
 
-# State directory — sentinel-id.txt, client-id.txt, monitor_urls.json,
+# State directory — sentinel-id.txt, client-id.txt, monitor_wire.json,
 # debug-tunnel.json. Created on first boot.
 state_dir = "C:/ProgramData/mirage/state"
 

@@ -389,13 +389,11 @@ impl WorkerHandle {
     /// policies to the local TUN daemon when the monitor pushes a new policy.
     pub async fn send_setup_monitor_link(
         &mut self,
-        monitor_urls: Vec<String>,
         monitor_api_key: Option<String>,
         transports_json: String,
         tun_api_url: Option<String>,
     ) -> anyhow::Result<()> {
         self.send(SupervisorMsg::SetupMonitorLink {
-            monitor_urls,
             monitor_api_key,
             transports_json,
             tun_api_url,

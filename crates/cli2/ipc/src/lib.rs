@@ -115,8 +115,6 @@ pub enum SupervisorMsg {
     /// share the same `Arc<ArcSwap<PeerTable>>` as the `MonitorLink` so the
     /// chain self-resolves from its own snapshots.
     SetupMonitorLink {
-        /// Base URL list for the monitor (DirectWs transport).
-        monitor_urls: Vec<String>,
         /// Optional Bearer token for monitor auth.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         monitor_api_key: Option<String>,

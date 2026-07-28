@@ -40,7 +40,6 @@ use worker_handle::{HandleState, WorkerHandle};
 struct MlSetup {
     /// chain_id of the designated ML-host worker.
     host_chain_id: String,
-    monitor_urls: Vec<String>,
     monitor_api_key: Option<String>,
     transports_json: String,
     /// Forwarded from `Config.tun_api_url` so the worker can push split
@@ -128,7 +127,6 @@ fn build_ml_setup(config: &Config) -> Option<MlSetup> {
 
     Some(MlSetup {
         host_chain_id,
-        monitor_urls: vec![config.monitor_url.clone()],
         monitor_api_key: config.monitor_api_key.clone(),
         transports_json,
         tun_api_url: config.tun_api_url.clone(),
@@ -464,7 +462,6 @@ async fn main() -> anyhow::Result<()> {
         Some(setup) => {
             if let Some(handle) = handles.get_mut(&setup.host_chain_id) {
                 if let Err(e) = handle.send_setup_monitor_link(
-                    setup.monitor_urls.clone(),
                     setup.monitor_api_key.clone(),
                     setup.transports_json.clone(),
                     setup.tun_api_url.clone(),
@@ -681,7 +678,6 @@ async fn main() -> anyhow::Result<()> {
                                 "supervisor: ML-host worker respawned — re-sending SetupMonitorLink"
                             );
                             if let Err(e) = new_handle.send_setup_monitor_link(
-                                setup.monitor_urls.clone(),
                                 setup.monitor_api_key.clone(),
                                 setup.transports_json.clone(),
                                 setup.tun_api_url.clone(),

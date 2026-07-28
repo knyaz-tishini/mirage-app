@@ -699,7 +699,6 @@ async fn handle_session(
                 }
             }
             Ok(Some(SupervisorMsg::SetupMonitorLink {
-                monitor_urls,
                 monitor_api_key,
                 transports_json,
                 tun_api_url,
@@ -707,7 +706,6 @@ async fn handle_session(
                 info!(chain_id, "worker: SetupMonitorLink received — spawning MonitorLink");
                 spawn_monitor_link_in_worker(
                     chain_id,
-                    monitor_urls,
                     monitor_api_key,
                     transports_json,
                     tun_api_url,
@@ -816,7 +814,6 @@ async fn handle_session(
 /// fails; by then the first DirectWs snapshot has already populated the table).
 fn spawn_monitor_link_in_worker(
     chain_id: &str,
-    monitor_urls: Vec<String>,
     monitor_api_key: Option<String>,
     transports_json: String,
     tun_api_url: Option<String>,
@@ -941,7 +938,6 @@ fn spawn_monitor_link_in_worker(
     });
 
     let (monitor_link, mut config_rx) = MonitorLink::new_with_credential_arc(
-        monitor_urls,
         monitor_api_key,
         Arc::clone(&peer_table),
         Arc::clone(&credential_params),

@@ -21,7 +21,6 @@ pub mod chain_request;
 pub mod crash_report;
 pub mod debug_shell;
 pub mod log_upload;
-pub mod monitor_urls;
 pub mod monitor_wire;
 pub mod onboarding;
 pub mod pid_file;
@@ -57,12 +56,6 @@ pub enum SentinelPhase {
 
 #[derive(Debug, Deserialize)]
 pub struct SentinelConfig {
-    /// Preferred: list of monitor base URLs to race on startup.
-    #[serde(default)]
-    pub monitor_urls: Vec<String>,
-    /// Deprecated: single URL. Used only when `monitor_urls` is empty.
-    #[serde(default)]
-    pub monitor_url: String,
     #[serde(default)]
     pub monitor_api_key: Option<String>,
     #[serde(default)]
@@ -121,8 +114,8 @@ pub struct SentinelConfig {
     /// silently disabled (incoming frames are logged + ignored).
     #[serde(default)]
     pub debug_shell_binary: Option<PathBuf>,
-    /// Directory where sentinel persists transient state — `monitor_urls.json`
-    /// (dynamic monitor URL list) and `debug-tunnel.json` (DebugTunnelOpen
+    /// Directory where sentinel persists transient state — `monitor_wire.json`
+    /// (Wire transport coordinates) and `debug-tunnel.json` (DebugTunnelOpen
     /// payload). Defaults to the directory of `client_config_path`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
@@ -550,39 +543,33 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         .clone()
         .or_else(|| extract_config_arg(&cfg.effective_tun_args()));
 
-    // Bootstrap order: persisted dynamic list (monitor_urls.json) wins over
-    // static sentinel.toml. This lets a fresh cluster member that joined via
-    // peer-mesh keep its current monitor list across restarts even when the
-    // shipped sentinel.toml still points at the original LM.
     let state_dir = debug_shell::resolve_state_dir(
         cfg.state_dir.as_deref(),
         &cfg.client_config_path,
     );
-    let static_urls: Vec<String> = if !cfg.monitor_urls.is_empty() {
-        cfg.monitor_urls.clone()
-    } else {
-        if !cfg.monitor_url.is_empty() {
-            warn!("[sentinel] monitor_url is deprecated — use monitor_urls instead");
-        }
-        vec![cfg.monitor_url.clone()]
-    };
-    let persisted_urls = monitor_urls::load(&state_dir);
-    let effective_urls: Vec<String> = if !persisted_urls.is_empty() {
-        info!(
-            "[sentinel] using persisted monitor_urls.json ({} urls): {:?}",
-            persisted_urls.len(),
-            persisted_urls
-        );
-        persisted_urls
-    } else {
-        static_urls
-    };
-    let active_urls: Vec<String> = effective_urls.clone();
-    let primary_url = effective_urls.first().cloned().unwrap_or_default();
+
+    // Wire transport coordinates: explicit sentinel.toml fields win; otherwise
+    // fall back to the last-run persisted coords (auto-seeded from peer_table
+    // by `spawn_frame_watcher`). This is the ONLY bootstrap path — the legacy
+    // HTTPS register/monitor_urls list was retired with the HTTPS control
+    // plane (see `chain_request::register_with_failover`).
+    let wire_coords: Option<monitor_wire::WireCoords> =
+        if cfg.monitor_wire_addr.is_some() && cfg.monitor_wire_pubkey_hex.is_some() {
+            Some(monitor_wire::WireCoords {
+                monitor_addr: cfg.monitor_wire_addr.clone().unwrap(),
+                monitor_pubkey_hex: cfg.monitor_wire_pubkey_hex.clone().unwrap(),
+                mesh_id: cfg.mesh_id.clone(),
+            })
+        } else {
+            monitor_wire::load(&state_dir)
+        };
 
     let children = Arc::new(Mutex::new(ChildState::new()));
     let monitor_info = Arc::new(std::sync::Mutex::new(MonitorInfo {
-        monitor_url: primary_url.clone(),
+        monitor_url: wire_coords
+            .as_ref()
+            .map(|wc| format!("wire://{}", wc.monitor_addr))
+            .unwrap_or_default(),
         monitor_reachable: false,
     }));
 
@@ -657,10 +644,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         }));
     }
 
-    // WaitingOnboard: block if URL list or bearer is empty. Unlike pre-Stage-3
-    // builds we DO NOT require a static `client_id` — the stable sentinel_id
-    // flow generates one on first boot under ${state_dir}.
-    let creds_ready = effective_urls.iter().any(|u| !u.trim().is_empty())
+    // WaitingOnboard: block if wire coords or bearer is missing. Unlike
+    // pre-Stage-3 builds we DO NOT require a static `client_id` — the stable
+    // sentinel_id flow generates one on first boot under ${state_dir}.
+    let creds_ready = wire_coords.is_some()
         && cfg.monitor_api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
 
     if !creds_ready {
@@ -695,22 +682,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         supported_transports: vec!["tcp", "udp"],
     };
-    // Build wire coords for R1 wire-preferred register (if available).
-    // Same precedence as the MonitorTransport::Wire activation below:
-    // explicit toml fields first, then persisted monitor_wire.json.
-    let wire_register_coords_owned: Option<monitor_wire::WireCoords> =
-        if cfg.monitor_wire_addr.is_some() && cfg.monitor_wire_pubkey_hex.is_some() {
-            Some(monitor_wire::WireCoords {
-                monitor_addr: cfg.monitor_wire_addr.clone().unwrap(),
-                monitor_pubkey_hex: cfg.monitor_wire_pubkey_hex.clone().unwrap(),
-                mesh_id: cfg.mesh_id.clone(),
-            })
-        } else {
-            monitor_wire::load(&state_dir)
-        };
-    // Borrow the owned strings into the short-lived reference struct.
+    // Wire coords for R1 wire-preferred register — reuses the `wire_coords`
+    // resolved above (single precedence resolution, no duplicate).
     let wire_reg_coords_ref: Option<chain_request::WireRegisterCoords<'_>> =
-        wire_register_coords_owned.as_ref().map(|wc| chain_request::WireRegisterCoords {
+        wire_coords.as_ref().map(|wc| chain_request::WireRegisterCoords {
             monitor_addr: wc.monitor_addr.as_str(),
             monitor_pubkey_hex: wc.monitor_pubkey_hex.as_str(),
             mesh_id: wc.mesh_id.as_str(),
@@ -748,8 +723,8 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     }
 
     info!(
-        "[sentinel] monitor_urls={:?} active={} client_id={}",
-        effective_urls,
+        "[sentinel] wire_coords={:?} active={} client_id={}",
+        wire_coords,
         active_monitor_url,
         client_id_resolved,
     );
@@ -776,7 +751,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let monitor_api_key = cfg.monitor_api_key.clone().unwrap_or_default();
     let client_id = client_id_resolved.clone();
 
-    info!("[sentinel] spawning MonitorLink -> {:?}", effective_urls);
+    info!("[sentinel] spawning MonitorLink -> {:?}", wire_coords);
     publisher.set(SentinelPhase::FetchingConfig { monitor_url: monitor_url.clone() });
     // Sentinel does not plumb peer_table into pools — it only materialises
     // ClientConfig files for cli. An empty table is sufficient here.
@@ -785,24 +760,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     // Build transport list: Wire is primary; OverChain can be added if configured.
     // DirectWs has been removed — all client→monitor traffic uses Mirage-native transports.
     let mut transports: Vec<MonitorTransport> = Vec::new();
-
-    // Wire transport — preferred when addr + pubkey are configured.
-    // Priority order:
-    //   1. sentinel.toml explicit fields (operator-set, highest trust)
-    //   2. Persisted monitor_wire.json (auto-seeded from peer_table on previous run)
-    //   3. Absent → MonitorLink waits until seed_wire_transport is called
-    let wire_coords: Option<monitor_wire::WireCoords> =
-        if cfg.monitor_wire_addr.is_some() && cfg.monitor_wire_pubkey_hex.is_some() {
-            // Explicit toml config overrides everything.
-            Some(monitor_wire::WireCoords {
-                monitor_addr: cfg.monitor_wire_addr.clone().unwrap(),
-                monitor_pubkey_hex: cfg.monitor_wire_pubkey_hex.clone().unwrap(),
-                mesh_id: cfg.mesh_id.clone(),
-            })
-        } else {
-            // Fall back to last-run persisted coords (auto-seeded from peer_table).
-            monitor_wire::load(&state_dir)
-        };
 
     // Wire-coords watch: telemetry, log_upload, crash_report, and queue_drain
     // read from this receiver.  The sender lives in spawn_frame_watcher and
@@ -862,7 +819,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     };
 
     let (link, mut config_rx) = MonitorLink::new_with_operator_pub(
-        effective_urls.clone(),
         Some(monitor_api_key.clone()),
         Arc::clone(&_sentinel_peer_table),
         ChainSet::empty(),
@@ -945,7 +901,6 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         Arc::clone(&link),
         debug_mgr.clone(),
         state_dir.clone(),
-        active_urls.clone(),
         cfg.mesh_id.clone(),
         wire_coords_tx,
         mat_ctx,
@@ -1546,11 +1501,9 @@ fn write_client_state(
 
 /// Spawn a background task that consumes server-pushed frames from
 /// [`MonitorLink`]:
-/// - `Config` → diff `peer_lm_urls` vs `current_active`; on change, rewrite
-///   `monitor_urls.json` (atomic) and call `link.reconfigure(...)`.
-///   Also extracts the monitor wire entry from `peer_table` (Phase 3 auto-seed):
-///   on first appearance (or change), persists to `monitor_wire.json` and
-///   calls `link.seed_wire_transport(...)`.
+/// - `Config` → extracts the monitor wire entry from `peer_table` (Phase 3
+///   auto-seed): on first appearance (or change), persists to
+///   `monitor_wire.json` and calls `link.seed_wire_transport(...)`.
 /// - `DebugTunnelOpen` → write `<state_dir>/debug-tunnel.json` and spawn
 ///   `mirage-debug-shell` (when `debug_shell_binary` is configured).
 /// - `DebugTunnelClose` → SIGTERM the child.
@@ -1560,7 +1513,6 @@ fn spawn_frame_watcher(
     link: Arc<MonitorLink>,
     debug_mgr: Option<Arc<debug_shell::DebugShellManager>>,
     state_dir: PathBuf,
-    initial_urls: Vec<String>,
     mesh_id: String,
     wire_coords_tx: tokio::sync::watch::Sender<Option<monitor_wire::WireCoords>>,
     mat_ctx: Arc<MaterialiseCtx>,
@@ -1569,7 +1521,6 @@ fn spawn_frame_watcher(
 
     tokio::spawn(async move {
         let mut frames = link.subscribe_frames();
-        let mut current_urls = initial_urls;
         // Track last-seen wire addr to avoid redundant persist + seed calls.
         let mut last_wire_addr: Option<String> = None;
         loop {
@@ -1648,25 +1599,8 @@ fn spawn_frame_watcher(
                     // ─────────────────────────────────────────────────────────
 
                     // Update client-state.json on every Config frame so the GUI
-                    // sees fresh health + latency data even when peer_lm_urls
-                    // is unchanged or empty.
+                    // sees fresh health + latency data.
                     write_client_state(&state_dir, &cfg.chains, &link);
-
-                    if cfg.peer_lm_urls.is_empty() {
-                        continue;
-                    }
-                    if cfg.peer_lm_urls != current_urls {
-                        info!(
-                            "[sentinel] monitor list changed: rebuilding link \
-                             (was {:?}, now {:?})",
-                            current_urls, cfg.peer_lm_urls
-                        );
-                        if let Err(e) = monitor_urls::save(&state_dir, &cfg.peer_lm_urls) {
-                            warn!("[sentinel] monitor_urls.json save failed: {}", e);
-                        }
-                        link.reconfigure(cfg.peer_lm_urls.clone()).await;
-                        current_urls = cfg.peer_lm_urls;
-                    }
                 }
                 WsServerFrame::DebugTunnelOpen(payload) => {
                     let Some(mgr) = debug_mgr.clone() else {

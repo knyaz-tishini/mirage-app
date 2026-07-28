@@ -179,7 +179,6 @@ pub async fn reconcile(
                 if let Some(handle) = handles.get_mut(chain_id.as_str()) {
                     if let Err(e) = handle
                         .send_setup_monitor_link(
-                            vec![config.monitor_url.clone()],
                             config.monitor_api_key.clone(),
                             transports_json,
                             config.tun_api_url.clone(),

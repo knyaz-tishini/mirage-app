@@ -166,9 +166,6 @@ pub struct MonitorConfig {
     pub camouflage: Option<HashMap<String, String>>,
     /// Optional traffic shaping parameters pushed by the monitor.
     pub shaping: Option<HashMap<String, String>>,
-    /// Dynamic monitor URL list pushed by the monitor (peers + self_public_url).
-    /// Sentinel persists this and uses it as bootstrap on next start.
-    pub peer_lm_urls: Vec<String>,
     /// Operator directive for flow-metadata collection and upload.
     ///
     /// `None` (absent or `collect: false`) means the client collects nothing.
@@ -297,11 +294,6 @@ struct ConfigResponse {
     camouflage: Option<HashMap<String, String>>,
     #[serde(default)]
     shaping: Option<HashMap<String, String>>,
-    /// Dynamic monitor URL list (peer LMs + this LM's public URL).
-    /// Old monitors that don't populate this field will leave it empty
-    /// and sentinel falls back to its static `monitor_urls` list.
-    #[serde(default)]
-    peer_lm_urls: Vec<String>,
     /// Peer table snapshot pushed by the monitor (Phase 8.5).
     /// Old monitors that don't include this field will leave it as `None`,
     /// and the client will use only chains with hardcoded `hop.public_key`.
@@ -556,10 +548,6 @@ pub struct CredentialSummary {
 /// Uses Mirage-native transports only: Wire (primary) and OverChain (fallback).
 /// No HTTPS, no bearer tokens.
 pub struct MonitorLink {
-    /// Retained for backward compat: callers may call `reconfigure` / `current_urls`
-    /// after a `peer_lm_urls` push from the monitor.  Not used for dialing —
-    /// all transport is via Wire or OverChain.
-    monitor_urls: Mutex<Vec<String>>,
     /// Cluster/mesh identifier sent in FRAME_AUTH (e.g. `"staging-v2"`).
     mesh_id: String,
     /// Local node/sentry identifier sent in FRAME_AUTH.
@@ -703,9 +691,6 @@ impl MonitorLink {
     ///
     /// The link does not start until [`MonitorLink::spawn`] is called.
     ///
-    /// `monitor_urls` — retained for `reconfigure` / `current_urls` callers;
-    /// not used for dialing (Wire/OverChain only).
-    ///
     /// `monitor_api_key` — **ignored**; kept in the signature for backward
     /// compat with call sites.  No bearer token is ever sent — authentication
     /// is provided by the Mirage V9 wire handshake.
@@ -721,7 +706,6 @@ impl MonitorLink {
     ///
     /// `node_client_id` — local node/sentry identifier sent in FRAME_AUTH.
     pub fn new(
-        monitor_urls: Vec<String>,
         monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         chain_set: Arc<ChainSet>,
@@ -730,7 +714,6 @@ impl MonitorLink {
         node_client_id: String,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         Self::new_with_operator_pub(
-            monitor_urls,
             monitor_api_key,
             peer_table,
             chain_set,
@@ -749,7 +732,6 @@ impl MonitorLink {
     /// held params remain active.  When `None`, params are applied without
     /// operator-signature verification (transition state).
     pub fn new_with_operator_pub(
-        monitor_urls: Vec<String>,
         monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         chain_set: Arc<ChainSet>,
@@ -759,7 +741,6 @@ impl MonitorLink {
         operator_pub: Option<ed25519_dalek::VerifyingKey>,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         Self::new_with_credential_arc(
-            monitor_urls,
             monitor_api_key,
             peer_table,
             Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
@@ -805,7 +786,6 @@ impl MonitorLink {
     /// `link.ring_credential_cell()` to retrieve `Arc::clone`s from a link
     /// built with the ordinary [`new`] constructor.
     pub fn new_with_credential_arc(
-        monitor_urls: Vec<String>,
         _monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
@@ -831,7 +811,6 @@ impl MonitorLink {
         };
 
         let link = Arc::new(Self {
-            monitor_urls: Mutex::new(monitor_urls),
             mesh_id,
             node_client_id,
             client_id: Mutex::new(None),
@@ -1500,14 +1479,6 @@ impl MonitorLink {
         self.client_id.lock().await.clone()
     }
 
-    /// Atomically swap the internal `monitor_urls` list. Used by sentinel when
-    /// the monitor's `peer_lm_urls` field changes — next race / WS reconnect
-    /// will use the new list.
-    pub async fn reconfigure(&self, new_urls: Vec<String>) {
-        let mut guard = self.monitor_urls.lock().await;
-        *guard = new_urls;
-    }
-
     /// Seed the registered client_id from outside (sentinel R1 path).
     ///
     /// Must be called **before** `spawn()` so that `run_wire_loop` sees the
@@ -1527,12 +1498,6 @@ impl MonitorLink {
     /// no-op for backward compat).
     pub async fn set_client_token(&self, token: Option<String>) {
         *self.client_token.lock().await = token;
-    }
-
-    /// Snapshot the current URL list (used internally by the run loop and by
-    /// callers that want to log what's active).
-    pub async fn current_urls(&self) -> Vec<String> {
-        self.monitor_urls.lock().await.clone()
     }
 
     /// Spawn the background loop.  Returns the task handle.
@@ -2353,7 +2318,6 @@ impl MonitorLink {
             policy: cfg.policy,
             camouflage: cfg.camouflage,
             shaping: cfg.shaping,
-            peer_lm_urls: cfg.peer_lm_urls,
             metadata_policy: cfg.metadata_policy,
         };
         let _ = self.config_tx.send(Some(monitor_cfg.clone()));
