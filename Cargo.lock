@@ -391,23 +391,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "awg-share-gen"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "flate2",
- "image",
- "mirage-standalone-templates",
- "qrcode",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "x25519-dalek",
-]
-
-[[package]]
 name = "aws-lc-rs"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1574,27 +1557,6 @@ checksum = "2e57e16b3fe8ff4364c0661fdaac543fb38b29ea9bc9c2f45612d90adf931d2b"
 dependencies = [
  "hashbrown 0.15.5",
  "ttf-parser 0.21.1",
-]
-
-[[package]]
-name = "foreign-probe"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "chacha20poly1305",
- "clap",
- "hex",
- "hkdf",
- "md-5",
- "rand 0.8.6",
- "rustls",
- "sha1",
- "sha2",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2980,24 +2942,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mirage-standalone-templates"
-version = "0.1.0"
-dependencies = [
- "base64",
- "flate2",
- "hex",
- "image",
- "mirage-core",
- "qrcode",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "url",
- "x25519-dalek",
-]
-
-[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3773,15 +3717,6 @@ name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
-dependencies = [
- "image",
-]
 
 [[package]]
 name = "quick-error"
@@ -5406,16 +5341,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8332c642e563d6a828c00f5c4088ad5ad70e63a9961d7fdb578612eb9e3c6e6"
 dependencies = [
  "uzor",
-]
-
-[[package]]
-name = "v2ray-share-gen"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "image",
- "qrcode",
 ]
 
 [[package]]

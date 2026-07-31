@@ -15,9 +15,6 @@ members = [
     "crates/debug-shell",
     "crates/launcher",
     # "crates/client-gui",  # uses vello-gpu + wgpu 29; windows-core version conflicts with launcher workspace — own workspace root
-    "crates/awg-share-gen",
-    "crates/v2ray-share-gen",
-    "crates/foreign-probe",
     # "crates/mobile",  # cdylib — skip on Windows build
     # "crates/mirage-pt-adapter",  # arc3 Phase-0 Tor PT+bridge spike — DELETED 2026-07-31.
     # Superseded by transparent-forward per the 2026-07-24 canon: one commit
@@ -52,7 +49,6 @@ mirage-control-plane = { path = "../mirage2web/crates/mirage-dial-core" }
 mirage-client-core  = { path = "crates/client-core" }
 tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roots"] }
 mirage-runtime-guard    = { path = "crates/runtime-guard" }
-mirage-standalone-templates = { path = "../mirage2web/crates/mirage-standalone-templates" }
 mirage-mesh-client  = { path = "../mirage2web/crates/mirage-mesh-client" }
 mirage-ringmember   = { path = "../mirage2web/crates/mirage-ringmember" }
 ed25519-dalek       = { version = "2", features = ["rand_core"] }
