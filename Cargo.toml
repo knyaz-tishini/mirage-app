@@ -19,7 +19,11 @@ members = [
     "crates/v2ray-share-gen",
     "crates/foreign-probe",
     # "crates/mobile",  # cdylib — skip on Windows build
-    "crates/mirage-pt-adapter",
+    # "crates/mirage-pt-adapter",  # arc3 Phase-0 Tor PT+bridge spike — DELETED 2026-07-31.
+    # Superseded by transparent-forward per the 2026-07-24 canon: one commit
+    # (2f8e7ba), never touched again, absent from every live-proof commit. It
+    # had also stopped compiling (E0106), and because it is a workspace member
+    # that broke `cargo test` for this whole repo — zero client tests ran.
 ]
 
 [workspace.package]
