@@ -86,19 +86,19 @@ async fn run_probe(h: &ChainHandle, timeout_ms: u64) -> Result<u64, String> {
     }
 }
 
+/// One probe = one real lease through the chain.
+///
+/// This used to open a mux stream first, "to confirm the session is alive",
+/// and then take a pool lease in BOTH branches — so the mux half decided
+/// nothing and the outcome was the lease either way. It also could not have
+/// confirmed what it claimed: `SessionHandle::open_stream` opens lazily and
+/// sends no frame, so a success proved only that the driver task had not
+/// already torn the session down, never that the transport still carried
+/// anything. Its one real effect was to burn a stream id against
+/// `max_num_streams` and put an RST on the wire when the unused stream
+/// dropped.
+///
+/// The lease is the probe, exactly as this module's header says.
 async fn lease_once(h: &ChainHandle) -> Result<TunnelLease, String> {
-    if let Some(mux) = &h.mux {
-        // Prefer mux: open a stream, immediately close it.
-        // We just need to confirm the session is alive.
-        match mux.open_stream().await {
-            Ok(_stream) => {
-                // stream dropped here — closes the mux sub-stream, session stays
-                return Ok(h.pool.lease().await.map_err(|e| e.to_string())?);
-            }
-            Err(_) => {
-                // Mux down — fall through to pool path
-            }
-        }
-    }
     h.pool.lease().await.map_err(|e| e.to_string())
 }
