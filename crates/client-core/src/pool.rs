@@ -965,7 +965,7 @@ mod pool_smoke_tests {
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
                 },
             ],
-            handshake: HandshakeStrategy::Ephemeral,
+            handshake: HandshakeStrategy::Telescopic,
             reply: mirage_core::config::ReplyMode::Raw,
             protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
             priority: 0,
@@ -1036,6 +1036,7 @@ mod pool_smoke_tests {
                     labels: vec![],
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
+                    chain_face: None,
                 },
                 PeerTableEntry {
                     mesh_id: "test".into(),
@@ -1046,6 +1047,7 @@ mod pool_smoke_tests {
                     labels: vec![],
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
+                    chain_face: None,
                 },
             ],
         };
@@ -1117,6 +1119,7 @@ mod pool_smoke_tests {
                     labels: vec![],
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
+                    chain_face: None,
                 },
                 PeerTableEntry {
                     mesh_id: "test".into(),
@@ -1127,6 +1130,7 @@ mod pool_smoke_tests {
                     labels: vec![],
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
+                    chain_face: None,
                 },
             ],
         };
