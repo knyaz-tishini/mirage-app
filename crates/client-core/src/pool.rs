@@ -1111,7 +1111,10 @@ mod pool_smoke_tests {
                     labels: vec![],
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
-                    chain_face: None,
+                    chain_face: Some(mirage_core::mirage::mesh::ChainFace {
+                        port: 19971,
+                        camouflage: mirage_core::config::TransportCamouflage::None,
+                    }),
                     chain_face_udp: None,
                 },
                 PeerTableEntry {
@@ -1196,7 +1199,10 @@ mod pool_smoke_tests {
                     labels: vec![],
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
-                    chain_face: None,
+                    chain_face: Some(mirage_core::mirage::mesh::ChainFace {
+                        port: 19971,
+                        camouflage: mirage_core::config::TransportCamouflage::None,
+                    }),
                     chain_face_udp: None,
                 },
                 PeerTableEntry {
