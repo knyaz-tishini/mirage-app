@@ -31,18 +31,18 @@ use std::{
 
 use arc_swap::ArcSwap;
 use mirage_core::{
-    config::{ChainConfig, TunnelPoolConfig},
+    config::{ChainConfig, ProtocolId, TunnelPoolConfig, UdpProtocolId},
     crypto::credential::CredentialParams,
     error::MirageError,
     mirage::mesh::PeerTable,
     mirage::wire::CredentialScheme,
 };
-use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
+use mirage_protocol::{core::MirageCoreUdpTunnel, negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::token_pool::{self, TokenPool};
-use crate::tunnel::{establish_raw_tunnel, freshen_chain_pubkeys};
+use crate::tunnel::{establish_raw_tunnel, establish_udp_datagram_tunnel, freshen_chain_pubkeys};
 
 // ── Cold-start credential gate ────────────────────────────────────────────────
 
@@ -654,6 +654,81 @@ impl TunnelPool {
     /// table that was passed to [`TunnelPool::new`].
     pub fn notify_peer_table_change(&self) {
         self.peer_table_notify.notify_waiters();
+    }
+
+    /// True when this pool's chain is a datagram-native single-hop UDP
+    /// chain: `chain.protocol == ProtocolId::Udp(UdpProtocolId::MirageUdp)`
+    /// AND the entry hop's `chain_face_udp` is present in the CURRENT
+    /// peer-table snapshot (looked up by `node_id`, falling back to
+    /// `display_name` — the same lookup rule
+    /// [`establish_udp_datagram_tunnel`] itself uses).
+    ///
+    /// `false` for every other chain shape, including a UDP chain whose
+    /// entry has not yet published a datagram face (peer_table lag, cold
+    /// start) — the caller falls back to the ordinary mux/stream path in
+    /// that case, exactly as before this method existed. Callers should
+    /// re-check on every session rather than cache the result: the
+    /// peer_table snapshot this reads can change between calls.
+    pub async fn is_datagram_chain(&self) -> bool {
+        let guard = self.inner.lock().await;
+        if !matches!(guard.chain.protocol, ProtocolId::Udp(UdpProtocolId::MirageUdp)) {
+            return false;
+        }
+        let Some(entry) = guard.chain.hops.first() else {
+            return false;
+        };
+        let Some(node_id) = entry.node_id.as_deref().or(entry.display_name.as_deref()) else {
+            return false;
+        };
+        guard
+            .peer_table
+            .load()
+            .lookup_by_str(node_id)
+            .and_then(|e| e.chain_face_udp.as_ref())
+            .is_some()
+    }
+
+    /// Dial a fresh [`MirageCoreUdpTunnel`] for this pool's chain via
+    /// [`establish_udp_datagram_tunnel`] — the datagram-native counterpart
+    /// of the ordinary tunnel dial this pool otherwise performs.
+    ///
+    /// Snapshots exactly what the initial pool dial snapshots in
+    /// [`TunnelPool::new`] (fresh peer_table, fresh `credential_params`) and
+    /// mints the same per-dial credential: ring membership (0x04) via
+    /// `token_pool::build_ring_credential` when active, else a popped blind
+    /// token (0x03), else `establish_udp_datagram_tunnel`'s own EpochHmac
+    /// self-mint fallback.
+    ///
+    /// One dial per destination session is the intended shape here — the
+    /// caller (`udp_session_task`'s datagram branch) calls this once per
+    /// SOCKS5 UDP destination and never pools or reuses the resulting
+    /// tunnel; there is no slot, no lease, and nothing to return.
+    pub async fn datagram_dial(&self) -> Result<MirageCoreUdpTunnel, MirageError> {
+        let (chain, mesh_id, peer_table_snap, cred_snap, pre_minted) = {
+            let guard = self.inner.lock().await;
+            let peer_table_snap = guard.peer_table.load_full();
+            let cred_snap = guard.credential_params.load_full();
+            let spent = token_pool::pop_one(&guard.token_pool);
+            let ring_snap = guard.ring_credential.load_full();
+            let pre_minted = token_pool::build_ring_credential(
+                cred_snap.as_ref().as_ref(),
+                ring_snap.as_ref().as_ref(),
+                &token_pool::ring_dial_context(&guard.chain),
+            )
+            .or_else(|| {
+                spent.as_ref().map(|t| {
+                    debug!(
+                        chain_id = %self.chain_id,
+                        epoch_id = t.epoch_id,
+                        "datagram_dial: spending blind token"
+                    );
+                    mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
+                })
+            });
+            (guard.chain.clone(), guard.mesh_id.clone(), peer_table_snap, cred_snap, pre_minted)
+        };
+        let cred_ref = cred_snap.as_ref().as_ref();
+        establish_udp_datagram_tunnel(&chain, &peer_table_snap, &mesh_id, pre_minted.as_ref(), cred_ref).await
     }
 }
 

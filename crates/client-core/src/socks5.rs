@@ -38,6 +38,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use mirage_protocol::core::MirageCoreUdpTunnel;
 use mirage_protocol::traits::Tunnel as _;
 
 use crate::{mux_pool::MuxPool, pool::TunnelPool, relay::{relay_loop, TunnelCompat}};
@@ -1490,8 +1491,70 @@ async fn udp_associate_relay(
     Ok(())
 }
 
-/// Per-destination tunnel session: forwards payloads through a mux stream or
-/// raw tunnel and sends responses back via `resp_tx`.
+/// Datagram-native UDP session body: given an already-dialed
+/// [`MirageCoreUdpTunnel`], sends the session's fixed destination as the
+/// bare `host:port` first datagram — no `udp:` prefix, no length prefix; the
+/// node's own reader
+/// (`mirage2node/crates/mirage-node/src/core/udp_chain_splice.rs::parse_target_datagram`)
+/// reads it as utf-8, trimmed, with no framing of any kind — then relays
+/// every later datagram whole and raw in both directions until
+/// `idle_timeout` elapses with nothing on `rx`, or either side of the
+/// tunnel errors. One dial per destination session; there is nothing to
+/// close (`MirageCoreUdpTunnel::close` is already a no-op).
+///
+/// Split via [`MirageCoreUdpTunnel::into_split`] — not a `Mutex` around the
+/// whole tunnel — because `send` and `recv_datagram` both need `&mut self`
+/// and this body needs to write from the main loop while reading
+/// concurrently in a spawned task, exactly like the mux/raw branches above
+/// do with their own read half.
+///
+/// Split into its own function, taking an already-dialed tunnel rather than
+/// the pool, so this body is testable directly against a hand-built
+/// loopback tunnel without going through [`TunnelPool::datagram_dial`] at
+/// all.
+async fn run_datagram_udp_session(
+    mut tunnel: MirageCoreUdpTunnel,
+    dst: SocketAddr,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    resp_tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+    idle_timeout: std::time::Duration,
+) -> Result<(), MirageError> {
+    tunnel.send(dst.to_string().as_bytes()).await?;
+
+    let (mut sender, mut receiver) = tunnel.into_split();
+
+    let resp_tx2 = resp_tx.clone();
+    let read_handle = tokio::spawn(async move {
+        loop {
+            match receiver.recv_datagram().await {
+                Ok(bytes) => {
+                    let _ = resp_tx2.send((bytes, dst));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    loop {
+        match tokio::time::timeout(idle_timeout, rx.recv()).await {
+            Ok(Some(payload)) => {
+                if sender.send(&payload).await.is_err() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    read_handle.abort();
+    Ok(())
+}
+
+/// Per-destination tunnel session: forwards payloads through a datagram-
+/// native tunnel, a mux stream, or a raw tunnel, and sends responses back
+/// via `resp_tx`. The datagram-native path (`pool.is_datagram_chain()`) is
+/// checked first and, when taken, never reaches the mux/raw branches below —
+/// see [`run_datagram_udp_session`] for that path's own framing (none).
 async fn udp_session_task(
     target: String,
     mux_pool: Option<Arc<MuxPool>>,
@@ -1502,6 +1565,21 @@ async fn udp_session_task(
     dst: SocketAddr,
 ) -> Result<(), MirageError> {
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // ── Datagram-native path ──────────────────────────────────────────────
+    //
+    // No mux, no length-prefixed `write_udp_frame`/`read_udp_frame` below —
+    // the node's own convention
+    // (`mirage2node/crates/mirage-node/src/core/udp_chain_splice.rs::parse_target_datagram`,
+    // utf-8, trimmed, no `udp:` prefix) reads the session's FIRST whole
+    // datagram as the `host:port` target and every later datagram as raw
+    // payload, relayed whole in both directions. `target` (built by the
+    // caller with a `udp:` prefix for the mux/stream branches below) is
+    // deliberately unused here — see `run_datagram_udp_session`.
+    if pool.is_datagram_chain().await {
+        let tunnel = pool.datagram_dial().await?;
+        return run_datagram_udp_session(tunnel, dst, rx, resp_tx, IDLE_TIMEOUT).await;
+    }
 
     if let Some(mp) = mux_pool {
         let is_onion = mp.is_onion.load(std::sync::atomic::Ordering::Acquire);
@@ -1865,5 +1943,140 @@ mod tests {
             matches!(result, Err(MirageError::PoolExhausted)),
             "expected PoolExhausted, got: {result:?}"
         );
+    }
+
+    // ── Datagram-native UDP session shape (run_datagram_udp_session) ──────────
+
+    /// The first datagram the tunnel carries is exactly `dst.to_string()` —
+    /// no `udp:` prefix, no length prefix — and every payload after it
+    /// relays whole and raw in both directions. Driven against a hand-built
+    /// loopback tunnel pair (client side via `establish_native_udp_tunnel`,
+    /// server side via `run_server_handshake_v9_datagram` played by hand,
+    /// the same pattern `mirage-dial-core`'s own tests use) rather than a
+    /// live `TunnelPool` or the node crate — neither is available here.
+    #[tokio::test]
+    async fn datagram_udp_session_sends_bare_target_then_relays_raw_payloads() {
+        use mirage_core::crypto::{AeadSuite, KeyPair};
+        use mirage_protocol::auth::v9::CLIENT_HELLO_LEN;
+        use mirage_protocol::core::{run_server_handshake_v9_datagram, ServerHelloCache};
+        use mirage_protocol::traits::{Tunnel, TransportInfo};
+        use mirage_protocol::transport::udp::UdpPeerSocket;
+        use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
+
+        const MESH_ID: &[u8] = b"test-mesh-datagram-udp-session";
+        const SUITE_PREFS: &[AeadSuite] = &[AeadSuite::ChaCha20Poly1305];
+
+        let server_kp = KeyPair::generate();
+        let server_static_pub = server_kp.public.to_bytes();
+        let client_static_priv = KeyPair::generate().secret.to_bytes();
+
+        let fixed = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixed rendezvous socket on loopback");
+        let fixed_addr = fixed.local_addr().expect("fixed socket local addr");
+
+        let cache = ServerHelloCache::new();
+
+        // The session's fixed destination — arbitrary and distinct from
+        // every real socket in this test, so the assertion below cannot
+        // pass by coincidentally matching some other address in scope.
+        let dst: SocketAddr = "203.0.113.7:4321".parse().expect("valid TEST-NET-3 addr");
+
+        let client_fut = crate::tunnel::establish_native_udp_tunnel(
+            fixed_addr,
+            &server_static_pub,
+            &client_static_priv,
+            MESH_ID,
+            SUITE_PREFS,
+            None,
+        );
+
+        let server_fut = async {
+            let mut raw = [0u8; CLIENT_HELLO_LEN];
+            let (n, client_addr) = fixed
+                .recv_from(&mut raw)
+                .await
+                .expect("recv ClientHello on the fixed rendezvous socket");
+            assert_eq!(n, CLIENT_HELLO_LEN, "ClientHello datagram must be exactly CLIENT_HELLO_LEN bytes");
+
+            let mut server_socket = UdpPeerSocket::bind_server_ephemeral(client_addr)
+                .await
+                .expect("bind server per-peer ephemeral socket");
+            let result = run_server_handshake_v9_datagram(
+                &mut server_socket,
+                &server_kp,
+                MESH_ID,
+                SUITE_PREFS,
+                |_ctx| true,
+                &raw,
+                &cache,
+            )
+            .await
+            .expect("server handshake I/O must not error")
+            .expect("server must accept the ClientHello");
+
+            let info = TransportInfo::udp_raw(server_socket.remote_addr());
+            mirage_protocol::core::MirageCoreUdpTunnel::new(
+                server_socket,
+                &result.session_keys,
+                false,
+                info,
+                mirage_protocol::auth::AuthMode::Hmac,
+            )
+        };
+
+        let (client_tunnel, mut server_tunnel) = tokio::join!(client_fut, server_fut);
+        let client_tunnel = client_tunnel.expect("client datagram handshake must succeed");
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+
+        let session_handle = tokio::spawn(super::run_datagram_udp_session(
+            client_tunnel,
+            dst,
+            rx,
+            resp_tx,
+            std::time::Duration::from_millis(500),
+        ));
+
+        // 1. The FIRST datagram the server receives must be exactly the
+        //    bare `host:port` target — no `udp:` prefix, no framing.
+        let first = server_tunnel
+            .recv_datagram()
+            .await
+            .expect("server must receive the target datagram");
+        assert_eq!(
+            first,
+            dst.to_string().into_bytes(),
+            "first datagram must be the bare host:port target, byte for byte"
+        );
+
+        // 2. A payload sent through the session's `tx` relays whole and raw.
+        let payload_out = b"raw-udp-payload-client-to-target";
+        tx.send(payload_out.to_vec()).await.expect("tx send must succeed");
+        let got = server_tunnel
+            .recv_datagram()
+            .await
+            .expect("server must receive the raw payload");
+        assert_eq!(got, payload_out, "payload must arrive whole and unframed");
+
+        // 3. A reply from the target relays whole to resp_tx, tagged with dst.
+        let payload_in = b"raw-udp-payload-target-to-client";
+        server_tunnel.send(payload_in).await.expect("server send must succeed");
+        let (got_bytes, got_dst) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            resp_rx.recv(),
+        )
+        .await
+        .expect("resp_rx recv must not time out")
+        .expect("resp_rx channel must not close");
+        assert_eq!(got_bytes, payload_in, "reply payload must arrive whole and unframed");
+        assert_eq!(got_dst, dst, "reply must be tagged with the session's destination");
+
+        // Ending the session: closing tx ends the write loop, which aborts
+        // the read task — there is nothing else to close.
+        drop(tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), session_handle).await;
     }
 }
