@@ -949,6 +949,7 @@ mod tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                     chain_face: None,
+                    chain_face_udp: None,
                 },
                 PeerTableEntry {
                     mesh_id: "test".into(),
@@ -960,6 +961,7 @@ mod tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                     chain_face: None,
+                    chain_face_udp: None,
                 },
             ],
         }));
@@ -1191,6 +1193,7 @@ mod tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                     chain_face: None,
+                    chain_face_udp: None,
                 },
                 PeerTableEntry {
                     mesh_id: "test".into(),
@@ -1202,6 +1205,7 @@ mod tests {
                     updated_at_ms: 0,
                     aead_suite_preference: Vec::new(),
                     chain_face: None,
+                    chain_face_udp: None,
                 },
             ],
         };
