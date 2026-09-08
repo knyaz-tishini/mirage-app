@@ -995,6 +995,11 @@ mod tests {
                     byte_cipher: None,
                     camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
+                    // No minted token: these fixtures predate per-hop
+                    // selectors and address their hops by the derived
+                    // `{chain_id}-h{position}` name, which is what a chain
+                    // without a token still resolves by.
+                    selector_token_hex: None,
                 },
                 HopConfig {
                     addr: "127.0.0.1:19989".into(),
@@ -1007,6 +1012,11 @@ mod tests {
                     byte_cipher: None,
                     camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
+                    // No minted token: these fixtures predate per-hop
+                    // selectors and address their hops by the derived
+                    // `{chain_id}-h{position}` name, which is what a chain
+                    // without a token still resolves by.
+                    selector_token_hex: None,
                 },
             ],
             handshake: HandshakeStrategy::Telescopic,
@@ -1096,6 +1106,11 @@ mod tests {
                     byte_cipher: None,
                     camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
+                    // No minted token: these fixtures predate per-hop
+                    // selectors and address their hops by the derived
+                    // `{chain_id}-h{position}` name, which is what a chain
+                    // without a token still resolves by.
+                    selector_token_hex: None,
                 },
                 HopConfig {
                     addr: "127.0.0.1:19982".into(),
@@ -1108,6 +1123,11 @@ mod tests {
                     byte_cipher: None,
                     camo_server_pubkey: None,
                     relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
+                    // No minted token: these fixtures predate per-hop
+                    // selectors and address their hops by the derived
+                    // `{chain_id}-h{position}` name, which is what a chain
+                    // without a token still resolves by.
+                    selector_token_hex: None,
                 },
             ],
             handshake: HandshakeStrategy::Telescopic,
