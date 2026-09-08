@@ -357,7 +357,11 @@ impl TunnelPool {
         // a 2-byte length, because that length's high byte (0x00 for
         // any address < 256 chars) collides with the mux-detect byte
         // and the server routes the connection into `run_mux_session`.
-        let is_onion = chain.hops.len() > 1;
+        // Depth is the wrong question — see `chain_uses_onion_framing`. A
+        // one-hop chain entered at a node's chain face is onion-shaped, and
+        // framing its target raw makes the exit read two payload bytes as a
+        // length and close without answering.
+        let is_onion = mirage_control_plane::chain_uses_onion_framing(&chain, &peer_table.load());
         let chain_id: Arc<str> = Arc::from(chain.chain_id.as_str());
         let pool_size = config.pool_size.max(1);
 
@@ -1371,7 +1375,8 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
         )
     };
 
-    let is_onion = chain.hops.len() > 1;
+    // Same predicate as the initial dial — see `TunnelPool::new`.
+    let is_onion = mirage_control_plane::chain_uses_onion_framing(&chain, &peer_table_shared.load());
     let mut attempt = 0u32;
     loop {
         attempt += 1;

@@ -381,11 +381,21 @@ impl MuxPool {
         ring_credential: crate::token_pool::RingCredentialCell,
         credential_gated: bool,
     ) -> Result<Arc<Self>, MirageError> {
-        // Phase 9.7: onion = multi-hop chain. Single-hop direct exit
-        // sends the address bytes raw (no length-prefix) so the
-        // server's `handle_exit` auto-detector reads the first byte
-        // as ASCII (>=0x30), not 0x00 (mux marker).
-        let is_onion = chain.hops.len() > 1;
+        // Onion framing is decided by the chain's shape, not its depth.
+        //
+        // This read `chain.hops.len() > 1`. A one-hop chain reached at a
+        // node's published chain face is onion-shaped too — it carries an
+        // envelope and its exit peels a layer — so answering by depth framed
+        // its target raw, and the onion exit read the first two bytes as a
+        // 16-bit length and closed the tunnel without a byte.
+        //
+        // `chain_uses_onion_framing` is the same predicate `establish_raw_tunnel`
+        // dials on, so the framing and the circuit cannot disagree about what
+        // the exit is.
+        let is_onion = mirage_control_plane::chain_uses_onion_framing(
+            &chain,
+            &peer_table.load(),
+        );
         let pool_size = config.pool_size.max(1).min(8);
         let chain_id: Arc<str> = Arc::from(chain.chain_id.as_str());
 
@@ -1356,7 +1366,11 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         )
     };
 
-    let is_onion = chain.hops.len() > 1;
+    // Same predicate as the initial build — see `MuxPool::new`.
+    let is_onion = mirage_control_plane::chain_uses_onion_framing(
+        &chain,
+        &peer_table_shared.load(),
+    );
     let mut attempt = 0u32;
     loop {
         attempt += 1;
