@@ -37,12 +37,14 @@ use mirage_core::{
     mirage::mesh::PeerTable,
     mirage::wire::CredentialScheme,
 };
-use mirage_protocol::{core::MirageCoreUdpTunnel, negotiation::ProtocolChain, traits::Tunnel};
+use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::token_pool::{self, TokenPool};
-use crate::tunnel::{establish_raw_tunnel, establish_udp_datagram_tunnel, freshen_chain_pubkeys};
+use crate::tunnel::{
+    establish_raw_tunnel, establish_udp_datagram_tunnel, freshen_chain_pubkeys, DatagramTunnel,
+};
 
 // ── Cold-start credential gate ────────────────────────────────────────────────
 
@@ -692,9 +694,12 @@ impl TunnelPool {
             .is_some()
     }
 
-    /// Dial a fresh [`MirageCoreUdpTunnel`] for this pool's chain via
+    /// Dial a fresh [`DatagramTunnel`] for this pool's chain via
     /// [`establish_udp_datagram_tunnel`] — the datagram-native counterpart
-    /// of the ordinary tunnel dial this pool otherwise performs.
+    /// of the ordinary tunnel dial this pool otherwise performs. Either a
+    /// direct single-hop tunnel or a multi-hop telescopic FS circuit; see
+    /// [`DatagramTunnel`]'s own doc for why the caller gets an enum rather
+    /// than the single concrete type this method used to return.
     ///
     /// Snapshots exactly what the initial pool dial snapshots in
     /// [`TunnelPool::new`] (fresh peer_table, fresh `credential_params`) and
@@ -707,7 +712,7 @@ impl TunnelPool {
     /// caller (`udp_session_task`'s datagram branch) calls this once per
     /// SOCKS5 UDP destination and never pools or reuses the resulting
     /// tunnel; there is no slot, no lease, and nothing to return.
-    pub async fn datagram_dial(&self) -> Result<MirageCoreUdpTunnel, MirageError> {
+    pub async fn datagram_dial(&self) -> Result<DatagramTunnel, MirageError> {
         let (chain, mesh_id, peer_table_snap, cred_snap, pre_minted) = {
             let guard = self.inner.lock().await;
             let peer_table_snap = guard.peer_table.load_full();

@@ -38,9 +38,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use mirage_protocol::core::MirageCoreUdpTunnel;
 use mirage_protocol::traits::Tunnel as _;
 
+use crate::tunnel::DatagramTunnel;
 use crate::{mux_pool::MuxPool, pool::TunnelPool, relay::{relay_loop, TunnelCompat}};
 use crate::udp_framing::{write_udp_frame, read_udp_frame};
 use crate::chain_set::{ChainId, Router, TargetKey, FlowKey, ProtocolHint};
@@ -1492,28 +1492,31 @@ async fn udp_associate_relay(
 }
 
 /// Datagram-native UDP session body: given an already-dialed
-/// [`MirageCoreUdpTunnel`], sends the session's fixed destination as the
-/// bare `host:port` first datagram — no `udp:` prefix, no length prefix; the
-/// node's own reader
+/// [`DatagramTunnel`] (either a direct single-hop tunnel or a multi-hop
+/// telescopic FS circuit — see that type's own doc), sends the session's
+/// fixed destination as the bare `host:port` first datagram — no `udp:`
+/// prefix, no length prefix; the node's own reader
 /// (`mirage2node/crates/mirage-node/src/core/udp_chain_splice.rs::parse_target_datagram`)
 /// reads it as utf-8, trimmed, with no framing of any kind — then relays
 /// every later datagram whole and raw in both directions until
 /// `idle_timeout` elapses with nothing on `rx`, or either side of the
 /// tunnel errors. One dial per destination session; there is nothing to
-/// close (`MirageCoreUdpTunnel::close` is already a no-op).
+/// close (`Tunnel::close` is a no-op for every `DatagramTunnel` variant).
 ///
-/// Split via [`MirageCoreUdpTunnel::into_split`] — not a `Mutex` around the
-/// whole tunnel — because `send` and `recv_datagram` both need `&mut self`
-/// and this body needs to write from the main loop while reading
-/// concurrently in a spawned task, exactly like the mux/raw branches above
-/// do with their own read half.
+/// Split via [`DatagramTunnel::into_split`] — not a `Mutex` around the whole
+/// tunnel — because `send` and `recv_datagram` both need `&mut self` and
+/// this body needs to write from the main loop while reading concurrently
+/// in a spawned task, exactly like the mux/raw branches above do with their
+/// own read half. `DatagramTunnel` exists as an enum, not `Box<dyn Tunnel>`,
+/// specifically so `into_split` stays available here — see that type's own
+/// doc for why the trait-object shape was tried first and rejected.
 ///
 /// Split into its own function, taking an already-dialed tunnel rather than
 /// the pool, so this body is testable directly against a hand-built
 /// loopback tunnel without going through [`TunnelPool::datagram_dial`] at
 /// all.
 async fn run_datagram_udp_session(
-    mut tunnel: MirageCoreUdpTunnel,
+    mut tunnel: DatagramTunnel,
     dst: SocketAddr,
     mut rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
@@ -2033,7 +2036,7 @@ mod tests {
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
 
         let session_handle = tokio::spawn(super::run_datagram_udp_session(
-            client_tunnel,
+            super::DatagramTunnel::Direct(client_tunnel),
             dst,
             rx,
             resp_tx,
