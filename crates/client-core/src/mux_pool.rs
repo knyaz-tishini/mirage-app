@@ -18,6 +18,7 @@ use mirage_protocol::{negotiation::ProtocolChain, traits::Tunnel};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
+use crate::capability_pool::{self, CapabilityTokenCell};
 use crate::relay::TunnelCompat;
 use crate::token_pool::{self, TokenPool};
 use crate::tunnel::{establish_mux_tunnel, freshen_chain_pubkeys};
@@ -39,6 +40,7 @@ fn mux_credential_is_ready(
     credential_params: &ArcSwap<Option<CredentialParams>>,
     token_pool: &ArcSwap<TokenPool>,
     ring_credential: &crate::token_pool::RingCredentialCell,
+    capability_tokens: &CapabilityTokenCell,
 ) -> bool {
     let params_guard = credential_params.load();
     let params = match params_guard.as_ref().as_ref() {
@@ -59,8 +61,10 @@ fn mux_credential_is_ready(
         Some(CredentialScheme::BlindRsaBatch) => {
             !token_pool.load().is_empty()
         }
+        // SignedCapability (0x02): the client cannot self-mint — ready only
+        // when the provider holds a pre-minted token.
+        Some(CredentialScheme::SignedCapability) => capability_tokens.is_ready(),
         Some(CredentialScheme::EpochHmac)
-        | Some(CredentialScheme::SignedCapability)
         | Some(CredentialScheme::Legacy)
         | None => true,
     }
@@ -74,8 +78,9 @@ async fn mux_wait_for_credential_ready(
     credential_params: &ArcSwap<Option<CredentialParams>>,
     token_pool: &ArcSwap<TokenPool>,
     ring_credential: &crate::token_pool::RingCredentialCell,
+    capability_tokens: &CapabilityTokenCell,
 ) {
-    if mux_credential_is_ready(credential_params, token_pool, ring_credential) {
+    if mux_credential_is_ready(credential_params, token_pool, ring_credential, capability_tokens) {
         return;
     }
 
@@ -104,7 +109,7 @@ async fn mux_wait_for_credential_ready(
     let deadline = tokio::time::Instant::now() + MUX_CREDENTIAL_GATE_TIMEOUT;
     loop {
         tokio::time::sleep(MUX_CREDENTIAL_GATE_POLL_INTERVAL).await;
-        if mux_credential_is_ready(credential_params, token_pool, ring_credential) {
+        if mux_credential_is_ready(credential_params, token_pool, ring_credential, capability_tokens) {
             debug!(
                 chain_id,
                 slot,
@@ -325,6 +330,10 @@ struct PoolInner {
     /// RingMembership authority is active in `credential_params`. Hot-swappable
     /// via ArcSwap — MonitorLink writes a new credential on epoch rotation.
     ring_credential: crate::token_pool::RingCredentialCell,
+    /// Pre-minted SignedCapability (0x02) token source — same seam as in
+    /// `pool.rs`. Preferred over ring/blind whenever a SignedCapability
+    /// authority is active in `credential_params`.
+    capability_tokens: CapabilityTokenCell,
     /// Whether this pool requires a credential to be present before dialing.
     /// When `true`, CREDENTIAL_REJECTED errors are treated as transient and the
     /// slot keeps retrying at a capped interval instead of permanently parking.
@@ -366,6 +375,11 @@ impl MuxPool {
     /// Pass `Arc::new(ArcSwap::from_pointee(None))` when ring membership is not
     /// configured. MonitorLink writes into the same cell on epoch rotation.
     ///
+    /// `capability_tokens` — pre-minted SignedCapability (0x02) token source.
+    /// Pass `capability_pool::null_capability_cell()` when no token file is
+    /// configured; session dials under a SignedCapability authority are then
+    /// withheld (never sent credential-less) until tokens appear.
+    ///
     /// `credential_gated` — when `true`, each slot's FIRST dial waits (bounded
     /// by ~8 s) until the active credential scheme has a presentable credential
     /// before opening the mux session. Set `true` when `operator_pub_hex` is
@@ -379,6 +393,7 @@ impl MuxPool {
         credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
         token_pool: Arc<ArcSwap<TokenPool>>,
         ring_credential: crate::token_pool::RingCredentialCell,
+        capability_tokens: CapabilityTokenCell,
         credential_gated: bool,
     ) -> Result<Arc<Self>, MirageError> {
         // Onion framing is decided by the chain's shape, not its depth.
@@ -415,6 +430,7 @@ impl MuxPool {
             let cred_params_arc = Arc::clone(&credential_params);
             let token_pool_arc = Arc::clone(&token_pool);
             let ring_cell_arc = Arc::clone(&ring_credential);
+            let cap_cell_arc = Arc::clone(&capability_tokens);
             let chain_id_log: Arc<str> = Arc::clone(&chain_id);
             let gated = credential_gated;
             join_set.spawn(async move {
@@ -428,6 +444,7 @@ impl MuxPool {
                         &cred_params_arc,
                         &token_pool_arc,
                         &ring_cell_arc,
+                        &cap_cell_arc,
                     ).await;
                 }
 
@@ -435,21 +452,37 @@ impl MuxPool {
                 let pt = pt_arc.load_full();
                 // Snapshot credential_params for this dial attempt.
                 let cred_snap = cred_params_arc.load_full();
-                // Phase 4: pop one blind token for this initial mux session dial.
-                let spent = token_pool::pop_one(&token_pool_arc);
-                // Prefer ring-membership (0x04) when a RingMembership authority is
-                // active; fall back to the blind token (0x03) otherwise.
-                let ring_snap = ring_cell_arc.load_full();
-                let pre_minted = crate::token_pool::build_ring_credential(
-                    cred_snap.as_ref().as_ref(),
-                    ring_snap.as_ref().as_ref(),
-                    &crate::token_pool::ring_dial_context(&ch),
-                ).or_else(|| spent.as_ref().map(|t| {
-                    debug!(epoch_id = t.epoch_id, "mux_pool: spending blind token on initial dial");
-                    mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
-                }));
                 let cred_ref = cred_snap.as_ref().as_ref();
-                (idx, build_session(&cp, &ch, &pt, &mid, pre_minted.as_ref(), cred_ref).await)
+                // Scheme 0x02 fleet: a SignedCapability authority in params wins —
+                // pop a pre-minted capability token and never touch ring/blind.
+                // An empty provider withholds the dial (never dial credential-less
+                // under 0x02); the slot enters Reconnecting and retries.
+                let dial_result = match capability_pool::capability_credential_for_dial(cred_ref, &cap_cell_arc) {
+                    capability_pool::CapabilityDial::Token(cred) => {
+                        debug!("mux_pool: spending capability token on initial dial");
+                        build_session(&cp, &ch, &pt, &mid, Some(&cred), cred_ref).await
+                    }
+                    capability_pool::CapabilityDial::Unavailable => {
+                        Err(capability_pool::capability_unavailable_error())
+                    }
+                    capability_pool::CapabilityDial::NotActive => {
+                        // Phase 4: pop one blind token for this initial mux session dial.
+                        let spent = token_pool::pop_one(&token_pool_arc);
+                        // Prefer ring-membership (0x04) when a RingMembership authority is
+                        // active; fall back to the blind token (0x03) otherwise.
+                        let ring_snap = ring_cell_arc.load_full();
+                        let pre_minted = crate::token_pool::build_ring_credential(
+                            cred_snap.as_ref().as_ref(),
+                            ring_snap.as_ref().as_ref(),
+                            &crate::token_pool::ring_dial_context(&ch),
+                        ).or_else(|| spent.as_ref().map(|t| {
+                            debug!(epoch_id = t.epoch_id, "mux_pool: spending blind token on initial dial");
+                            mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
+                        }));
+                        build_session(&cp, &ch, &pt, &mid, pre_minted.as_ref(), cred_ref).await
+                    }
+                };
+                (idx, dial_result)
             });
         }
 
@@ -501,6 +534,7 @@ impl MuxPool {
             credential_params,
             token_pool,
             ring_credential,
+            capability_tokens,
             credential_gated,
         }));
 
@@ -1302,6 +1336,7 @@ mod tests {
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
             Arc::new(arc_swap::ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            crate::capability_pool::null_capability_cell(),
             false, // credential_gated: no gating in tests
         )
             .await
@@ -1355,6 +1390,7 @@ mod tests {
             credential_params,
             Arc::new(arc_swap::ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
             Arc::new(arc_swap::ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            crate::capability_pool::null_capability_cell(),
             false, // credential_gated: no gating in tests
         )
             .await
@@ -1369,7 +1405,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
     let chain_id = Arc::clone(&pool.chain_id);
     let (max_attempts, base_ms, chain, chain_protocols, mesh_id, peer_table_shared,
          peer_table_notify, credential_params_shared, token_pool_shared,
-         ring_credential_shared, credential_gated) = {
+         ring_credential_shared, capability_tokens_shared, credential_gated) = {
         let guard = pool.inner.lock().await;
         (
             guard.config.max_reconnect_attempts,
@@ -1382,6 +1418,7 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             Arc::clone(&guard.credential_params),
             Arc::clone(&guard.token_pool),
             Arc::clone(&guard.ring_credential),
+            Arc::clone(&guard.capability_tokens),
             guard.credential_gated,
         )
     };
@@ -1412,38 +1449,55 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
         };
         let cred_snap = credential_params_shared.load_full();
         let cred_ref = cred_snap.as_ref().as_ref();
-        // Phase 4: pop one blind token for this mux reconnect dial.
-        // A popped token must not be re-inserted on failure — it may have reached
-        // the node's SpentSet and would be rejected as a replay on any retry.
-        let spent = token_pool::pop_one(&token_pool_shared);
-        if spent.is_none() {
-            let creds = credential_params_shared.load();
-            if let Some(cp) = creds.as_ref() {
-                let has_blind = cp.authorities.iter().any(|a| {
-                    a.scheme == mirage_core::mirage::wire::CredentialScheme::BlindRsaBatch
-                });
-                if has_blind {
-                    warn!(
-                        chain_id = %chain_id,
-                        slot = slot_idx,
-                        "mux: token pool empty but BlindRsaBatch authority is active — \
-                         session may be rejected by enforce-mode nodes"
-                    );
-                }
+        // Scheme 0x02 fleet: a SignedCapability authority in params wins —
+        // pop a pre-minted capability token and never touch ring/blind. An
+        // empty provider withholds the dial (never dial credential-less under
+        // 0x02): the error follows the ordinary backoff path below and the
+        // next attempt picks up newly provisioned tokens.
+        let dial_result = match capability_pool::capability_credential_for_dial(cred_ref, &capability_tokens_shared) {
+            capability_pool::CapabilityDial::Token(cred) => {
+                debug!(chain_id = %chain_id, slot = slot_idx, "mux_pool: spending capability token on reconnect");
+                build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, Some(&cred), cred_ref).await
             }
-        }
-        // Prefer ring-membership (0x04) when a RingMembership authority is
-        // active; fall back to the blind token (0x03) otherwise.
-        let ring_snap = ring_credential_shared.load_full();
-        let pre_minted = crate::token_pool::build_ring_credential(
-            cred_snap.as_ref().as_ref(),
-            ring_snap.as_ref().as_ref(),
-            &crate::token_pool::ring_dial_context(&fresh_chain),
-        ).or_else(|| spent.as_ref().map(|t| {
-            debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "mux_pool: spending blind token on reconnect");
-            mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
-        }));
-        match build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, pre_minted.as_ref(), cred_ref).await {
+            capability_pool::CapabilityDial::Unavailable => {
+                Err(capability_pool::capability_unavailable_error())
+            }
+            capability_pool::CapabilityDial::NotActive => {
+                // Phase 4: pop one blind token for this mux reconnect dial.
+                // A popped token must not be re-inserted on failure — it may have reached
+                // the node's SpentSet and would be rejected as a replay on any retry.
+                let spent = token_pool::pop_one(&token_pool_shared);
+                if spent.is_none() {
+                    let creds = credential_params_shared.load();
+                    if let Some(cp) = creds.as_ref() {
+                        let has_blind = cp.authorities.iter().any(|a| {
+                            a.scheme == mirage_core::mirage::wire::CredentialScheme::BlindRsaBatch
+                        });
+                        if has_blind {
+                            warn!(
+                                chain_id = %chain_id,
+                                slot = slot_idx,
+                                "mux: token pool empty but BlindRsaBatch authority is active — \
+                                 session may be rejected by enforce-mode nodes"
+                            );
+                        }
+                    }
+                }
+                // Prefer ring-membership (0x04) when a RingMembership authority is
+                // active; fall back to the blind token (0x03) otherwise.
+                let ring_snap = ring_credential_shared.load_full();
+                let pre_minted = crate::token_pool::build_ring_credential(
+                    cred_snap.as_ref().as_ref(),
+                    ring_snap.as_ref().as_ref(),
+                    &crate::token_pool::ring_dial_context(&fresh_chain),
+                ).or_else(|| spent.as_ref().map(|t| {
+                    debug!(chain_id = %chain_id, slot = slot_idx, epoch_id = t.epoch_id, "mux_pool: spending blind token on reconnect");
+                    mirage_protocol::driver::ClientCredential { scheme: 0x03, token: t.to_wire() }
+                }));
+                build_session(&chain_protocols, &fresh_chain, &peer_table_snap, &mesh_id, pre_minted.as_ref(), cred_ref).await
+            }
+        };
+        match dial_result {
             Ok(session) => {
                 info!(chain_id = %chain_id, slot = slot_idx, attempt, "mux reconnect succeeded");
                 {

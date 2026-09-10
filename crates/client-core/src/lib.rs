@@ -2,6 +2,7 @@ pub mod chain_set;
 pub mod health_watcher;
 pub mod policy_push;
 pub mod token_pool;
+pub mod capability_pool;
 pub mod log_capture;
 pub mod monitor_channel;
 pub mod monitor_link;

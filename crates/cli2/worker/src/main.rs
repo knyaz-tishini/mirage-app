@@ -276,6 +276,20 @@ async fn main() -> anyhow::Result<()> {
             &nf_counter_dir,
         )));
 
+    // Pre-minted SignedCapability (0x02) token source. The client cannot
+    // self-mint 0x02 (only the operator-box holds the Ed25519 seed), so tokens
+    // come from a file provisioned externally (test line; the source is a
+    // replaceable seam — see capability_pool). No reload wiring needed: every
+    // pop lazily re-reads the file, so tokens appended later are picked up.
+    let capability_tokens: mirage_client_core::capability_pool::CapabilityTokenCell =
+        match client_config.capability_tokens_path.as_deref() {
+            Some(path) => {
+                info!(chain_id = %chain_id, path, "worker: capability token file source configured");
+                Arc::new(mirage_client_core::capability_pool::FileCapabilityTokenSource::new(path))
+            }
+            None => mirage_client_core::capability_pool::null_capability_cell(),
+        };
+
     // Gate initial dials when the operator key is configured: credential-gated
     // nodes require a valid credential before accepting any connection.
     let credential_gated = client_config.operator_pub_hex.is_some();
@@ -296,6 +310,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&credential_params),
             Arc::clone(&token_pool),
             Arc::clone(&ring_credential),
+            Arc::clone(&capability_tokens),
             credential_gated,
         ).await {
             Ok(mp) => {
@@ -343,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         pool_cfg.clone()
     };
-    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg_for_tunnel, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), credential_gated)
+    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg_for_tunnel, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), Arc::clone(&capability_tokens), credential_gated)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
 
