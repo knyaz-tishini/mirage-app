@@ -44,6 +44,14 @@ use tracing::{debug, info, warn};
 /// Default max idle seconds before orphaned worker exits.
 const DEFAULT_ORPHAN_TIMEOUT_SECS: u64 = 3600;
 
+/// Exit code used when the worker gives up waiting for the supervisor to
+/// reconnect (orphan timeout), or the IPC listener itself fails while
+/// orphaned. Distinct from a clean exit (`0` — Drain/Shutdown/Restart, all
+/// requested by the supervisor) and from a panic (`1`, see the panic hook
+/// below) so a supervising parent can tell "nobody came back" apart from
+/// "asked to stop" and respawn the pair accordingly.
+const EXIT_CODE_ORPHAN_TIMEOUT: i32 = 3;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -347,17 +355,7 @@ async fn main() -> anyhow::Result<()> {
         warn!(chain_id = %chain_id, %reason, "data-plane: LEGACY non-mux path (run_simple) selected");
     }
 
-    // On mux chains the warm TunnelPool is fallback-only (degraded-mode pool.lease in
-    // socks5.rs); its spares are never leased by the mux data-plane, so the 120s
-    // idle-eviction would churn-redial them in lockstep every ~120s (DPI-visible).
-    // Disable idle eviction for the mux carrier pool; MuxPool owns its carriers'
-    // lifetime via its own 600s reaper.  When MuxPool init failed (mux_pool_opt is
-    // None), TunnelPool is the primary data-plane — keep the configured eviction.
-    let pool_cfg_for_tunnel = if mux_pool_opt.is_some() {
-        TunnelPoolConfig { idle_timeout_secs: 0, ..pool_cfg.clone() }
-    } else {
-        pool_cfg.clone()
-    };
+    let pool_cfg_for_tunnel = tunnel_pool_config_for(&pool_cfg, mux_pool_opt.is_some());
     let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg_for_tunnel, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), Arc::clone(&capability_tokens), credential_gated)
         .await
         .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
@@ -374,63 +372,16 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     info!(chain_id = %chain_id, pid, "sent Ready");
 
-    // Channel to signal SOCKS5 server to stop.
-    let (stop_tx, stop_rx) = watch::channel(false);
+    // Pulse channel used to stop whichever SOCKS5 accept loop is currently
+    // running. Fired from `handle_session` on Drain/Shutdown/Restart, and
+    // from `supervisor_loop` on an ordinary supervisor disconnect (the fix
+    // for the orphan-window blackhole — see `stop_socks5` /
+    // `spawn_socks5_accept_loop` below). Each accept-loop spawn subscribes a
+    // fresh receiver via `stop_tx.subscribe()`, so reusing one sender across
+    // many stop/resume cycles is safe — a receiver only observes `.send()`
+    // calls made after it subscribed.
+    let (stop_tx, _) = watch::channel(false);
 
-    // Per-worker kill-switch setup.
-    //
-    // A worker owns exactly one chain — no cross-chain failover pools are
-    // available here (General-group cross-wire rerouting spans multiple workers
-    // and is a supervisor-level concern, not handled inside a single worker).
-    // We pass an empty failover list so the server is purely fail-closed for
-    // its own wire.  The policy map contains this worker's single chain so the
-    // kill-switch invariant (dead wire → SOCKS5 error, never bypass) is enforced.
-    let shared_wire_health = WireHealthMap::new();
-    let worker_policy = SocksFailurePolicy::from_chain_config(
-        chain.kill_switch.as_ref(),
-        chain.group.as_deref(),
-        &chain_id,
-    );
-    let chain_policies: HashMap<String, SocksFailurePolicy> =
-        [(chain_id.clone(), worker_policy)].into();
-    let chain_natures: HashMap<String, WireNature> =
-        [(chain_id.clone(), chain.effective_nature())].into();
-
-    // Spawn SOCKS5 server.
-    let server = Socks5Server::new_with_failover(addr, vec![])
-        .with_kill_switch(chain_id.clone(), chain_policies, chain_natures)
-        .with_shared_wire_health(Arc::clone(&shared_wire_health));
-    // Clone for supervisor_loop; original moves into server closure below.
-    let mux_pool_for_loop = mux_pool_opt.as_ref().map(Arc::clone);
-    let server_handle = tokio::spawn({
-        let pool = Arc::clone(&pool);
-        let mut stop_rx = stop_rx.clone();
-        async move {
-            let serve_fut = if mux_pool_opt.is_some() {
-                tokio::spawn({
-                    let pool = Arc::clone(&pool);
-                    async move { server.run(pool, mux_pool_opt, config_arc, router).await }
-                })
-            } else {
-                tokio::spawn({
-                    let pool = Arc::clone(&pool);
-                    async move { server.run_simple(pool).await }
-                })
-            };
-            tokio::select! {
-                result = serve_fut => {
-                    if let Ok(Err(e)) = result {
-                        tracing::error!(error = %e, "SOCKS5 server exited with error");
-                    }
-                }
-                _ = stop_rx.changed() => {
-                    // Drain signal received — server_handle task exits.
-                }
-            }
-        }
-    });
-
-    // IPC supervisor loop — handles current session + reconnects.
     let current_state = Arc::new(tokio::sync::Mutex::new(WorkerState::Ready));
 
     // Channel for background tasks (MonitorLink watcher) to send WorkerMsg
@@ -439,6 +390,11 @@ async fn main() -> anyhow::Result<()> {
     let (outgoing_tx_raw, outgoing_rx) = mpsc::channel::<WorkerMsg>(16);
     let outgoing_tx = Arc::new(outgoing_tx_raw);
 
+    // IPC supervisor loop — handles current session + reconnects. Also owns
+    // the SOCKS5 accept-loop lifecycle: live only while a supervisor is
+    // connected, torn down the instant the link is lost so new dials get an
+    // honest connection-refused instead of being accepted and blackholed for
+    // up to `orphan_timeout_secs`.
     let result = supervisor_loop(
         &mut listener,
         &chain_id,
@@ -449,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
         started_at_unix,
         ipc,
         Arc::clone(&pool),
-        mux_pool_for_loop,
+        mux_pool_opt.as_ref().map(Arc::clone),
         Arc::clone(&current_state),
         Arc::clone(&peer_table),
         Arc::clone(&credential_params),
@@ -464,24 +420,74 @@ async fn main() -> anyhow::Result<()> {
         operator_pub_hex_str,
         enrol_token_str,
         nf_counter_dir,
+        addr,
+        config_arc,
+        router,
     )
     .await;
-
-    // If loop returned with a drain request, wait for server to finish.
-    let _ = server_handle.await;
 
     // Remove PID file on clean exit.
     if let Err(e) = std::fs::remove_file(&pid_file) {
         warn!("could not remove PID file {:?}: {e}", pid_file);
     }
 
-    result
+    match result {
+        Ok(WorkerExit::Clean) => Ok(()),
+        Ok(WorkerExit::Orphaned) => {
+            warn!(
+                chain_id = %chain_id,
+                exit_code = EXIT_CODE_ORPHAN_TIMEOUT,
+                "worker exiting via the orphan-timeout path — supervisor never reconnected, signalling a supervising parent to respawn the pair"
+            );
+            std::process::exit(EXIT_CODE_ORPHAN_TIMEOUT);
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Derive the `TunnelPoolConfig` for the worker's fallback `TunnelPool`,
+/// shrinking it when the mux carrier pool is healthy.
+///
+/// When `mux_is_alive`, `TunnelPool` is fallback-only (degraded-mode
+/// `pool.lease()` call sites in socks5.rs) — its spares are never leased by
+/// the mux data-plane. Two changes apply in that case:
+/// - `pool_size` floors to 1: building it at the same pool_size the mux
+///   carrier pool uses (3, forced under `use_mux`) would eagerly dial 3 more
+///   tunnels — 3 more capability-token spends — at cold start for a pool
+///   nothing but the fallback path ever leases while mux is healthy.
+///   `TunnelPool::new` floors pool_size at 1 regardless of what's passed, so
+///   1 is the cheapest fallback that still exists to catch a runtime mux
+///   failure.
+/// - `idle_timeout_secs` disables (0): the 120s idle-eviction would
+///   churn-redial the fallback spares in lockstep every ~120s (DPI-visible).
+///   MuxPool owns its own carriers' lifetime via its own 600s reaper.
+///
+/// When mux init failed (`!mux_is_alive`), `TunnelPool` is the primary
+/// data-plane — `pool_cfg` passes through unchanged.
+fn tunnel_pool_config_for(pool_cfg: &TunnelPoolConfig, mux_is_alive: bool) -> TunnelPoolConfig {
+    if mux_is_alive {
+        TunnelPoolConfig { idle_timeout_secs: 0, pool_size: 1, ..pool_cfg.clone() }
+    } else {
+        pool_cfg.clone()
+    }
 }
 
 /// Run the IPC command loop across multiple supervisor connections.
 ///
-/// Returns `Ok(())` when the worker should exit cleanly (Drain completed or
-/// Restart acknowledged). Returns `Err` on fatal internal errors.
+/// Also owns the SOCKS5 accept-loop lifecycle for this chain: a fresh accept
+/// loop is spawned as soon as a supervisor session is live, and torn down
+/// (listener dropped — OS refuses new connections) the instant the link is
+/// lost, for the whole orphan wait. This is what bounds the blackhole window
+/// to zero: `orphan_timeout_secs` now only bounds how long the worker keeps
+/// *refusing* dials while waiting for the supervisor to come back, not how
+/// long it silently accepts-and-hangs them.
+///
+/// Returns `Ok(WorkerExit::Clean)` when the worker should exit cleanly
+/// (Drain completed or Restart acknowledged — the supervisor asked for it).
+/// Returns `Ok(WorkerExit::Orphaned)` when no supervisor reconnected within
+/// `orphan_timeout_secs`, or the IPC listener itself failed while waiting —
+/// `main` maps this to a distinct non-zero exit code. Returns `Err` on fatal
+/// internal errors.
 async fn supervisor_loop(
     listener: &mut PipeListener,
     chain_id: &str,
@@ -507,8 +513,42 @@ async fn supervisor_loop(
     operator_pub_hex: Option<String>,
     enrol_token: Option<String>,
     nf_counter_dir: std::path::PathBuf,
-) -> anyhow::Result<()> {
+    socks5_addr: SocketAddr,
+    socks5_config: Arc<ClientConfig>,
+    socks5_router: Arc<RoutingTable>,
+) -> anyhow::Result<WorkerExit> {
     let mut ipc = initial_ipc;
+
+    // Per-worker kill-switch setup, recomputed on every accept-loop (re)spawn
+    // inside `start_socks5` below.
+    //
+    // A worker owns exactly one chain — no cross-chain failover pools are
+    // available here (General-group cross-wire rerouting spans multiple
+    // workers and is a supervisor-level concern, not handled inside a single
+    // worker). `wire_health` persists across accept-loop stop/resume cycles
+    // (orphan pauses) so kill-switch failure streaks survive a brief
+    // supervisor blip instead of resetting on every reconnect.
+    let shared_wire_health = WireHealthMap::new();
+
+    // Builds (or rebuilds) the SOCKS5 accept loop for the current pool/mux
+    // pair. Only the stop-signal receiver changes between calls — pool,
+    // mux_pool_opt, and the socks5_* config are fixed for the worker's
+    // lifetime.
+    let start_socks5 = || {
+        spawn_socks5_accept_loop(
+            socks5_addr,
+            chain_id,
+            chain_cfg,
+            Arc::clone(&shared_wire_health),
+            Arc::clone(&pool),
+            mux_pool_opt.as_ref().map(Arc::clone),
+            Arc::clone(&socks5_config),
+            Arc::clone(&socks5_router),
+            stop_tx.subscribe(),
+        )
+    };
+
+    let mut server_task: Option<tokio::task::JoinHandle<()>> = Some(start_socks5());
 
     loop {
         // Handle messages from the current supervisor connection.
@@ -540,15 +580,21 @@ async fn supervisor_loop(
             SessionEnd::Exit => {
                 // Drain completed — worker should exit.
                 info!(chain_id, "drain/exit complete — worker exiting");
-                return Ok(());
+                stop_socks5(&mut server_task, &stop_tx).await;
+                return Ok(WorkerExit::Clean);
             }
             SessionEnd::Disconnect => {
-                // Supervisor disconnected; wait for reconnect or orphan timeout.
-                info!(chain_id, "supervisor disconnected — waiting for reconnect");
+                // Supervisor disconnected. Stop accepting SOCKS5 connections
+                // right now — the orphan wait below bounds how long dials are
+                // REFUSED (listener down), never how long they're accepted
+                // and then blackholed.
+                info!(chain_id, "supervisor disconnected — SOCKS5 accept loop stopped, waiting for reconnect");
+                stop_socks5(&mut server_task, &stop_tx).await;
             }
         }
 
-        // Orphan wait: accept next supervisor connection or timeout.
+        // Orphan wait: accept next supervisor connection or timeout. The
+        // SOCKS5 listener stays down for the entire wait.
         let orphan_timeout = tokio::time::Duration::from_secs(orphan_timeout_secs);
         match tokio::time::timeout(orphan_timeout, listener.accept()).await {
             Err(_) => {
@@ -557,11 +603,11 @@ async fn supervisor_loop(
                     timeout_secs = orphan_timeout_secs,
                     "no supervisor reconnected — orphan timeout, exiting"
                 );
-                return Ok(());
+                return Ok(WorkerExit::Orphaned);
             }
             Ok(Err(e)) => {
                 warn!(chain_id, "IPC accept error: {e} — exiting");
-                return Ok(());
+                return Ok(WorkerExit::Orphaned);
             }
             Ok(Ok(new_ipc)) => {
                 ipc = new_ipc;
@@ -591,14 +637,16 @@ async fn supervisor_loop(
                 match ipc.read_msg::<SupervisorMsg>().await {
                     Ok(Some(SupervisorMsg::Continue)) => {
                         info!(chain_id, "supervisor sent Continue — resuming");
+                        server_task = Some(start_socks5());
                     }
                     Ok(Some(SupervisorMsg::Restart { reason })) => {
                         info!(chain_id, reason = %reason, "supervisor sent Restart — draining");
                         let _ = stop_tx.send(true);
-                        return Ok(());
+                        return Ok(WorkerExit::Clean);
                     }
                     Ok(Some(other)) => {
                         warn!(chain_id, ?other, "unexpected message after Hello — treating as Continue");
+                        server_task = Some(start_socks5());
                     }
                     Ok(None) => {
                         warn!(chain_id, "supervisor closed pipe immediately after Hello");
@@ -620,6 +668,96 @@ enum SessionEnd {
     Exit,
     /// Supervisor disconnected; worker should wait for reconnect.
     Disconnect,
+}
+
+/// Outcome of [`supervisor_loop`], distinguishing a clean stop the supervisor
+/// asked for (Drain/Shutdown/Restart) from giving up on an orphan (nobody
+/// reconnected within `orphan_timeout_secs`, or the IPC listener itself
+/// failed while waiting). `main` maps `Orphaned` to a distinct non-zero exit
+/// code so a supervising parent can respawn the pair instead of treating this
+/// exit the same as a requested stop.
+enum WorkerExit {
+    /// Drain/Shutdown completed, or Restart was acknowledged.
+    Clean,
+    /// No supervisor reconnected within the orphan window (or the IPC
+    /// listener failed while waiting).
+    Orphaned,
+}
+
+/// Tear down the currently running SOCKS5 accept loop, if any: pulse
+/// `stop_tx` and wait for the accept-loop task to unwind. Unwinding drops the
+/// bound `TcpListener`, so the OS refuses new connection attempts instead of
+/// the process accepting them and then blackholing the client. Idempotent —
+/// a second call with `task` already `None` is a no-op.
+async fn stop_socks5(task: &mut Option<tokio::task::JoinHandle<()>>, stop_tx: &watch::Sender<bool>) {
+    if let Some(handle) = task.take() {
+        let _ = stop_tx.send(true);
+        let _ = handle.await;
+    }
+}
+
+/// Spawn a fresh SOCKS5 accept loop for this chain, bound to `addr`.
+///
+/// Returns the loop's `JoinHandle`. The caller stops it by pulsing any
+/// `watch::Sender` that `stop_rx` was subscribed from (see [`stop_socks5`]) —
+/// the loop races the accept future against `stop_rx.changed()`, aborts the
+/// accept future on a pulse, and exits. `stop_rx` must be freshly subscribed
+/// (`stop_tx.subscribe()`) for each call: a receiver only observes `.send()`
+/// calls made *after* it subscribed, so reusing an old receiver across a
+/// stop/respawn cycle would make the new loop see a pulse instantly.
+fn spawn_socks5_accept_loop(
+    addr: SocketAddr,
+    chain_id: &str,
+    chain_cfg: &mirage_core::config::ChainConfig,
+    shared_wire_health: Arc<WireHealthMap>,
+    pool: Arc<TunnelPool>,
+    mux_pool_opt: Option<Arc<MuxPool>>,
+    config_arc: Arc<ClientConfig>,
+    router: Arc<RoutingTable>,
+    mut stop_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    // Per-worker kill-switch setup. A worker owns exactly one chain — no
+    // cross-chain failover pools are available here (General-group
+    // cross-wire rerouting spans multiple workers and is a supervisor-level
+    // concern, not handled inside a single worker). We pass an empty
+    // failover list so the server is purely fail-closed for its own wire.
+    // The policy map contains this worker's single chain so the kill-switch
+    // invariant (dead wire → SOCKS5 error, never bypass) is enforced.
+    let worker_policy = SocksFailurePolicy::from_chain_config(
+        chain_cfg.kill_switch.as_ref(),
+        chain_cfg.group.as_deref(),
+        chain_id,
+    );
+    let chain_policies: HashMap<String, SocksFailurePolicy> =
+        [(chain_id.to_string(), worker_policy)].into();
+    let chain_natures: HashMap<String, WireNature> =
+        [(chain_id.to_string(), chain_cfg.effective_nature())].into();
+
+    let server = Socks5Server::new_with_failover(addr, vec![])
+        .with_kill_switch(chain_id.to_string(), chain_policies, chain_natures)
+        .with_shared_wire_health(shared_wire_health);
+
+    let chain_id = chain_id.to_string();
+    let mux_pool_is_some = mux_pool_opt.is_some();
+    tokio::spawn(async move {
+        let mut serve_fut = if mux_pool_is_some {
+            tokio::spawn(async move { server.run(pool, mux_pool_opt, config_arc, router).await })
+        } else {
+            tokio::spawn(async move { server.run_simple(pool).await })
+        };
+        tokio::select! {
+            result = &mut serve_fut => {
+                if let Ok(Err(e)) = result {
+                    tracing::error!(chain_id = %chain_id, error = %e, "SOCKS5 server exited with error");
+                }
+            }
+            _ = stop_rx.changed() => {
+                serve_fut.abort();
+                let _ = serve_fut.await;
+                debug!(chain_id = %chain_id, "SOCKS5 accept loop stopped — no longer accepting connections");
+            }
+        }
+    })
 }
 
 /// Run one IPC session until supervisor disconnects or sends Drain/Shutdown.
@@ -1191,4 +1329,115 @@ fn ring_credential_from_config(
         path.push((sib, step.is_right));
     }
     Some(mirage_client_core::RingCredential::new_persisted(member_sk, path, epoch_id, counter_dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Defect 1: fallback TunnelPool sizing ────────────────────────────────
+
+    #[test]
+    fn tunnel_pool_config_for_mux_alive_floors_pool_size_and_disables_eviction() {
+        let base = TunnelPoolConfig { pool_size: 3, idle_timeout_secs: 120, ..Default::default() };
+
+        let derived = tunnel_pool_config_for(&base, true);
+
+        assert_eq!(derived.pool_size, 1, "healthy mux must not pay for 3 eager fallback dials");
+        assert_eq!(derived.idle_timeout_secs, 0, "mux path disables fallback idle eviction");
+    }
+
+    #[test]
+    fn tunnel_pool_config_for_mux_dead_passes_through_unchanged() {
+        let base = TunnelPoolConfig { pool_size: 3, idle_timeout_secs: 120, ..Default::default() };
+
+        let derived = tunnel_pool_config_for(&base, false);
+
+        assert_eq!(derived.pool_size, base.pool_size, "TunnelPool is primary here — keep the configured size");
+        assert_eq!(derived.idle_timeout_secs, base.idle_timeout_secs, "TunnelPool is primary here — keep the configured eviction");
+    }
+
+    // ── Defect 2: SOCKS5 accept-loop stop/resume signalling ─────────────────
+    //
+    // These tests cover the pause/resume *signalling contract* that the
+    // orphan-window fix depends on: `stop_socks5` must actually stop a
+    // running accept-loop task (idempotently), and a freshly-subscribed
+    // `watch::Receiver` must not fire on a pulse sent before it subscribed —
+    // otherwise every resumed accept loop would see a stale "stop" and never
+    // actually start accepting again. They exercise the real `stop_socks5`
+    // against a stand-in task shaped exactly like the real accept-loop's
+    // `tokio::select!` (pending future raced against `stop_rx.changed()`).
+    //
+    // NOT covered here (not unit-testable from this crate): that
+    // `spawn_socks5_accept_loop` actually stops accepting on a real
+    // `TcpListener`, or that a real `Socks5Server` refuses dials while
+    // stopped. That needs a live-bound listener plus a real
+    // `TunnelPool`/`MuxPool`/`ClientConfig`/`RoutingTable` fixture — the
+    // worker crate is a bin-only crate with no test-fixture scaffolding for
+    // those types, and building one here would duplicate most of `main()`
+    // without adding confidence beyond what the signalling contract already
+    // proves.
+
+    /// Stand-in for the real accept-loop task's `tokio::select!` shape,
+    /// without a real `Socks5Server`/`TunnelPool`.
+    fn spawn_stub_accept_loop(mut stop_rx: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = std::future::pending::<()>() => {}
+                _ = stop_rx.changed() => {}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn stop_socks5_stops_the_running_task() {
+        let (stop_tx, _) = watch::channel(false);
+        let mut task = Some(spawn_stub_accept_loop(stop_tx.subscribe()));
+
+        stop_socks5(&mut task, &stop_tx).await;
+
+        assert!(task.is_none(), "stop_socks5 must clear the handle of the task it stopped");
+    }
+
+    #[tokio::test]
+    async fn stop_socks5_is_idempotent_when_already_stopped() {
+        let (stop_tx, _) = watch::channel(false);
+        let mut task: Option<tokio::task::JoinHandle<()>> = None;
+
+        // supervisor_loop calls stop_socks5 unconditionally on every
+        // disconnect, including two disconnects in a row with no successful
+        // reconnect in between — must not panic or hang on an already-empty
+        // handle.
+        stop_socks5(&mut task, &stop_tx).await;
+
+        assert!(task.is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_subscribe_after_a_pulse_does_not_fire_immediately() {
+        let (stop_tx, _) = watch::channel(false);
+
+        // First cycle: stop it once — this pulses the shared sender.
+        let mut first = Some(spawn_stub_accept_loop(stop_tx.subscribe()));
+        stop_socks5(&mut first, &stop_tx).await;
+
+        // Second cycle: a fresh receiver subscribed AFTER that pulse must
+        // treat the sender's current value as already-seen and keep running
+        // until the NEXT pulse. Yield repeatedly instead of sleeping — this
+        // gives the spawned task every chance to wake and finish if it saw
+        // a stale pulse, without a wall-clock-dependent assertion.
+        let second = spawn_stub_accept_loop(stop_tx.subscribe());
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second.is_finished(),
+            "a freshly-subscribed receiver must not observe a pulse sent before it subscribed"
+        );
+
+        // A genuine pulse sent after subscribing must still stop it.
+        let mut second = Some(second);
+        stop_socks5(&mut second, &stop_tx).await;
+        assert!(second.is_none());
+    }
 }
