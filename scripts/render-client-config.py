@@ -137,6 +137,13 @@ def main() -> None:
         ],
         "routing": {},
         "capability_tokens_path": args.tokens,
+        # Without these the worker knows no scheme, presents scheme 0x00 and the
+        # exit refuses every dial — which looks exactly like a bad token file and
+        # is not: the token source is configured, consulted by nobody, and the
+        # file never shrinks. The sentinel normally injects them from its
+        # MonitorLink; a config rendered for a worker that has no monitor link
+        # has to carry them itself, and `credential_params` exists for that.
+        "credential_params": fetch("/mesh/credential-current", key)["params"],
     }
 
     out = pathlib.Path(args.out)
