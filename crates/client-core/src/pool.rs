@@ -574,6 +574,95 @@ impl TunnelPool {
         Ok(pool)
     }
 
+    /// Create a pool for the FALLBACK-only role: costs nothing until the
+    /// first [`TunnelPool::lease`] call actually needs a raw tunnel.
+    ///
+    /// Unlike [`TunnelPool::new`], this dials NOTHING at construction — every
+    /// slot starts `Dormant`, the same state the idle reaper already parks a
+    /// slot in after [`TUNNEL_POOL_IDLE_KILL_TIMEOUT`], and that `lease()`
+    /// already knows how to wake (it wakes any `Dormant` slot to
+    /// `Reconnecting` when no `Idle` slot is found, and the maintenance loop
+    /// picks up `Reconnecting` slots on its next tick). No new dial machinery
+    /// is added here — construction just starts where the reaper would
+    /// otherwise eventually leave an unused pool.
+    ///
+    /// `pool_size` still floors at 1 (a pool of size 0 has nothing to lease),
+    /// but that slot pays zero dial cost and zero capability token until
+    /// something actually calls `lease()`. The one behavioural trade-off:
+    /// the cold-start credential gate (`credential_gated` — see
+    /// [`wait_for_credential_ready`]) only runs on the initial join_set dial
+    /// in `new`, so a lazy pool's first real dial goes straight through
+    /// `reconnect_slot`, which does not wait for that gate before its first
+    /// attempt. This is fine for a fallback pool: `reconnect_slot` already
+    /// treats `CREDENTIAL_REJECTED` as transient and retries at a capped
+    /// interval regardless of how it got there.
+    ///
+    /// Takes the identical arguments a caller would pass to [`TunnelPool::new`]
+    /// — only use this for a pool that is NOT the primary data plane (e.g. the
+    /// legacy `TunnelPool` sitting behind a live `MuxPool` as failover). A pool
+    /// that IS the primary data plane must keep using `new` so it is actually
+    /// warm when the first request arrives.
+    pub async fn new_lazy(
+        chain: ChainConfig,
+        chain_protocols: Arc<ProtocolChain>,
+        config: TunnelPoolConfig,
+        mesh_id: Vec<u8>,
+        peer_table: Arc<ArcSwap<PeerTable>>,
+        credential_params: Arc<ArcSwap<Option<CredentialParams>>>,
+        token_pool: Arc<ArcSwap<TokenPool>>,
+        ring_credential: crate::token_pool::RingCredentialCell,
+        capability_tokens: CapabilityTokenCell,
+        credential_gated: bool,
+    ) -> Result<Arc<Self>, MirageError> {
+        let is_onion = mirage_control_plane::chain_uses_onion_framing(&chain, &peer_table.load());
+        let chain_id: Arc<str> = Arc::from(chain.chain_id.as_str());
+        let pool_size = config.pool_size.max(1);
+
+        let slots: Vec<Slot> = (0..pool_size).map(|_| Slot::Dormant).collect();
+
+        info!(
+            chain_id = %chain_id,
+            size = pool_size,
+            "pool ready (lazy, fallback role) -- zero dials at construction, first lease() triggers the first dial"
+        );
+
+        let inner = Arc::new(Mutex::new(PoolInner {
+            slots,
+            chain,
+            chain_protocols,
+            config,
+            mesh_id,
+            peer_table,
+            credential_params,
+            token_pool,
+            ring_credential,
+            capability_tokens,
+            credential_gated,
+        }));
+
+        let pool = Arc::new(Self {
+            inner: Arc::clone(&inner),
+            available: Arc::new(Notify::new()),
+            is_onion: AtomicBool::new(is_onion),
+            peer_table_notify: Arc::new(Notify::new()),
+            chain_id: Arc::clone(&chain_id),
+        });
+
+        // Same background tasks as `new` — the reconnect/reaper machinery is
+        // shared; only the eager initial dial is skipped.
+        let pool_weak = Arc::downgrade(&pool);
+        tokio::spawn(async move {
+            maintenance_loop(pool_weak).await;
+        });
+
+        let pool_weak_reaper = Arc::downgrade(&pool);
+        tokio::spawn(async move {
+            reaper_loop(pool_weak_reaper).await;
+        });
+
+        Ok(pool)
+    }
+
     /// Lease an idle tunnel from the pool.
     ///
     /// Waits (with backoff notifications) until a slot is `Idle`.  Returns
@@ -1482,6 +1571,96 @@ mod pool_smoke_tests {
             credential_is_ready(&hmac_params, &token_pool, &ring_cell, &empty_cell),
             "EpochHmac gate must not change (self-mint stays sufficient)"
         );
+    }
+
+    // ── new_lazy: zero-dial fallback pool construction ───────────────────────
+
+    /// `new_lazy` must not dial anything at construction: every slot starts
+    /// `Dormant`, so a fallback pool built this way costs zero dials (and
+    /// zero capability tokens) until something actually calls `lease()`.
+    ///
+    /// Checked immediately after construction, before the 1s-interval
+    /// maintenance loop has had a chance to run — so this is not a race: a
+    /// dial-happened-anyway defect would show up as a non-Dormant slot here
+    /// deterministically, not intermittently.
+    #[tokio::test]
+    async fn new_lazy_dials_nothing_at_construction() {
+        use super::TunnelPool;
+        use arc_swap::ArcSwap;
+        use mirage_core::{config::TunnelPoolConfig, mirage::mesh::PeerTable};
+        use std::sync::Arc;
+
+        let chain = two_hop_chain("node-lazy-a", "node-lazy-b");
+        let chain_protocols = minimal_chain_protocols();
+        let peer_table = Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+        let config = TunnelPoolConfig {
+            pool_size: 3,
+            max_reconnect_attempts: 5,
+            reconnect_base_ms: 500,
+            idle_timeout_secs: 120,
+        };
+
+        let pool = TunnelPool::new_lazy(
+            chain,
+            chain_protocols,
+            config,
+            vec![],
+            peer_table,
+            Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+            Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+            Arc::new(ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            crate::capability_pool::null_capability_cell(),
+            false,
+        )
+        .await
+        .expect("new_lazy must construct without dialing anything");
+
+        let stats = pool.pool_stats().await;
+        assert_eq!(stats.size, 3);
+        assert_eq!(stats.dormant, 3, "every slot must start Dormant -- zero dials at construction");
+        assert_eq!(stats.idle, 0, "a lazy pool must not have any pre-warmed tunnels");
+        assert_eq!(stats.leased, 0);
+        assert_eq!(stats.reconnecting, 0, "no reconnect may be in flight before the first lease()");
+    }
+
+    /// `new_lazy`'s `pool_size` floors at 1, same as `new` -- a fallback pool
+    /// configured with size 0 still gets one (dormant, zero-cost) slot rather
+    /// than becoming permanently unleaseable.
+    #[tokio::test]
+    async fn new_lazy_floors_pool_size_at_one() {
+        use super::TunnelPool;
+        use arc_swap::ArcSwap;
+        use mirage_core::{config::TunnelPoolConfig, mirage::mesh::PeerTable};
+        use std::sync::Arc;
+
+        let chain = two_hop_chain("node-lazy-c", "node-lazy-d");
+        let chain_protocols = minimal_chain_protocols();
+        let peer_table = Arc::new(ArcSwap::from_pointee(PeerTable::empty()));
+        let config = TunnelPoolConfig {
+            pool_size: 0,
+            max_reconnect_attempts: 5,
+            reconnect_base_ms: 500,
+            idle_timeout_secs: 120,
+        };
+
+        let pool = TunnelPool::new_lazy(
+            chain,
+            chain_protocols,
+            config,
+            vec![],
+            peer_table,
+            Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+            Arc::new(ArcSwap::from_pointee(crate::token_pool::TokenPool::default())),
+            Arc::new(ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>)),
+            crate::capability_pool::null_capability_cell(),
+            false,
+        )
+        .await
+        .expect("new_lazy must construct without dialing anything");
+
+        let stats = pool.pool_stats().await;
+        assert_eq!(stats.size, 1, "pool_size=0 must floor to 1, matching TunnelPool::new");
+        assert_eq!(stats.dormant, 1);
     }
 
 }

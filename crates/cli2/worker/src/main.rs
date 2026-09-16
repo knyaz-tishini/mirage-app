@@ -356,9 +356,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool_cfg_for_tunnel = tunnel_pool_config_for(&pool_cfg, mux_pool_opt.is_some());
-    let pool = TunnelPool::new(chain.clone(), chain_protocols, pool_cfg_for_tunnel, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), Arc::clone(&capability_tokens), credential_gated)
-        .await
-        .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?;
+    // Fallback-only pools cost nothing until something actually leases one: every
+    // slot starts Dormant and `lease()` wakes it. When MuxPool init failed this
+    // pool IS the data plane, so it stays eager — a first CONNECT must not wait
+    // on a cold dial.
+    let pool = if mux_pool_opt.is_some() {
+        TunnelPool::new_lazy(chain.clone(), chain_protocols, pool_cfg_for_tunnel, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), Arc::clone(&capability_tokens), credential_gated)
+            .await
+            .map_err(|e| anyhow::anyhow!("TunnelPool::new_lazy failed: {e}"))?
+    } else {
+        TunnelPool::new(chain.clone(), chain_protocols, pool_cfg_for_tunnel, mesh_id, Arc::clone(&peer_table), Arc::clone(&credential_params), Arc::clone(&token_pool), Arc::clone(&ring_credential), Arc::clone(&capability_tokens), credential_gated)
+            .await
+            .map_err(|e| anyhow::anyhow!("TunnelPool::new failed: {e}"))?
+    };
 
     let router = Arc::new(RoutingTable::new(&client_config.routing));
     let config_arc = Arc::new(client_config.clone());

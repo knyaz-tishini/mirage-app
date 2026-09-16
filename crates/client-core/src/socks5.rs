@@ -46,6 +46,82 @@ use crate::udp_framing::{write_udp_frame, read_udp_frame};
 use crate::chain_set::{ChainId, Router, TargetKey, FlowKey, ProtocolHint};
 use crate::wire_health::WireHealthMap;
 
+// ── Mux-degraded-to-raw visibility ────────────────────────────────────────────
+//
+// The legacy `TunnelPool` fallback path is not a bug: a raw (non-mux) mirage
+// tunnel carries exactly one stream by construction (the classic exit closes
+// the upstream after one request — see `pool.rs`'s `TunnelLease::Drop` and
+// `mirage2node`'s `handle_exit_with_prefix`), so `lease.poison()` after every
+// `relay_loop` below is CORRECT: the slot cannot be reused regardless of what
+// the client does. What is not obvious from the field is WHEN a connection is
+// paying that cost — every CONNECT that falls off the mux path pays one fresh
+// dial and spends one capability token, so under sustained mux degradation
+// (circuit-breaker trip, `open_stream` failures) that is one token per TCP
+// connection instead of one token per pool-lifetime tunnel, and a 1000-token
+// pool empties in minutes with nothing in the log to say why. This section is
+// the visible, rate-limited marker for "we are currently on that path".
+
+/// Minimum interval between consecutive "mux degraded to raw" warnings for a
+/// given [`Socks5Server`]. SOCKS5 handlers spawn one per TCP connection, so an
+/// un-throttled warning here would itself flood the log under the exact load
+/// this is meant to explain.
+const MUX_FALLBACK_WARN_INTERVAL_MS: u64 = 60_000;
+
+/// Milliseconds since the Unix epoch, for the rate-limit window below.
+/// `0` on a clock error — treated as "long enough ago", so a broken clock
+/// fails open to logging rather than silently suppressing the warning.
+fn current_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Claim the rate-limit window for a "mux degraded to raw" warning: returns
+/// `true` at most once per [`MUX_FALLBACK_WARN_INTERVAL_MS`] for a given
+/// `last_warn_ms` cell. `now_ms` is a parameter (not read internally via
+/// `current_millis()`) so this decision is unit-testable without real sleeps.
+/// Races between concurrent connection handlers are resolved by
+/// `compare_exchange`: only the handler that wins the CAS logs.
+///
+/// `prev == 0` is treated as the cell's initial "never claimed" sentinel
+/// (its `AtomicU64::new(0)` default) rather than a real timestamp, so the
+/// very first claim always succeeds regardless of `now_ms`. Real wall-clock
+/// epoch millis is never exactly `0`, so this never collides in production;
+/// callers unit-testing this function should avoid passing `now_ms == 0` for
+/// a claim meant to start a fresh interval, for the same reason.
+fn claim_mux_fallback_warn_window(last_warn_ms: &std::sync::atomic::AtomicU64, now_ms: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let prev = last_warn_ms.load(Ordering::Relaxed);
+    if prev != 0 && now_ms.saturating_sub(prev) < MUX_FALLBACK_WARN_INTERVAL_MS {
+        return false;
+    }
+    last_warn_ms
+        .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Emit the named, rate-limited warning that marks a CONNECT falling off the
+/// mux data plane onto the legacy raw `TunnelPool` path. See the module
+/// section doc above for why this path exists and why poisoning on it is
+/// correct rather than the defect.
+fn warn_mux_degraded_to_raw(
+    last_warn_ms: &std::sync::atomic::AtomicU64,
+    chain_id: &str,
+    target: &str,
+    reason: &str,
+) {
+    if claim_mux_fallback_warn_window(last_warn_ms, current_millis()) {
+        warn!(
+            chain = %chain_id,
+            target = %target,
+            reason,
+            interval_secs = MUX_FALLBACK_WARN_INTERVAL_MS / 1000,
+            "mux-degraded-to-raw: dial cost is now per-connection (one capability token per CONNECT) -- repeats suppressed for interval_secs"
+        );
+    }
+}
+
 // ── Kill-switch policy for the SOCKS5 path ───────────────────────────────────
 
 /// Per-chain failure policy for the SOCKS5 routing path.
@@ -169,6 +245,10 @@ pub struct Socks5Server {
     wire_health: Arc<WireHealthMap>,
     /// `chain_id` this server instance is the primary for.
     primary_chain_id: String,
+    /// Rate-limit window for the "mux degraded to raw" warning (see the
+    /// module doc above `MUX_FALLBACK_WARN_INTERVAL_MS`). Shared across all
+    /// connection handlers spawned by this server.
+    mux_fallback_warn_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Socks5Server {
@@ -183,6 +263,7 @@ impl Socks5Server {
             chain_natures: Arc::new(HashMap::new()),
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
+            mux_fallback_warn_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -201,6 +282,7 @@ impl Socks5Server {
             chain_natures: Arc::new(HashMap::new()),
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
+            mux_fallback_warn_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -251,6 +333,7 @@ impl Socks5Server {
             chain_natures: Arc::new(HashMap::new()),
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
+            mux_fallback_warn_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -272,6 +355,7 @@ impl Socks5Server {
         let chain_natures = Arc::clone(&self.chain_natures);
         let wire_health = Arc::clone(&self.wire_health);
         let primary_chain_id = Arc::new(self.primary_chain_id.clone());
+        let mux_fallback_warn_ms = Arc::clone(&self.mux_fallback_warn_ms);
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -287,6 +371,7 @@ impl Socks5Server {
             let chain_natures = Arc::clone(&chain_natures);
             let wire_health = Arc::clone(&wire_health);
             let primary_chain_id = Arc::clone(&primary_chain_id);
+            let mux_fallback_warn_ms = Arc::clone(&mux_fallback_warn_ms);
 
             tokio::spawn(async move {
                 #[cfg(target_os = "linux")]
@@ -300,7 +385,7 @@ impl Socks5Server {
                     };
                     match kind {
                         ConnectionKind::Socks5 => {
-                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id).await
+                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms).await
                         }
                         ConnectionKind::Transparent => {
                             handle_transparent_connection(stream, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await
@@ -309,7 +394,7 @@ impl Socks5Server {
                 };
 
                 #[cfg(not(target_os = "linux"))]
-                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id).await;
+                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms).await;
 
                 if let Err(e) = result {
                     error!(%peer, "connection error: {e}");
@@ -386,6 +471,9 @@ async fn handle_socks5_simple(
             let tunnel = lease.take_tunnel().ok_or(MirageError::TunnelClosed)?;
             let mut compat = TunnelCompat::wrap(tunnel);
             let result = relay_loop(&mut stream, &mut compat).await;
+            // Always poison: correct, not a bug -- see the module doc above
+            // `MUX_FALLBACK_WARN_INTERVAL_MS` for why a raw tunnel is
+            // single-use by construction.
             lease.poison();
             result
         }
@@ -627,6 +715,7 @@ async fn handle_socks5_connection(
     chain_natures: Arc<HashMap<String, WireNature>>,
     wire_health: Arc<WireHealthMap>,
     primary_chain_id: Arc<String>,
+    mux_fallback_warn_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), MirageError> {
     // ── 1. SOCKS5 greeting ────────────────────────────────────────────────
     // Client: [0x05, n_methods, method1, ...]
@@ -737,6 +826,7 @@ async fn handle_socks5_connection(
                                 Ok(()) => Ok(()),
                                 Err(e) if matches!(&e, MirageError::CircuitOpen) => {
                                     tracing::warn!(target = %target_addr, "mux circuit open — falling back to TunnelPool");
+                                    warn_mux_degraded_to_raw(&mux_fallback_warn_ms, &primary_chain_id, &target_addr, "circuit_open");
                                     route_via_pool_with_failover(
                                         &mut stream,
                                         pool,
@@ -751,6 +841,7 @@ async fn handle_socks5_connection(
                                 }
                                 Err(e) => {
                                     tracing::warn!(target = %target_addr, error = %e, "mux open_stream failed — falling back to TunnelPool");
+                                    warn_mux_degraded_to_raw(&mux_fallback_warn_ms, &primary_chain_id, &target_addr, "open_stream_failed");
                                     route_via_pool_with_failover(
                                         &mut stream,
                                         pool,
@@ -1070,6 +1161,9 @@ async fn route_via_pool_with_failover(
     let tunnel = lease.take_tunnel().ok_or(MirageError::TunnelClosed)?;
     let mut compat = TunnelCompat::wrap(tunnel);
     let result = relay_loop(client, &mut compat).await;
+    // Always poison: correct, not a bug -- see the module doc above
+    // `MUX_FALLBACK_WARN_INTERVAL_MS` for why a raw tunnel is single-use by
+    // construction.
     lease.poison();
     result
 }
@@ -2081,5 +2175,54 @@ mod tests {
         // the read task — there is nothing else to close.
         drop(tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), session_handle).await;
+    }
+
+    // ── Mux-degraded-to-raw rate limit ────────────────────────────────────────
+
+    /// First claim on a fresh cell always succeeds — a cold pool must not
+    /// suppress its very first "mux degraded to raw" warning.
+    #[test]
+    fn mux_fallback_warn_first_claim_succeeds() {
+        use std::sync::atomic::AtomicU64;
+        let cell = AtomicU64::new(0);
+        assert!(super::claim_mux_fallback_warn_window(&cell, 1_000));
+    }
+
+    /// A second claim inside the interval is suppressed; a claim at/after the
+    /// interval boundary succeeds again.
+    #[test]
+    fn mux_fallback_warn_is_rate_limited_then_reopens() {
+        use std::sync::atomic::AtomicU64;
+        let cell = AtomicU64::new(0);
+        let interval = super::MUX_FALLBACK_WARN_INTERVAL_MS;
+        // Anchor away from 0 -- 0 is the cell's own "never claimed" sentinel,
+        // see `claim_mux_fallback_warn_window`'s doc.
+        let t0 = 1_000_000u64;
+
+        assert!(super::claim_mux_fallback_warn_window(&cell, t0), "first claim must succeed");
+        assert!(
+            !super::claim_mux_fallback_warn_window(&cell, t0 + interval - 1),
+            "a claim 1ms before the interval elapses must be suppressed"
+        );
+        assert!(
+            !super::claim_mux_fallback_warn_window(&cell, t0 + interval / 2),
+            "a claim mid-interval must still be suppressed"
+        );
+        assert!(
+            super::claim_mux_fallback_warn_window(&cell, t0 + interval),
+            "a claim exactly at the interval boundary must succeed"
+        );
+    }
+
+    /// Only one of two concurrent claims at the same instant wins the window
+    /// — the CAS must not let both callers log.
+    #[test]
+    fn mux_fallback_warn_concurrent_claims_only_one_wins() {
+        use std::sync::atomic::AtomicU64;
+        let cell = AtomicU64::new(0);
+        let first = super::claim_mux_fallback_warn_window(&cell, 5_000);
+        let second = super::claim_mux_fallback_warn_window(&cell, 5_000);
+        assert!(first, "first claim at a fresh instant must win");
+        assert!(!second, "a second claim at the same instant must not also win");
     }
 }
