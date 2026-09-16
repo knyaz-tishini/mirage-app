@@ -674,14 +674,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         .shortname
         .clone()
         .unwrap_or_else(|| sentinel.clone());
-    let reg_body = chain_request::RegisterBody {
-        sentinel_id: &sentinel,
-        role: &cfg.role,
-        shortname: &shortname_owned,
-        os: std::env::consts::OS,
-        version: env!("CARGO_PKG_VERSION"),
-        supported_transports: vec!["tcp", "udp"],
-    };
+
     // Wire coords for R1 wire-preferred register — reuses the `wire_coords`
     // resolved above (single precedence resolution, no duplicate).
     let wire_reg_coords_ref: Option<chain_request::WireRegisterCoords<'_>> =
@@ -690,6 +683,25 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             monitor_pubkey_hex: wc.monitor_pubkey_hex.as_str(),
             mesh_id: wc.mesh_id.as_str(),
         });
+
+    // Ownership proof for a RE-registration of this sentinel_id: whatever
+    // this monitor issued to us last time, keyed by its own token_key() (see
+    // `chain_request::WireRegisterCoords::token_key`). `None` on a first
+    // registration with this monitor — `RegisterBody` then omits the field
+    // entirely rather than sending it as `null`.
+    let stored_client_token: Option<String> = wire_reg_coords_ref
+        .as_ref()
+        .and_then(|wc| chain_request::load_client_token(&state_dir, wc.token_key()));
+
+    let reg_body = chain_request::RegisterBody {
+        sentinel_id: &sentinel,
+        role: &cfg.role,
+        shortname: &shortname_owned,
+        os: std::env::consts::OS,
+        version: env!("CARGO_PKG_VERSION"),
+        supported_transports: vec!["tcp", "udp"],
+        client_token: stored_client_token.as_deref(),
+    };
 
     let (active_monitor_url, registered_client_id, registered_client_token) =
         match chain_request::register_with_failover(
@@ -700,6 +712,25 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         {
             Ok(out) => out,
             Err(e) => {
+                // A 401 while we DID send a stored token means that token is
+                // stale (the monitor's registry was reset, or the row was
+                // re-minted elsewhere) — drop it so the next attempt (next
+                // process start; we do not retry in a loop here) registers
+                // as a first-timer instead of repeating the same refusal.
+                if stored_client_token.is_some() && chain_request::is_unauthorized(&e) {
+                    if let Some(wc) = wire_reg_coords_ref.as_ref() {
+                        warn!(
+                            monitor = %wc.monitor_addr,
+                            "[sentinel] register refused (401) with a stored client_token — \
+                             token is stale; dropping it for this monitor"
+                        );
+                        if let Err(drop_err) =
+                            chain_request::drop_client_token(&state_dir, wc.token_key())
+                        {
+                            warn!(error = %drop_err, "[sentinel] drop_client_token failed (non-fatal)");
+                        }
+                    }
+                }
                 error!(error = %e, "[sentinel] register failed across all monitor URLs");
                 return Err(e);
             }
@@ -714,12 +745,15 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     if let Err(e) = chain_request::persist_client_id(&state_dir, &client_id_resolved) {
         warn!(error = %e, "[sentinel] persist_client_id failed (non-fatal)");
     }
-    // Phase 2: persist client_token when the monitor issues one.
+    // Phase 2: persist client_token when the monitor issues one, keyed to
+    // the monitor we just registered with.
     if let Some(ref tok) = registered_client_token {
-        if let Err(e) = chain_request::persist_client_token(&state_dir, tok) {
-            warn!(error = %e, "[sentinel] persist_client_token failed (non-fatal)");
+        if let Some(wc) = wire_reg_coords_ref.as_ref() {
+            if let Err(e) = chain_request::persist_client_token(&state_dir, wc.token_key(), tok) {
+                warn!(error = %e, "[sentinel] persist_client_token failed (non-fatal)");
+            }
+            info!("[sentinel] client_token received and persisted");
         }
-        info!("[sentinel] client_token received and persisted");
     }
 
     info!(
@@ -842,10 +876,12 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     debug!("[sentinel] client_id seeded into MonitorLink");
 
     // Phase 2: seed the per-client token.  Use freshly-registered token first;
-    // fall back to persisted from last run.
+    // fall back to `stored_client_token` (already loaded for this monitor
+    // before the register call above — re-reading the store here would just
+    // repeat that same lookup).
     let effective_token = registered_client_token
         .clone()
-        .or_else(|| chain_request::load_client_token(&state_dir));
+        .or_else(|| stored_client_token.clone());
     if effective_token.is_some() {
         link.set_client_token(effective_token.clone()).await;
         debug!("[sentinel] client_token seeded into MonitorLink");

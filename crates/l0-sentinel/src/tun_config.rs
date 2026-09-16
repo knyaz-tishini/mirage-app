@@ -232,6 +232,7 @@ mod tests {
             byte_cipher: None,
             camo_server_pubkey: None,
             relay_mode: mirage_core::mirage::wire::RelayMode::OnionPeel,
+            selector_token_hex: None,
         }
     }
 
