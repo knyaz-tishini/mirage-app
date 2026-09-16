@@ -38,6 +38,11 @@ anyhow               = "1"
 rustls               = { version = "0.23", default-features = false, features = ["ring"] }
 mirage-runtime-guard = { workspace = true }
 uuid                 = { version = "1", features = ["v4"] }
+thiserror            = { workspace = true }
+# Pinned to the version already resolved transitively in this workspace's
+# Cargo.lock (pulled in by reqwest/tokio-tungstenite) — no new major version
+# introduced. Used by access_packet.rs for the QR form (base64url, no pad).
+base64               = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

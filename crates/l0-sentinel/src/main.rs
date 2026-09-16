@@ -14,6 +14,13 @@ struct Args {
     /// Path to sentinel TOML config file.
     #[arg(long, default_value = "sentinel.toml")]
     config: PathBuf,
+
+    /// Path to a customer access packet (K2 delivery unit — see
+    /// `mirage_l0_sentinel::access_packet`) to consume on this boot. When
+    /// absent, the sentinel falls back to the unconsumed
+    /// `${state_dir}/access.json`, if any.
+    #[arg(long)]
+    access: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -38,7 +45,10 @@ async fn main() -> Result<()> {
     tracing::info!("[sentinel] loading config {:?}", args.config);
     let cfg_raw = std::fs::read_to_string(&args.config)
         .with_context(|| format!("cannot read sentinel config {:?}", args.config))?;
-    let cfg: SentinelConfig = toml::from_str(&cfg_raw).context("failed to parse sentinel TOML")?;
+    let mut cfg: SentinelConfig = toml::from_str(&cfg_raw).context("failed to parse sentinel TOML")?;
+    if let Some(access) = args.access {
+        cfg.access_packet_path = Some(access);
+    }
 
     match mirage_l0_sentinel::run(cfg).await {
         Ok(()) => {

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, error, info, warn};
 
+pub mod access_packet;
 pub mod chain_request;
 pub mod crash_report;
 pub mod debug_shell;
@@ -119,6 +120,13 @@ pub struct SentinelConfig {
     /// payload). Defaults to the directory of `client_config_path`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
+    /// K2: explicit path to an access packet (see [`access_packet`]) to
+    /// consume on this boot. Set from the binary's `--access <path>` flag;
+    /// `None` here (the default) falls back to the unconsumed
+    /// `${state_dir}/access.json`, if any. Both entry points go through the
+    /// identical `access_packet::AccessPacket::apply`.
+    #[serde(default)]
+    pub access_packet_path: Option<PathBuf>,
 
     // ── Stage 3 identity (sent on register; nothing axis-related here) ───
     //
@@ -313,6 +321,7 @@ pub(crate) fn materialise(
     ring_path: Option<&[mirage_core::config::RingPathStep]>,
     ring_epoch_id: Option<u32>,
     credential_params: Option<&mirage_core::crypto::credential::CredentialParams>,
+    capability_tokens_path: Option<&str>,
     tun_api_bind: Option<&str>,
     connect_generation: u64,
 ) -> Result<String> {
@@ -385,6 +394,17 @@ pub(crate) fn materialise(
         match serde_json::to_value(cp) {
             Ok(v) => { map.insert("credential_params".to_owned(), v); }
             Err(e) => warn!("materialise: failed to serialise credential_params: {e}"),
+        }
+    }
+    // K2: point the worker's pre-minted-0x02 source at the sentinel's own
+    // state_dir file (see `access_packet::capability_tokens_path`) unless the
+    // template already sets this explicitly (manual/legacy deployments keep
+    // their own path). The target file need not exist yet — an absent file
+    // is simply an empty source — so this is safe to set unconditionally
+    // whether or not any access packet has ever delivered tokens.
+    if !map.contains_key("capability_tokens_path") {
+        if let Some(p) = capability_tokens_path {
+            map.insert("capability_tokens_path".to_owned(), serde_json::Value::String(p.to_owned()));
         }
     }
     // Derive tun_api_url from the TUN's api_bind so cli2's split-policy pusher
@@ -473,6 +493,11 @@ pub struct MaterialiseCtx {
     /// always carries the latest accepted CredentialParams without requiring a
     /// struct mutation.
     pub credential_params_arc: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
+    /// K2: worker-facing path for pre-minted 0x02 tokens — always
+    /// `access_packet::capability_tokens_path(state_dir)`; see `materialise`'s
+    /// `capability_tokens_path` parameter for why it is safe to set
+    /// unconditionally.
+    pub capability_tokens_path: String,
     /// Live ring-membership credential cell from MonitorLink. When the sentinel
     /// re-enrols on epoch rotation, MonitorLink hot-swaps the fresh credential
     /// here; rewrite() prefers it over the static `ring_*` fields above so the
@@ -542,6 +567,7 @@ impl MaterialiseCtx {
             path_owned.as_deref(),
             ring_epoch,
             cp_ref,
+            Some(self.capability_tokens_path.as_str()),
             Some(tun_api_bind.as_str()),
             generation,
         )?;
@@ -582,6 +608,41 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         cfg.state_dir.as_deref(),
         &cfg.client_config_path,
     );
+
+    // K2: worker-facing path for pre-minted 0x02 tokens — always this file
+    // under state_dir (see `access_packet::capability_tokens_path`), whether
+    // or not an access packet has ever delivered any (an absent file is
+    // simply an empty source).
+    let capability_tokens_path_str: String =
+        access_packet::capability_tokens_path(&state_dir).to_string_lossy().into_owned();
+
+    // K2: consume the access packet — the config/QR delivery unit — before
+    // anything below reads persisted state. It is what seeds
+    // monitor_wire.json, client-tokens.json and client-id.txt on a box that
+    // carries no hand-authored files at all. `cfg.access_packet_path` (set
+    // from the binary's `--access <path>` flag) wins when present; otherwise
+    // the default unconsumed `${state_dir}/access.json` is tried. Both entry
+    // points go through the identical `AccessPacket::apply`, which is a
+    // no-op on a repeat of the same packet — a malformed or missing packet
+    // is logged and never blocks boot; sentinel.toml's own static fields
+    // remain the fallback.
+    let access_path = cfg
+        .access_packet_path
+        .clone()
+        .unwrap_or_else(|| access_packet::default_path(&state_dir));
+    if access_path.exists() {
+        match std::fs::read_to_string(&access_path) {
+            Ok(raw) => match access_packet::AccessPacket::from_json(&raw) {
+                Ok(packet) => {
+                    if let Err(e) = packet.apply(&state_dir) {
+                        error!("[sentinel] access packet at {:?} refused: {}", access_path, e);
+                    }
+                }
+                Err(e) => error!("[sentinel] access packet at {:?} invalid: {}", access_path, e),
+            },
+            Err(e) => warn!("[sentinel] access packet at {:?} unreadable: {}", access_path, e),
+        }
+    }
 
     // Wire transport coordinates: explicit sentinel.toml fields win; otherwise
     // fall back to the last-run persisted coords (auto-seeded from peer_table
@@ -679,11 +740,21 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         }));
     }
 
-    // WaitingOnboard: block if wire coords or bearer is missing. Unlike
-    // pre-Stage-3 builds we DO NOT require a static `client_id` — the stable
-    // sentinel_id flow generates one on first boot under ${state_dir}.
-    let creds_ready = wire_coords.is_some()
-        && cfg.monitor_api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
+    // WaitingOnboard: block if wire coords are missing. Unlike pre-Stage-3
+    // builds we DO NOT require a static `client_id` — the stable sentinel_id
+    // flow generates one on first boot under ${state_dir}.
+    //
+    // K2 (2026-09-17): this used to ALSO require a non-empty
+    // `monitor_api_key`, a field nothing on the wire reads —
+    // `monitor_link.rs` documents it as "ignored; kept in the signature for
+    // backward compat" and the Wire transport sends no `Authorization`
+    // header at all (the Mirage V9 wire handshake is the authentication). A
+    // gate CAN require a field nobody reads — that combination held a box
+    // with valid wire_coords (including one freshly seeded by an access
+    // packet, which never carries a monitor_api_key at all) in
+    // WaitingOnboard forever. wire_coords alone is the real readiness
+    // signal.
+    let creds_ready = wire_coords.is_some();
 
     if !creds_ready {
         publisher.set(SentinelPhase::WaitingOnboard);
@@ -887,9 +958,25 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         None
     };
 
-    let (link, mut config_rx) = MonitorLink::new_with_operator_pub(
+    // K2: seed the credential_params ArcSwap from a persisted access-packet
+    // value (if `AccessPacket::apply` wrote one) BEFORE construction, so the
+    // very first materialise — before any live CredentialParams push
+    // arrives — already carries operator-signed params. A worker with none
+    // presents scheme 0x00 and every exit refuses it while the log reports
+    // its token source as configured (see `access_packet::
+    // load_persisted_credential_params`). A live push still wins
+    // unconditionally: `MonitorLink::apply_credential_params` overwrites
+    // this same ArcSwap whenever a fresh frame arrives.
+    let seeded_credential_params = access_packet::load_persisted_credential_params(&state_dir);
+    if seeded_credential_params.is_some() {
+        info!("[sentinel] credential_params seeded from access packet");
+    }
+    let (link, mut config_rx) = MonitorLink::new_with_credential_arc(
         Some(monitor_api_key.clone()),
         Arc::clone(&_sentinel_peer_table),
+        Arc::new(ArcSwap::from_pointee(seeded_credential_params)),
+        Arc::new(ArcSwap::from_pointee(mirage_client_core::token_pool::TokenPool::default())),
+        Arc::new(ArcSwap::from_pointee(None)),
         ChainSet::empty(),
         transports,
         cfg.mesh_id.clone(),
@@ -940,6 +1027,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         ring_path: cfg.ring_path.clone(),
         ring_epoch_id: cfg.ring_epoch_id,
         credential_params_arc: link.credential_params(),
+        capability_tokens_path: capability_tokens_path_str.clone(),
         ring_cell: link.ring_credential_cell(),
         tun_template_path: cfg.tun_template_path.clone(),
         connect_generation: Arc::clone(&connect_generation),
@@ -1062,7 +1150,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let cp_guard = cp_arc.load();
     let cp_ref = cp_guard.as_ref().as_ref();
     let tun_api_bind = crate::tun_config::effective_api_bind(cfg.tun_template_path.as_deref());
-    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref, Some(tun_api_bind.as_str()), connect_generation.load(Ordering::Relaxed)) {
+    let full_json = match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), cfg.ring_member_sk_hex.as_deref(), cfg.ring_path.as_deref(), cfg.ring_epoch_id, cp_ref, Some(capability_tokens_path_str.as_str()), Some(tun_api_bind.as_str()), connect_generation.load(Ordering::Relaxed)) {
         Ok(j) => j,
         Err(e) => { publisher.set(SentinelPhase::Error { message: e.to_string() }); return Err(e); }
     };
@@ -1349,7 +1437,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                     cfg.ring_epoch_id,
                 );
                 let tun_api_bind_update = crate::tun_config::effective_api_bind(cfg.tun_template_path.as_deref());
-                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), ring_sk_owned.as_deref(), ring_path_owned.as_deref(), ring_epoch_owned, cp_ref, Some(tun_api_bind_update.as_str()), connect_generation.load(Ordering::Relaxed)) {
+                match materialise(&template_raw, chains.clone(), cfg.operator_pub_hex.as_deref(), cfg.monitor_wire_addr.as_deref(), cfg.monitor_wire_pubkey_hex.as_deref(), cfg.enrol_token.as_deref(), ring_sk_owned.as_deref(), ring_path_owned.as_deref(), ring_epoch_owned, cp_ref, Some(capability_tokens_path_str.as_str()), Some(tun_api_bind_update.as_str()), connect_generation.load(Ordering::Relaxed)) {
                     Ok(json) => match write_atomic(&cfg.client_config_path, &json) {
                         Ok(()) => {
                             info!("[sentinel] config rewritten");
