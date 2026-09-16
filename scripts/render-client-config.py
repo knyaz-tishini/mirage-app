@@ -83,6 +83,12 @@ def hop(peer_row: dict, node_id: str, role: str, selector: str | None) -> dict:
         h["sni"] = camo["sni"]
     if selector:
         h["selector_token_hex"] = selector
+    # HopConfig.relay_mode has no default and no shim: every hop must declare
+    # it. OnionPeel is the only surviving variant (Transparent and CryptoVerify
+    # were removed 2026-09-02), so the binding's own leg value and this are the
+    # same thing; the exit's leg is not in `legs[]`, which is why it is spelled
+    # rather than copied.
+    h["relay_mode"] = {"mode": "onion_peel"}
     return h
 
 
@@ -142,6 +148,14 @@ def main() -> None:
     sup.write_text(
         "\n".join(
             [
+                "# monitor_url and ota_pubkey are REQUIRED fields of the supervisor's",
+                "# Config with no defaults, and both are legacy: monitor_url feeds the",
+                "# OTA poll and an HTTP peer-table bootstrap against a control plane that",
+                "# is wire-only now, and its failure is a warning, not an error. Every hop",
+                "# below carries an explicit public_key, so an empty bootstrap costs",
+                "# nothing here.",
+                'monitor_url = "http://127.0.0.1:19410"',
+                'ota_pubkey = "unused-in-this-harness"',
                 f'worker_binary = "{args.worker_binary}"',
                 "",
                 "[[chains]]",
