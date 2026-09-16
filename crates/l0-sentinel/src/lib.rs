@@ -122,11 +122,13 @@ pub struct SentinelConfig {
 
     // ── Stage 3 identity (sent on register; nothing axis-related here) ───
     //
-    // Sentinel is passive: after register it just subscribes to WS and
-    // spawns cli. The monitor pushes chains on its own schedule. If the
-    // operator (or a debug UI on the client) wants to request a specific
-    // chain, they call /relay/clients/{id}/chains/request directly — that
-    // is NOT sentinel's job.
+    // K1 (2026-09-17): the sentinel now ALSO asks the monitor to build a
+    // chain for this client (`chain_ask_*` knobs below, `chain_request::
+    // spawn_chain_asker`) instead of only waiting for the monitor's own push
+    // schedule. Asking does not replace the push — the materialised chain
+    // still arrives the same way, through `WsServerFrame::Config`; asking
+    // only gives the monitor something to build and push. See
+    // `docs/mirage/plans/client-track-checklist-2026-09-17.md` K1.
     /// Mesh id sent on register + carried in handshakes. Defaults to
     /// `"v3-staging"` to match the current staging mesh.
     #[serde(default = "default_mesh_id")]
@@ -201,6 +203,34 @@ pub struct SentinelConfig {
     /// Defaults to `true` (existing behaviour — sentinel spawns cli on its own).
     #[serde(default = "default_spawn_cli")]
     pub spawn_cli: bool,
+
+    // ── K1: chain ask ──────────────────────────────────────────────────
+    //
+    // The sentinel asks the monitor to BUILD a chain for this client
+    // instead of only waiting for the monitor's own push schedule to hand
+    // one over (see the identity block above). Asking does not replace the
+    // push — see `chain_request::spawn_chain_asker`.
+    /// Whether the sentinel asks at all. Default `true` — this IS the point
+    /// of K1; set `false` to restore pure wait-for-push behaviour.
+    #[serde(default = "default_chain_ask_enabled")]
+    pub chain_ask_enabled: bool,
+    /// Hop count sent in the chain-ask `AxisSpec`. Default 2 — matches the
+    /// monitor's own default
+    /// (`mirage2monitor::auto_chain::default_auto_axis_spec`).
+    #[serde(default = "default_chain_ask_hops")]
+    pub chain_ask_hops: u8,
+    /// How long (seconds) to wait for an asked-for chain to appear in the
+    /// pushed chain set before logging a named WARN and scheduling a
+    /// re-ask. Default 90.
+    #[serde(default = "default_chain_ask_wait_secs")]
+    pub chain_ask_wait_secs: u64,
+    /// Floor (seconds) of the re-ask backoff — never re-asks more often
+    /// than this. Default 30.
+    #[serde(default = "default_chain_ask_retry_floor_secs")]
+    pub chain_ask_retry_floor_secs: u64,
+    /// Cap (seconds) of the re-ask backoff. Default 300 (5 minutes).
+    #[serde(default = "default_chain_ask_retry_cap_secs")]
+    pub chain_ask_retry_cap_secs: u64,
 }
 
 pub(crate) fn default_poll_interval() -> u64 { 30 }
@@ -236,6 +266,11 @@ pub(crate) fn default_supervisor_args() -> Vec<String> {
 pub(crate) fn default_mesh_id() -> String { "v3-staging".into() }
 pub(crate) fn default_role() -> String { "sentry-client".into() }
 pub(crate) fn default_spawn_cli() -> bool { true }
+pub(crate) fn default_chain_ask_enabled() -> bool { true }
+pub(crate) fn default_chain_ask_hops() -> u8 { 2 }
+pub(crate) fn default_chain_ask_wait_secs() -> u64 { 90 }
+pub(crate) fn default_chain_ask_retry_floor_secs() -> u64 { 30 }
+pub(crate) fn default_chain_ask_retry_cap_secs() -> u64 { 300 }
 
 /// Extract the path following a `--config <path>` pair in tun args.
 /// macOS tun uses `--config <tun.json>`; when `tun_config_path` is unset we
@@ -933,6 +968,13 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
             }
         });
     }
+    // K1: pushed chain-id set, fed by spawn_frame_watcher's Config arm (the
+    // SAME frame the materialise path consumes) and watched by the chain
+    // asker to know when an asked-for chain actually arrives (or, once
+    // active, disappears -- reaped / TTL decay).
+    let (pushed_ids_tx, pushed_ids_rx) =
+        tokio::sync::watch::channel::<Vec<String>>(Vec::new());
+
     spawn_frame_watcher(
         Arc::clone(&link),
         debug_mgr.clone(),
@@ -940,6 +982,21 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         cfg.mesh_id.clone(),
         wire_coords_tx,
         mat_ctx,
+        pushed_ids_tx,
+    );
+
+    chain_request::spawn_chain_asker(
+        chain_request::ChainAskConfig {
+            enabled: cfg.chain_ask_enabled,
+            hops: cfg.chain_ask_hops,
+            wait_bound: Duration::from_secs(cfg.chain_ask_wait_secs),
+            retry_floor: Duration::from_secs(cfg.chain_ask_retry_floor_secs),
+            retry_cap: Duration::from_secs(cfg.chain_ask_retry_cap_secs),
+        },
+        client_id.clone(),
+        state_dir.clone(),
+        wire_coords_rx.clone(),
+        pushed_ids_rx,
     );
 
     // Disk-first: if a managed config from a prior session is on disk AND this
@@ -1552,6 +1609,7 @@ fn spawn_frame_watcher(
     mesh_id: String,
     wire_coords_tx: tokio::sync::watch::Sender<Option<monitor_wire::WireCoords>>,
     mat_ctx: Arc<MaterialiseCtx>,
+    pushed_chain_ids_tx: tokio::sync::watch::Sender<Vec<String>>,
 ) {
     use mirage_client_core::monitor_link::WsServerFrame;
 
@@ -1633,6 +1691,16 @@ fn spawn_frame_watcher(
                         }
                     }
                     // ─────────────────────────────────────────────────────────
+
+                    // K1: publish the pushed chain-id set for the chain asker
+                    // (`chain_request::spawn_chain_asker`) to observe arrival
+                    // (or disappearance -- reaped / TTL decay) of the chain
+                    // it asked for. This is the ONE place pushed chains land
+                    // before materialise; the asker watches it instead of
+                    // polling client-config.json on disk.
+                    let pushed_ids: Vec<String> =
+                        cfg.chains.iter().map(|c| c.chain.chain_id.clone()).collect();
+                    let _ = pushed_chain_ids_tx.send(pushed_ids);
 
                     // Update client-state.json on every Config frame so the GUI
                     // sees fresh health + latency data.
