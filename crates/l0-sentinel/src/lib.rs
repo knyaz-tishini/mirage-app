@@ -239,6 +239,17 @@ pub struct SentinelConfig {
     /// Cap (seconds) of the re-ask backoff. Default 300 (5 minutes).
     #[serde(default = "default_chain_ask_retry_cap_secs")]
     pub chain_ask_retry_cap_secs: u64,
+    /// K4: the egress country the box asks the monitor for, e.g. `"nl"`.
+    /// Sent as `anchor.exit_region` on every chain ask. `None` (default) asks
+    /// for no region at all — full-auto, the monitor's own picker decides.
+    ///
+    /// Box-local for now: the customer names a country to the box (out of
+    /// band, today a hand-set config value; K2's access packet is the
+    /// natural carrier once the customer-to-box path exists), and the box
+    /// carries that name into every ask. This field is that carrier, so the
+    /// later step is a new writer of the same field, not a new field.
+    #[serde(default)]
+    pub chain_ask_exit_region: Option<String>,
 }
 
 pub(crate) fn default_poll_interval() -> u64 { 30 }
@@ -1077,6 +1088,7 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         chain_request::ChainAskConfig {
             enabled: cfg.chain_ask_enabled,
             hops: cfg.chain_ask_hops,
+            exit_region: cfg.chain_ask_exit_region.clone(),
             wait_bound: Duration::from_secs(cfg.chain_ask_wait_secs),
             retry_floor: Duration::from_secs(cfg.chain_ask_retry_floor_secs),
             retry_cap: Duration::from_secs(cfg.chain_ask_retry_cap_secs),

@@ -297,8 +297,10 @@ pub struct ChainAskExitMode {
     pub kind: &'static str,
 }
 
-/// Mirrors `mirage2monitor::auto_chain::Anchor`. Always the empty default —
-/// the sentinel does not pin a topology.
+/// Mirrors `mirage2monitor::auto_chain::Anchor`. `exit_region` carries K4's
+/// egress-country ask (`SentinelConfig::chain_ask_exit_region`) when the box
+/// has one configured; every other field stays the empty default — the
+/// sentinel does not pin a topology or an entry region.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChainAskAnchor {
     pub entry_region: Option<String>,
@@ -309,8 +311,10 @@ pub struct ChainAskAnchor {
 }
 
 /// Build the chain-ask body: `default_auto_axis_spec()`'s values verbatim,
-/// with `hops` overridden by the sentinel's own knob.
-pub fn default_chain_ask_spec(hops: u8) -> ChainAskSpec {
+/// with `hops` overridden by the sentinel's own knob and `anchor.exit_region`
+/// set from `exit_region` (K4 — the box's configured egress country, `None`
+/// for full-auto).
+pub fn default_chain_ask_spec(hops: u8, exit_region: Option<String>) -> ChainAskSpec {
     ChainAskSpec {
         transport: "tcp",
         camouflage: "none",
@@ -321,7 +325,10 @@ pub fn default_chain_ask_spec(hops: u8) -> ChainAskSpec {
         byte_cipher: "none",
         reply_mode: "onion",
         handshake: "telescopic",
-        anchor: ChainAskAnchor::default(),
+        anchor: ChainAskAnchor {
+            exit_region,
+            ..ChainAskAnchor::default()
+        },
         ttl_secs: None,
         camo_params: None,
     }
@@ -583,6 +590,10 @@ impl ChainAskCycle {
 pub struct ChainAskConfig {
     pub enabled: bool,
     pub hops: u8,
+    /// K4: `SentinelConfig::chain_ask_exit_region` — the box's configured
+    /// egress country, carried verbatim into `anchor.exit_region` on every
+    /// ask. `None` asks for no region (full-auto).
+    pub exit_region: Option<String>,
     pub wait_bound: Duration,
     pub retry_floor: Duration,
     pub retry_cap: Duration,
@@ -691,7 +702,7 @@ async fn issue_ask(
         );
         return;
     };
-    let spec = default_chain_ask_spec(ask_cfg.hops);
+    let spec = default_chain_ask_spec(ask_cfg.hops, ask_cfg.exit_region.clone());
     let now = Instant::now();
     match ask_for_chain(&wrc, &bearer, client_id, &spec).await {
         Ok(outcome) => {
@@ -841,7 +852,7 @@ mod tests {
     fn chain_ask_spec_matches_the_monitor_default_shape() {
         // Mirrors `mirage2monitor::auto_chain::default_auto_axis_spec()`'s
         // JSON exactly (field order + enum tag strings) except `hops`.
-        let spec = default_chain_ask_spec(2);
+        let spec = default_chain_ask_spec(2, None);
         let json = serde_json::to_value(&spec).unwrap();
         let expected = serde_json::json!({
             "transport": "tcp",
@@ -864,6 +875,17 @@ mod tests {
             "camo_params": null
         });
         assert_eq!(json, expected);
+    }
+
+    /// K4: a box configured with an egress country carries it into the ask
+    /// as `anchor.exit_region`, and touches nothing else in the anchor.
+    #[test]
+    fn chain_ask_spec_carries_the_configured_exit_region() {
+        let spec = default_chain_ask_spec(2, Some("nl".to_string()));
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["anchor"]["exit_region"], serde_json::json!("nl"));
+        assert_eq!(json["anchor"]["entry_region"], serde_json::json!(null));
+        assert_eq!(json["anchor"]["hop_nodes"], serde_json::json!([]));
     }
 
     #[test]
