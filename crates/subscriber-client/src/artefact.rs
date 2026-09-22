@@ -8,14 +8,30 @@
 //! `handshake_client_stream_v9` requires `server_static_pub: &[u8; 32]` and
 //! folds `mesh_id: &[u8]` into the client proof
 //! (`mirage2web/crates/mirage-protocol/src/driver.rs:1528,1531`), and neither
-//! exists anywhere on the artefact as that companion plan drafted it. Since
-//! no crate in this workspace has landed `EntranceArtefact` yet (grepped
-//! empty at the time of writing), this type is free to close that gap
-//! locally rather than parse a shape that cannot be dialed. When the panel /
-//! opbox issuance side (`mirage2panel`, `mirage2operator` — out of this
-//! crate's scope) lands its own wire encoding, it must emit these two fields
-//! or a translator must sit between the two shapes; that is follow-up work,
-//! reported, not solved here.
+//! exists anywhere on the artefact as that companion plan drafted it. At the
+//! time this closed the gap locally, no crate in this workspace had landed
+//! `EntranceArtefact` yet (grepped empty) — so this type was free to close
+//! it rather than parse a shape that could not be dialed.
+//!
+//! # Reconciled with the panel's own type (2026-09-22)
+//!
+//! `mirage2panel/crates/panel/src/entrance.rs` has since landed its OWN
+//! `EntranceArtefact` — written independently there too, for the same
+//! reason (it grepped ITS tree and found nothing). The two now agree field
+//! for field: the panel renamed its per-entrance key field from
+//! `pubkey_hex: Option<String>` to `server_pubkey_hex: String`, matching
+//! this crate's already-required field exactly, and moved the
+//! optionality that genuinely exists at its source (opbox may not yet hold
+//! a Monitor identity in escrow for a given box) to a filter at
+//! artefact-build time rather than an `Option` on the wire — a face this
+//! crate could never dial is never shipped in the first place. Neither
+//! crate depends on the other: the panel's own contract keeps it free of
+//! `mirage-core` and every other mesh crate, so the two types can only
+//! agree by JSON shape, not by sharing a Rust type.
+//! `tests::parses_a_panel_produced_artefact_field_for_field` is the proof —
+//! it parses the exact literal the panel's own
+//! `entrance::tests::panel_output_matches_the_client_wire_contract`
+//! serialises through its REAL `Serialize` impl.
 //!
 //! Three-step discipline, mirroring `l0-sentinel::access_packet` (the K2
 //! artefact this replaces for the commercial track): parse
@@ -373,5 +389,67 @@ mod tests {
         let a = sample_artefact();
         let pk = a.entrances[0].server_pubkey().unwrap();
         assert_eq!(pk, [0x22u8; HEX32_BYTES]);
+    }
+
+    // ── wire compatibility with the panel ───────────────────────────────
+
+    /// The wire contract with `mirage-panel` — see this module's own doc,
+    /// "Reconciled with the panel's own type", and
+    /// `mirage2panel/crates/panel/src/entrance.rs`'s
+    /// `tests::panel_output_matches_the_client_wire_contract`, which
+    /// serialises the IDENTICAL literal values below through the panel's
+    /// REAL `Serialize` impl (kept in sync by hand — the two crates share
+    /// no dependency, so a matching literal is the only handle either side
+    /// has on the other's shape). This test is the consuming half: it
+    /// parses that exact shape through this crate's REAL `Deserialize` +
+    /// `validate()`, field for field, including the camouflage passthrough
+    /// decoding into a real typed variant and the (now required, never
+    /// optional) per-entrance public key.
+    #[test]
+    fn parses_a_panel_produced_artefact_field_for_field() {
+        let raw = serde_json::json!({
+            "v": 1,
+            "private_key_hex": "11".repeat(32),
+            "mesh_id": "22".repeat(32),
+            "entrances": [{
+                "addr": "203.0.113.9:443",
+                "server_pubkey_hex": "33".repeat(32),
+                "camouflage": {"type": "tls_real", "sni": "entrance.example.com", "alpn": ["h2"]}
+            }],
+            "mode": "full_auto",
+            "label": "Ada",
+            "issued_at_ms": 1_726_000_000_000u64
+        })
+        .to_string();
+
+        let artefact = EntranceArtefact::from_json(&raw).expect("panel-shaped JSON must parse");
+        artefact.validate().expect("panel-shaped artefact must validate");
+
+        assert_eq!(artefact.v, CURRENT_VERSION);
+        assert_eq!(artefact.private_key_hex, "11".repeat(32));
+        assert_eq!(artefact.mesh_id, "22".repeat(32));
+        assert_eq!(artefact.mode, ArtefactMode::FullAuto);
+        assert_eq!(artefact.label, "Ada");
+        assert_eq!(artefact.issued_at_ms, 1_726_000_000_000);
+
+        assert_eq!(artefact.entrances.len(), 1);
+        let entrance = &artefact.entrances[0];
+        assert_eq!(entrance.addr, "203.0.113.9:443");
+        assert_eq!(entrance.server_pubkey_hex, "33".repeat(32));
+        assert_eq!(
+            entrance.server_pubkey().expect("decode server pubkey"),
+            [0x33u8; HEX32_BYTES],
+            "the panel's server_pubkey_hex must decode to the exact bytes it sent"
+        );
+        assert_eq!(
+            entrance.camouflage,
+            TransportCamouflage::TlsReal { sni: "entrance.example.com".to_owned(), alpn: vec!["h2".to_owned()] },
+            "the panel's opaque camouflage passthrough must decode to the exact typed variant, unmodified"
+        );
+
+        assert_eq!(
+            artefact.client_static_priv().expect("decode client private key"),
+            [0x11u8; HEX32_BYTES]
+        );
     }
 }
