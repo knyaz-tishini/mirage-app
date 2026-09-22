@@ -10,6 +10,7 @@ members = [
     # "crates/desktop/windows/v2",  # legacy — uses path-deps to uzor; conflicts with crates.io uzor used by launcher
     "crates/l0-sentinel",
     "crates/l0-orchestrator",
+    "crates/subscriber-client",
     # "crates/desktop-cli",  # legacy pre-orchestrator launcher (spawned cli1) — RETIRED 2026-06-14 → crates/_deprecated/desktop-cli
     "crates/runtime-guard",
     "crates/debug-shell",

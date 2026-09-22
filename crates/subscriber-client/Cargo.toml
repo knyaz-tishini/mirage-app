@@ -1,0 +1,24 @@
+[package]
+name    = "mirage-subscriber-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mirage_subscriber_client"
+
+[dependencies]
+mirage-core         = { workspace = true }
+mirage-protocol      = { workspace = true }
+mirage-client-core   = { workspace = true }
+tokio                = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+arc-swap             = { workspace = true }
+async-trait          = "0.1"
+hex                  = "0.4"
+dashmap              = "5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

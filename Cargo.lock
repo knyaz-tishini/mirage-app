@@ -2866,6 +2866,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirage-subscriber-client"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "dashmap",
+ "hex",
+ "mirage-client-core",
+ "mirage-core",
+ "mirage-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
