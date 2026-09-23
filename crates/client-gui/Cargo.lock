@@ -904,7 +904,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "rustybuzz",
  "self_cell",
- "swash",
+ "swash 0.1.19",
  "sys-locale",
  "ttf-parser 0.21.1",
  "unicode-bidi",
@@ -2189,6 +2189,12 @@ dependencies = [
  "tower-service",
  "tracing",
 ]
+
+[[package]]
+name = "hypher"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45f2b4f6b5da34d400d4c112eadcc14512cc5d04307a8eee182586d9bebd7ce6"
 
 [[package]]
 name = "icu_collections"
@@ -4696,8 +4702,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbd59f3f359ddd2c95af4758c18270eddd9c730dde98598023cdabff472c2ca2"
 dependencies = [
  "skrifa 0.22.3",
- "yazi",
- "zeno",
+ "yazi 0.1.6",
+ "zeno 0.2.3",
+]
+
+[[package]]
+name = "swash"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
+dependencies = [
+ "skrifa 0.42.1",
+ "yazi 0.2.1",
+ "zeno 0.3.3",
 ]
 
 [[package]]
@@ -5320,7 +5337,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uzor"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "ahash 0.8.12",
  "bitflags 2.13.0",
@@ -5340,7 +5357,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-agent-api"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "axum",
  "serde",
@@ -5351,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-desktop"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "image",
  "objc2 0.5.2",
@@ -5364,6 +5381,7 @@ dependencies = [
  "uzor",
  "uzor-agent-api",
  "uzor-render-hub",
+ "uzor-urx-3d",
  "uzor-window-desktop",
  "vello",
  "wgpu",
@@ -5373,11 +5391,11 @@ dependencies = [
 
 [[package]]
 name = "uzor-fonts"
-version = "1.4.18"
+version = "1.5.2"
 
 [[package]]
 name = "uzor-render-canvas2d"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "js-sys",
  "uzor",
@@ -5387,7 +5405,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-hub"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "js-sys",
  "metrics",
@@ -5422,7 +5440,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-tiny-skia"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -5431,17 +5449,19 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-urx"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "kurbo",
+ "metrics",
  "peniko",
  "uzor",
  "uzor-urx-core",
+ "uzor-urx-glyph",
 ]
 
 [[package]]
 name = "uzor-render-vello-cpu"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -5450,7 +5470,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-gpu"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -5459,7 +5479,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-hybrid"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "glifo",
  "skrifa 0.42.1",
@@ -5471,7 +5491,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-wgpu-instanced"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -5485,15 +5505,17 @@ dependencies = [
 
 [[package]]
 name = "uzor-text"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "fastrand",
+ "hypher",
+ "metrics",
  "uzor",
 ]
 
 [[package]]
 name = "uzor-urx-3d"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "bytemuck",
  "glam",
@@ -5503,7 +5525,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-core"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "kurbo",
  "metrics",
@@ -5513,7 +5535,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-cpu"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "bumpalo",
  "bytemuck",
@@ -5522,12 +5544,14 @@ dependencies = [
  "multiversion",
  "peniko",
  "uzor-urx-core",
+ "uzor-urx-glyph",
+ "uzor-urx-image",
  "wide",
 ]
 
 [[package]]
 name = "uzor-urx-engine"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "metrics",
  "uzor-urx-core",
@@ -5539,8 +5563,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "uzor-urx-glyph"
+version = "1.5.2"
+dependencies = [
+ "metrics",
+ "swash 0.2.10",
+ "uzor-urx-core",
+ "zeno 0.3.3",
+]
+
+[[package]]
 name = "uzor-urx-hybrid"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "bytemuck",
  "etagere",
@@ -5552,28 +5586,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "uzor-urx-image"
+version = "1.5.2"
+dependencies = [
+ "uzor-urx-core",
+]
+
+[[package]]
 name = "uzor-urx-physics"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "glam",
 ]
 
 [[package]]
 name = "uzor-urx-wgpu"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
+ "bytemuck",
+ "etagere",
  "kurbo",
+ "lyon_path",
+ "lyon_tessellation",
  "metrics",
  "peniko",
+ "thiserror 1.0.69",
  "uzor",
  "uzor-render-wgpu-instanced",
  "uzor-urx-core",
+ "uzor-urx-glyph",
+ "uzor-urx-image",
  "wgpu",
 ]
 
 [[package]]
 name = "uzor-urx-wgpu-full"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "bytemuck",
  "kurbo",
@@ -5585,7 +5633,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-desktop"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "arboard",
  "dark-light",
@@ -5596,7 +5644,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-web"
-version = "1.4.18"
+version = "1.5.2"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -6653,6 +6701,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c94451ac9513335b5e23d7a8a2b61a7102398b8cca5160829d313e84c9d98be1"
 
 [[package]]
+name = "yazi"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6742,6 +6796,12 @@ name = "zeno"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd15f8e0dbb966fd9245e7498c7e9e5055d9e5c8b676b95bd67091cd11a1e697"
+
+[[package]]
+name = "zeno"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zerocopy"

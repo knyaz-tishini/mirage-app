@@ -11,7 +11,7 @@
 | Asset | Location | Status |
 |---|---|---|
 | Landing codebase | `github.com/knyaz-tishini/mirage2landing` @ `master` | Mirrored in `reference/landing/` |
-| Live URL | `https://zengeld.com` | External |
+| Live URL | `https://m1r4g3.bid` | External |
 | Service manifest | `.nemo-service.toml` (mirage2landing) | Served by `mirage2server` via tower_http |
 
 The landing is the **only** design surface provided for this system. Everything in this kit is extracted from `reference/landing/style.css` (tokens) and `reference/landing/index.html` + `app.js` (components, copy, structure).

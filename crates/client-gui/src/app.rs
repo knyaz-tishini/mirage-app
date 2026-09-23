@@ -526,7 +526,7 @@ impl App<NoPanel> for MirageClientApp {
                         self.menu_note = Some("запускаю камеру…".into());
                     }
                     MenuRow::Action(MenuAction::Login) => {
-                        self.menu_note = Some("вход на zengeld.com — скоро".into());
+                        self.menu_note = Some("вход на m1r4g3.bid — скоро".into());
                     }
                     _ => {}
                 }

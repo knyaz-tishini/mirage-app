@@ -556,7 +556,7 @@ fn draw_row(
                 MenuAction::ImportText => "Import  ·  paste text",
                 MenuAction::ImportQrClip => "Import  ·  paste QR",
                 MenuAction::ImportCamera => "Import  ·  scan camera",
-                MenuAction::Login => "Log in to zengeld.com",
+                MenuAction::Login => "Log in to m1r4g3.bid",
             };
             ctx.set_fill_color(AMBER);
             ctx.set_font("14px sans-serif");
