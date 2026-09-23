@@ -75,20 +75,33 @@ pub struct RouterChain {
 
 // ── SupervisorRouter ─────────────────────────────────────────────────────────
 
-/// Lightweight round-robin router over a static chain list.
+/// Lightweight round-robin router over a live-updatable chain list.
 ///
-/// Holds an ordered snapshot of `(chain_id, socks5_addr)` pairs.  On each
-/// `pick()` call it returns chains ordered starting from the current cursor
-/// position (wrapping around). The caller iterates in order, trying each
-/// worker's SOCKS5 until one succeeds.
+/// Holds an ordered snapshot of `(chain_id, socks5_addr)` pairs behind an
+/// [`arc_swap::ArcSwap`] — [`pick()`](Self::pick) loads the current snapshot
+/// lock-free and clones the chains it needs, so a connection in flight is
+/// never pinned to a stale generation and no lock is ever held across an
+/// `.await`. On each `pick()` call it returns chains ordered starting from
+/// the current cursor position (wrapping around). The caller iterates in
+/// order, trying each worker's SOCKS5 until one succeeds.
 ///
 /// `kill_switch = Strict` chains are excluded from the rotation pool at
-/// construction — a Strict chain's entire point is reachability only via its
-/// own dedicated `socks5_bind` port; mixing it into the shared rotation pool
-/// would defeat that pinning contract for every other flow that might
-/// round-robin onto it.
+/// construction/update time — a Strict chain's entire point is reachability
+/// only via its own dedicated `socks5_bind` port; mixing it into the shared
+/// rotation pool would defeat that pinning contract for every other flow
+/// that might round-robin onto it.
+///
+/// # Why the chain list is swappable, not fixed at construction
+///
+/// Before this, `chains` was a plain `Vec` set once in [`new`](Self::new) and
+/// never touched again — a router bound in box mode before any chain had
+/// started (`supervisor starting chains=0`, ae-other-172.86.76.34,
+/// 2026-09-23 22:31:52Z) stayed empty for the rest of the process's life:
+/// nothing on the config-reload path (`reconcile`) ever told it a chain had
+/// since appeared. `update_chains` is the missing write side; the
+/// config-reload call site is `reconcile`'s own doc.
 pub struct SupervisorRouter {
-    chains: Vec<RouterChain>,
+    chains: arc_swap::ArcSwap<Vec<RouterChain>>,
     cursor: AtomicU64,
     /// Router-level per-wire liveness map, shared across all router
     /// connection handlers so a dead worker is detected instantly instead of
@@ -99,44 +112,118 @@ pub struct SupervisorRouter {
 impl SupervisorRouter {
     /// Build from config chains list. `Strict`-policy chains are filtered out
     /// of the rotation pool (with a `warn!` per exclusion) — they remain
-    /// reachable only via their own dedicated worker `socks5_bind`.
+    /// reachable only via their own dedicated worker `socks5_bind`. `chains`
+    /// may be empty (box mode binds before any chain exists) — [`pick()`](Self::pick)
+    /// simply returns nothing until [`update_chains`](Self::update_chains) is
+    /// next called with a non-empty set.
     pub fn new(chains: Vec<RouterChain>) -> Arc<Self> {
-        let pool: Vec<RouterChain> = chains
-            .into_iter()
-            .filter(|c| {
-                let strict = matches!(c.policy, SocksFailurePolicy::FailClosed);
-                if strict {
-                    warn!(
-                        chain = %c.chain_id,
-                        "router: excluding Strict-policy chain from shared rotation pool \
-                         — reachable only via its own dedicated socks5_bind"
-                    );
-                }
-                !strict
-            })
-            .collect();
         Arc::new(Self {
-            chains: pool,
+            chains: arc_swap::ArcSwap::new(Arc::new(filter_strict(chains))),
             cursor: AtomicU64::new(0),
             health: WireHealthMap::new(),
         })
     }
 
+    /// Replace the rotation pool with `chains` — same Strict-policy
+    /// filtering as [`new`](Self::new). Called on every config reload
+    /// (`reconcile`) so the router reflects the reloaded chain set with no
+    /// process restart: a chain added, removed, or re-policied since the
+    /// last reload takes effect on the very next `pick()`.
+    pub fn update_chains(&self, chains: Vec<RouterChain>) {
+        self.chains.store(Arc::new(filter_strict(chains)));
+    }
+
     /// Return ordered chain list starting at the current round-robin cursor.
     ///
-    /// Returns an empty vec when no chains are configured.
-    pub fn pick(&self) -> Vec<&RouterChain> {
-        if self.chains.is_empty() {
+    /// Returns an empty vec when no chains are configured. Owned
+    /// (`Vec<RouterChain>`, not `Vec<&RouterChain>`): the snapshot loaded via
+    /// `ArcSwap::load_full` may be superseded by a concurrent
+    /// `update_chains` call at any point during the caller's (long-lived,
+    /// `.await`-spanning) connection handling, so nothing here borrows from
+    /// it past this function returning.
+    pub fn pick(&self) -> Vec<RouterChain> {
+        let chains = self.chains.load_full();
+        if chains.is_empty() {
             return Vec::new();
         }
-        let n = self.chains.len();
+        let n = chains.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) as usize % n;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
-            result.push(&self.chains[(start + i) % n]);
+            result.push(chains[(start + i) % n].clone());
         }
         result
     }
+}
+
+/// Drop every `kill_switch = Strict` chain from `chains`, logging each
+/// exclusion — shared by [`SupervisorRouter::new`] and
+/// [`SupervisorRouter::update_chains`] so construction and every later
+/// reload apply the identical rule.
+fn filter_strict(chains: Vec<RouterChain>) -> Vec<RouterChain> {
+    chains
+        .into_iter()
+        .filter(|c| {
+            let strict = matches!(c.policy, SocksFailurePolicy::FailClosed);
+            if strict {
+                warn!(
+                    chain = %c.chain_id,
+                    "router: excluding Strict-policy chain from shared rotation pool \
+                     — reachable only via its own dedicated socks5_bind"
+                );
+            }
+            !strict
+        })
+        .collect()
+}
+
+/// Build the router's chain list from `config`: the workstation-mode TCP
+/// `socks5_bind` per chain, or box mode's derived unix-socket path
+/// (`crate::config::worker_socks5_unix_path`), gated by the optional
+/// `routing.chain_ids` whitelist. Empty when `config.routing` is absent.
+///
+/// Shared by the startup bind in `main.rs` and every config reload
+/// (`reconcile`) so the router's chain set is always derived the same way
+/// regardless of when it runs — see [`SupervisorRouter`]'s own doc for the
+/// incident this closes: a router built once at startup from this exact
+/// logic, inlined, then never re-run.
+pub fn build_router_chains(config: &crate::config::Config, box_mode: bool) -> Vec<RouterChain> {
+    let Some(routing_cfg) = &config.routing else {
+        return Vec::new();
+    };
+    let whitelist: Option<&Vec<String>> = routing_cfg.chain_ids.as_ref();
+    config
+        .chains
+        .iter()
+        .filter(|c| match whitelist {
+            Some(ids) => ids.iter().any(|id| id == &c.id),
+            None => true,
+        })
+        .filter_map(|c| {
+            // Box mode: every worker binds a unix socket at a path the
+            // supervisor derives itself — `Config::validate` already refused
+            // this config if `c.socks5_bind` were set instead. Workstation
+            // mode: the worker's TCP `socks5_bind`, as before.
+            let socks5_addr = if box_mode {
+                Some(WorkerSocksAddr::Unix(crate::config::worker_socks5_unix_path(&c.id)))
+            } else {
+                c.socks5_bind
+                    .as_deref()
+                    .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+                    .map(WorkerSocksAddr::Tcp)
+            };
+            socks5_addr.map(|socks5_addr| RouterChain {
+                chain_id: c.id.clone(),
+                socks5_addr,
+                policy: SocksFailurePolicy::from_chain_config(
+                    c.kill_switch.as_ref(),
+                    c.group.as_deref(),
+                    &c.id,
+                ),
+                nature: c.nature,
+            })
+        })
+        .collect()
 }
 
 // ── Router listener ───────────────────────────────────────────────────────────
@@ -277,7 +364,7 @@ where
 
     // The round-robin start candidate anchors the group/nature gate for every
     // subsequent retry candidate — see §5/§6 of the same-nature killswitch plan.
-    let first = candidates[0];
+    let first = &candidates[0];
     let first_group: Option<&str> = match &first.policy {
         SocksFailurePolicy::Failover { group } => Some(group.as_str()),
         _ => None,

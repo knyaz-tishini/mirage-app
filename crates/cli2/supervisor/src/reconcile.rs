@@ -14,13 +14,14 @@
 //!
 //! All decisions are logged with `chain_id` so every adoption is traceable.
 
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use crate::{
     config::{ChainConfig, Config, MonitorTransportConfig},
+    router_listener::{build_router_chains, SupervisorRouter},
     state,
     tun_registry::push_tun_registry,
     worker_handle::{HandleState, StopOutcome, WorkerHandle},
@@ -39,11 +40,19 @@ const RECONCILE_DRAIN_SECS: u64 = 30;
 ///                 chain that has `monitor_link_host = true`).
 /// `binary_path` — worker binary used for all new spawns.
 /// `state_dir`   — supervisor state directory (for `last-peer-table.json`).
+/// `router`      — the supervisor-level SOCKS5 router, if `[routing]` bound
+///                 one at startup. Its chain set is refreshed from `config`
+///                 unconditionally (step 7 below) so a router bound with
+///                 zero chains (box mode, before the first chain existed)
+///                 picks up chains the moment this reload adds them, and any
+///                 later add/remove/re-policy is reflected too — see
+///                 `router_listener::SupervisorRouter`'s own doc.
 pub async fn reconcile(
     handles: &mut HashMap<String, WorkerHandle>,
     config: &Config,
     binary_path: &Path,
     state_dir: &Path,
+    router: Option<&Arc<SupervisorRouter>>,
 ) {
     let new_chains: &[ChainConfig] = &config.chains;
     let box_mode = config.box_mode();
@@ -191,6 +200,20 @@ pub async fn reconcile(
                 }
             }
         }
+    }
+
+    // ── 7. Refresh the router's chain set ─────────────────────────────────────
+    //
+    // Unconditional (not gated on `any_change`/`newly_ready`): a chain-config
+    // change that only touches `kill_switch`/`group`/`nature` never spawns or
+    // removes a worker, but it DOES change what `router_listener::RouterChain`
+    // the router should hold — the same reason the fingerprint check above
+    // reruns even for a "same id" chain. Cheap either way (one `ArcSwap`
+    // store), and a no-op reload (mtime bump, no real change) just re-stores
+    // an equal chain set.
+    if let Some(router) = router {
+        let box_mode = config.box_mode();
+        router.update_chains(build_router_chains(config, box_mode));
     }
 }
 

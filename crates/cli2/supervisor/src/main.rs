@@ -16,6 +16,7 @@ mod worker_handle;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::mpsc;
@@ -260,6 +261,20 @@ async fn main() -> anyhow::Result<()> {
             info!("supervisor: loaded peer_table from {}", state_dir_path.display());
             Some(s)
         }
+        // Box mode carries no HTTP `monitor_url` — peer_table arrives over
+        // the Wire transport via the MonitorLink-host worker instead (see
+        // `build_ml_setup`). `bootstrap_peer_table_http` would build
+        // `format!("{monitor_url}/relay/clients/config")` from an empty
+        // string, which `reqwest` rejects with "builder error: relative URL
+        // without a base" — skipped here by name rather than attempted and
+        // logged as a failure.
+        None if config.monitor_url.is_empty() => {
+            info!(
+                "supervisor: monitor_url is unset — skipping HTTP peer_table bootstrap \
+                 (box mode: peer_table arrives over the Wire transport instead)"
+            );
+            None
+        }
         None => match bootstrap_peer_table_http(
             &config.monitor_url,
             config.monitor_api_key.as_deref(),
@@ -332,52 +347,45 @@ async fn main() -> anyhow::Result<()> {
     // the configured policy (default: round-robin). Box mode
     // (`routing.listen_local_channel` set) binds a box-local channel instead
     // of a TCP port and never falls back to TCP — see `Config::box_mode`.
+    //
+    // `supervisor_router` is kept for the life of the process (not just this
+    // block) so the config-reload path below can call `update_chains` on the
+    // SAME router instance instead of rebuilding a fresh, disconnected one —
+    // see `router_listener::SupervisorRouter`'s own doc for why a chain set
+    // fixed at construction was the bug.
+    let mut supervisor_router: Option<Arc<router_listener::SupervisorRouter>> = None;
     if let Some(routing_cfg) = &config.routing {
         let box_mode = config.box_mode();
-        let whitelist: Option<&Vec<String>> = routing_cfg.chain_ids.as_ref();
-        let router_chains: Vec<router_listener::RouterChain> = config
-            .chains
-            .iter()
-            .filter(|c| match whitelist {
-                Some(ids) => ids.iter().any(|id| id == &c.id),
-                None => true,
-            })
-            .filter_map(|c| {
-                // Box mode: every worker binds a unix socket at a path the
-                // supervisor derives itself — `Config::validate` already
-                // refused this config if `c.socks5_bind` were set instead.
-                // Workstation mode: the worker's TCP `socks5_bind`, as before.
-                let socks5_addr = if box_mode {
-                    Some(router_listener::WorkerSocksAddr::Unix(
-                        config::worker_socks5_unix_path(&c.id),
-                    ))
-                } else {
-                    c.socks5_bind
-                        .as_deref()
-                        .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
-                        .map(router_listener::WorkerSocksAddr::Tcp)
-                };
-                socks5_addr.map(|socks5_addr| router_listener::RouterChain {
-                    chain_id: c.id.clone(),
-                    socks5_addr,
-                    policy: mirage_client_core::socks5::SocksFailurePolicy::from_chain_config(
-                        c.kill_switch.as_ref(),
-                        c.group.as_deref(),
-                        &c.id,
-                    ),
-                    nature: c.nature,
-                })
-            })
-            .collect();
+        let router_chains = router_listener::build_router_chains(&config, box_mode);
 
-        if router_chains.is_empty() {
-            warn!("routing configured but no valid chain socks5_bind addresses — router listener not started");
-        } else if let Some(channel_name) = &routing_cfg.listen_local_channel {
+        if box_mode {
+            // Box mode binds the entrance unconditionally, even with zero
+            // chains: the node's entrance is a Mirage unit under the warden
+            // and must be reachable from the moment the supervisor starts,
+            // not only once the first chain worker is Ready. A CONNECT
+            // arriving before any chain exists gets a clean SOCKS5 failure
+            // reply from `handle_router_connection`'s own
+            // `candidates.is_empty()` branch — never a refused/dropped
+            // connection. `update_chains` (config-reload block below) fills
+            // the router in the moment a chain appears, with no restart.
+            //
+            // `box_mode() == true` is defined as `listen_local_channel`
+            // being `Some` (`Config::box_mode`), so this is always present.
+            let channel_name = routing_cfg
+                .listen_local_channel
+                .as_deref()
+                .expect("box_mode() guarantees listen_local_channel is Some");
             match router_listener::resolve_local_channel(channel_name) {
                 Some(channel) => {
+                    let chain_count = router_chains.len();
                     let router = router_listener::SupervisorRouter::new(router_chains);
-                    router_listener::spawn_router_listener_local_channel(channel, router);
-                    info!(channel = channel.label(), "supervisor router local-channel listener spawned (box mode)");
+                    router_listener::spawn_router_listener_local_channel(channel, Arc::clone(&router));
+                    info!(
+                        channel = channel.label(),
+                        chains = chain_count,
+                        "supervisor router local-channel listener spawned (box mode)"
+                    );
+                    supervisor_router = Some(router);
                 }
                 None => {
                     error!(
@@ -387,6 +395,8 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        } else if router_chains.is_empty() {
+            warn!("routing configured but no valid chain socks5_bind addresses — router listener not started");
         } else {
             let bind_str = routing_cfg.socks5_bind.clone();
             match bind_str.parse::<std::net::SocketAddr>() {
@@ -395,8 +405,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(bind_addr) => {
                     let router = router_listener::SupervisorRouter::new(router_chains);
-                    router_listener::spawn_router_listener(bind_addr, router);
+                    router_listener::spawn_router_listener(bind_addr, Arc::clone(&router));
                     info!(addr = %bind_addr, "supervisor router listener spawned");
+                    supervisor_router = Some(router);
                 }
             }
         }
@@ -535,13 +546,23 @@ async fn main() -> anyhow::Result<()> {
     let (ota_tx, mut ota_rx) = mpsc::channel::<UpdateAvailable>(4);
     let current_version = mirage_chain_ota::current_version().to_string();
 
-    spawn_ota_poller(
-        config.monitor_url.clone(),
-        config.ota_pubkey.clone(),
-        config.ota_poll_interval_secs,
-        current_version,
-        ota_tx,
-    );
+    // Box mode carries no HTTP `monitor_url` (OTA checks are not this
+    // process's job there). `fetch_manifest` builds `format!("{monitor_url}/
+    // ota/client/latest")` from an empty string, which `reqwest` rejects
+    // with "builder error: relative URL without a base" — every
+    // `ota_poll_interval_secs` (default 300s) forever. Skipped by name
+    // instead of started and left to fail on a timer.
+    if config.monitor_url.is_empty() {
+        info!("supervisor: monitor_url is unset — OTA poller not started");
+    } else {
+        spawn_ota_poller(
+            config.monitor_url.clone(),
+            config.ota_pubkey.clone(),
+            config.ota_poll_interval_secs,
+            current_version,
+            ota_tx,
+        );
+    }
 
     // ── Config-reload channel ─────────────────────────────────────────────────
     // Both the mtime poll task and the control HTTP endpoint send `()` here to
@@ -889,6 +910,7 @@ async fn main() -> anyhow::Result<()> {
                         &config,
                         &binary_path,
                         &state_dir_path,
+                        supervisor_router.as_ref(),
                     ).await;
                 }
             }
