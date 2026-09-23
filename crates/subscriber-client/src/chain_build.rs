@@ -8,6 +8,7 @@
 
 use mirage_core::config::{
     ChainConfig, HandshakeStrategy, HopConfig, HopRole, ProtocolId, ReplyMode, TcpProtocolId,
+    UdpProtocolId,
 };
 use mirage_core::crypto::AeadSuite;
 use mirage_core::mirage::wire::RelayMode;
@@ -37,7 +38,24 @@ pub fn entrance_chain_id(index: usize) -> String {
 /// the type has (`mirage_core::mirage::wire::RelayMode` — see its own module
 /// doc for why the other two were removed 2026-09-02); it does not imply
 /// onion routing by itself, as explained above.
+///
+/// # TCP vs UDP protocol
+///
+/// `entrance.camouflage.is_udp()` decides `protocol`: any of the seven
+/// datagram-shaped [`TransportCamouflage`](mirage_core::config::TransportCamouflage)
+/// variants (`Quic`, `Http3`, `Hysteria2`, `WireGuard`, `RawUdp`,
+/// `WebTransport`, `DnsTunnel`) produces `ProtocolId::Udp(MirageUdp)`;
+/// everything else produces the TCP protocol this crate has always built.
+/// This function never dials — it only shapes the config. Only
+/// `TransportCamouflage::RawUdp` is actually dialable by this crate's UDP
+/// path today; see `crate::udp_dial`'s own module doc for why the other six
+/// are recognised here but refused at dial time.
 pub fn build_chain_config(index: usize, entrance: &ArtefactEntrance) -> ChainConfig {
+    let protocol = if entrance.camouflage.is_udp() {
+        ProtocolId::Udp(UdpProtocolId::MirageUdp)
+    } else {
+        ProtocolId::Tcp(TcpProtocolId::Mirage)
+    };
     let hop = HopConfig {
         addr: entrance.addr.clone(),
         public_key: Some(entrance.server_pubkey_hex.clone()),
@@ -56,7 +74,7 @@ pub fn build_chain_config(index: usize, entrance: &ArtefactEntrance) -> ChainCon
         hops: vec![hop],
         handshake: HandshakeStrategy::Telescopic,
         reply: ReplyMode::Raw,
-        protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
+        protocol,
         priority: 0,
         shaping: Default::default(),
         camouflage: Default::default(),
@@ -121,5 +139,81 @@ mod tests {
         let c = build_chain_config(0, &e);
         assert_eq!(c.hops[0].public_key.as_deref(), Some(e.server_pubkey_hex.as_str()));
         assert_eq!(c.hops[0].node_id, None, "no peer_table lookup — explicit key only");
+    }
+
+    // ── TCP vs UDP protocol selection ───────────────────────────────────────
+
+    #[test]
+    fn raw_udp_camouflage_builds_a_udp_protocol_chain_not_tcp() {
+        let e = entrance(
+            "172.86.76.34:853",
+            TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:853".parse().expect("valid addr") },
+        );
+        let c = build_chain_config(1, &e);
+        assert_eq!(
+            c.protocol,
+            ProtocolId::Udp(mirage_core::config::UdpProtocolId::MirageUdp),
+            "a raw_udp entrance must build a UDP-protocol chain, never the hardcoded TCP one"
+        );
+        assert_eq!(c.chain_id, "entrance-1");
+        assert_eq!(c.hops[0].camouflage, Some(e.camouflage.clone()));
+    }
+
+    #[test]
+    fn none_and_websocket_camouflage_still_build_tcp_protocol_chains() {
+        let e_none = entrance("203.0.113.10:8443", TransportCamouflage::None);
+        let e_ws = entrance(
+            "203.0.113.11:8443",
+            TransportCamouflage::WebSocket { path: "/ws".to_owned(), host: "cdn.example.com".to_owned() },
+        );
+        assert_eq!(build_chain_config(0, &e_none).protocol, ProtocolId::Tcp(TcpProtocolId::Mirage));
+        assert_eq!(build_chain_config(1, &e_ws).protocol, ProtocolId::Tcp(TcpProtocolId::Mirage));
+    }
+
+    /// Every other datagram-shaped camouflage `TransportCamouflage::is_udp()`
+    /// recognises also routes to the UDP protocol here — this function only
+    /// SHAPES the config; whether the dial path can actually speak that
+    /// specific wrapper is `crate::udp_dial::UdpEntranceHandle::is_dialable`'s
+    /// decision, not this one's. See `build_chain_config`'s own doc.
+    #[test]
+    fn every_udp_shaped_camouflage_builds_a_udp_protocol_chain() {
+        let cases = vec![
+            TransportCamouflage::Quic { alpn: vec!["h3".into()], bind_addr: "0.0.0.0:443".parse().expect("addr") },
+            TransportCamouflage::Http3 {
+                authority: "example.com".into(),
+                tunnel_path: "/t".into(),
+                alpn: "h3".into(),
+                bind_addr: "0.0.0.0:443".parse().expect("addr"),
+            },
+            TransportCamouflage::Hysteria2 { psk_hex: "ab".into(), bind_addr: "0.0.0.0:443".parse().expect("addr") },
+            TransportCamouflage::WireGuard {
+                magic_byte: 1,
+                junk_count: 2,
+                junk_min: 10,
+                junk_max: 20,
+                bind_addr: "0.0.0.0:51820".parse().expect("addr"),
+            },
+            TransportCamouflage::WebTransport {
+                path: "/wt".into(),
+                authority: "example.com".into(),
+                bind_addr: "0.0.0.0:443".parse().expect("addr"),
+            },
+            TransportCamouflage::DnsTunnel {
+                domain: "example.com".into(),
+                dns_server: "8.8.8.8:53".parse().expect("addr"),
+                encoding: "base32".into(),
+                query_type: "TXT".into(),
+            },
+        ];
+        for camo in cases {
+            let e = entrance("203.0.113.20:9000", camo.clone());
+            let c = build_chain_config(0, &e);
+            assert_eq!(
+                c.protocol,
+                ProtocolId::Udp(mirage_core::config::UdpProtocolId::MirageUdp),
+                "{} must build a UDP-protocol chain",
+                camo.label()
+            );
+        }
     }
 }

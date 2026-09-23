@@ -29,6 +29,7 @@
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use async_trait::async_trait;
 use mirage_core::{config::{ClientConfig, KillSwitchMode, WireNature}, error::MirageError, routing::RouteDecision, routing::RoutingTable};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -201,6 +202,51 @@ impl Destination {
     }
 }
 
+/// A pluggable source of already-authenticated datagram-native tunnels for
+/// SOCKS5 UDP ASSOCIATE (RFC 1928 §7), used instead of
+/// `TunnelPool::datagram_dial()` when a caller's identity model does not fit
+/// a pool-owned peer_table dial — e.g. a subscriber client presenting a
+/// persistent static key against one fixed entrance rather than an
+/// ephemeral per-dial key resolved through mesh peer_table gossip. See
+/// `mirage-subscriber-client`'s `udp_dial` module for the concrete impl.
+#[async_trait]
+pub trait DatagramEntranceDialer: Send + Sync {
+    /// Dial a fresh datagram-native tunnel. Called once per SOCKS5 UDP
+    /// destination session, mirroring `TunnelPool::datagram_dial()`'s own
+    /// "one dial per destination, never pooled" contract.
+    async fn dial_datagram(&self) -> Result<DatagramTunnel, MirageError>;
+}
+
+/// How a [`Socks5Server`] instance handles SOCKS5 CMD 0x03 UDP ASSOCIATE.
+///
+/// `Legacy` reproduces this module's original behaviour byte-for-byte —
+/// every existing caller (including every `cli2` chain) gets `Legacy` by
+/// default and observes zero change. The other two variants are additive:
+/// `DatagramEntrance` lets a caller supply its own dial source instead of
+/// `TunnelPool::datagram_dial()`; `Unsupported` makes ASSOCIATE fail cleanly
+/// with a SOCKS5 general-failure reply instead of silently attempting a
+/// pool lease that was never going to carry UDP correctly (see
+/// `mirage-subscriber-client`'s own artefact-driven choice between these
+/// three).
+#[derive(Clone)]
+pub enum UdpAssociateSupport {
+    /// `pool` / `mux_pool` / `failover` decide per destination, exactly as
+    /// before this enum existed.
+    Legacy,
+    /// Every destination session dials fresh through `dialer` — `pool`,
+    /// `mux_pool` and `failover` are never consulted.
+    DatagramEntrance(Arc<dyn DatagramEntranceDialer>),
+    /// No datagram-capable entrance exists at all: refuse the ASSOCIATE
+    /// request immediately, never bind a relay socket.
+    Unsupported,
+}
+
+impl Default for UdpAssociateSupport {
+    fn default() -> Self {
+        UdpAssociateSupport::Legacy
+    }
+}
+
 /// A minimal SOCKS5 proxy server.
 ///
 /// Each instance is bound to one chain's tunnel pool.  An optional
@@ -249,6 +295,10 @@ pub struct Socks5Server {
     /// module doc above `MUX_FALLBACK_WARN_INTERVAL_MS`). Shared across all
     /// connection handlers spawned by this server.
     mux_fallback_warn_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// How SOCKS5 UDP ASSOCIATE is served — see [`UdpAssociateSupport`].
+    /// `Legacy` (this module's original behaviour) unless
+    /// [`Self::with_udp_associate`] is called.
+    udp_associate: UdpAssociateSupport,
 }
 
 impl Socks5Server {
@@ -264,6 +314,7 @@ impl Socks5Server {
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
             mux_fallback_warn_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            udp_associate: UdpAssociateSupport::Legacy,
         }
     }
 
@@ -283,6 +334,7 @@ impl Socks5Server {
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
             mux_fallback_warn_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            udp_associate: UdpAssociateSupport::Legacy,
         }
     }
 
@@ -314,6 +366,14 @@ impl Socks5Server {
         self
     }
 
+    /// Configure how this server handles SOCKS5 UDP ASSOCIATE — see
+    /// [`UdpAssociateSupport`]. Defaults to `Legacy` (this module's
+    /// original pool/mux/raw-fallback behaviour) when never called.
+    pub fn with_udp_associate(mut self, support: UdpAssociateSupport) -> Self {
+        self.udp_associate = support;
+        self
+    }
+
     /// Create a server with a dynamic `Router` driving chain selection.
     ///
     /// `all_pools` must contain every chain pool the router may return,
@@ -334,6 +394,7 @@ impl Socks5Server {
             wire_health: WireHealthMap::new(),
             primary_chain_id: String::new(),
             mux_fallback_warn_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            udp_associate: UdpAssociateSupport::Legacy,
         }
     }
 
@@ -356,6 +417,7 @@ impl Socks5Server {
         let wire_health = Arc::clone(&self.wire_health);
         let primary_chain_id = Arc::new(self.primary_chain_id.clone());
         let mux_fallback_warn_ms = Arc::clone(&self.mux_fallback_warn_ms);
+        let udp_associate = self.udp_associate.clone();
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -372,6 +434,7 @@ impl Socks5Server {
             let wire_health = Arc::clone(&wire_health);
             let primary_chain_id = Arc::clone(&primary_chain_id);
             let mux_fallback_warn_ms = Arc::clone(&mux_fallback_warn_ms);
+            let udp_associate = udp_associate.clone();
 
             tokio::spawn(async move {
                 #[cfg(target_os = "linux")]
@@ -385,7 +448,7 @@ impl Socks5Server {
                     };
                     match kind {
                         ConnectionKind::Socks5 => {
-                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms).await
+                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms, udp_associate).await
                         }
                         ConnectionKind::Transparent => {
                             handle_transparent_connection(stream, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await
@@ -394,7 +457,7 @@ impl Socks5Server {
                 };
 
                 #[cfg(not(target_os = "linux"))]
-                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms).await;
+                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms, udp_associate).await;
 
                 if let Err(e) = result {
                     error!(%peer, "connection error: {e}");
@@ -716,6 +779,7 @@ async fn handle_socks5_connection(
     wire_health: Arc<WireHealthMap>,
     primary_chain_id: Arc<String>,
     mux_fallback_warn_ms: Arc<std::sync::atomic::AtomicU64>,
+    udp_associate: UdpAssociateSupport,
 ) -> Result<(), MirageError> {
     // ── 1. SOCKS5 greeting ────────────────────────────────────────────────
     // Client: [0x05, n_methods, method1, ...]
@@ -875,7 +939,7 @@ async fn handle_socks5_connection(
         SOCKS5_CMD_UDP_ASSOCIATE => {
             // Consume client's declared address (RFC 1928 §4) — we ignore it.
             consume_socks5_addr(atyp, &mut stream).await?;
-            handle_udp_associate(stream, pool, mux_pool, failover).await
+            handle_udp_associate(stream, pool, mux_pool, failover, udp_associate).await
         }
         _ => {
             send_socks5_error(&mut stream, SOCKS5_REP_CMD_NOT_SUPPORTED).await;
@@ -1462,12 +1526,30 @@ async fn send_socks5_error(stream: &mut TcpStream, rep: u8) {
 /// datagrams between the TUN client and the exit node via the tunnel pool.
 /// The TCP connection is kept alive as a keepalive signal — when it closes
 /// the relay is torn down.
+///
+/// `udp_associate == UdpAssociateSupport::Unsupported` refuses immediately
+/// with a SOCKS5 general-failure reply and never binds the relay socket —
+/// see that variant's own doc for why a caller chooses it over letting
+/// `Legacy`'s pool/mux/raw fallback attempt a dial that was never going to
+/// carry UDP correctly for a non-UDP-shaped chain.
 async fn handle_udp_associate(
     mut tcp_stream: TcpStream,
     pool: Arc<TunnelPool>,
     mux_pool: Option<Arc<MuxPool>>,
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
+    udp_associate: UdpAssociateSupport,
 ) -> Result<(), MirageError> {
+    let datagram_entrance = match udp_associate {
+        UdpAssociateSupport::Unsupported => {
+            send_socks5_error(&mut tcp_stream, SOCKS5_REP_GENERAL_FAILURE).await;
+            return Err(MirageError::Protocol(
+                "SOCKS5 UDP ASSOCIATE: no datagram-capable entrance configured".into(),
+            ));
+        }
+        UdpAssociateSupport::DatagramEntrance(dialer) => Some(dialer),
+        UdpAssociateSupport::Legacy => None,
+    };
+
     let udp_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .map_err(MirageError::Io)?;
@@ -1483,7 +1565,9 @@ async fn handle_udp_associate(
     let relay_cancel = cancel.clone();
     let relay_udp = Arc::clone(&udp_sock);
     let relay_handle = tokio::spawn(async move {
-        if let Err(e) = udp_associate_relay(relay_udp, mux_pool, pool, failover, relay_cancel).await {
+        if let Err(e) =
+            udp_associate_relay(relay_udp, mux_pool, pool, failover, datagram_entrance, relay_cancel).await
+        {
             debug!("UDP ASSOCIATE relay ended: {e}");
         }
     });
@@ -1509,6 +1593,7 @@ async fn udp_associate_relay(
     mux_pool: Option<Arc<MuxPool>>,
     pool: Arc<TunnelPool>,
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
+    datagram_entrance: Option<Arc<dyn DatagramEntranceDialer>>,
     cancel: CancellationToken,
 ) -> Result<(), MirageError> {
     let mut buf = vec![0u8; 65535];
@@ -1557,9 +1642,10 @@ async fn udp_associate_relay(
                     let mux = mux_pool.clone();
                     let p = Arc::clone(&pool);
                     let fo = Arc::clone(&failover);
+                    let de = datagram_entrance.clone();
                     let resp = resp_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = udp_session_task(target, mux, p, fo, rx, resp, dst).await {
+                        if let Err(e) = udp_session_task(target, mux, p, fo, de, rx, resp, dst).await {
                             debug!("UDP session {dst} ended: {e}");
                         }
                     });
@@ -1657,11 +1743,24 @@ async fn udp_session_task(
     mux_pool: Option<Arc<MuxPool>>,
     pool: Arc<TunnelPool>,
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
+    datagram_entrance: Option<Arc<dyn DatagramEntranceDialer>>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
     dst: SocketAddr,
 ) -> Result<(), MirageError> {
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // ── Caller-supplied datagram entrance (highest priority) ───────────────
+    //
+    // Checked before `pool.is_datagram_chain()`: a caller that configured
+    // `UdpAssociateSupport::DatagramEntrance` already decided its `pool` is
+    // not the right dial source for UDP (see that variant's own doc), so
+    // `pool`/`mux_pool`/`failover` below are never even consulted on this
+    // branch.
+    if let Some(dialer) = datagram_entrance {
+        let tunnel = dialer.dial_datagram().await?;
+        return run_datagram_udp_session(tunnel, dst, rx, resp_tx, IDLE_TIMEOUT).await;
+    }
 
     // ── Datagram-native path ──────────────────────────────────────────────
     //
