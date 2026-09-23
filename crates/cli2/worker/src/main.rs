@@ -15,7 +15,7 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use mirage_chain_ipc::{
-    MonitorTransportSpec, SupervisorMsg, WorkerMsg, WorkerState,
+    MonitorTransportSpec, Socks5ListenSpec, SupervisorMsg, WorkerMsg, WorkerState,
     pid_file_path, pipe_path,
     pipe::{PipePair, PipeListener},
 };
@@ -139,12 +139,23 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0);
 
     // Wait for the first supervisor connection and the Start message.
-    let (socks5_bind, config_path, initial_peer_table_json, initial_ipc) =
+    let (socks5_listen, config_path, initial_peer_table_json, initial_ipc) =
         wait_for_start(&mut listener, &chain_id, pid, started_at_unix, WorkerState::Starting).await?;
 
-    let addr: SocketAddr = socks5_bind.parse().with_context(|| {
-        format!("invalid socks5_bind address '{socks5_bind}'")
-    })?;
+    // Validate once, here, so a malformed Start fails the worker fast and
+    // loudly rather than surfacing later as an opaque bind error deep inside
+    // `spawn_socks5_accept_loop`.
+    match &socks5_listen {
+        Socks5ListenSpec::Tcp { addr } => {
+            addr.parse::<SocketAddr>()
+                .with_context(|| format!("invalid socks5_listen TCP addr '{addr}'"))?;
+        }
+        Socks5ListenSpec::Unix { path } => {
+            if path.is_empty() {
+                anyhow::bail!("socks5_listen unix path is empty");
+            }
+        }
+    }
 
     // Load and parse config.
     let raw = std::fs::read_to_string(&config_path)
@@ -430,7 +441,7 @@ async fn main() -> anyhow::Result<()> {
         operator_pub_hex_str,
         enrol_token_str,
         nf_counter_dir,
-        addr,
+        socks5_listen,
         config_arc,
         router,
     )
@@ -523,7 +534,7 @@ async fn supervisor_loop(
     operator_pub_hex: Option<String>,
     enrol_token: Option<String>,
     nf_counter_dir: std::path::PathBuf,
-    socks5_addr: SocketAddr,
+    socks5_listen: Socks5ListenSpec,
     socks5_config: Arc<ClientConfig>,
     socks5_router: Arc<RoutingTable>,
 ) -> anyhow::Result<WorkerExit> {
@@ -546,7 +557,7 @@ async fn supervisor_loop(
     // lifetime.
     let start_socks5 = || {
         spawn_socks5_accept_loop(
-            socks5_addr,
+            socks5_listen.clone(),
             chain_id,
             chain_cfg,
             Arc::clone(&shared_wire_health),
@@ -706,7 +717,13 @@ async fn stop_socks5(task: &mut Option<tokio::task::JoinHandle<()>>, stop_tx: &w
     }
 }
 
-/// Spawn a fresh SOCKS5 accept loop for this chain, bound to `addr`.
+/// Spawn a fresh SOCKS5 accept loop for this chain, bound to `listen`.
+///
+/// `listen` selects the transport: `Tcp` binds a loopback port (workstation
+/// mode, unchanged), `Unix` binds a socket in the edge-client's own private
+/// runtime directory (box mode — never a TCP port, owner ruling
+/// 2026-09-23). The SOCKS5 protocol served is identical either way; only
+/// which `Socks5Server` method runs the accept loop differs.
 ///
 /// Returns the loop's `JoinHandle`. The caller stops it by pulsing any
 /// `watch::Sender` that `stop_rx` was subscribed from (see [`stop_socks5`]) —
@@ -716,7 +733,7 @@ async fn stop_socks5(task: &mut Option<tokio::task::JoinHandle<()>>, stop_tx: &w
 /// calls made *after* it subscribed, so reusing an old receiver across a
 /// stop/respawn cycle would make the new loop see a pulse instantly.
 fn spawn_socks5_accept_loop(
-    addr: SocketAddr,
+    listen: Socks5ListenSpec,
     chain_id: &str,
     chain_cfg: &mirage_core::config::ChainConfig,
     shared_wire_health: Arc<WireHealthMap>,
@@ -743,18 +760,56 @@ fn spawn_socks5_accept_loop(
     let chain_natures: HashMap<String, WireNature> =
         [(chain_id.to_string(), chain_cfg.effective_nature())].into();
 
-    let server = Socks5Server::new_with_failover(addr, vec![])
+    // `Socks5Server::new_with_failover` always wants a `SocketAddr` field —
+    // it is genuinely used to bind in `Tcp` mode; in `Unix` mode it is dead
+    // weight (`run_unix`/`run_simple_unix` never read `self.bind_addr`), so a
+    // loopback placeholder is fine there.
+    let bind_addr: SocketAddr = match &listen {
+        Socks5ListenSpec::Tcp { addr } => addr
+            .parse()
+            .expect("socks5_listen Tcp addr was already validated as parseable in main() before spawn_socks5_accept_loop was ever called"),
+        Socks5ListenSpec::Unix { .. } => SocketAddr::from(([127, 0, 0, 1], 0)),
+    };
+
+    let server = Socks5Server::new_with_failover(bind_addr, vec![])
         .with_kill_switch(chain_id.to_string(), chain_policies, chain_natures)
         .with_shared_wire_health(shared_wire_health);
 
     let chain_id = chain_id.to_string();
     let mux_pool_is_some = mux_pool_opt.is_some();
     tokio::spawn(async move {
-        let mut serve_fut = if mux_pool_is_some {
-            tokio::spawn(async move { server.run(pool, mux_pool_opt, config_arc, router).await })
-        } else {
-            tokio::spawn(async move { server.run_simple(pool).await })
-        };
+        let mut serve_fut: tokio::task::JoinHandle<Result<(), mirage_core::error::MirageError>> =
+            match listen {
+                Socks5ListenSpec::Tcp { .. } => {
+                    if mux_pool_is_some {
+                        tokio::spawn(async move { server.run(pool, mux_pool_opt, config_arc, router).await })
+                    } else {
+                        tokio::spawn(async move { server.run_simple(pool).await })
+                    }
+                }
+                #[cfg(unix)]
+                Socks5ListenSpec::Unix { path } => {
+                    let path = std::path::PathBuf::from(path);
+                    if mux_pool_is_some {
+                        tokio::spawn(async move { server.run_unix(&path, pool, mux_pool_opt, config_arc, router).await })
+                    } else {
+                        tokio::spawn(async move { server.run_simple_unix(&path, pool).await })
+                    }
+                }
+                // Box mode only ever runs on the fleet's Linux boxes. This
+                // arm exists so the worker still compiles on the Windows
+                // dev/test target — it is never reached there, since
+                // nothing on Windows sends a `Socks5ListenSpec::Unix` Start.
+                #[cfg(not(unix))]
+                Socks5ListenSpec::Unix { .. } => {
+                    let _ = (pool, mux_pool_opt, config_arc, router);
+                    tokio::spawn(async move {
+                        Err(mirage_core::error::MirageError::Config(
+                            "box-mode unix SOCKS5 listener requested on a non-unix target".to_string(),
+                        ))
+                    })
+                }
+            };
         tokio::select! {
             result = &mut serve_fut => {
                 if let Ok(Err(e)) = result {
@@ -1236,7 +1291,7 @@ fn spawn_monitor_link_in_worker(
 
 /// Wait for the first supervisor connection and the `Start` message.
 ///
-/// Returns `(socks5_bind, config_path, peer_table_json, ipc)`.
+/// Returns `(socks5_listen, config_path, peer_table_json, ipc)`.
 ///
 /// The worker sends `Hello` immediately on connect (with `Starting` state).
 /// After `Hello`, the supervisor either sends `Start` (fresh spawn) or
@@ -1249,7 +1304,7 @@ async fn wait_for_start(
     pid: u32,
     started_at_unix: u64,
     worker_state: WorkerState,
-) -> anyhow::Result<(String, String, Option<String>, PipePair)> {
+) -> anyhow::Result<(Socks5ListenSpec, String, Option<String>, PipePair)> {
     loop {
         let mut ipc = listener.accept().await
             .with_context(|| "accepting first supervisor connection")?;
@@ -1280,15 +1335,15 @@ async fn wait_for_start(
                 }
                 Some(SupervisorMsg::Start {
                     chain_id: _,
-                    socks5_bind,
+                    socks5_listen,
                     config_path,
                     peer_table_json,
                 }) => {
-                    info!(chain_id, bind = %socks5_bind, "received Start");
+                    info!(chain_id, listen = ?socks5_listen, "received Start");
                     // Prefer peer_table_json from Start; fall back to any
                     // PeerTableUpdate that arrived before Start.
                     let resolved_pt = peer_table_json.or(buffered_peer_table_json);
-                    return Ok((socks5_bind, config_path, resolved_pt, ipc));
+                    return Ok((socks5_listen, config_path, resolved_pt, ipc));
                 }
                 Some(SupervisorMsg::PeerTableUpdate { peer_table_json }) => {
                     info!(chain_id, "PeerTableUpdate received before Start — buffering");

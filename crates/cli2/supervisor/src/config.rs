@@ -158,6 +158,31 @@ fn default_router_bind() -> String {
     "127.0.0.1:19489".to_string()
 }
 
+/// Box-mode per-worker SOCKS5 unix socket path.
+///
+/// The supervisor's router dials this (see `router_listener::WorkerSocksAddr`)
+/// and tells the worker to bind it via `Socks5ListenSpec::Unix` at `Start`
+/// time (`worker_handle::WorkerHandle::send_start`) — both sides derive the
+/// SAME path from this one function so they can never disagree.
+///
+/// `workers/` is a PRIVATE subdirectory of the same runtime root
+/// `mirage_core::local_endpoint::LocalChannel::EdgeClientEntrance` binds
+/// into — derived from that channel's own declared path (never a second
+/// hardcoded constant) so the two can never drift apart. Unlike the
+/// entrance socket's directory (which grants the node account group
+/// access), this one grants nothing: it is supervisor↔worker only, both
+/// already the same uid, so the worker's own bind ceremony
+/// (`mirage_client_core::socks5::bind_unix_socks5_listener`) sets it 0700
+/// owner-only every time it binds.
+pub fn worker_socks5_unix_path(chain_id: &str) -> std::path::PathBuf {
+    let entrance = mirage_core::local_endpoint::LocalChannel::EdgeClientEntrance.unix_path();
+    let base = std::path::Path::new(entrance)
+        .parent()
+        .map(|p| p.join("workers"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/run/mirage/edge-client/workers"));
+    base.join(format!("worker-{chain_id}.sock"))
+}
+
 fn default_ota_poll() -> u64 {
     300
 }
@@ -172,7 +197,15 @@ pub struct ChainConfig {
     /// Unique chain identifier, e.g. `"byte-cipher-classic"`.
     pub id: String,
     /// Address + port the worker should bind its SOCKS5 listener on.
-    pub socks5_bind: String,
+    ///
+    /// Required in workstation mode, MUST be absent in box mode — box mode
+    /// never binds a TCP port (owner ruling 2026-09-23: fleet boxes have no
+    /// internal TCP ports). The worker binds a unix socket instead, at a
+    /// path the supervisor derives itself (`worker_socks5_unix_path`) and
+    /// sends over `Start` as `Socks5ListenSpec::Unix`. See [`Config::validate`],
+    /// which refuses a config that gets this backwards in either direction.
+    #[serde(default)]
+    pub socks5_bind: Option<String>,
     /// Path to the per-chain client config file passed to the worker.
     pub config_path: String,
     /// When `true`, the supervisor designates this worker as the MonitorLink host.
@@ -259,6 +292,35 @@ impl Config {
             .is_some()
     }
 
+    /// Validate the shape that spans every chain: `socks5_bind` must be
+    /// present in workstation mode (the worker needs a real TCP bind
+    /// target) and ABSENT in box mode — fail closed, exactly like the
+    /// router's own `listen_local_channel` refusal in `main.rs`. Box mode
+    /// never binds a TCP port (owner ruling 2026-09-23); a chain that still
+    /// sets `socks5_bind` there is refused rather than silently ignored, so
+    /// a config left over from a workstation deployment can never turn into
+    /// a live TCP listener on a fleet box by accident.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let box_mode = self.box_mode();
+        for chain in &self.chains {
+            match (box_mode, &chain.socks5_bind) {
+                (true, Some(_)) => anyhow::bail!(
+                    "box mode: chain '{}' sets socks5_bind — box mode never binds a TCP port; \
+                     remove it, the worker binds a unix socket automatically \
+                     (see worker_socks5_unix_path)",
+                    chain.id
+                ),
+                (false, None) => anyhow::bail!(
+                    "chain '{}' has no socks5_bind — workstation mode requires a TCP SOCKS5 \
+                     bind address per chain",
+                    chain.id
+                ),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Load a config file, auto-detecting the format.
     ///
     /// A `.json` path (or a file whose first non-whitespace byte is `{`) is
@@ -327,7 +389,10 @@ impl Config {
             })?;
             chains.push(ChainConfig {
                 id: c.chain_id.clone(),
-                socks5_bind,
+                // Sentinel-managed JSON is always workstation mode (box mode
+                // is operator-authored TOML only, see `Config::box_mode`) —
+                // always `Some` here.
+                socks5_bind: Some(socks5_bind),
                 config_path: config_path.to_string(),
                 monitor_link_host: ml_host.as_deref() == Some(c.chain_id.as_str()),
                 kill_switch: c.kill_switch.clone(),
@@ -427,7 +492,6 @@ worker_binary = "mirage-chain-worker"
 
 [[chains]]
 id = "edge-exit-1"
-socks5_bind = "127.0.0.1:19500"
 config_path = "/etc/mirage/edge-client-config.json"
 
 [routing]
@@ -443,6 +507,71 @@ listen_local_channel = "edge-client-entrance"
             Some("edge-client-entrance")
         );
         assert!(cfg.box_mode(), "box_mode() must be true once listen_local_channel is set");
+        assert_eq!(cfg.chains[0].socks5_bind, None, "box-mode chain sets no socks5_bind");
+        cfg.validate().expect("a clean box-mode config (no socks5_bind) validates");
+    }
+
+    #[test]
+    fn validate_refuses_socks5_bind_in_box_mode() {
+        let toml_text = r#"
+monitor_url = "https://lm-nl.example.net:19443"
+ota_pubkey = "deadbeef"
+worker_binary = "mirage-chain-worker"
+
+[[chains]]
+id = "edge-exit-1"
+socks5_bind = "127.0.0.1:19500"
+config_path = "/etc/mirage/edge-client-config.json"
+
+[routing]
+listen_local_channel = "edge-client-entrance"
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("TOML parses (validate catches it, not serde)");
+        let err = cfg.validate().expect_err("box mode + socks5_bind must be refused");
+        assert!(
+            err.to_string().contains("socks5_bind"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_refuses_missing_socks5_bind_in_workstation_mode() {
+        let toml_text = r#"
+monitor_url = "https://lm-nl.example.net:19443"
+ota_pubkey = "deadbeef"
+worker_binary = "mirage-chain-worker"
+
+[[chains]]
+id = "c1"
+config_path = "/etc/mirage/client-config.json"
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("TOML parses (validate catches it, not serde)");
+        let err = cfg.validate().expect_err("workstation mode without socks5_bind must be refused");
+        assert!(
+            err.to_string().contains("socks5_bind"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn worker_socks5_unix_path_is_derived_from_the_entrance_channel_dir() {
+        let path = worker_socks5_unix_path("edge-exit-1");
+        // Component-wise comparison, not a string prefix: `PathBuf::join` uses
+        // the native separator, so a literal "/a/b/" string prefix check
+        // would spuriously fail on Windows (dev/test box) even though the
+        // path is only ever real on the Linux fleet.
+        let expected_dir = std::path::Path::new("/run/mirage/edge-client").join("workers");
+        assert!(
+            path.starts_with(&expected_dir),
+            "expected a private subdirectory of the entrance channel's own runtime dir \
+             ({}), got {}",
+            expected_dir.display(),
+            path.display()
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("worker-edge-exit-1.sock")
+        );
     }
 
     #[test]

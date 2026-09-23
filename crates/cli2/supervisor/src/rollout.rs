@@ -73,7 +73,7 @@ async fn update_one_chain(
     let rollout_pt = state::load_peer_table(state_dir);
     let mut new_handle = WorkerHandle::spawn(new_binary, chain)
         .with_context(|| format!("spawning new worker for {}", chain.id))?;
-    new_handle.send_start(chain, rollout_pt).await?;
+    new_handle.send_start(chain, rollout_pt, box_mode).await?;
 
     // Wait for new worker to signal Ready.
     wait_for_ready(&mut new_handle).await.with_context(|| {

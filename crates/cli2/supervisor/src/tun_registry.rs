@@ -34,12 +34,20 @@ pub async fn push_tun_registry(config: &Config) {
         }
     };
 
+    // Box-mode chains have no `socks5_bind` (a unix socket, not a registry
+    // string the TUN process — a desktop-only component with no box-mode
+    // counterpart — could dial anyway) and are skipped rather than sent as
+    // an empty address: `tun_api_url` is `None` on every box-mode config in
+    // practice, so this loop never runs at all there, but skipping is the
+    // honest behaviour if it ever did.
     let chains: Vec<ChainEntry<'_>> = config
         .chains
         .iter()
-        .map(|c| ChainEntry {
-            name: &c.id,
-            socks5_addr: &c.socks5_bind,
+        .filter_map(|c| {
+            c.socks5_bind.as_deref().map(|socks5_addr| ChainEntry {
+                name: &c.id,
+                socks5_addr,
+            })
         })
         .collect();
 

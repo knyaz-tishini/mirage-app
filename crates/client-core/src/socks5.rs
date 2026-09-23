@@ -27,12 +27,20 @@
 //!    - `SocksFailurePolicy::Default` (no kill-switch configured): legacy behavior,
 //!      try all failover pools in order.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+#[cfg(unix)]
+use std::path::Path;
 
 use async_trait::async_trait;
 use mirage_core::{config::{ClientConfig, KillSwitchMode, WireNature}, error::MirageError, routing::RouteDecision, routing::RoutingTable};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::mpsc,
 };
@@ -185,6 +193,76 @@ const SOCKS5_REP_SUCCESS: u8 = 0x00;
 const SOCKS5_REP_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS5_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
+
+// ── Client-facing stream transport ────────────────────────────────────────────
+
+/// The client-facing side of a SOCKS5 connection — TCP for the workstation
+/// listener ([`Socks5Server::run`] / [`Socks5Server::run_simple`]), unix for
+/// cli2's box-mode worker listener ([`Socks5Server::run_unix`] /
+/// [`Socks5Server::run_simple_unix`]). The SOCKS5 protocol carried is
+/// identical either way — this type exists so every connection handler below
+/// is written once and serves both listeners, exactly mirroring
+/// `mirage_core::local_endpoint::LocalStream`'s own TCP/unix duplex shape.
+///
+/// Deliberately NOT a generic type parameter threaded through a dozen
+/// functions: a concrete enum keeps every one of those signatures unchanged
+/// in shape (`&mut ClientStream` where `&mut TcpStream` used to be) and the
+/// `Unix` variant compiles away entirely on non-unix targets.
+pub enum ClientStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl From<TcpStream> for ClientStream {
+    fn from(stream: TcpStream) -> Self {
+        ClientStream::Tcp(stream)
+    }
+}
+
+impl AsyncRead for ClientStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
+            ClientStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ClientStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ClientStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
+            ClientStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
+            ClientStream::Unix(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
+            ClientStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// The parsed destination from a SOCKS5 CONNECT request.
 enum Destination {
@@ -448,7 +526,7 @@ impl Socks5Server {
                     };
                     match kind {
                         ConnectionKind::Socks5 => {
-                            handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms, udp_associate).await
+                            handle_socks5_connection(stream.into(), peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms, udp_associate).await
                         }
                         ConnectionKind::Transparent => {
                             handle_transparent_connection(stream, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, wire_health, primary_chain_id).await
@@ -457,7 +535,7 @@ impl Socks5Server {
                 };
 
                 #[cfg(not(target_os = "linux"))]
-                let result = handle_socks5_connection(stream, peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms, udp_associate).await;
+                let result = handle_socks5_connection(stream.into(), peer, pool, mux_pool, router, failover, chain_router, all_pools, chain_policies, chain_natures, wire_health, primary_chain_id, mux_fallback_warn_ms, udp_associate).await;
 
                 if let Err(e) = result {
                     error!(%peer, "connection error: {e}");
@@ -482,18 +560,154 @@ impl Socks5Server {
             let pool = Arc::clone(&pool);
 
             tokio::spawn(async move {
-                if let Err(e) = handle_socks5_simple(stream, pool).await {
+                if let Err(e) = handle_socks5_simple(stream.into(), pool).await {
                     error!(%peer, "connection error: {e}");
+                }
+            });
+        }
+    }
+
+    /// Accept connections forever over a box-mode unix socket, spawning a
+    /// handler task per connection. Mirrors [`Self::run`] exactly except for
+    /// the listener transport — box mode never binds a TCP port (owner
+    /// ruling 2026-09-23: fleet boxes have no internal TCP ports).
+    ///
+    /// There is no transparent-proxy detection branch here: `iptables`
+    /// REDIRECT + `SO_ORIGINAL_DST` (`Self::run`'s Linux arm) is a TCP-only
+    /// concept with no unix-domain equivalent — every connection accepted
+    /// here is a real SOCKS5 request from the caller (cli2's supervisor
+    /// router, dialing in as a SOCKS5 client exactly like a workstation
+    /// app does against the TCP listener).
+    #[cfg(unix)]
+    pub async fn run_unix(
+        &self,
+        path: &Path,
+        pool: Arc<TunnelPool>,
+        mux_pool: Option<Arc<MuxPool>>,
+        _config: Arc<ClientConfig>,
+        router: Arc<RoutingTable>,
+    ) -> Result<(), MirageError> {
+        let listener = bind_unix_socks5_listener(path).await?;
+        info!(path = %path.display(), "SOCKS5 server listening (box mode, unix)");
+
+        let failover = Arc::new(self.failover_pools.clone());
+        let chain_router = self.chain_router.clone();
+        let all_pools = Arc::clone(&self.all_pools);
+        let chain_policies = Arc::clone(&self.chain_policies);
+        let chain_natures = Arc::clone(&self.chain_natures);
+        let wire_health = Arc::clone(&self.wire_health);
+        let primary_chain_id = Arc::new(self.primary_chain_id.clone());
+        let mux_fallback_warn_ms = Arc::clone(&self.mux_fallback_warn_ms);
+        let udp_associate = self.udp_associate.clone();
+
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            debug!("new SOCKS5 connection (box mode, unix)");
+
+            let pool = Arc::clone(&pool);
+            let mux_pool = mux_pool.clone();
+            let router = Arc::clone(&router);
+            let failover = Arc::clone(&failover);
+            let chain_router = chain_router.clone();
+            let all_pools = Arc::clone(&all_pools);
+            let chain_policies = Arc::clone(&chain_policies);
+            let chain_natures = Arc::clone(&chain_natures);
+            let wire_health = Arc::clone(&wire_health);
+            let primary_chain_id = Arc::clone(&primary_chain_id);
+            let mux_fallback_warn_ms = Arc::clone(&mux_fallback_warn_ms);
+            let udp_associate = udp_associate.clone();
+
+            tokio::spawn(async move {
+                // Unix connections carry no `SocketAddr` peer — `SO_PEERCRED`
+                // gives a uid/pid, not a network address. This placeholder is
+                // display-only (it never gates anything, unlike the real
+                // `LocalChannel` accept-time allowlist mirage-core applies):
+                // the filesystem mode this socket binds with (owner-only,
+                // same uid as the supervisor — see `bind_unix_socks5_listener`)
+                // is what actually restricts who can reach it.
+                let peer = SocketAddr::from(([127, 0, 0, 1], 0));
+                let result = handle_socks5_connection(
+                    ClientStream::Unix(stream), peer, pool, mux_pool, router, failover,
+                    chain_router, all_pools, chain_policies, chain_natures, wire_health,
+                    primary_chain_id, mux_fallback_warn_ms, udp_associate,
+                ).await;
+                if let Err(e) = result {
+                    error!("connection error (box mode, unix): {e}");
+                }
+            });
+        }
+    }
+
+    /// Box-mode unix counterpart to [`Self::run_simple`] — see that method's
+    /// doc and [`Self::run_unix`]'s doc for why there is no TCP fallback.
+    #[cfg(unix)]
+    pub async fn run_simple_unix(&self, path: &Path, pool: Arc<TunnelPool>) -> Result<(), MirageError> {
+        let listener = bind_unix_socks5_listener(path).await?;
+        info!(path = %path.display(), "SOCKS5 server (simple) listening (box mode, unix)");
+
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            debug!("new SOCKS5 connection (simple, box mode, unix)");
+            let pool = Arc::clone(&pool);
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_socks5_simple(ClientStream::Unix(stream), pool).await {
+                    error!("connection error (simple, box mode, unix): {e}");
                 }
             });
         }
     }
 }
 
+/// Bind a box-mode worker SOCKS5 unix socket.
+///
+/// Removes a stale socket file first — but only after proving nothing is
+/// listening on it: a successful connect means a live process owns the
+/// path (left alone, bind fails honestly), a connect error means the file
+/// is stale and safe to unlink. Mirrors
+/// `mirage_core::local_endpoint::remove_stale_socket_if_dead`'s exact
+/// reasoning (that function is not `pub`, so this is a second, small
+/// instance of the same ceremony rather than a shared call).
+///
+/// Sets the socket to mode `0600` — owner-only. This channel is
+/// supervisor↔worker only, both processes already the same uid (they are
+/// the same `edge-client` unit), so unlike `LocalChannel::EdgeClientEntrance`
+/// (which grants a second account, the node, group access) there is no
+/// group to grant here at all.
+///
+/// Also re-applies the parent directory's mode (`0700`, owner-only) on
+/// every bind — re-applied every time for the same reason
+/// `mirage_core::local_endpoint` re-applies its own directory grants on
+/// every boot: a mode that is only set once is one hand-edit away from
+/// silently drifting.
+#[cfg(unix)]
+async fn bind_unix_socks5_listener(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    if path.exists() {
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("a live listener already owns {}", path.display()),
+            ));
+        }
+        std::fs::remove_file(path)?;
+    }
+
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
 /// Handle a single SOCKS5 connection — always route via the chain pool.
 /// No routing decision, no failover, no mux.
 async fn handle_socks5_simple(
-    mut stream: TcpStream,
+    mut stream: ClientStream,
     pool: Arc<TunnelPool>,
 ) -> Result<(), MirageError> {
     // ── 1. SOCKS5 greeting ───────────────────────────────────────────────────
@@ -738,7 +952,7 @@ async fn lease_with_failover_policy(
 
 /// Read and discard a SOCKS5 address field (atyp + addr bytes + port).
 /// Used for UDP ASSOCIATE where client sends its own address which we ignore.
-async fn consume_socks5_addr(atyp: u8, stream: &mut TcpStream) -> Result<(), MirageError> {
+async fn consume_socks5_addr(atyp: u8, stream: &mut ClientStream) -> Result<(), MirageError> {
     match atyp {
         SOCKS5_ATYP_IPV4 => {
             let mut buf = [0u8; 6]; // 4 addr + 2 port
@@ -766,7 +980,7 @@ async fn consume_socks5_addr(atyp: u8, stream: &mut TcpStream) -> Result<(), Mir
 
 /// Handle a single SOCKS5 client connection.
 async fn handle_socks5_connection(
-    mut stream: TcpStream,
+    mut stream: ClientStream,
     peer: SocketAddr,
     pool: Arc<TunnelPool>,
     mux_pool: Option<Arc<MuxPool>>,
@@ -956,7 +1170,7 @@ async fn handle_socks5_connection(
 /// demotes that chain and tries the next. Returns `PoolExhausted` if no chain
 /// succeeds.
 async fn route_via_router_pools(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     chain_ids: &[ChainId],
     all_pools: &HashMap<ChainId, Arc<TunnelPool>>,
     target_addr: &str,
@@ -1005,7 +1219,7 @@ async fn route_via_router_pools(
 
 /// Connect directly to the target and relay data.
 async fn route_direct(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     target_addr: &str,
 ) -> Result<(), MirageError> {
     let mut target = TcpStream::connect(target_addr).await.map_err(|e| {
@@ -1047,7 +1261,7 @@ async fn route_direct(
 /// dead wires fail closed immediately instead of waiting 300–600 s for the
 /// pool-lease timeout.
 async fn route_via_pool_with_failover(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     pool: Arc<TunnelPool>,
     primary_chain_id: &str,
     failover: &[(String, Arc<TunnelPool>)],
@@ -1241,7 +1455,7 @@ async fn route_via_pool_with_failover(
 /// and enter the relay loop — at that point any further error is unrecoverable
 /// (the client already saw success, can't re-route).
 async fn route_via_mux_pool(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     mux_pool: Arc<MuxPool>,
     target_addr: &str,
 ) -> Result<(), MirageError> {
@@ -1268,7 +1482,7 @@ async fn route_via_mux_pool(
 }
 
 /// Send a SOCKS5 success reply with a zeroed bind address and port.
-async fn send_socks5_success(stream: &mut TcpStream) -> Result<(), MirageError> {
+async fn send_socks5_success(stream: &mut ClientStream) -> Result<(), MirageError> {
     // [version, rep=success, rsv, atyp=IPv4, 0.0.0.0, port=0]
     stream
         .write_all(&[
@@ -1291,7 +1505,7 @@ async fn send_socks5_success(stream: &mut TcpStream) -> Result<(), MirageError> 
 /// that address and route the connection through the tunnel pool just like a
 /// normal SOCKS5 CONNECT would.
 async fn handle_transparent_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     pool: Arc<TunnelPool>,
     mux_pool: Option<Arc<MuxPool>>,
     router: Arc<RoutingTable>,
@@ -1303,6 +1517,11 @@ async fn handle_transparent_connection(
     primary_chain_id: Arc<String>,
 ) -> Result<(), MirageError> {
     let orig_dst = get_original_dst(&stream)?;
+    // TCP-specific work (`SO_ORIGINAL_DST`) is done — everything from here
+    // shares the same connection handling `handle_socks5_connection` uses,
+    // including `route_via_mux_pool`, which is `ClientStream`-typed because
+    // it also serves the box-mode unix listener.
+    let mut stream = ClientStream::Tcp(stream);
 
     let decision = router.decide_ip(&orig_dst.ip());
     let target_addr = orig_dst.to_string();
@@ -1415,7 +1634,7 @@ async fn handle_transparent_connection(
 /// Router-driven transparent proxy path (no SOCKS5 success reply needed).
 #[cfg(target_os = "linux")]
 async fn route_via_router_pools_transparent(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     chain_ids: &[ChainId],
     all_pools: &HashMap<ChainId, Arc<TunnelPool>>,
     target_addr: &str,
@@ -1465,7 +1684,7 @@ async fn route_via_router_pools_transparent(
 ///
 /// Reads the address and port fields according to RFC 1928 §5.
 /// Returns a [`Destination`] on success.
-async fn parse_destination(stream: &mut TcpStream, atyp: u8) -> Result<Destination, MirageError> {
+async fn parse_destination(stream: &mut ClientStream, atyp: u8) -> Result<Destination, MirageError> {
     match atyp {
         SOCKS5_ATYP_IPV4 => {
             let mut addr_buf = [0u8; 4];
@@ -1505,7 +1724,7 @@ async fn parse_destination(stream: &mut TcpStream, atyp: u8) -> Result<Destinati
 }
 
 /// Send a SOCKS5 error reply (best-effort — errors are ignored).
-async fn send_socks5_error(stream: &mut TcpStream, rep: u8) {
+async fn send_socks5_error(stream: &mut ClientStream, rep: u8) {
     let _ = stream
         .write_all(&[
             SOCKS5_VERSION,
@@ -1533,7 +1752,7 @@ async fn send_socks5_error(stream: &mut TcpStream, rep: u8) {
 /// `Legacy`'s pool/mux/raw fallback attempt a dial that was never going to
 /// carry UDP correctly for a non-UDP-shaped chain.
 async fn handle_udp_associate(
-    mut tcp_stream: TcpStream,
+    mut tcp_stream: ClientStream,
     pool: Arc<TunnelPool>,
     mux_pool: Option<Arc<MuxPool>>,
     failover: Arc<Vec<(String, Arc<TunnelPool>)>>,
@@ -1936,7 +2155,7 @@ fn build_udp_response_header(src: SocketAddr) -> Vec<u8> {
 
 /// Send SOCKS5 UDP ASSOCIATE success reply with the bound UDP socket address.
 pub(crate) async fn send_socks5_udp_success(
-    stream: &mut TcpStream,
+    stream: &mut ClientStream,
     addr: SocketAddr,
 ) -> Result<(), MirageError> {
     let mut reply = Vec::with_capacity(10);
@@ -1984,7 +2203,8 @@ mod tests {
     /// SOCKS5 CONNECT ATYP=4 (IPv6): 16-byte addr + 2-byte port.
     #[tokio::test]
     async fn parse_destination_ipv6_atyp4() {
-        let (mut writer, mut reader) = tcp_pair().await;
+        let (mut writer, reader) = tcp_pair().await;
+        let mut reader = super::ClientStream::Tcp(reader);
 
         // Write: 16 bytes of IPv6 addr + 2 bytes port (big-endian).
         let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
@@ -2012,7 +2232,8 @@ mod tests {
     /// SOCKS5 CONNECT ATYP=1 (IPv4) still works after the IPv6 arm is present.
     #[tokio::test]
     async fn parse_destination_ipv4_atyp1_still_works() {
-        let (mut writer, mut reader) = tcp_pair().await;
+        let (mut writer, reader) = tcp_pair().await;
+        let mut reader = super::ClientStream::Tcp(reader);
 
         let ip: std::net::Ipv4Addr = "192.168.1.1".parse().unwrap();
         let port: u16 = 80;
@@ -2118,7 +2339,8 @@ mod tests {
             // Just accept and drop immediately.
             let _ = listener.accept().await;
         });
-        let mut client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_stream = super::ClientStream::Tcp(client_stream);
 
         let chain_ids = vec![
             ChainId("chain-a".to_string()),
@@ -2323,5 +2545,75 @@ mod tests {
         let second = super::claim_mux_fallback_warn_window(&cell, 5_000);
         assert!(first, "first claim at a fresh instant must win");
         assert!(!second, "a second claim at the same instant must not also win");
+    }
+
+    // ── Box mode: bind_unix_socks5_listener ────────────────────────────────
+
+    /// The worker's box-mode SOCKS5 socket binds at mode `0600` (owner-only
+    /// — supervisor and worker are always the same uid) and its parent
+    /// directory at `0700`, re-applied every bind, exactly like
+    /// `mirage_core::local_endpoint`'s own directory grants.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_unix_socks5_listener_sets_owner_only_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "cli2-socks5-unix-bind-test-{}",
+            std::process::id()
+        ));
+        let dir = base.join("workers");
+        let sock_path = dir.join("worker-edge-exit-1.sock");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let _listener = super::bind_unix_socks5_listener(&sock_path)
+            .await
+            .expect("bind_unix_socks5_listener must succeed on a clean path");
+
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("parent dir must exist after bind")
+            .permissions()
+            .mode()
+            & 0o777;
+        let sock_mode = std::fs::metadata(&sock_path)
+            .expect("socket file must exist after bind")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(dir_mode, 0o700, "parent dir must be owner-only 0700");
+        assert_eq!(sock_mode, 0o600, "socket file must be owner-only 0600");
+
+        drop(_listener);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A stale socket file (no live listener behind it) is removed and
+    /// re-bound rather than refused — mirrors
+    /// `mirage_core::local_endpoint::remove_stale_socket_if_dead`'s exact
+    /// contract: a *live* listener is never stolen, a *dead* one is cleaned
+    /// up automatically so a worker respawn does not need an external
+    /// cleanup step.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_unix_socks5_listener_removes_a_stale_socket_file() {
+        let base = std::env::temp_dir().join(format!(
+            "cli2-socks5-unix-stale-test-{}",
+            std::process::id()
+        ));
+        let sock_path = base.join("worker-edge-exit-1.sock");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create test dir");
+
+        // A stale file — not a socket, nothing listening — left over from an
+        // unclean exit.
+        std::fs::write(&sock_path, b"stale").expect("write stale placeholder file");
+
+        let listener = super::bind_unix_socks5_listener(&sock_path)
+            .await
+            .expect("a stale (dead) socket file must be removed and re-bound, not refused");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

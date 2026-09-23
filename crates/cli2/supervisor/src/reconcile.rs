@@ -130,7 +130,7 @@ pub async fn reconcile(
             }
         };
 
-        if let Err(e) = handle.send_start(chain, initial_pt.clone()).await {
+        if let Err(e) = handle.send_start(chain, initial_pt.clone(), box_mode).await {
             warn!(chain_id = %chain.id, "reconcile: send_start failed: {e:#}");
             handles.insert(chain.id.clone(), handle);
             continue;
@@ -303,8 +303,17 @@ fn build_monitor_transport_specs(config: &Config) -> Vec<MonitorTransportSpec> {
         match t {
             MonitorTransportConfig::DirectWs { .. } => {}
             MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
+                // Box-mode chains have no TCP `socks5_bind` for this TCP-SOCKS5
+                // hop to dial through — skipped exactly like a parse failure,
+                // never a config error (a monitor_transports list mixing
+                // OverChain with a box-mode chain id is simply a transport
+                // this chain cannot offer).
                 if let Some(chain_cfg) = config.chains.iter().find(|c| &c.id == chain_id) {
-                    if let Ok(socks5) = chain_cfg.socks5_bind.parse() {
+                    if let Some(socks5) = chain_cfg
+                        .socks5_bind
+                        .as_deref()
+                        .and_then(|s| s.parse().ok())
+                    {
                         specs.push(MonitorTransportSpec::OverChain {
                             worker_socks5: socks5,
                             monitor_addr: *monitor_addr,
@@ -331,13 +340,20 @@ fn build_monitor_transport_specs(config: &Config) -> Vec<MonitorTransportSpec> {
     specs
 }
 
-/// Reload the config from `path` and return a fresh `Config`, or `None` on error.
+/// Reload the config from `path` and return a fresh `Config`, or `None` on
+/// error (parse failure or `Config::validate` refusal — e.g. a reload that
+/// tries to add a `socks5_bind` to a box-mode chain).
 pub fn try_reload_config(path: &str) -> Option<Config> {
-    match Config::load_any(path) {
-        Ok(c) => Some(c),
+    let config = match Config::load_any(path) {
+        Ok(c) => c,
         Err(e) => {
             warn!(path, "reconcile: config reload failed: {e:#}");
-            None
+            return None;
         }
+    };
+    if let Err(e) = config.validate() {
+        warn!(path, "reconcile: reloaded config failed validation: {e:#} — keeping the running config");
+        return None;
     }
+    Some(config)
 }

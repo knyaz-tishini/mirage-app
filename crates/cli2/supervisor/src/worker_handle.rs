@@ -361,14 +361,39 @@ impl WorkerHandle {
     }
 
     /// Send `Start` with the chain config and an optional initial peer table.
+    ///
+    /// `box_mode` decides how the worker binds its own SOCKS5 listener:
+    /// a unix socket at `config::worker_socks5_unix_path` in box mode (never
+    /// a TCP port — owner ruling 2026-09-23), `chain.socks5_bind` in
+    /// workstation mode. `Config::validate` already guarantees `chain` has
+    /// the field appropriate to the mode by the time any handle reaches this
+    /// call — the `ok_or_else` below is defense in depth, not the primary
+    /// gate.
     pub async fn send_start(
         &mut self,
         chain: &ChainConfig,
         initial_peer_table: Option<String>,
+        box_mode: bool,
     ) -> anyhow::Result<()> {
+        let socks5_listen = if box_mode {
+            mirage_chain_ipc::Socks5ListenSpec::Unix {
+                path: crate::config::worker_socks5_unix_path(&chain.id)
+                    .to_string_lossy()
+                    .into_owned(),
+            }
+        } else {
+            let addr = chain.socks5_bind.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "chain '{}' has no socks5_bind in workstation mode — Config::validate \
+                     should have refused this earlier",
+                    chain.id
+                )
+            })?;
+            mirage_chain_ipc::Socks5ListenSpec::Tcp { addr }
+        };
         self.send(SupervisorMsg::Start {
             chain_id: chain.id.clone(),
-            socks5_bind: chain.socks5_bind.clone(),
+            socks5_listen,
             config_path: chain.config_path.clone(),
             peer_table_json: initial_peer_table,
         })

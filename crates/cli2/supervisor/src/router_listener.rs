@@ -40,11 +40,31 @@ const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 
 // ── Chain entry ───────────────────────────────────────────────────────────────
 
+/// A worker's SOCKS5 dial target. Workstation mode: TCP loopback
+/// (`chain.socks5_bind`). Box mode: a unix socket in the edge-client's own
+/// private runtime directory (`config::worker_socks5_unix_path`) — never a
+/// TCP port (owner ruling 2026-09-23: fleet boxes have no internal TCP
+/// ports).
+#[derive(Debug, Clone)]
+pub enum WorkerSocksAddr {
+    Tcp(SocketAddr),
+    Unix(std::path::PathBuf),
+}
+
+impl std::fmt::Display for WorkerSocksAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerSocksAddr::Tcp(addr) => write!(f, "tcp:{addr}"),
+            WorkerSocksAddr::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
 /// One chain known to the supervisor, with its worker's SOCKS5 address.
 #[derive(Debug, Clone)]
 pub struct RouterChain {
     pub chain_id: String,
-    pub socks5_addr: SocketAddr,
+    pub socks5_addr: WorkerSocksAddr,
     /// Kill-switch failure policy for this chain (mirrors the per-worker
     /// gate in `client-core::socks5`). `Default` = legacy passthrough
     /// (unconditional round-robin, unchanged behavior).
@@ -286,7 +306,7 @@ where
         }
 
         debug!(chain = %chain.chain_id, worker = %chain.socks5_addr, "router: trying worker");
-        match forward_via_worker(&mut client, chain.socks5_addr, &target_host, target_port).await {
+        match forward_via_worker(&mut client, &chain.socks5_addr, &target_host, target_port).await {
             Ok(()) => {
                 router.health.record_success(&chain.chain_id);
                 return Ok(());
@@ -356,24 +376,71 @@ const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// between client and the upstream connection.
 async fn forward_via_worker<S>(
     client: &mut S,
-    worker_addr: SocketAddr,
+    worker_target: &WorkerSocksAddr,
     target_host: &str,
     target_port: u16,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let handshake = async {
-        let mut worker = TcpStream::connect(worker_addr).await?;
-        worker.write_all(&[VER, 1, AUTH_NONE]).await?;
-        let mut resp = [0u8; 2];
-        worker.read_exact(&mut resp).await?;
-        Ok::<_, std::io::Error>((worker, resp))
-    };
-    let (mut worker, resp) =
-        tokio::time::timeout(WORKER_HANDSHAKE_TIMEOUT, handshake)
-            .await
-            .map_err(|_| std::io::Error::other("worker handshake timed out"))??;
+    match worker_target {
+        WorkerSocksAddr::Tcp(addr) => {
+            let addr = *addr;
+            let handshake = async move {
+                let mut worker = TcpStream::connect(addr).await?;
+                worker.write_all(&[VER, 1, AUTH_NONE]).await?;
+                let mut resp = [0u8; 2];
+                worker.read_exact(&mut resp).await?;
+                Ok::<_, std::io::Error>((worker, resp))
+            };
+            let (worker, resp) = tokio::time::timeout(WORKER_HANDSHAKE_TIMEOUT, handshake)
+                .await
+                .map_err(|_| std::io::Error::other("worker handshake timed out"))??;
+            relay_through_worker(client, worker, resp, target_host, target_port).await
+        }
+        #[cfg(unix)]
+        WorkerSocksAddr::Unix(path) => {
+            let path = path.clone();
+            let handshake = async move {
+                let mut worker = tokio::net::UnixStream::connect(&path).await?;
+                worker.write_all(&[VER, 1, AUTH_NONE]).await?;
+                let mut resp = [0u8; 2];
+                worker.read_exact(&mut resp).await?;
+                Ok::<_, std::io::Error>((worker, resp))
+            };
+            let (worker, resp) = tokio::time::timeout(WORKER_HANDSHAKE_TIMEOUT, handshake)
+                .await
+                .map_err(|_| std::io::Error::other("worker handshake timed out"))??;
+            relay_through_worker(client, worker, resp, target_host, target_port).await
+        }
+        // Box mode (and therefore `WorkerSocksAddr::Unix`) only ever runs on
+        // the fleet's Linux boxes. This arm exists so the crate still
+        // compiles on the Windows dev/test target — it is never reached
+        // there, since nothing on Windows constructs a box-mode config.
+        #[cfg(not(unix))]
+        WorkerSocksAddr::Unix(_path) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unix socket worker targets are not supported on this platform",
+        )),
+    }
+}
+
+/// Shared tail of [`forward_via_worker`]: once a worker stream is connected
+/// and its SOCKS5 greeting reply (`resp`) is in hand, the rest of the
+/// handshake (CONNECT request, reply, relay) is identical whether `worker`
+/// is a `TcpStream` or a `UnixStream` — the worker speaks the same SOCKS5
+/// protocol over either transport.
+async fn relay_through_worker<S, W>(
+    client: &mut S,
+    mut worker: W,
+    resp: [u8; 2],
+    target_host: &str,
+    target_port: u16,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncRead + AsyncWrite + Unpin,
+{
     if resp[0] != VER || resp[1] != AUTH_NONE {
         return Err(std::io::Error::other("worker: auth negotiation failed"));
     }
@@ -534,7 +601,7 @@ mod tests {
 
         let router = SupervisorRouter::new(vec![RouterChain {
             chain_id: "test-chain".to_string(),
-            socks5_addr: worker_addr,
+            socks5_addr: WorkerSocksAddr::Tcp(worker_addr),
             policy: SocksFailurePolicy::Default,
             nature: WireNature::Direct,
         }]);
@@ -575,5 +642,98 @@ mod tests {
         drop(client);
         let _ = accept_task.await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// Box mode's other half: the ROUTER dials a `WorkerSocksAddr::Unix`
+    /// target (the worker's own SOCKS5 listener, box-mode-bound per
+    /// `mirage_client_core::socks5::bind_unix_socks5_listener`) instead of a
+    /// TCP one. The client-facing side is plain TCP here — the previous test
+    /// already proves the entrance-side unix transport; this one isolates
+    /// the OTHER leg `forward_via_worker`'s `WorkerSocksAddr::Unix` branch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_dials_a_unix_worker_target() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use tokio::net::UnixListener;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let worker_sock_path = std::env::temp_dir()
+            .join(format!("cli2-router-worker-test-{}-{n}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&worker_sock_path);
+
+        // Mock worker: SOCKS5 over a UNIX socket, exactly what a box-mode
+        // worker binds via `bind_unix_socks5_listener`.
+        let worker_listener = UnixListener::bind(&worker_sock_path).expect("bind mock unix worker");
+        let worker_path_for_task = worker_sock_path.clone();
+        let worker_task = tokio::spawn(async move {
+            let (mut w, _addr) = worker_listener.accept().await.expect("worker accept");
+            let mut greeting = [0u8; 3];
+            w.read_exact(&mut greeting).await.expect("worker read greeting");
+            w.write_all(&[VER, AUTH_NONE]).await.expect("worker auth reply");
+            let mut req_hdr = [0u8; 5];
+            w.read_exact(&mut req_hdr).await.expect("worker read req hdr");
+            let host_len = req_hdr[4] as usize;
+            let mut rest = vec![0u8; host_len + 2];
+            w.read_exact(&mut rest).await.expect("worker read host+port");
+            w.write_all(&[VER, REP_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+                .await
+                .expect("worker connect reply");
+            let mut buf = [0u8; 256];
+            loop {
+                match w.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&worker_path_for_task);
+        });
+
+        let router = SupervisorRouter::new(vec![RouterChain {
+            chain_id: "edge-exit-1".to_string(),
+            socks5_addr: WorkerSocksAddr::Unix(worker_sock_path.clone()),
+            policy: SocksFailurePolicy::Default,
+            nature: WireNature::Direct,
+        }]);
+
+        // Client-facing side: plain TCP loopback pair (a raw pair is enough —
+        // `handle_router_connection` is generic over the client stream, and
+        // that genericity is proven by the sibling unix-entrance test).
+        let entrance = TcpListener::bind("127.0.0.1:0").await.expect("bind entrance");
+        let entrance_addr = entrance.local_addr().expect("entrance addr");
+        let accept_task = tokio::spawn(async move {
+            let (stream, _peer) = entrance.accept().await.expect("entrance accept");
+            handle_router_connection(stream, &router).await
+        });
+
+        let mut client = TcpStream::connect(entrance_addr).await.expect("client connect");
+        client.write_all(&[VER, 1, AUTH_NONE]).await.expect("write greeting");
+        let mut greeting_reply = [0u8; 2];
+        client.read_exact(&mut greeting_reply).await.expect("read greeting reply");
+        assert_eq!(greeting_reply, [VER, AUTH_NONE]);
+
+        let host = b"example.com";
+        let mut req = vec![VER, CMD_CONNECT, 0x00, ATYP_DOMAIN, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        client.write_all(&req).await.expect("write connect request");
+
+        let mut connect_reply = [0u8; 10];
+        client.read_exact(&mut connect_reply).await.expect("read connect reply");
+        assert_eq!(connect_reply[..2], [VER, REP_SUCCESS], "router must have dialled the unix worker target successfully");
+
+        client.write_all(b"ping").await.expect("write payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.expect("read echoed payload");
+        assert_eq!(&echoed, b"ping", "bytes must relay through the unix-dialled worker and back");
+
+        drop(client);
+        let _ = accept_task.await;
+        let _ = worker_task.await;
+        let _ = std::fs::remove_file(&worker_sock_path);
     }
 }

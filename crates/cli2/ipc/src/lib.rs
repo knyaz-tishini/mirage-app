@@ -57,6 +57,23 @@ fn default_monitor_addr() -> SocketAddr {
     "127.0.0.1:19445".parse().expect("static addr is valid")
 }
 
+/// Where a worker's own SOCKS5 listener binds — set by the supervisor at
+/// `Start` time.
+///
+/// Workstation mode: TCP loopback (`ChainConfig.socks5_bind`). Box mode: a
+/// unix socket the worker binds itself, in the edge-client's own private
+/// runtime directory (`mirage_chain_supervisor::config::worker_socks5_unix_path`)
+/// — never a TCP port (owner ruling 2026-09-23: fleet boxes have no internal
+/// TCP ports). A tagged enum rather than two optional fields on `Start`:
+/// exactly one of these is ever true, and the type makes the other state
+/// unrepresentable instead of merely undocumented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Socks5ListenSpec {
+    Tcp { addr: String },
+    Unix { path: String },
+}
+
 pub use transport::{IpcReader, IpcWriter};
 
 /// Messages sent from supervisor to worker.
@@ -66,7 +83,7 @@ pub enum SupervisorMsg {
     /// Start serving — worker should build pool, bind SOCKS5, signal Ready.
     Start {
         chain_id: String,
-        socks5_bind: String,
+        socks5_listen: Socks5ListenSpec,
         config_path: String,
         /// Initial peer table JSON snapshot from monitor (Phase 8.5).
         /// `None` on cold start before any monitor config is received;
@@ -350,7 +367,7 @@ mod tests {
     fn start_without_peer_table_omits_field() {
         let msg = SupervisorMsg::Start {
             chain_id: "chain-a".to_string(),
-            socks5_bind: "127.0.0.1:1080".to_string(),
+            socks5_listen: Socks5ListenSpec::Tcp { addr: "127.0.0.1:1080".to_string() },
             config_path: "/tmp/cfg.json".to_string(),
             peer_table_json: None,
         };
@@ -376,7 +393,7 @@ mod tests {
         let pt_json = r#"{"generation":3,"peers":[]}"#;
         let msg = SupervisorMsg::Start {
             chain_id: "chain-b".to_string(),
-            socks5_bind: "127.0.0.1:1081".to_string(),
+            socks5_listen: Socks5ListenSpec::Tcp { addr: "127.0.0.1:1081".to_string() },
             config_path: "/tmp/cfg2.json".to_string(),
             peer_table_json: Some(pt_json.to_string()),
         };
@@ -393,6 +410,37 @@ mod tests {
                 assert_eq!(chain_id, "chain-b");
             }
             other => panic!("expected Start{{peer_table_json:Some}}, got {other:?}"),
+        }
+    }
+
+    /// Box mode's `Start` carries `Socks5ListenSpec::Unix` — round-trips
+    /// exactly like the `Tcp` variant, and the tag distinguishes them on
+    /// the wire (never ambiguous which the worker should bind).
+    #[test]
+    fn start_with_unix_socks5_listen_round_trips() {
+        let msg = SupervisorMsg::Start {
+            chain_id: "edge-exit-1".to_string(),
+            socks5_listen: Socks5ListenSpec::Unix {
+                path: "/run/mirage/edge-client/workers/worker-edge-exit-1.sock".to_string(),
+            },
+            config_path: "/etc/mirage/edge-client-config.json".to_string(),
+            peer_table_json: None,
+        };
+        let serialized = serde_json::to_string(&msg).expect("serialize Start (unix listen)");
+        assert!(
+            serialized.contains(r#""kind":"unix""#),
+            "expected unix tag in: {serialized}"
+        );
+        let deserialized: SupervisorMsg =
+            serde_json::from_str(&serialized).expect("deserialize Start (unix listen)");
+        match deserialized {
+            SupervisorMsg::Start {
+                socks5_listen: Socks5ListenSpec::Unix { path },
+                ..
+            } => {
+                assert_eq!(path, "/run/mirage/edge-client/workers/worker-edge-exit-1.sock");
+            }
+            other => panic!("expected Start{{socks5_listen:Unix}}, got {other:?}"),
         }
     }
 

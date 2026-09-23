@@ -87,7 +87,20 @@ fn build_ml_setup(config: &Config) -> Option<MlSetup> {
             MonitorTransportConfig::DirectWs { .. } => {}
             MonitorTransportConfig::OverChain { chain_id, monitor_addr } => {
                 let chain_cfg = config.chains.iter().find(|c| &c.id == chain_id)?;
-                let socks5: std::net::SocketAddr = match chain_cfg.socks5_bind.parse() {
+                // Box-mode chains have no TCP `socks5_bind` for this TCP-SOCKS5
+                // hop to dial through — treated the same as an invalid address:
+                // the whole MonitorLink setup bails, same as before box mode
+                // existed. (Box mode's monitor_transports should use `Wire`
+                // instead, which needs no socks5_bind.)
+                let Some(socks5_str) = chain_cfg.socks5_bind.as_deref() else {
+                    warn!(
+                        "supervisor: build_ml_setup: chain {chain_id} has no socks5_bind \
+                         (box mode) — OverChain transport needs a TCP SOCKS5 hop; \
+                         MonitorLink setup skipped"
+                    );
+                    return None;
+                };
+                let socks5: std::net::SocketAddr = match socks5_str.parse() {
                     Ok(a) => a,
                     Err(e) => {
                         warn!(
@@ -194,6 +207,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Config::load_any(&config_path)
         .with_context(|| format!("loading config from {config_path}"))?;
+    config
+        .validate()
+        .with_context(|| format!("config {config_path} failed validation"))?;
 
     // If no explicit reload_config_path, default to the CLI config path so the
     // operator can trigger chain adoption simply by editing supervisor.toml.
@@ -283,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     Ok(mut new_handle) => {
-                        if let Err(se) = new_handle.send_start(chain, initial_pt.clone()).await {
+                        if let Err(se) = new_handle.send_start(chain, initial_pt.clone(), config.box_mode()).await {
                             error!(chain_id = %chain.id, "send_start failed: {se:#}");
                         }
                         handles.insert(chain.id.clone(), new_handle);
@@ -295,7 +311,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             let mut handle = WorkerHandle::spawn(&binary_path, chain)
                 .with_context(|| format!("spawning worker for chain {}", chain.id))?;
-            handle.send_start(chain, initial_pt.clone()).await?;
+            handle.send_start(chain, initial_pt.clone(), config.box_mode()).await?;
             handles.insert(chain.id.clone(), handle);
         }
     }
@@ -317,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
     // (`routing.listen_local_channel` set) binds a box-local channel instead
     // of a TCP port and never falls back to TCP — see `Config::box_mode`.
     if let Some(routing_cfg) = &config.routing {
+        let box_mode = config.box_mode();
         let whitelist: Option<&Vec<String>> = routing_cfg.chain_ids.as_ref();
         let router_chains: Vec<router_listener::RouterChain> = config
             .chains
@@ -326,17 +343,29 @@ async fn main() -> anyhow::Result<()> {
                 None => true,
             })
             .filter_map(|c| {
-                c.socks5_bind.parse::<std::net::SocketAddr>().ok().map(|addr| {
-                    router_listener::RouterChain {
-                        chain_id: c.id.clone(),
-                        socks5_addr: addr,
-                        policy: mirage_client_core::socks5::SocksFailurePolicy::from_chain_config(
-                            c.kill_switch.as_ref(),
-                            c.group.as_deref(),
-                            &c.id,
-                        ),
-                        nature: c.nature,
-                    }
+                // Box mode: every worker binds a unix socket at a path the
+                // supervisor derives itself — `Config::validate` already
+                // refused this config if `c.socks5_bind` were set instead.
+                // Workstation mode: the worker's TCP `socks5_bind`, as before.
+                let socks5_addr = if box_mode {
+                    Some(router_listener::WorkerSocksAddr::Unix(
+                        config::worker_socks5_unix_path(&c.id),
+                    ))
+                } else {
+                    c.socks5_bind
+                        .as_deref()
+                        .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+                        .map(router_listener::WorkerSocksAddr::Tcp)
+                };
+                socks5_addr.map(|socks5_addr| router_listener::RouterChain {
+                    chain_id: c.id.clone(),
+                    socks5_addr,
+                    policy: mirage_client_core::socks5::SocksFailurePolicy::from_chain_config(
+                        c.kill_switch.as_ref(),
+                        c.group.as_deref(),
+                        &c.id,
+                    ),
+                    nature: c.nature,
                 })
             })
             .collect();
@@ -681,7 +710,7 @@ async fn main() -> anyhow::Result<()> {
                     // Use the last persisted peer_table on respawn so the worker
                     // doesn't start with an empty pool.
                     let respawn_pt = state::load_peer_table(&state_dir_path);
-                    if let Err(e) = new_handle.send_start(chain_cfg, respawn_pt).await {
+                    if let Err(e) = new_handle.send_start(chain_cfg, respawn_pt, config.box_mode()).await {
                         error!(chain_id = %chain_id, "send_start after respawn failed: {e:#}");
                     }
 
