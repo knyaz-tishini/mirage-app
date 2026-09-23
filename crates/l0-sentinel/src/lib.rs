@@ -21,6 +21,7 @@ pub mod access_packet;
 pub mod chain_request;
 pub mod crash_report;
 pub mod debug_shell;
+pub mod entrance_artefact;
 pub mod log_upload;
 pub mod monitor_wire;
 pub mod onboarding;
@@ -127,6 +128,25 @@ pub struct SentinelConfig {
     /// identical `access_packet::AccessPacket::apply`.
     #[serde(default)]
     pub access_packet_path: Option<PathBuf>,
+
+    // ── T1.1: the commercial artefact branch ──────────────────────────
+    //
+    // Fires instead of the whole MonitorLink/cli2 bootstrap above when the
+    // file at `access_packet_path` (or its default) is shaped like an
+    // `EntranceArtefact` rather than a legacy `AccessPacket` — see
+    // `entrance_artefact::detect_kind`, called from `run()` before any
+    // monitor-related state is touched.
+    /// Path to the `mirage-subscriber-client` binary. Defaults to
+    /// `<exe_dir>/mirage-subscriber-client[.exe]` when `None` (the same
+    /// "next to this one" convention as `tun_binary`/`supervisor_binary`).
+    #[serde(default)]
+    pub subscriber_client_binary: Option<PathBuf>,
+    /// Local SOCKS5 bind sentinel spawns the connector with. Must be
+    /// loopback — the connector itself refuses any other bind by name, this
+    /// default simply matches it. See
+    /// `entrance_artefact::DEFAULT_CONNECTOR_BIND`.
+    #[serde(default = "default_subscriber_client_bind")]
+    pub subscriber_client_bind: String,
 
     // ── Stage 3 identity (sent on register; nothing axis-related here) ───
     //
@@ -281,6 +301,9 @@ pub(crate) fn default_telemetry_interval() -> u64 { 0 }
 pub(crate) fn default_logs_upload_interval() -> u64 { 0 }
 pub(crate) fn default_supervisor_args() -> Vec<String> {
     vec!["{client_config_path}".to_owned()]
+}
+pub(crate) fn default_subscriber_client_bind() -> String {
+    entrance_artefact::DEFAULT_CONNECTOR_BIND.to_owned()
 }
 pub(crate) fn default_mesh_id() -> String { "v3-staging".into() }
 pub(crate) fn default_role() -> String { "sentry-client".into() }
@@ -627,32 +650,92 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
     let capability_tokens_path_str: String =
         access_packet::capability_tokens_path(&state_dir).to_string_lossy().into_owned();
 
-    // K2: consume the access packet — the config/QR delivery unit — before
-    // anything below reads persisted state. It is what seeds
-    // monitor_wire.json, client-tokens.json and client-id.txt on a box that
-    // carries no hand-authored files at all. `cfg.access_packet_path` (set
-    // from the binary's `--access <path>` flag) wins when present; otherwise
-    // the default unconsumed `${state_dir}/access.json` is tried. Both entry
-    // points go through the identical `AccessPacket::apply`, which is a
-    // no-op on a repeat of the same packet — a malformed or missing packet
-    // is logged and never blocks boot; sentinel.toml's own static fields
-    // remain the fallback.
+    // K2 / T1.1: consume whatever is at `access_path` — the config/QR
+    // delivery unit — before anything below reads persisted state or builds
+    // a MonitorLink. `cfg.access_packet_path` (set from the binary's
+    // `--access <path>` flag) wins when present; otherwise the default
+    // unconsumed `${state_dir}/access.json` is tried.
+    //
+    // T1.1: the file is no longer assumed to be a legacy `AccessPacket` by
+    // virtue of living at this path — `entrance_artefact::detect_kind`
+    // sniffs its JSON SHAPE (which discriminating field it carries, never
+    // its filename) to tell a commercial `EntranceArtefact` from the
+    // mesh-participant `AccessPacket`. An artefact is parsed and validated
+    // with the SAME parser `mirage-subscriber-client` itself uses
+    // (`mirage_subscriber_client::EntranceArtefact`, shared as a dependency,
+    // not copied); a malformed one is refused by name (which field) and
+    // sentinel falls through to the ordinary boot below exactly as it does
+    // today for a malformed `AccessPacket`. A validated artefact instead
+    // short-circuits `run()` entirely — see `entrance_artefact`'s module doc
+    // for why the rest of this function (wire coords, register, MonitorLink)
+    // must never run on this branch.
     let access_path = cfg
         .access_packet_path
         .clone()
         .unwrap_or_else(|| access_packet::default_path(&state_dir));
+    let mut ready_artefact: Option<PathBuf> = None;
     if access_path.exists() {
         match std::fs::read_to_string(&access_path) {
-            Ok(raw) => match access_packet::AccessPacket::from_json(&raw) {
-                Ok(packet) => {
-                    if let Err(e) = packet.apply(&state_dir) {
-                        error!("[sentinel] access packet at {:?} refused: {}", access_path, e);
+            Ok(raw) => match entrance_artefact::detect_kind(&raw) {
+                Ok(entrance_artefact::DeliveryKind::Artefact) => {
+                    match mirage_subscriber_client::EntranceArtefact::from_json(&raw) {
+                        Ok(artefact) => match artefact.validate() {
+                            Ok(()) => match entrance_artefact::materialise(&state_dir, &artefact) {
+                                Ok(materialised) => {
+                                    info!(
+                                        "[sentinel] entrance artefact at {:?} validated — materialised {:?}",
+                                        access_path, materialised
+                                    );
+                                    ready_artefact = Some(materialised);
+                                }
+                                Err(e) => error!(
+                                    "[sentinel] entrance artefact at {:?} materialise failed: {:#}",
+                                    access_path, e
+                                ),
+                            },
+                            Err(e) => error!(
+                                "[sentinel] entrance artefact at {:?} refused: {}",
+                                access_path, e
+                            ),
+                        },
+                        Err(e) => error!(
+                            "[sentinel] entrance artefact at {:?} did not parse: {}",
+                            access_path, e
+                        ),
                     }
                 }
-                Err(e) => error!("[sentinel] access packet at {:?} invalid: {}", access_path, e),
+                Ok(entrance_artefact::DeliveryKind::Packet) => {
+                    match access_packet::AccessPacket::from_json(&raw) {
+                        Ok(packet) => {
+                            if let Err(e) = packet.apply(&state_dir) {
+                                error!("[sentinel] access packet at {:?} refused: {}", access_path, e);
+                            }
+                        }
+                        Err(e) => error!("[sentinel] access packet at {:?} invalid: {}", access_path, e),
+                    }
+                }
+                Err(e) => error!("[sentinel] delivery file at {:?} refused: {}", access_path, e),
             },
             Err(e) => warn!("[sentinel] access packet at {:?} unreadable: {}", access_path, e),
         }
+    }
+
+    // T1.1 spawn branch: a validated, materialised artefact takes over here
+    // — no wire coords, no register, no MonitorLink. Spawns
+    // `mirage-subscriber-client` via `supervisor::spawn_child` (the exact
+    // primitive the cli2 spawn below also uses) with a restart policy.
+    if let Some(materialised) = ready_artefact {
+        let binary = entrance_artefact::resolve_connector_binary(cfg.subscriber_client_binary.as_ref())
+            .unwrap_or_else(|| {
+                warn!("[sentinel] subscriber-client binary not found via auto-detect; using fallback name");
+                let exe = std::env::consts::EXE_SUFFIX;
+                PathBuf::from(format!("mirage-subscriber-client{exe}"))
+            });
+        let args = entrance_artefact::build_connector_args(&materialised, &cfg.subscriber_client_bind);
+        info!(
+            "[sentinel] EntranceArtefact detected — skipping MonitorLink, spawning the commercial connector"
+        );
+        return entrance_artefact::run(binary, args).await;
     }
 
     // Wire transport coordinates: explicit sentinel.toml fields win; otherwise

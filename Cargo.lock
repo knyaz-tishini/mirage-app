@@ -2731,6 +2731,7 @@ dependencies = [
  "mirage-client-core",
  "mirage-core",
  "mirage-runtime-guard",
+ "mirage-subscriber-client",
  "reqwest",
  "rustls",
  "serde",
