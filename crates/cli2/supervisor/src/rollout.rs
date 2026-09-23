@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use crate::{
     config::ChainConfig,
     state,
-    worker_handle::{HandleState, WorkerHandle},
+    worker_handle::{HandleState, StopOutcome, WorkerHandle},
 };
 
 /// Default seconds supervisor waits for `Drained` before force-killing old worker.
@@ -35,6 +35,7 @@ pub async fn rolling_update(
     chains: &[ChainConfig],
     new_binary: &Path,
     state_dir: &Path,
+    box_mode: bool,
 ) -> anyhow::Result<()> {
     info!(
         binary = ?new_binary,
@@ -43,7 +44,7 @@ pub async fn rolling_update(
     );
 
     for chain in chains {
-        if let Err(e) = update_one_chain(handles, chain, new_binary, state_dir).await {
+        if let Err(e) = update_one_chain(handles, chain, new_binary, state_dir, box_mode).await {
             error!(chain_id = %chain.id, "update failed: {e:#}");
             // Continue with remaining chains rather than aborting the whole rollout.
         }
@@ -54,11 +55,17 @@ pub async fn rolling_update(
 }
 
 /// Replace the worker for a single chain.
+///
+/// Box mode: the old worker is stopped only over its graceful IPC `Drain`
+/// path — see `WorkerHandle::stop`. A worker that does not exit within the
+/// drain wait is fatal for the whole supervisor process, mid-rollout or not:
+/// there is no safe way to reclaim its `socks5_bind` port otherwise.
 async fn update_one_chain(
     handles: &mut HashMap<String, WorkerHandle>,
     chain: &ChainConfig,
     new_binary: &Path,
     state_dir: &Path,
+    box_mode: bool,
 ) -> anyhow::Result<()> {
     info!(chain_id = %chain.id, "updating chain");
 
@@ -82,8 +89,17 @@ async fn update_one_chain(
             .with_context(|| format!("sending Drain to old worker for {}", chain.id))?;
 
         wait_for_drained(old_handle).await;
-        old_handle.kill().await;
-        info!(chain_id = %chain.id, "old worker drained and killed");
+        match old_handle.stop(box_mode).await {
+            StopOutcome::Stopped => info!(chain_id = %chain.id, "old worker drained and stopped"),
+            StopOutcome::StuckInBoxMode => {
+                error!(
+                    chain_id = %chain.id,
+                    "box mode: old worker did not exit after Drain during OTA rollout — \
+                     supervisor exiting non-zero so the warden restarts the unit"
+                );
+                std::process::exit(1);
+            }
+        }
     } else {
         warn!(chain_id = %chain.id, "no existing handle — nothing to drain");
     }
@@ -137,8 +153,16 @@ async fn wait_for_drained(handle: &mut WorkerHandle) {
     .await;
 }
 
-/// Shut down all workers gracefully. Called on supervisor SIGTERM/ctrl-c.
-pub async fn shutdown_all(handles: &mut HashMap<String, WorkerHandle>) {
+/// Shut down all workers gracefully. Called on supervisor SIGTERM/ctrl-c and
+/// on the memory guard's fatal threshold.
+///
+/// Box mode: never calls `kill()`. A worker still alive after `Shutdown` is
+/// fatal for the whole supervisor process — see `WorkerHandle::stop`'s doc.
+/// This exits the supervisor itself as soon as the first stuck worker is
+/// found, which is correct even mid-shutdown: the caller's own subsequent
+/// `std::process::exit(0)` (the ctrl-c and memory-guard call sites) would
+/// otherwise mask a worker the warden needs to know did not stop cleanly.
+pub async fn shutdown_all(handles: &mut HashMap<String, WorkerHandle>, box_mode: bool) {
     for (chain_id, handle) in handles.iter_mut() {
         info!(chain_id = %chain_id, "sending Shutdown");
         if let Err(e) = handle.send_shutdown().await {
@@ -149,9 +173,16 @@ pub async fn shutdown_all(handles: &mut HashMap<String, WorkerHandle>) {
     for (chain_id, handle) in handles.iter_mut() {
         let deadline = Duration::from_secs(DRAIN_TIMEOUT_SECS);
         let _ = timeout(deadline, handle.wait()).await;
-        if handle.state != HandleState::Exited {
-            warn!(chain_id = %chain_id, "worker did not exit — killing");
-            handle.kill().await;
+        match handle.stop(box_mode).await {
+            StopOutcome::Stopped => {}
+            StopOutcome::StuckInBoxMode => {
+                error!(
+                    chain_id = %chain_id,
+                    "box mode: worker did not exit after Shutdown — supervisor exiting \
+                     non-zero so the warden restarts the unit"
+                );
+                std::process::exit(1);
+            }
         }
     }
 }

@@ -53,6 +53,20 @@ pub enum HandleState {
     Exited,
 }
 
+/// Outcome of [`WorkerHandle::stop`]. See that method's doc for the box-mode
+/// contract — `StuckInBoxMode` is never resolved by retrying `stop()` again;
+/// the caller must exit the supervisor process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The worker reached `Exited` — either it stopped itself over the
+    /// graceful IPC path, or (workstation mode only) `kill()` was applied.
+    Stopped,
+    /// Box mode only: the worker did not reach `Exited` within the caller's
+    /// wait, and `kill()` was never attempted (eBPF denies it once the
+    /// warden's cgroup is armed). The whole supervisor must exit non-zero.
+    StuckInBoxMode,
+}
+
 /// Messages forwarded from the per-handle reader task to the supervisor loop.
 #[derive(Debug)]
 pub struct WorkerEvent {
@@ -447,6 +461,42 @@ impl WorkerHandle {
         self.state = HandleState::Exited;
     }
 
+    /// Stop this worker after the caller has already asked it to drain/shut
+    /// down over IPC (`send_drain` / `send_shutdown`) and drained
+    /// `WorkerMsg` events into `apply_msg` — i.e. after the same bounded wait
+    /// every existing stop path already performs.
+    ///
+    /// Workstation mode (`box_mode = false`): unchanged behaviour.
+    /// Unconditionally calls [`Self::kill`] — a no-op that only sets
+    /// `Exited` when the worker already stopped on its own (reattached
+    /// orphans have no owned `Child` either; `kill()` is harmless there too).
+    ///
+    /// Box mode (`box_mode = true`): NEVER calls `kill()`. The supervisor's
+    /// own process runs inside the warden's kill-protected cgroup once
+    /// armed, and every worker is spawned into the SAME cgroup
+    /// (`spawn_with_tracker`'s `setsid()`, not a child of a different unit) —
+    /// `child.kill()` would be denied EPERM for a worker exactly as it would
+    /// be for the supervisor itself. If the worker already reached `Exited`
+    /// (the graceful IPC stop worked), this is a no-op returning `Stopped`.
+    /// If it did not, this returns `StopOutcome::StuckInBoxMode` and leaves
+    /// the process untouched — the caller must log the worker by name and
+    /// exit the whole supervisor non-zero so the warden restarts the unit
+    /// (see the three call sites in `reconcile.rs` / `rollout.rs`).
+    pub async fn stop(&mut self, box_mode: bool) -> StopOutcome {
+        // One last chance to observe an OS-level exit that raced the
+        // caller's wait loop. No-op for reattached orphans (no owned
+        // `Child`) — cheap otherwise.
+        let _ = self.try_wait();
+        if self.state == HandleState::Exited {
+            return StopOutcome::Stopped;
+        }
+        if box_mode {
+            return StopOutcome::StuckInBoxMode;
+        }
+        self.kill().await;
+        StopOutcome::Stopped
+    }
+
     /// Process a received WorkerMsg and update handle state.
     ///
     /// `PeerTableSnapshot` / `CredentialParamsSnapshot` are intentionally NOT
@@ -528,5 +578,133 @@ async fn ipc_relay_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mirage_chain_ipc::pipe::{PipeListener, connect};
+
+    /// Build a connected `(supervisor-side, worker-side)` `PipePair` pair
+    /// over a fresh pipe/socket name, so parallel `cargo test` runs never
+    /// collide. Mirrors the real supervisor↔worker wiring (worker binds,
+    /// supervisor connects — `pipe.rs`'s own doc) without spawning a real
+    /// worker process: the test drives the worker side directly as the
+    /// "mock worker" the task asks for.
+    async fn connected_test_pipes(tag: &str) -> (PipePair, PipePair) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let chain_id = format!("test-{tag}-{}-{n}", std::process::id());
+        let path = pipe_path(&chain_id);
+        let mut listener = PipeListener::bind(&path).expect("bind test pipe");
+        let (client, server) = tokio::join!(connect(&path), listener.accept());
+        (
+            client.expect("supervisor-side connect"),
+            server.expect("worker-side accept"),
+        )
+    }
+
+    /// Graceful stop path: the mock worker answers `Drain` with
+    /// `Draining`→`Drained`, exactly like the real worker's `handle_session`
+    /// (`worker/src/main.rs`). Box mode must resolve this via the IPC path
+    /// alone — `stop(true)` must never need `kill()`.
+    #[tokio::test]
+    async fn stop_box_mode_graceful_worker_exits_without_kill() {
+        let (client_ipc, mut server_ipc) = connected_test_pipes("graceful").await;
+
+        let mock_worker = tokio::spawn(async move {
+            match server_ipc.read_msg::<SupervisorMsg>().await {
+                Ok(Some(SupervisorMsg::Drain { .. })) => {}
+                other => panic!("mock worker expected Drain, got {other:?}"),
+            }
+            server_ipc
+                .write_msg(&WorkerMsg::Draining {
+                    chain_id: "c1".to_string(),
+                    active_connections: 0,
+                })
+                .await
+                .expect("mock worker write Draining");
+            server_ipc
+                .write_msg(&WorkerMsg::Drained { chain_id: "c1".to_string() })
+                .await
+                .expect("mock worker write Drained");
+        });
+
+        let mut handle = WorkerHandle::reattach("c1".to_string(), 4242, client_ipc);
+        handle.send_drain(5).await.expect("send_drain");
+
+        // Drain the WorkerMsg stream the same way `wait_for_drained_reconcile`
+        // does — apply every event, stop once Exited.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout_at(deadline, handle.rx.recv())
+                .await
+                .expect("timed out waiting for Drained")
+                .expect("worker channel closed before Drained");
+            handle.apply_msg(&event.msg);
+            if handle.state == HandleState::Exited {
+                break;
+            }
+        }
+
+        assert_eq!(handle.stop(true).await, StopOutcome::Stopped);
+        let _ = mock_worker.await;
+    }
+
+    /// Exit-when-stuck path: the mock worker accepts the connection but never
+    /// answers `Drain` — the case `ManagedKillable` box mode exists for.
+    /// `stop(true)` must report `StuckInBoxMode` and must NOT touch the
+    /// process (there is nothing here to observe that directly, but the
+    /// absence of a panic/hang proves `kill()` was never invoked on a stream
+    /// this handle has no OS process behind).
+    #[tokio::test]
+    async fn stop_box_mode_returns_stuck_when_worker_never_responds() {
+        let (client_ipc, mut server_ipc) = connected_test_pipes("stuck").await;
+
+        let mock_worker = tokio::spawn(async move {
+            let _ = server_ipc.read_msg::<SupervisorMsg>().await;
+            // Hold the connection open without ever responding.
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        });
+
+        let mut handle = WorkerHandle::reattach("c2".to_string(), 4343, client_ipc);
+        handle.send_drain(5).await.expect("send_drain");
+
+        // Bounded wait that elapses with nothing received — mirrors what a
+        // caller's `wait_for_drained`-style loop does under its own timeout.
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(100), handle.rx.recv()).await;
+
+        assert_eq!(
+            handle.state,
+            HandleState::Draining,
+            "send_drain sets Draining immediately; nothing since has updated it"
+        );
+        assert_eq!(handle.stop(true).await, StopOutcome::StuckInBoxMode);
+
+        mock_worker.abort();
+    }
+
+    /// Workstation mode keeps today's behaviour: `stop(false)` still
+    /// resolves even though the mock worker never acknowledged — `kill()`
+    /// unconditionally marks the handle `Exited` (a reattached handle has no
+    /// owned `Child`, so this is the same no-op `kill()` already documents,
+    /// not a new code path).
+    #[tokio::test]
+    async fn stop_workstation_mode_kills_even_without_worker_response() {
+        let (client_ipc, mut server_ipc) = connected_test_pipes("workstation").await;
+
+        let mock_worker = tokio::spawn(async move {
+            let _ = server_ipc.read_msg::<SupervisorMsg>().await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        });
+
+        let mut handle = WorkerHandle::reattach("c3".to_string(), 4444, client_ipc);
+        handle.send_drain(5).await.expect("send_drain");
+
+        assert_eq!(handle.stop(false).await, StopOutcome::Stopped);
+        assert_eq!(handle.state, HandleState::Exited);
+
+        mock_worker.abort();
     }
 }

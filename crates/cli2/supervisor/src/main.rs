@@ -312,42 +312,59 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Supervisor-level router SOCKS5 listener ───────────────────────────────
     // When `[routing]` is configured in supervisor.toml, bind a router-facing
-    // SOCKS5 port. Connections to this port are dispatched to worker SOCKS5
-    // ports using the configured policy (default: round-robin).
+    // SOCKS5 listener. Connections are dispatched to worker SOCKS5 ports using
+    // the configured policy (default: round-robin). Box mode
+    // (`routing.listen_local_channel` set) binds a box-local channel instead
+    // of a TCP port and never falls back to TCP — see `Config::box_mode`.
     if let Some(routing_cfg) = &config.routing {
-        let bind_str = routing_cfg.socks5_bind.clone();
-        match bind_str.parse::<std::net::SocketAddr>() {
-            Err(e) => {
-                warn!(bind = %bind_str, "routing.socks5_bind is invalid: {e} — router listener not started");
-            }
-            Ok(bind_addr) => {
-                let whitelist: Option<&Vec<String>> = routing_cfg.chain_ids.as_ref();
-                let router_chains: Vec<router_listener::RouterChain> = config
-                    .chains
-                    .iter()
-                    .filter(|c| match whitelist {
-                        Some(ids) => ids.iter().any(|id| id == &c.id),
-                        None => true,
-                    })
-                    .filter_map(|c| {
-                        c.socks5_bind.parse::<std::net::SocketAddr>().ok().map(|addr| {
-                            router_listener::RouterChain {
-                                chain_id: c.id.clone(),
-                                socks5_addr: addr,
-                                policy: mirage_client_core::socks5::SocksFailurePolicy::from_chain_config(
-                                    c.kill_switch.as_ref(),
-                                    c.group.as_deref(),
-                                    &c.id,
-                                ),
-                                nature: c.nature,
-                            }
-                        })
-                    })
-                    .collect();
+        let whitelist: Option<&Vec<String>> = routing_cfg.chain_ids.as_ref();
+        let router_chains: Vec<router_listener::RouterChain> = config
+            .chains
+            .iter()
+            .filter(|c| match whitelist {
+                Some(ids) => ids.iter().any(|id| id == &c.id),
+                None => true,
+            })
+            .filter_map(|c| {
+                c.socks5_bind.parse::<std::net::SocketAddr>().ok().map(|addr| {
+                    router_listener::RouterChain {
+                        chain_id: c.id.clone(),
+                        socks5_addr: addr,
+                        policy: mirage_client_core::socks5::SocksFailurePolicy::from_chain_config(
+                            c.kill_switch.as_ref(),
+                            c.group.as_deref(),
+                            &c.id,
+                        ),
+                        nature: c.nature,
+                    }
+                })
+            })
+            .collect();
 
-                if router_chains.is_empty() {
-                    warn!("routing configured but no valid chain socks5_bind addresses — router listener not started");
-                } else {
+        if router_chains.is_empty() {
+            warn!("routing configured but no valid chain socks5_bind addresses — router listener not started");
+        } else if let Some(channel_name) = &routing_cfg.listen_local_channel {
+            match router_listener::resolve_local_channel(channel_name) {
+                Some(channel) => {
+                    let router = router_listener::SupervisorRouter::new(router_chains);
+                    router_listener::spawn_router_listener_local_channel(channel, router);
+                    info!(channel = channel.label(), "supervisor router local-channel listener spawned (box mode)");
+                }
+                None => {
+                    error!(
+                        channel = %channel_name,
+                        "routing.listen_local_channel names an unknown channel — box-mode router \
+                         listener NOT started (fail closed; box mode never falls back to a TCP port)"
+                    );
+                }
+            }
+        } else {
+            let bind_str = routing_cfg.socks5_bind.clone();
+            match bind_str.parse::<std::net::SocketAddr>() {
+                Err(e) => {
+                    warn!(bind = %bind_str, "routing.socks5_bind is invalid: {e} — router listener not started");
+                }
+                Ok(bind_addr) => {
                     let router = router_listener::SupervisorRouter::new(router_chains);
                     router_listener::spawn_router_listener(bind_addr, router);
                     info!(addr = %bind_addr, "supervisor router listener spawned");
@@ -698,13 +715,13 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             _ = &mut shutdown => {
                 info!("ctrl-c — shutting down all workers");
-                shutdown_all(&mut handles).await;
+                shutdown_all(&mut handles, config.box_mode()).await;
                 break;
             }
 
             _ = fatal_rx.recv() => {
                 warn!("memory guard: fatal threshold — shutting down workers and exiting");
-                shutdown_all(&mut handles).await;
+                shutdown_all(&mut handles, config.box_mode()).await;
                 std::process::exit(0);
             }
 
@@ -777,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
                                     &config.chains,
                                     &new_binary,
                                     &state_dir_path,
+                                    config.box_mode(),
                                 )
                                 .await
                                 {

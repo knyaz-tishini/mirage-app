@@ -19,8 +19,9 @@ use std::{
 
 use mirage_client_core::{socks5::SocksFailurePolicy, wire_health::WireHealthMap};
 use mirage_core::config::WireNature;
+use mirage_core::local_endpoint::LocalChannel;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tracing::{debug, error, info, warn};
@@ -153,12 +154,72 @@ async fn run_router_listener(
     }
 }
 
+// ── Box mode: local-channel listener ──────────────────────────────────────────
+
+/// Resolve `routing.listen_local_channel` to the [`LocalChannel`] it names.
+///
+/// Only `"edge-client-entrance"` — [`LocalChannel::EdgeClientEntrance`]'s own
+/// stable label — resolves today. Any other string is `None`, and the caller
+/// (`main.rs`) treats that as a hard config error: box mode never falls back
+/// to the TCP `socks5_bind` listener, because fleet boxes have no internal
+/// TCP ports (owner ruling 2026-09-23).
+pub fn resolve_local_channel(name: &str) -> Option<LocalChannel> {
+    match name {
+        "edge-client-entrance" => Some(LocalChannel::EdgeClientEntrance),
+        _ => None,
+    }
+}
+
+/// Spawn the supervisor SOCKS5 router listener on a box-local channel —
+/// box mode's counterpart to [`spawn_router_listener`]. The channel carries
+/// the SAME SOCKS5 protocol as the TCP listener; only the transport changes
+/// (unix socket on the fleet, loopback TCP on the Windows/test arm — see
+/// [`LocalChannel::endpoint`]). The node's entrance dials in as the
+/// [`LocalChannel::EdgeClientEntrance`] client and sends SOCKS5 CONNECT with
+/// the subscriber's destination, exactly like a workstation SOCKS5 client
+/// does against the TCP listener.
+pub fn spawn_router_listener_local_channel(channel: LocalChannel, router: Arc<SupervisorRouter>) {
+    tokio::spawn(async move {
+        match run_router_listener_local_channel(channel, router).await {
+            Ok(()) => {}
+            Err(e) => error!(channel = channel.label(), "box-mode router listener exited with error: {e}"),
+        }
+    });
+}
+
+async fn run_router_listener_local_channel(
+    channel: LocalChannel,
+    router: Arc<SupervisorRouter>,
+) -> std::io::Result<()> {
+    let listener = channel.bind().await?;
+    info!(channel = channel.label(), "supervisor router local-channel listener started (box mode)");
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        debug!(?peer, "router: new connection (box mode)");
+
+        let router = Arc::clone(&router);
+        tokio::spawn(async move {
+            if let Err(e) = handle_router_connection(stream, &router).await {
+                warn!(?peer, "router connection error: {e}");
+            }
+        });
+    }
+}
+
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_router_connection(
-    mut client: TcpStream,
-    router: &SupervisorRouter,
-) -> std::io::Result<()> {
+/// Handle one client connection and relay it through a worker's SOCKS5 port.
+///
+/// Generic over the client-facing stream so the SAME SOCKS5 parsing and
+/// worker-forwarding logic serves both listeners: `TcpStream` for the
+/// workstation-mode TCP router, `mirage_core::local_endpoint::LocalStream`
+/// for the box-mode local-channel router. The wire protocol carried is
+/// identical either way — only the transport underneath `client` differs.
+async fn handle_router_connection<S>(mut client: S, router: &SupervisorRouter) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // ── 1. SOCKS5 greeting ─────────────────────────────────────────────────
     let mut hdr = [0u8; 2];
     client.read_exact(&mut hdr).await?;
@@ -242,10 +303,10 @@ async fn handle_router_connection(
 }
 
 /// Read the SOCKS5 target address + port from the stream.
-async fn read_socks5_target(
-    stream: &mut TcpStream,
-    atyp: u8,
-) -> std::io::Result<(String, u16)> {
+async fn read_socks5_target<S>(stream: &mut S, atyp: u8) -> std::io::Result<(String, u16)>
+where
+    S: AsyncRead + Unpin,
+{
     match atyp {
         ATYP_IPV4 => {
             let mut buf = [0u8; 4];
@@ -293,14 +354,17 @@ const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 ///
 /// This implements a second SOCKS5 handshake to the worker, then splices data
 /// between client and the upstream connection.
-async fn forward_via_worker(
-    client: &mut TcpStream,
+async fn forward_via_worker<S>(
+    client: &mut S,
     worker_addr: SocketAddr,
     target_host: &str,
     target_port: u16,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let handshake = async {
-        let mut worker = tokio::net::TcpStream::connect(worker_addr).await?;
+        let mut worker = TcpStream::connect(worker_addr).await?;
         worker.write_all(&[VER, 1, AUTH_NONE]).await?;
         let mut resp = [0u8; 2];
         worker.read_exact(&mut resp).await?;
@@ -375,14 +439,141 @@ async fn forward_via_worker(
         .map_err(std::io::Error::from)
 }
 
-async fn write_socks5_success(stream: &mut TcpStream) {
+async fn write_socks5_success<S: AsyncWrite + Unpin>(stream: &mut S) {
     let _ = stream
         .write_all(&[VER, REP_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await;
 }
 
-async fn write_socks5_error(stream: &mut TcpStream, rep: u8) {
+async fn write_socks5_error<S: AsyncWrite + Unpin>(stream: &mut S, rep: u8) {
     let _ = stream
         .write_all(&[VER, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_local_channel_maps_edge_client_entrance() {
+        assert_eq!(
+            resolve_local_channel("edge-client-entrance"),
+            Some(LocalChannel::EdgeClientEntrance)
+        );
+        // The resolved channel's own label round-trips — the config string
+        // IS the channel's stable name, not a parallel vocabulary.
+        assert_eq!(LocalChannel::EdgeClientEntrance.label(), "edge-client-entrance");
+    }
+
+    #[test]
+    fn resolve_local_channel_rejects_unknown_names() {
+        assert_eq!(resolve_local_channel(""), None);
+        assert_eq!(resolve_local_channel("node-chain"), None);
+        assert_eq!(resolve_local_channel("edge-client-entrance "), None);
+    }
+
+    /// A unix-socket round trip through `handle_router_connection` — the same
+    /// per-connection function the box-mode local-channel listener drives.
+    ///
+    /// Binds a REAL unix socket under the OS temp dir rather than through
+    /// `mirage_core::local_endpoint::LocalChannel::bind()`: that helper binds
+    /// the hardcoded fleet path `/run/mirage/...` and applies a uid grant via
+    /// `getpwnam_r`, both privileged operations this crate does not own and
+    /// must not re-test here (mirage2web is read-only for this task; its own
+    /// bind/grant contract has its own tests). What this test proves is OURS:
+    /// that a SOCKS5 CONNECT arriving over a `UnixStream` — the shape the
+    /// node's entrance actually sends once `LocalChannel::bind()` hands the
+    /// listener a connection — is parsed and relayed exactly like the TCP
+    /// listener's, ending at a worker's SOCKS5 port and echoing bytes back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socks5_connect_over_unix_stream_reaches_router() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use tokio::net::{UnixListener, UnixStream};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let sock_path = std::env::temp_dir()
+            .join(format!("cli2-router-test-{}-{n}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+
+        // Mock worker: a bare TCP SOCKS5 upstream that accepts one CONNECT
+        // and then echoes bytes — proves the relay is bidirectional, not just
+        // that the reply header was forwarded.
+        let worker_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock worker");
+        let worker_addr = worker_listener.local_addr().expect("worker addr");
+        tokio::spawn(async move {
+            let (mut w, _) = worker_listener.accept().await.expect("worker accept");
+            let mut greeting = [0u8; 3];
+            w.read_exact(&mut greeting).await.expect("worker read greeting");
+            w.write_all(&[VER, AUTH_NONE]).await.expect("worker auth reply");
+            let mut req_hdr = [0u8; 5];
+            w.read_exact(&mut req_hdr).await.expect("worker read req hdr");
+            let host_len = req_hdr[4] as usize;
+            let mut rest = vec![0u8; host_len + 2];
+            w.read_exact(&mut rest).await.expect("worker read host+port");
+            w.write_all(&[VER, REP_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+                .await
+                .expect("worker connect reply");
+            // Echo whatever the relay sends until EOF.
+            let mut buf = [0u8; 256];
+            loop {
+                match w.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let router = SupervisorRouter::new(vec![RouterChain {
+            chain_id: "test-chain".to_string(),
+            socks5_addr: worker_addr,
+            policy: SocksFailurePolicy::Default,
+            nature: WireNature::Direct,
+        }]);
+
+        let unix_listener = UnixListener::bind(&sock_path).expect("bind unix test socket");
+        let accept_task = tokio::spawn(async move {
+            let (stream, _addr) = unix_listener.accept().await.expect("unix accept");
+            handle_router_connection(stream, &router).await
+        });
+
+        let mut client = UnixStream::connect(&sock_path)
+            .await
+            .expect("client connect to unix socket");
+
+        // SOCKS5 greeting: ver=5, 1 method, no-auth.
+        client.write_all(&[VER, 1, AUTH_NONE]).await.expect("write greeting");
+        let mut greeting_reply = [0u8; 2];
+        client.read_exact(&mut greeting_reply).await.expect("read greeting reply");
+        assert_eq!(greeting_reply, [VER, AUTH_NONE]);
+
+        // CONNECT request: domain "example.com":80.
+        let host = b"example.com";
+        let mut req = vec![VER, CMD_CONNECT, 0x00, ATYP_DOMAIN, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        client.write_all(&req).await.expect("write connect request");
+
+        let mut connect_reply = [0u8; 10];
+        client.read_exact(&mut connect_reply).await.expect("read connect reply");
+        assert_eq!(connect_reply[..2], [VER, REP_SUCCESS]);
+
+        // Data plane: send bytes, expect them echoed back through the worker.
+        client.write_all(b"ping").await.expect("write payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.expect("read echoed payload");
+        assert_eq!(&echoed, b"ping");
+
+        drop(client);
+        let _ = accept_task.await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
 }

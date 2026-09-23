@@ -123,6 +123,31 @@ pub struct RoutingConfig {
     /// every chain in `[[chains]]` is eligible.
     #[serde(default)]
     pub chain_ids: Option<Vec<String>>,
+
+    /// Box mode: bind the router's client-facing listener on a box-local
+    /// channel (`mirage_core::local_endpoint::LocalChannel`, a unix socket
+    /// on the fleet, loopback TCP only on the Windows/test arm) instead of
+    /// `socks5_bind`.
+    ///
+    /// The value names the channel by its stable label
+    /// (`LocalChannel::label()`) — today only `"edge-client-entrance"`
+    /// resolves (see `router_listener::resolve_local_channel`). Any other
+    /// value is a hard config error at startup: the router listener refuses
+    /// to start rather than silently falling back to the TCP `socks5_bind`
+    /// port, because fleet boxes have no internal TCP ports (owner ruling
+    /// 2026-09-23).
+    ///
+    /// `None` (the default): workstation mode, unchanged — TCP SOCKS5 on
+    /// `socks5_bind`.
+    ///
+    /// This single field is the sole selector of "box mode" for the whole
+    /// supervisor process — see [`Config::box_mode`]. It also governs how a
+    /// worker is stopped: box mode never calls `child.kill()` (the
+    /// supervisor's cgroup is kill-protected by the warden once armed, and
+    /// every worker lives in the same cgroup), only the worker's own
+    /// graceful IPC `Drain`/`Shutdown` path — see `worker_handle::StopOutcome`.
+    #[serde(default)]
+    pub listen_local_channel: Option<String>,
 }
 
 fn default_policy() -> String {
@@ -216,6 +241,24 @@ fn default_monitor_addr() -> SocketAddr {
 }
 
 impl Config {
+    /// Whether this supervisor process runs in box mode — the `edge-client`
+    /// Mirage unit under the warden, entrance on a box-local channel, workers
+    /// stopped only over their own graceful IPC path, never `kill()`.
+    ///
+    /// Sole selector: `routing.listen_local_channel` being set. There is
+    /// deliberately no second flag — a box that binds the box-local entrance
+    /// but still tries `kill()` on a stuck worker (denied EPERM once the
+    /// warden arms the cgroup) is a worse state than either mode cleanly
+    /// applied, so one field decides both the listener transport
+    /// (`router_listener::resolve_local_channel`) and the worker-stop
+    /// mechanism (`worker_handle::WorkerHandle::stop`).
+    pub fn box_mode(&self) -> bool {
+        self.routing
+            .as_ref()
+            .and_then(|r| r.listen_local_channel.as_deref())
+            .is_some()
+    }
+
     /// Load a config file, auto-detecting the format.
     ///
     /// A `.json` path (or a file whose first non-whitespace byte is `{`) is
@@ -336,6 +379,12 @@ impl Config {
             policy: r.policy.clone(),
             socks5_bind: r.socks5_bind.clone(),
             chain_ids: r.chain_ids.clone(),
+            // Box mode is never selected via the sentinel-managed JSON path —
+            // `mirage_core::config`'s routing sub-object carries no such
+            // field. Only an operator-authored `supervisor.toml` for the
+            // dedicated `edge-client` unit sets it (parsed directly by
+            // `load_any`'s TOML branch, below `from_client_config`).
+            listen_local_channel: None,
         });
 
         if cc.monitor_url.is_none() {
@@ -364,5 +413,73 @@ impl Config {
             dns: Some(cc.dns.clone()),
             http_proxy: Some(cc.http_proxy.clone()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOX_MODE_TOML: &str = r#"
+monitor_url = "https://lm-nl.example.net:19443"
+ota_pubkey = "deadbeef"
+worker_binary = "mirage-chain-worker"
+
+[[chains]]
+id = "edge-exit-1"
+socks5_bind = "127.0.0.1:19500"
+config_path = "/etc/mirage/edge-client-config.json"
+
+[routing]
+listen_local_channel = "edge-client-entrance"
+"#;
+
+    #[test]
+    fn box_mode_toml_parses_listen_local_channel() {
+        let cfg: Config = toml::from_str(BOX_MODE_TOML).expect("box-mode TOML parses");
+        let routing = cfg.routing.as_ref().expect("[routing] present");
+        assert_eq!(
+            routing.listen_local_channel.as_deref(),
+            Some("edge-client-entrance")
+        );
+        assert!(cfg.box_mode(), "box_mode() must be true once listen_local_channel is set");
+    }
+
+    #[test]
+    fn workstation_toml_has_no_box_mode() {
+        let toml_text = r#"
+monitor_url = "https://lm-nl.example.net:19443"
+ota_pubkey = "deadbeef"
+worker_binary = "mirage-chain-worker"
+
+[[chains]]
+id = "c1"
+socks5_bind = "127.0.0.1:19500"
+config_path = "/etc/mirage/client-config.json"
+
+[routing]
+socks5_bind = "127.0.0.1:19489"
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("workstation TOML parses");
+        let routing = cfg.routing.as_ref().expect("[routing] present");
+        assert_eq!(routing.listen_local_channel, None);
+        assert!(!cfg.box_mode(), "box_mode() must stay false without listen_local_channel");
+    }
+
+    #[test]
+    fn no_routing_block_is_not_box_mode() {
+        let toml_text = r#"
+monitor_url = "https://lm-nl.example.net:19443"
+ota_pubkey = "deadbeef"
+worker_binary = "mirage-chain-worker"
+
+[[chains]]
+id = "c1"
+socks5_bind = "127.0.0.1:19500"
+config_path = "/etc/mirage/client-config.json"
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("no-routing TOML parses");
+        assert!(cfg.routing.is_none());
+        assert!(!cfg.box_mode());
     }
 }

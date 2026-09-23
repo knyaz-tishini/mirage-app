@@ -17,13 +17,13 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     config::{ChainConfig, Config, MonitorTransportConfig},
     state,
     tun_registry::push_tun_registry,
-    worker_handle::{HandleState, WorkerHandle},
+    worker_handle::{HandleState, StopOutcome, WorkerHandle},
 };
 
 use mirage_chain_ipc::MonitorTransportSpec;
@@ -46,6 +46,7 @@ pub async fn reconcile(
     state_dir: &Path,
 ) {
     let new_chains: &[ChainConfig] = &config.chains;
+    let box_mode = config.box_mode();
 
     // ── 1. Classify every chain id ─────────────────────────────────────────────
 
@@ -99,17 +100,17 @@ pub async fn reconcile(
     // ── 2. Drain+kill removed workers ─────────────────────────────────────────
 
     for chain_id in &to_remove {
-        drain_and_kill(handles, chain_id, "removed").await;
+        drain_and_stop(handles, chain_id, "removed", box_mode).await;
     }
 
-    // ── 3. Drain+kill changed workers BEFORE spawning replacements ─────────────
+    // ── 3. Drain+stop changed workers BEFORE spawning replacements ─────────────
     //
     // This ordering is the fix for bug 16 (port-contention): we stop the old
     // worker and wait for its OS process to release the port before spawning the
     // new one.
 
     for chain in &to_replace {
-        drain_and_kill(handles, &chain.id, "changed — stopping before respawn").await;
+        drain_and_stop(handles, &chain.id, "changed — stopping before respawn", box_mode).await;
     }
 
     // ── 4. Spawn new / replacement workers ────────────────────────────────────
@@ -193,12 +194,17 @@ pub async fn reconcile(
     }
 }
 
-/// Drain+kill one worker by chain_id, waiting for exit.
+/// Drain+stop one worker by chain_id, waiting for exit.
 /// No-op if the handle is not present or already exited.
-async fn drain_and_kill(
+///
+/// Box mode: never calls `kill()`. A worker that does not exit on its own
+/// after `Drain` is fatal for the whole supervisor process — see
+/// `WorkerHandle::stop`'s doc.
+async fn drain_and_stop(
     handles: &mut HashMap<String, WorkerHandle>,
     chain_id: &str,
     reason: &str,
+    box_mode: bool,
 ) {
     let Some(handle) = handles.get_mut(chain_id) else {
         return;
@@ -209,12 +215,21 @@ async fn drain_and_kill(
 
     info!(chain_id, reason, "reconcile: draining worker");
     if let Err(e) = handle.send_drain(RECONCILE_DRAIN_SECS).await {
-        warn!(chain_id, "reconcile: send_drain failed: {e:#} — killing directly");
+        warn!(chain_id, "reconcile: send_drain failed: {e:#}");
     } else {
         wait_for_drained_reconcile(handle).await;
     }
-    handle.kill().await;
-    info!(chain_id, "reconcile: worker stopped");
+    match handle.stop(box_mode).await {
+        StopOutcome::Stopped => info!(chain_id, "reconcile: worker stopped"),
+        StopOutcome::StuckInBoxMode => {
+            error!(
+                chain_id,
+                "box mode: worker did not exit after graceful Drain — supervisor exiting \
+                 non-zero so the warden restarts the unit"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Wait up to `RECONCILE_DRAIN_SECS + 5` for the handle to reach Exited.
