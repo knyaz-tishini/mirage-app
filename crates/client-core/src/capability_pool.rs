@@ -189,6 +189,23 @@ pub fn has_capability_authority(params: Option<&CredentialParams>) -> bool {
     })
 }
 
+/// True when `params` advertises a RoleSigned (`0x05`) authority.
+///
+/// RoleSigned is an EDGE-BOX credential: the box-side edge presents its own
+/// operator-signed Edge identity to an exit. A client in public-mesh or
+/// dedicated-edge mode knows only its edge's address and never holds — and
+/// must never present — this credential (owner ruling 2026-09-24). If a
+/// monitor ever declares it as a client-facing epoch scheme, that is a
+/// server-side misconfiguration; the client refuses the dial rather than
+/// sending no credential or panicking. See [`role_signed_refusal_error`].
+pub fn has_role_signed_authority(params: Option<&CredentialParams>) -> bool {
+    params.is_some_and(|p| {
+        p.authorities
+            .iter()
+            .any(|a| a.scheme == CredentialScheme::RoleSigned)
+    })
+}
+
 /// Outcome of asking the capability provider for a dial credential.
 pub(crate) enum CapabilityDial {
     /// No SignedCapability authority in params — the caller falls back to the
@@ -202,18 +219,29 @@ pub(crate) enum CapabilityDial {
     /// node a handshake. The caller surfaces this as a dial error so the
     /// slot's reconnect/backoff retries once tokens are provisioned.
     Unavailable,
+    /// A RoleSigned (`0x05`) authority is active — an edge-box-only
+    /// credential a client can never hold or mint. The dial must NOT proceed
+    /// credential-less and must NOT panic; the caller surfaces this as a
+    /// named refusal (see [`role_signed_refusal_error`]) instead of
+    /// attempting a ring/blind/capability selection that would never apply.
+    RoleSignedRefused,
 }
 
 /// Select the `0x02` pre-minted credential for one dial.
 ///
-/// Priority is driven by the authorities in `params`: when a SignedCapability
-/// authority is present, the dial presents a capability token and the ring /
-/// blind pools are left untouched (a 0x03/0x04 token would be rejected by a
-/// 0x02 fleet anyway, and popping one would waste it).
+/// Priority is driven by the authorities in `params`: RoleSigned (`0x05`)
+/// wins first — a client refuses outright, since it is edge-box-only and the
+/// client can never present it. Otherwise, when a SignedCapability authority
+/// is present, the dial presents a capability token and the ring / blind
+/// pools are left untouched (a 0x03/0x04 token would be rejected by a 0x02
+/// fleet anyway, and popping one would waste it).
 pub(crate) fn capability_credential_for_dial(
     params: Option<&CredentialParams>,
     capability: &CapabilityTokenCell,
 ) -> CapabilityDial {
+    if has_role_signed_authority(params) {
+        return CapabilityDial::RoleSignedRefused;
+    }
     if !has_capability_authority(params) {
         return CapabilityDial::NotActive;
     }
@@ -232,6 +260,18 @@ pub(crate) fn capability_unavailable_error() -> mirage_core::error::MirageError 
         "capability token source empty while a SignedCapability authority is active — \
          dial withheld (never dial credential-less under 0x02)"
             .to_string(),
+    )
+}
+
+/// Error surfaced when a dial cannot proceed under
+/// [`CapabilityDial::RoleSignedRefused`].
+///
+/// Named so a caller (and its logs) can tell this apart from an ordinary
+/// transient credential shortage: this scheme can never become available to
+/// a client, no matter how long it waits.
+pub(crate) fn role_signed_refusal_error() -> mirage_core::error::MirageError {
+    mirage_core::error::MirageError::Protocol(
+        "role_signed is an edge-box credential; a client cannot present it".to_string(),
     )
 }
 
@@ -440,6 +480,59 @@ mod tests {
         ));
         // The synthetic error must NOT masquerade as a node-side rejection.
         let err = capability_unavailable_error();
+        assert!(!crate::pool::is_credential_rejected(&err));
+    }
+
+    // ── RoleSigned (0x05) refusal ────────────────────────────────────────────
+
+    /// `has_role_signed_authority` is `true` only when a RoleSigned authority
+    /// is present, `false` for every other scheme and for absent params.
+    #[test]
+    fn role_signed_authority_detected() {
+        assert!(has_role_signed_authority(Some(&params_with_scheme(
+            CredentialScheme::RoleSigned
+        ))));
+        assert!(!has_role_signed_authority(Some(&params_with_scheme(
+            CredentialScheme::SignedCapability
+        ))));
+        assert!(!has_role_signed_authority(None));
+    }
+
+    /// A RoleSigned authority in params refuses the dial outright — never a
+    /// token, never `NotActive` (which would fall through to the ring/blind
+    /// selection and could dial credential-less).
+    #[test]
+    fn role_signed_authority_refuses_dial() {
+        let cell = null_capability_cell();
+        let params = params_with_scheme(CredentialScheme::RoleSigned);
+        assert!(matches!(
+            capability_credential_for_dial(Some(&params), &cell),
+            CapabilityDial::RoleSignedRefused
+        ));
+    }
+
+    /// RoleSigned wins over a SignedCapability provider that DOES hold a
+    /// token — the refusal is unconditional, not a fallback for emptiness.
+    #[test]
+    fn role_signed_refuses_even_with_capability_tokens_available() {
+        let content = format!("{}\n", token_line(0x99));
+        let (path, src) = file_source_with(&content, "role-signed-with-tokens");
+        let cell: CapabilityTokenCell = Arc::new(src);
+        let params = params_with_scheme(CredentialScheme::RoleSigned);
+        assert!(matches!(
+            capability_credential_for_dial(Some(&params), &cell),
+            CapabilityDial::RoleSignedRefused
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The refusal error names the scheme and never claims a node-side
+    /// rejection (no dial ever went out).
+    #[test]
+    fn role_signed_refusal_error_is_named_and_not_a_rejection() {
+        let err = role_signed_refusal_error();
+        let msg = err.to_string();
+        assert!(msg.contains("role_signed"), "error must name the scheme: {msg}");
         assert!(!crate::pool::is_credential_rejected(&err));
     }
 }

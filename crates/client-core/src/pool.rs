@@ -107,6 +107,12 @@ fn credential_is_ready(
         // pre-minted token the dial would go out credential-less and be
         // CREDENTIAL_REJECTED by the 0x02 fleet.
         Some(CredentialScheme::SignedCapability) => capability_tokens.is_ready(),
+        // RoleSigned (0x05): edge-box-only — a client can never become
+        // "ready" for it (no ring/blind/capability material applies). Report
+        // ready immediately so the gate does not waste its timeout; the
+        // actual dial refuses with a named error every attempt (see
+        // `capability_pool::capability_credential_for_dial`).
+        Some(CredentialScheme::RoleSigned) => true,
         // EpochHmac: params alone is sufficient.
         Some(CredentialScheme::EpochHmac)
         | Some(CredentialScheme::Legacy)
@@ -435,6 +441,9 @@ impl TunnelPool {
                     }
                     capability_pool::CapabilityDial::Unavailable => {
                         Err(capability_pool::capability_unavailable_error())
+                    }
+                    capability_pool::CapabilityDial::RoleSignedRefused => {
+                        Err(capability_pool::role_signed_refusal_error())
                     }
                     capability_pool::CapabilityDial::NotActive => {
                         // Phase 4: pop one blind token for this dial (single-use).
@@ -858,6 +867,9 @@ impl TunnelPool {
                 }
                 capability_pool::CapabilityDial::Unavailable => {
                     return Err(capability_pool::capability_unavailable_error());
+                }
+                capability_pool::CapabilityDial::RoleSignedRefused => {
+                    return Err(capability_pool::role_signed_refusal_error());
                 }
                 capability_pool::CapabilityDial::NotActive => {
                     let spent = token_pool::pop_one(&guard.token_pool);
@@ -1573,6 +1585,35 @@ mod pool_smoke_tests {
         );
     }
 
+    /// Cold-start gate under a RoleSigned (0x05) authority: edge-box-only, so
+    /// the client can never satisfy it via ring/blind/capability material —
+    /// the gate must report ready immediately (never spend the 30s timeout
+    /// waiting for something that can never arrive). The actual dial refuses
+    /// separately (see `capability_pool::role_signed_authority_refuses_dial`).
+    #[test]
+    fn credential_gate_skips_wait_under_role_signed() {
+        use super::credential_is_ready;
+        use arc_swap::ArcSwap;
+        use mirage_core::crypto::credential::{CredentialParams, EpochEntry};
+        use mirage_core::mirage::wire::CredentialScheme;
+
+        let params = CredentialParams::single(
+            1,
+            CredentialScheme::RoleSigned,
+            vec![EpochEntry::with_secret(1, u64::MAX, [0u8; 32])],
+        );
+        let cred_params = ArcSwap::from_pointee(Some(params));
+        let token_pool = ArcSwap::from_pointee(crate::token_pool::TokenPool::default());
+        let ring_cell: crate::token_pool::RingCredentialCell =
+            Arc::new(ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>));
+        let empty_cell = crate::capability_pool::null_capability_cell();
+
+        assert!(
+            credential_is_ready(&cred_params, &token_pool, &ring_cell, &empty_cell),
+            "RoleSigned gate must not block waiting on unsatisfiable material"
+        );
+    }
+
     // ── new_lazy: zero-dial fallback pool construction ───────────────────────
 
     /// `new_lazy` must not dial anything at construction: every slot starts
@@ -1730,6 +1771,9 @@ async fn reconnect_slot(pool: Arc<TunnelPool>, slot_idx: usize) {
             }
             capability_pool::CapabilityDial::Unavailable => {
                 Err(capability_pool::capability_unavailable_error())
+            }
+            capability_pool::CapabilityDial::RoleSignedRefused => {
+                Err(capability_pool::role_signed_refusal_error())
             }
             capability_pool::CapabilityDial::NotActive => {
                 // Phase 4: pop one blind token for this reconnect dial.

@@ -64,6 +64,12 @@ fn mux_credential_is_ready(
         // SignedCapability (0x02): the client cannot self-mint — ready only
         // when the provider holds a pre-minted token.
         Some(CredentialScheme::SignedCapability) => capability_tokens.is_ready(),
+        // RoleSigned (0x05): edge-box-only — a client can never become
+        // "ready" for it (no ring/blind/capability material applies). Report
+        // ready immediately so the gate does not waste its timeout; the
+        // actual dial refuses with a named error every attempt (see
+        // `capability_pool::capability_credential_for_dial`).
+        Some(CredentialScheme::RoleSigned) => true,
         Some(CredentialScheme::EpochHmac)
         | Some(CredentialScheme::Legacy)
         | None => true,
@@ -464,6 +470,9 @@ impl MuxPool {
                     }
                     capability_pool::CapabilityDial::Unavailable => {
                         Err(capability_pool::capability_unavailable_error())
+                    }
+                    capability_pool::CapabilityDial::RoleSignedRefused => {
+                        Err(capability_pool::role_signed_refusal_error())
                     }
                     capability_pool::CapabilityDial::NotActive => {
                         // Phase 4: pop one blind token for this initial mux session dial.
@@ -957,6 +966,38 @@ mod tests {
         assert!(!magic.is_empty());
         assert_eq!(&magic[..3], b"MUX");
         assert_eq!(magic[3], 0u8); // null terminator
+    }
+
+    /// Cold-start gate under a RoleSigned (0x05) authority: edge-box-only, so
+    /// the client can never satisfy it via ring/blind/capability material —
+    /// the mux gate must report ready immediately (never spend
+    /// `MUX_CREDENTIAL_GATE_TIMEOUT` waiting for something that can never
+    /// arrive). The actual dial refuses separately (see
+    /// `capability_pool::role_signed_authority_refuses_dial`). Mirrors
+    /// `pool::tests::credential_gate_skips_wait_under_role_signed`.
+    #[test]
+    fn mux_credential_gate_skips_wait_under_role_signed() {
+        use super::mux_credential_is_ready;
+        use arc_swap::ArcSwap;
+        use mirage_core::crypto::credential::{CredentialParams, EpochEntry};
+        use mirage_core::mirage::wire::CredentialScheme;
+        use std::sync::Arc;
+
+        let params = CredentialParams::single(
+            1,
+            CredentialScheme::RoleSigned,
+            vec![EpochEntry::with_secret(1, u64::MAX, [0u8; 32])],
+        );
+        let cred_params = ArcSwap::from_pointee(Some(params));
+        let token_pool = ArcSwap::from_pointee(crate::token_pool::TokenPool::default());
+        let ring_cell: crate::token_pool::RingCredentialCell =
+            Arc::new(ArcSwap::from_pointee(None::<crate::token_pool::RingCredential>));
+        let empty_cell = crate::capability_pool::null_capability_cell();
+
+        assert!(
+            mux_credential_is_ready(&cred_params, &token_pool, &ring_cell, &empty_cell),
+            "RoleSigned mux gate must not block waiting on unsatisfiable material"
+        );
     }
 
     /// `establish_mux_tunnel` for an onion chain where hops have
@@ -1461,6 +1502,9 @@ async fn reconnect_mux_slot(pool: Arc<MuxPool>, slot_idx: usize) {
             }
             capability_pool::CapabilityDial::Unavailable => {
                 Err(capability_pool::capability_unavailable_error())
+            }
+            capability_pool::CapabilityDial::RoleSignedRefused => {
+                Err(capability_pool::role_signed_refusal_error())
             }
             capability_pool::CapabilityDial::NotActive => {
                 // Phase 4: pop one blind token for this mux reconnect dial.

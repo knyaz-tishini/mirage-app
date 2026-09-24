@@ -2783,6 +2783,7 @@ dependencies = [
  "hyper-util",
  "mirage-control-plane",
  "mirage-core",
+ "mirage-mux",
  "mirage-protocol",
  "serde",
  "serde_json",
