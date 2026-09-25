@@ -102,6 +102,9 @@ pub enum EdgeStreamError {
 
     #[error("edge stream: io error writing the StreamOpen header: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("edge stream: udp datagram frame codec error: {0}")]
+    Codec(WireError),
 }
 
 /// Map an artefact's [`ArtefactMode`] onto the wire's [`ExitPreference`].
@@ -252,8 +255,23 @@ impl EdgeSession {
         Ok(stream)
     }
 
+    /// Open one mux stream for a UDP flow, writing the [`StreamOpen`] header
+    /// as its first bytes — mirrors [`Self::open_tcp_stream`] exactly,
+    /// `kind: StreamKind::Udp` instead, wrapped in
+    /// [`crate::udp_flow::EdgeUdpFlow`]'s `[2B len][payload]` datagram
+    /// framing. `target` is this flow's ONE fixed destination for its whole
+    /// life — see `crate::udp_associate`.
+    pub async fn open_udp_flow(&self, target: &str) -> Result<crate::udp_flow::EdgeUdpFlow, EdgeStreamError> {
+        let target = StreamTarget::new(target).map_err(EdgeStreamError::BadTarget)?;
+        let stream = self.session.open_stream().await?;
+        let mut stream = TokioMuxStream(stream);
+        let open = StreamOpen { kind: StreamKind::Udp, target };
+        stream.write_all(&open.encode()).await?;
+        Ok(crate::udp_flow::EdgeUdpFlow::new(stream))
+    }
+
     #[cfg(test)]
-    fn for_test(session: SessionHandle, welcome: EdgeWelcome) -> Self {
+    pub(crate) fn for_test(session: SessionHandle, welcome: EdgeWelcome) -> Self {
         Self { session, welcome, entrance_label: "test".to_owned() }
     }
 }
@@ -399,6 +417,20 @@ impl EdgeSessionSupervisor {
                 _ = tokio::time::sleep(remaining) => return None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl EdgeSessionSupervisor {
+    /// Test-only: a supervisor whose slot already holds a live `session`,
+    /// with no dial loop behind it — lets `crate::udp_associate`'s tests
+    /// exercise a real mux pair without a real V9 handshake or entrance
+    /// dial. The driver task never completes; the test process ending is
+    /// the only cleanup this needs.
+    pub(crate) fn for_test(session: Arc<EdgeSession>) -> Arc<Self> {
+        let (tx, _rx) = tokio::sync::watch::channel(Some(session));
+        let driver = tokio::spawn(std::future::pending());
+        Arc::new(Self { slot: tx, _driver: driver })
     }
 }
 

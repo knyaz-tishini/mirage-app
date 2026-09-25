@@ -24,8 +24,10 @@
 //!    crate's earlier one-single-hop-dial-per-flow path — see
 //!    [`assembly`]'s own module doc.
 //! 3. Stand up a local SOCKS5 listener (`crate::socks5`) — CONNECT opens
-//!    one mux stream per flow; UDP ASSOCIATE is refused cleanly (the UDP
-//!    relay is a later slice).
+//!    one mux stream per flow; UDP ASSOCIATE (`crate::udp_associate`) opens
+//!    one `StreamKind::Udp` mux stream per (association, destination) pair,
+//!    per RFC 1928 §7 — see `mirage2app/CLAUDE.md` "subscriber-client config
+//!    (edge session)".
 //! 4. Optionally drive the existing TUN bridge — [`tun_feed`].
 //!
 //! **What must not be in this crate, and why it structurally cannot be**:
@@ -39,8 +41,8 @@
 //! `chain_build.rs` (per-entrance `ChainConfig` builder) and `udp_dial.rs`
 //! (per-entrance UDP entrance dial, wired into the old SOCKS5 UDP
 //! ASSOCIATE path) are retired to `src/_deprecated/` — superseded by the
-//! mux session's own `StreamOpen{Tcp,..}` framing and, for UDP, by the
-//! clean refusal in `crate::socks5` until the mux-carried UDP relay lands.
+//! mux session's own `StreamOpen{Tcp,..}` framing and, for UDP, by
+//! `crate::udp_associate`'s real `StreamOpen{Udp,..}`-carried relay.
 
 pub mod artefact;
 pub mod assembly;
@@ -48,9 +50,13 @@ pub mod dial;
 pub mod session;
 pub mod socks5;
 pub mod tun_feed;
+pub mod udp_associate;
+pub mod udp_flow;
 
 pub use artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefact};
 pub use assembly::{SubscriberClient, SubscriberClientError, SubscriberClientOptions};
 pub use session::{
     exit_preference_from_mode, EdgeDialError, EdgeSession, EdgeSessionSupervisor, EdgeStreamError,
 };
+pub use udp_associate::{serve_udp_association, UdpAssociateError};
+pub use udp_flow::EdgeUdpFlow;

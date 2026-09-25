@@ -7,16 +7,17 @@
 //! domain name is passed through UNRESOLVED, so DNS resolves at the exit,
 //! never on this machine.
 //!
-//! **UDP ASSOCIATE** refuses cleanly with the SOCKS5 "command not
-//! supported" reply (`0x07`) and logs it once, process-wide — the UDP relay
-//! is the next slice (`docs/mirage/plans/2026-09-24-edge-as-entry.md` PART
-//! TWO, "UDP datagram framing").
+//! **UDP ASSOCIATE** (§7) is served for real by
+//! [`crate::udp_associate::serve_udp_association`] — this module owns only
+//! the SOCKS5 wire-level pieces that path reuses: the per-datagram header
+//! parser ([`parse_socks5_udp_request`]) and the ASSOCIATE reply writer
+//! ([`write_udp_associate_reply`]), both `pub(crate)` for that.
 //!
 //! Not reused from `mirage_client_core::socks5::Socks5Server` on purpose:
 //! that type is built around a `Router`/`ChainSet`/`TunnelPool` — a fixed
 //! set of pre-built chains — which this crate no longer has. Every flow
 //! here opens a fresh mux stream on the ONE live [`EdgeSession`], dynamically
-//! at CONNECT time, never resolved from a pre-built chain table.
+//! at CONNECT/ASSOCIATE time, never resolved from a pre-built chain table.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -40,8 +41,8 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
-const REP_SUCCESS: u8 = 0x00;
-const REP_GENERAL_FAILURE: u8 = 0x01;
+pub(crate) const REP_SUCCESS: u8 = 0x00;
+pub(crate) const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
@@ -51,7 +52,7 @@ const CONNECT_SESSION_WAIT: Duration = Duration::from_secs(5);
 
 /// Every way reading a SOCKS5 request off the wire fails.
 #[derive(Debug, Error)]
-enum Socks5RequestError {
+pub(crate) enum Socks5RequestError {
     #[error("socks5: client offered no acceptable auth method")]
     NoAcceptableAuthMethod,
     #[error("socks5: unsupported protocol version 0x{0:02x}")]
@@ -98,8 +99,9 @@ async fn handle_connection(mut stream: TcpStream, supervisor: Arc<EdgeSessionSup
     match cmd {
         CMD_CONNECT => handle_connect(stream, target, supervisor).await,
         CMD_UDP_ASSOCIATE => {
-            log_udp_associate_refused_once();
-            let _ = write_reply(&mut stream, REP_COMMAND_NOT_SUPPORTED).await;
+            if let Err(e) = crate::udp_associate::serve_udp_association(stream, supervisor).await {
+                debug!(error = %e, "socks5: udp associate ended with an io error");
+            }
         }
         other => {
             debug!(cmd = other, "socks5: unsupported command");
@@ -137,21 +139,6 @@ async fn handle_connect(mut stream: TcpStream, target: String, supervisor: Arc<E
             let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
         }
     }
-}
-
-/// Logged once, process-wide, the first time a client requests UDP
-/// ASSOCIATE — this is a standing refusal, not a per-connection event worth
-/// repeating in the log.
-static UDP_ASSOCIATE_LOGGED: std::sync::Once = std::sync::Once::new();
-
-fn log_udp_associate_refused_once() {
-    UDP_ASSOCIATE_LOGGED.call_once(|| {
-        warn!(
-            "socks5: UDP ASSOCIATE requested but refused (command not supported) — the UDP \
-             relay over the edge mux session is a later slice, see \
-             docs/mirage/plans/2026-09-24-edge-as-entry.md PART TWO"
-        );
-    });
 }
 
 /// Read the SOCKS5 greeting + request, replying to the greeting inline (a
@@ -236,13 +223,121 @@ fn target_from_socks5_address(
     }
 }
 
-async fn write_reply(stream: &mut TcpStream, rep: u8) -> std::io::Result<()> {
+pub(crate) async fn write_reply(stream: &mut TcpStream, rep: u8) -> std::io::Result<()> {
     // BND.ADDR/BND.PORT are unused by every caller of this listener (it
     // never tells the client to reconnect elsewhere) — 0.0.0.0:0, matching
     // the crate's previous SOCKS5 wiring.
     stream
         .write_all(&[SOCKS5_VERSION, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await
+}
+
+/// Reply to a UDP ASSOCIATE request with `rep` and the relay's own bound
+/// `BND.ADDR`/`BND.PORT` — unlike CONNECT's [`write_reply`] (always
+/// `0.0.0.0:0`, unused by every one of ITS callers), a UDP ASSOCIATE client
+/// needs this address for real: RFC 1928 §7 requires every subsequent UDP
+/// datagram be sent TO it.
+pub(crate) async fn write_udp_associate_reply(
+    stream: &mut TcpStream,
+    rep: u8,
+    bound: SocketAddr,
+) -> std::io::Result<()> {
+    let mut out = vec![SOCKS5_VERSION, rep, 0x00];
+    match bound {
+        SocketAddr::V4(v4) => {
+            out.push(ATYP_IPV4);
+            out.extend_from_slice(&v4.ip().octets());
+            out.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            out.push(ATYP_IPV6);
+            out.extend_from_slice(&v6.ip().octets());
+            out.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
+    stream.write_all(&out).await
+}
+
+/// One already-received UDP datagram's SOCKS5 §7 header, parsed:
+/// `[2B RSV][1B FRAG][1B ATYP][DST.ADDR][DST.PORT][DATA]`. Pure, no I/O —
+/// used by `crate::udp_associate` against one `recv_from` buffer at a time.
+#[derive(Debug)]
+pub(crate) struct Socks5UdpRequest {
+    /// `0` for an unfragmented datagram — `crate::udp_associate` refuses
+    /// anything else (RFC 1928 leaves reassembly optional; this deployment
+    /// implements none of it, see that module's doc).
+    pub frag: u8,
+    /// `ATYP + DST.ADDR + DST.PORT` exactly as received — echoed back
+    /// verbatim in every reply belonging to this destination's flow, so a
+    /// client that only understands the ATYP it itself sent (e.g.
+    /// `mirage2tun`'s `parse_socks5_udp_response`, IPv4/IPv6 only) always
+    /// gets back the same shape.
+    pub header_echo: Vec<u8>,
+    /// The `host:port` string this destination becomes as a `StreamOpen`
+    /// target — see [`target_from_socks5_address`].
+    pub target: String,
+    pub data: Vec<u8>,
+}
+
+/// Every way parsing one UDP datagram's SOCKS5 header fails.
+#[derive(Debug, Error)]
+pub(crate) enum Socks5UdpHeaderError {
+    #[error("socks5 udp: datagram truncated (need at least {need} bytes, have {have})")]
+    Truncated { need: usize, have: usize },
+    #[error("socks5 udp: malformed destination: {0}")]
+    Address(#[from] Socks5RequestError),
+}
+
+pub(crate) fn parse_socks5_udp_request(buf: &[u8]) -> Result<Socks5UdpRequest, Socks5UdpHeaderError> {
+    if buf.len() < 4 {
+        return Err(Socks5UdpHeaderError::Truncated { need: 4, have: buf.len() });
+    }
+    let frag = buf[2];
+    let atyp = buf[3];
+    let mut pos = 4usize;
+    let addr_bytes: &[u8] = match atyp {
+        ATYP_IPV4 => {
+            let end = pos + 4;
+            if buf.len() < end {
+                return Err(Socks5UdpHeaderError::Truncated { need: end, have: buf.len() });
+            }
+            let bytes = &buf[pos..end];
+            pos = end;
+            bytes
+        }
+        ATYP_IPV6 => {
+            let end = pos + 16;
+            if buf.len() < end {
+                return Err(Socks5UdpHeaderError::Truncated { need: end, have: buf.len() });
+            }
+            let bytes = &buf[pos..end];
+            pos = end;
+            bytes
+        }
+        ATYP_DOMAIN => {
+            if buf.len() < pos + 1 {
+                return Err(Socks5UdpHeaderError::Truncated { need: pos + 1, have: buf.len() });
+            }
+            let len = buf[pos] as usize;
+            pos += 1;
+            let end = pos + len;
+            if buf.len() < end {
+                return Err(Socks5UdpHeaderError::Truncated { need: end, have: buf.len() });
+            }
+            let bytes = &buf[pos..end];
+            pos = end;
+            bytes
+        }
+        other => return Err(Socks5RequestError::UnsupportedAddressType(other).into()),
+    };
+    if buf.len() < pos + 2 {
+        return Err(Socks5UdpHeaderError::Truncated { need: pos + 2, have: buf.len() });
+    }
+    let port = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    let header_echo = buf[3..pos + 2].to_vec();
+    pos += 2;
+    let target = target_from_socks5_address(atyp, addr_bytes, port)?;
+    Ok(Socks5UdpRequest { frag, header_echo, target, data: buf[pos..].to_vec() })
 }
 
 #[cfg(test)]
@@ -284,42 +379,71 @@ mod tests {
         assert!(matches!(err, Socks5RequestError::UnsupportedAddressType(0x7f)));
     }
 
-    // ── UDP ASSOCIATE refusal, end to end over a real loopback socket ───
+    // ── parse_socks5_udp_request: pure, no I/O ──────────────────────────
+
+    #[test]
+    fn parse_udp_request_ipv4() {
+        let mut buf = vec![0x00, 0x00, 0x00, ATYP_IPV4];
+        buf.extend_from_slice(&[93, 184, 216, 34]);
+        buf.extend_from_slice(&443u16.to_be_bytes());
+        buf.extend_from_slice(b"payload");
+        let req = parse_socks5_udp_request(&buf).expect("valid header");
+        assert_eq!(req.frag, 0);
+        assert_eq!(req.target, "93.184.216.34:443");
+        assert_eq!(req.data, b"payload");
+        assert_eq!(req.header_echo, buf[3..10], "ATYP+ADDR+PORT, verbatim");
+    }
+
+    #[test]
+    fn parse_udp_request_ipv6() {
+        let mut buf = vec![0x00, 0x00, 0x00, ATYP_IPV6];
+        buf.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        buf.extend_from_slice(&53u16.to_be_bytes());
+        buf.extend_from_slice(b"dns-query");
+        let req = parse_socks5_udp_request(&buf).expect("valid header");
+        assert_eq!(req.target, "[::1]:53");
+        assert_eq!(req.data, b"dns-query");
+    }
+
+    #[test]
+    fn parse_udp_request_domain() {
+        let mut buf = vec![0x00, 0x00, 0x00, ATYP_DOMAIN, 11u8];
+        buf.extend_from_slice(b"example.com");
+        buf.extend_from_slice(&80u16.to_be_bytes());
+        buf.extend_from_slice(b"data");
+        let req = parse_socks5_udp_request(&buf).expect("valid header");
+        assert_eq!(req.target, "example.com:80");
+        assert_eq!(req.data, b"data");
+    }
+
+    #[test]
+    fn parse_udp_request_preserves_frag_for_the_caller_to_refuse() {
+        let mut buf = vec![0x00, 0x00, 0x07, ATYP_IPV4]; // FRAG = 7, not 0.
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        let req = parse_socks5_udp_request(&buf).expect("header still parses — refusal is the caller's job");
+        assert_eq!(req.frag, 7);
+    }
+
+    #[test]
+    fn parse_udp_request_truncated_is_named() {
+        let err = parse_socks5_udp_request(&[0x00, 0x00]).expect_err("too short for even a header");
+        assert!(matches!(err, Socks5UdpHeaderError::Truncated { need: 4, have: 2 }));
+    }
+
+    #[test]
+    fn parse_udp_request_unsupported_address_type_is_named() {
+        let buf = [0x00, 0x00, 0x00, 0x7f];
+        let err = parse_socks5_udp_request(&buf).expect_err("must refuse");
+        assert!(matches!(
+            err,
+            Socks5UdpHeaderError::Address(Socks5RequestError::UnsupportedAddressType(0x7f))
+        ));
+    }
 
     async fn free_local_addr() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral");
         listener.local_addr().expect("local addr")
-    }
-
-    #[tokio::test]
-    async fn udp_associate_is_refused_with_command_not_supported() {
-        let bind = free_local_addr().await;
-        let listener = TcpListener::bind(bind).await.expect("bind");
-        let supervisor =
-            EdgeSessionSupervisor::spawn(Vec::new(), b"MESH2".to_vec(), [0x11u8; 32], ExitPreference::Auto);
-        tokio::spawn(async move {
-            let (stream, _peer) = listener.accept().await.expect("accept");
-            handle_connection(stream, supervisor).await;
-        });
-
-        let mut client = TcpStream::connect(bind).await.expect("connect");
-        client.write_all(&[0x05, 0x01, 0x00]).await.expect("write greeting");
-        let mut greeting_reply = [0u8; 2];
-        client.read_exact(&mut greeting_reply).await.expect("read greeting reply");
-        assert_eq!(greeting_reply, [0x05, 0x00]);
-
-        // CMD=UDP_ASSOCIATE(0x03), ATYP=IPv4, addr 0.0.0.0:0.
-        client
-            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await
-            .expect("write request");
-        let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).await.expect("read reply");
-        assert_eq!(reply[0], SOCKS5_VERSION);
-        assert_eq!(
-            reply[1], REP_COMMAND_NOT_SUPPORTED,
-            "UDP ASSOCIATE must reply command-not-supported, not a false success"
-        );
     }
 
     #[tokio::test]

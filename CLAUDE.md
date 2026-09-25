@@ -231,15 +231,71 @@ rewrite:
   ::socks5_bind`). CONNECT opens one mux stream per flow
   (`EdgeSession::open_tcp_stream`, `StreamOpen{Tcp, host:port}` as the
   stream's first bytes — a domain name rides through UNRESOLVED so DNS
-  resolves at the exit). UDP ASSOCIATE replies SOCKS5 "command not
-  supported" (`0x07`) and logs it once, process-wide — the UDP relay over
-  the mux session is the next slice. NOT reused from
-  `mirage_client_core::socks5::Socks5Server` (that type is
-  `Router`/`ChainSet`/`TunnelPool`-shaped — a fixed pre-built chain set this
-  crate no longer has).
+  resolves at the exit). NOT reused from `mirage_client_core::socks5::
+  Socks5Server` (that type is `Router`/`ChainSet`/`TunnelPool`-shaped — a
+  fixed pre-built chain set this crate no longer has).
+- **UDP ASSOCIATE** (`crate::udp_associate`, `docs/mirage/plans/2026-09-25-edge-udp.md`
+  §4) is served for real — a full RFC 1928 §7 relay, not a refusal. On
+  `CMD_UDP_ASSOCIATE`, `serve_udp_association` binds a fresh loopback UDP
+  socket and replies SUCCESS with its own `BND.ADDR`/`BND.PORT` on the
+  control TCP stream. Every subsequent datagram the client sends there
+  carries its own SOCKS5 UDP header (`[2B RSV][1B FRAG][1B ATYP][DST.ADDR]
+  [DST.PORT][DATA]`, RFC 1928 §7) and maps to one `StreamKind::Udp` mux
+  stream per **(association, destination)** pair
+  (`EdgeSession::open_udp_flow`, `crate::udp_flow::EdgeUdpFlow` framing each
+  datagram `[2B BE len][payload]` on that stream, both directions —
+  `mirage_control_plane::{encode,decode}_udp_datagram_frame`). A flow opens
+  lazily on the first datagram to a new destination and is evicted after
+  `UDP_FLOW_IDLE_TIMEOUT` (60s) of silence in BOTH directions — matching the
+  edge/exit's own `UDP_SESSION_TIMEOUT`. `FRAG != 0` is refused (dropped,
+  counted, logged once) — no reassembly. A payload over
+  `UDP_PAYLOAD_MTU_SAFE_LEN` (1200 bytes, matching
+  `SAFE_UDP_HANDSHAKE_PAYLOAD_LEN`'s own MTU reasoning) is dropped the same
+  way. `MAX_DESTINATIONS_PER_ASSOCIATION` (32) bounds one association's
+  worst case. The WHOLE association dies the instant its control TCP
+  connection closes or errors, per RFC 1928 §7's own lifetime rule — driven
+  by one `tokio::select!` between reading that connection to EOF and the
+  relay loop.
 - `mirage-subscriber-client countries --artefact <path>` — connects, prints
   every country the edge can serve (one per line), exits. Never starts the
   SOCKS5 listener.
+
+### TUN over subscriber-client's SOCKS5 (UDP)
+
+`mirage2tun`'s existing SOCKS5 UDP client
+(`mirage2tun/crates/mirage-tun-{windows,linux}/src/udp_socks5.rs`,
+`udp_proxy_forward`/`udp_proxy_session_task`) needed **zero changes** for
+this — it already performs a real SOCKS5 UDP ASSOCIATE handshake against
+whatever `socks5_addr` it is pointed at (`socks5_udp_associate`), keyed by
+`(src_addr, dst_addr)` like a NAT table, with its own independent 30s idle
+timeout (`UDP_IDLE_TIMEOUT`, tighter than and unrelated to this crate's 60s
+— harmless, it just means TUN's own local relay session recycles sooner).
+`crate::tun_feed::TunFeed` already points TUN's one shared chain
+(`TUN_FEED_CHAIN_ID`) at THIS crate's own SOCKS5 listener via
+`socks5_bind` (`chain.socks5_bind = Some(socks5_bind.to_string())`) — so a
+TUN-intercepted UDP packet (games, voice, system DNS) rides:
+
+```
+TUN (mirage-tun-windows/linux) --SOCKS5 UDP ASSOCIATE--> subscriber-client's
+crate::socks5 listener --StreamKind::Udp mux stream--> edge --native-UDP
+FS chain--> mesh exit --> real destination
+```
+
+**Wire-shape constraint this interop depends on**: `mirage2tun`'s own
+`build_socks5_udp_request` always sends `ATYP` 0x01 (IPv4) or 0x04 (IPv6) —
+never a domain — because it intercepts already-resolved raw IP packets; and
+its `parse_socks5_udp_response` only understands ATYP 0x01/0x04 in the
+REPLY. `serve_udp_association` accommodates this by echoing the exact
+`ATYP+ADDR+PORT` bytes from the ORIGINAL request back in every reply for
+that flow (never re-deriving or re-resolving an address locally) — so a
+TUN-originated IPv4/IPv6 request always gets an IPv4/IPv6-shaped reply back,
+exactly the shape `mirage2tun`'s parser expects, whether or not the
+underlying `StreamOpen` target string travelled as a resolved address or
+(for a directly SOCKS5-aware caller, never TUN) an unresolved domain.
+
+No TUN-side config points at a UDP-shaped entrance directly — TUN only ever
+talks to this crate's own local SOCKS5 listener, which is the ONE surface
+that turns both TCP CONNECT and UDP ASSOCIATE into mux streams to the edge.
 
 ### Retired (kept for reference, `src/_deprecated/`, not compiled)
 
