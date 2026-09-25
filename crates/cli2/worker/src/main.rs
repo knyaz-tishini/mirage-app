@@ -22,7 +22,7 @@ use mirage_chain_ipc::{
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use mirage_client_core::{
     ChainHandle, ChainId, ChainMetrics, ChainSet, ChainState, HealthProbeConfig, PrewarmStrategy,
-    monitor_link::{MonitorLink, MonitorTransport, WsServerFrame},
+    monitor_link::{MonitorLink, MonitorLinkOptions, MonitorTransport, WsServerFrame},
     mux_pool::MuxPool,
     pool::TunnelPool,
     socks5::{Socks5Server, SocksFailurePolicy},
@@ -1165,7 +1165,12 @@ fn spawn_monitor_link_in_worker(
         transports,
         mesh_id,
         node_client_id,
-        operator_pub,
+        MonitorLinkOptions {
+            operator_pub,
+            // The worker never spawns a debug shell (only l0-sentinel does) —
+            // it has no business honouring this frame either way.
+            allow_operator_debug_shell: false,
+        },
     );
     monitor_link.set_enrol_token(enrol_token);
     monitor_link.set_nf_counter_dir(nf_counter_dir);

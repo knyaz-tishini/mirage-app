@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use mirage_client_core::{
     chain_set::ChainSet,
-    monitor_link::{MonitorLink, MonitorTransport},
+    monitor_link::{MonitorLink, MonitorLinkOptions, MonitorTransport},
 };
 use mirage_core::mirage::mesh::PeerTable;
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
@@ -116,6 +116,20 @@ pub struct SentinelConfig {
     /// silently disabled (incoming frames are logged + ignored).
     #[serde(default)]
     pub debug_shell_binary: Option<PathBuf>,
+    /// Local opt-in for operator-triggered debug tunnels
+    /// (`WsServerFrame::DebugTunnelOpen`/`DebugTunnelClose`).
+    ///
+    /// `false` by default. This is the ONLY switch that can enable the
+    /// debug-shell path — a monitor pushing the frame, or any field carried
+    /// in an `AccessPacket`, can never turn it on: `MonitorLink` refuses (and
+    /// logs once per monitor) every `DebugTunnelOpen`/`DebugTunnelClose`
+    /// frame before it ever reaches this process's frame handling when this
+    /// is `false`, regardless of whether `debug_shell_binary` is configured.
+    /// A mode-3/customer issuance of this config never sets this field —
+    /// flip it by hand, locally, only for an operator-fleet box that is
+    /// meant to accept a reverse-SSH debug tunnel.
+    #[serde(default)]
+    pub allow_operator_debug_shell: bool,
     /// Directory where sentinel persists transient state — `monitor_wire.json`
     /// (Wire transport coordinates) and `debug-tunnel.json` (DebugTunnelOpen
     /// payload). Defaults to the directory of `client_config_path`.
@@ -1075,7 +1089,10 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         transports,
         cfg.mesh_id.clone(),
         client_id.clone(),
-        operator_pub,
+        MonitorLinkOptions {
+            operator_pub,
+            allow_operator_debug_shell: cfg.allow_operator_debug_shell,
+        },
     );
 
     // Seed enrol_token for blind-token batch requests (Phase 3).
