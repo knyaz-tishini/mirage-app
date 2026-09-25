@@ -2,57 +2,55 @@
 //! sign-off (`thin-customer-connector-2026-09-17.md` §8 #2).
 //!
 //! The commercial customer's own light, non-mesh client. It talks ONLY to
-//! his own entrance box faces, holds no mesh credential, sees no hop list,
-//! no node list, no monitor — matching
-//! `docs/mirage/plans/ruling-2026-09-17-edge-boxes-trust-and-tiers.md` §3:
-//! an edge terminates a paying customer and never hands him a peer table or
-//! a place in the topology.
+//! his own edge box's faces, holds no mesh credential, sees no hop list, no
+//! node list, no monitor — matching
+//! `docs/mirage/plans/2026-09-24-edge-as-entry.md` PART TWO: the client
+//! knows only its edge, and every downstream choice (which chain, which
+//! exit, which node) is the edge's own job.
 //!
-//! Five things, per `docs/mirage/plans/thin-customer-connector-2026-09-17.md`
-//! plus real UDP-entrance support (`docs/mirage/research/2026-09-23-edge-
-//! egress-cli2-recon.md` §4):
-//! 1. Parse and validate the delivery artefact — [`artefact`].
-//! 2. Translate it into the `ChainConfig` shapes `mirage-client-core`
-//!    already consumes, one single-hop chain per published TCP-shaped face,
-//!    each dialed with the subscriber's own PERSISTENT static key instead
-//!    of a fresh ephemeral one — [`chain_build`], [`dial`].
-//! 2b. Every UDP-shaped face (`TransportCamouflage::is_udp()`) is instead
-//!    wired as a [`udp_dial::UdpEntranceHandle`], dialed with the SAME
-//!    persistent identity through the datagram-native V9 driver directly —
-//!    [`udp_dial`].
-//! 3. Stand up a local SOCKS5 listener over the existing router (sharding
-//!    across TCP faces, default `StickyPerFlow`) for CONNECT, plus UDP
-//!    ASSOCIATE routed to the UDP entrance when one exists — [`assembly`].
+//! Four things:
+//! 1. Parse and validate the delivery artefact — [`artefact`]. The artefact
+//!    IS the config shape the operator hands the customer: the edge's
+//!    faces (`host:port` + camouflage), the edge's own static key (one per
+//!    face, normally identical across every face of the same edge), the
+//!    customer's own persistent static key, and a default exit preference
+//!    (full-auto or a named country) — see `mirage2app/CLAUDE.md`
+//!    "subscriber-client config (edge session)".
+//! 2. Dial one persistent [`session::EdgeSession`] over the artefact's
+//!    TCP-shaped entrance faces (round-robin failover), exchange
+//!    `EdgeHello`/`EdgeWelcome`, and — once accepted — upgrade to a mux
+//!    session. [`session::EdgeSessionSupervisor`] holds this session up
+//!    across drops with exponential-backoff reconnect. This replaces the
+//!    crate's earlier one-single-hop-dial-per-flow path — see
+//!    [`assembly`]'s own module doc.
+//! 3. Stand up a local SOCKS5 listener (`crate::socks5`) — CONNECT opens
+//!    one mux stream per flow; UDP ASSOCIATE is refused cleanly (the UDP
+//!    relay is a later slice).
 //! 4. Optionally drive the existing TUN bridge — [`tun_feed`].
 //!
-//! Everything below the artefact translation is REUSED machinery from
-//! `mirage-client-core` (`ChainSet`, `RouterImpl`, `Socks5Server`,
-//! `TunnelPool`, `TunBridge`) and already-public functions from
-//! `mirage-protocol`/`mirage-control-plane` (`driver::run_client_tcp_v9`,
-//! `tunnel::establish_native_udp_tunnel_addressed`). `mirage2web` never
-//! needed to change — see [`dial::StaticKeyProtocol`]'s and [`udp_dial`]'s
-//! own module docs for why the persistent-identity requirement did not need
-//! a `mirage2web` edit for either transport. `mirage-client-core` gained one
-//! small, additive, backward-compatible seam (`socks5::
-//! DatagramEntranceDialer` / `UdpAssociateSupport`) so its existing SOCKS5
-//! UDP ASSOCIATE machinery (RFC 1928 §7 framing, per-destination session
-//! management) could be reused rather than re-implemented — every existing
-//! caller (every `cli2` chain) defaults to `UdpAssociateSupport::Legacy` and
-//! observes zero behaviour change.
+//! **What must not be in this crate, and why it structurally cannot be**:
+//! no dependency on `mirage_core::crypto::credential` (no ring membership,
+//! no blind-RSA batch, no signed-capability pool reachable even as an
+//! import), no `mirage_client_core::monitor_link::MonitorLink` import (no
+//! monitor WS dial, no debug-tunnel listener), no `mirage-debug-shell`
+//! dependency. `crate::dial::StaticKeyProtocol` (the persistent-identity V9
+//! dial adapter) and `crate::tun_feed` are unchanged and reused as-is.
 //!
-//! **What must not be in this crate, and why it structurally cannot be** —
-//! see [`assembly`]'s module doc for the exact dependency-boundary argument
-//! per item (no fleet constant, no node list, no chain composition, no
-//! credential-scheme policy, no debug shell, no monitor link).
+//! `chain_build.rs` (per-entrance `ChainConfig` builder) and `udp_dial.rs`
+//! (per-entrance UDP entrance dial, wired into the old SOCKS5 UDP
+//! ASSOCIATE path) are retired to `src/_deprecated/` — superseded by the
+//! mux session's own `StreamOpen{Tcp,..}` framing and, for UDP, by the
+//! clean refusal in `crate::socks5` until the mux-carried UDP relay lands.
 
 pub mod artefact;
 pub mod assembly;
-pub mod chain_build;
 pub mod dial;
+pub mod session;
+pub mod socks5;
 pub mod tun_feed;
-pub mod udp_dial;
 
 pub use artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefact};
 pub use assembly::{SubscriberClient, SubscriberClientError, SubscriberClientOptions};
-pub use dial::StaticKeyProtocol;
-pub use udp_dial::{UdpDialError, UdpEntranceHandle};
+pub use session::{
+    exit_preference_from_mode, EdgeDialError, EdgeSession, EdgeSessionSupervisor, EdgeStreamError,
+};

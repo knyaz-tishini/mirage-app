@@ -147,6 +147,92 @@ mirage2tun (отдельный submodule) — низкоуровневый TUN-�
 
 GUI потом натянется на этот headless backend как отдельная обёртка.
 
+## subscriber-client config (edge session)
+
+`crates/subscriber-client/` (`mirage-subscriber-client`) is the client for
+modes 1 (public edge) and 2 (private/dedicated edge) — see
+`docs/mirage/plans/2026-09-24-edge-as-entry.md` PART TWO. It is NOT cli2:
+it knows only its own edge (the edge's faces + the edge's static key), never
+a peer table, never a hop list. It holds ONE persistent mux session to the
+edge (`EdgeHello`/`EdgeWelcome`/`StreamOpen`, over
+`mirage2web/crates/mirage-dial-core/src/edge_session.rs`'s wire types +
+`mirage-mux`), never one V9 tunnel per flow.
+
+### Delivery artefact = the whole config shape
+
+The operator hands the customer one JSON file — `EntranceArtefact`
+(`crates/subscriber-client/src/artefact.rs`), unchanged by the edge-session
+rewrite:
+
+```json
+{
+  "v": 1,
+  "private_key_hex": "<64 hex chars — the CUSTOMER's own persistent X25519 secret>",
+  "mesh_id": "MESH2",
+  "entrances": [
+    {
+      "addr": "172.86.76.34:443",
+      "server_pubkey_hex": "<64 hex chars — the EDGE's own static X25519 pubkey>",
+      "camouflage": { "type": "tls_real", "sni": "entrance.example.com", "alpn": ["h2"] }
+    }
+  ],
+  "mode": "full_auto",
+  "label": "pilot-1",
+  "issued_at_ms": 1726000000000
+}
+```
+
+- `entrances` — every face THIS edge publishes (host:port + camouflage).
+  Several boxes are several independent entrances in principle, but for one
+  edge every entry normally carries the SAME `server_pubkey_hex` — the
+  edge's own operator-signed identity key, never a node key (PART ONE's
+  perimeter/capsule fix). Plural only for face-sharding/failover, not for
+  reaching more than one edge.
+- `private_key_hex` — the CUSTOMER's own persistent static key, presented on
+  every dial (`crate::dial::StaticKeyProtocol`, unchanged).
+- `mode` — the default exit preference: `"full_auto"` or
+  `{"type":"country","code":"NL"}`-shaped (see `ArtefactMode`). Converted to
+  the wire's `ExitPreference` by `exit_preference_from_mode` and sent inside
+  `EdgeHello` on every dial — the edge answers with the countries it can
+  serve and the exit it actually fulfils (`EdgeWelcome`), never a node list.
+- A UDP-shaped entrance (`TransportCamouflage::is_udp()`) is recognised but
+  skipped with a logged warning — the edge-session dial only speaks
+  TCP-shaped faces today (`crate::assembly`).
+
+### Session + local surface
+
+- `crate::session::EdgeSession::connect` — one V9 dial
+  (`StaticKeyProtocol`) + `EdgeHello`/`EdgeWelcome` + mux upgrade
+  (`mirage_mux::tokio_compat::SessionHandle`). Refuses BY NAME
+  (`EdgeDialError::Refused`) on `EdgeOutcome::Refused`, never a bare IO
+  error.
+- `crate::session::EdgeSessionSupervisor` — holds the session up across the
+  artefact's entrances (round-robin failover — the face sharding this crate
+  already had, now applied to picking a dial path for the one persistent
+  session rather than to sharding independent flows) and reconnects with
+  exponential backoff (1s → 30s cap) whenever the live session closes.
+- `crate::socks5` — a purpose-built SOCKS5 (RFC 1928) listener on
+  `127.0.0.1:<port>` (default **1080**, `--bind` / `SubscriberClientOptions
+  ::socks5_bind`). CONNECT opens one mux stream per flow
+  (`EdgeSession::open_tcp_stream`, `StreamOpen{Tcp, host:port}` as the
+  stream's first bytes — a domain name rides through UNRESOLVED so DNS
+  resolves at the exit). UDP ASSOCIATE replies SOCKS5 "command not
+  supported" (`0x07`) and logs it once, process-wide — the UDP relay over
+  the mux session is the next slice. NOT reused from
+  `mirage_client_core::socks5::Socks5Server` (that type is
+  `Router`/`ChainSet`/`TunnelPool`-shaped — a fixed pre-built chain set this
+  crate no longer has).
+- `mirage-subscriber-client countries --artefact <path>` — connects, prints
+  every country the edge can serve (one per line), exits. Never starts the
+  SOCKS5 listener.
+
+### Retired (kept for reference, `src/_deprecated/`, not compiled)
+
+`chain_build.rs` (per-entrance `ChainConfig` builder) and `udp_dial.rs`
+(per-entrance UDP dial wired into the old SOCKS5 `UdpAssociateSupport::
+DatagramEntrance` path) — both superseded by the mux session's own
+`StreamOpen` framing. See `src/_deprecated/_DEPRECATED.md`.
+
 ## mirage-l0-sentinel
 
 Маленький daemon, живёт в `crates/l0-sentinel/`. Читает `sentinel.toml`:

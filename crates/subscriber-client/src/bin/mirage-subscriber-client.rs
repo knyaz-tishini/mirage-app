@@ -4,28 +4,33 @@
 //! parses it, refuses it BY NAME if it is malformed
 //! (`mirage_subscriber_client::artefact`'s three-step discipline — parse,
 //! then validate, then assemble), and otherwise stands up the local,
-//! loopback-only SOCKS5 listener the platform's TUN binaries dial into
-//! (`mirage2tun/crates/mirage-tun-{linux,windows,macos}/src/bin/mirage2tun.rs`).
+//! loopback-only SOCKS5 listener carrying every flow over one persistent
+//! mux session to the customer's edge
+//! (`mirage_subscriber_client::session::EdgeSession`). The
+//! `countries` subcommand instead connects, prints the edge's country list,
+//! and exits — it never starts the SOCKS5 listener.
 //!
-//! This binary is NOT an admin surface: its only two inputs are the
-//! artefact path and the local bind address, and the bind address is
-//! refused outright if it is not loopback — the customer has no flag that
-//! picks a hop, a node, or a chain composition; that is all in the
-//! artefact, sealed by the issuing panel.
+//! This binary is NOT an admin surface: its only inputs are the artefact
+//! path and the local bind address, and the bind address is refused
+//! outright if it is not loopback — the customer has no flag that picks a
+//! hop, a node, or a chain composition; that is all the edge's own job.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
-use mirage_subscriber_client::{EntranceArtefact, SubscriberClient, SubscriberClientOptions};
+use clap::{Parser, Subcommand};
+use mirage_subscriber_client::{
+    exit_preference_from_mode, EdgeSession, EntranceArtefact, SubscriberClient,
+    SubscriberClientOptions,
+};
 use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(
     name = "mirage-subscriber-client",
     version,
-    about = "Mirage commercial subscriber client — local SOCKS5 proxy over the delivered entrance artefact"
+    about = "Mirage commercial subscriber client — local SOCKS5 proxy over one persistent edge session"
 )]
 struct Args {
     /// Path to the delivery artefact (JSON) issued by the operator.
@@ -33,9 +38,20 @@ struct Args {
     artefact: PathBuf,
 
     /// Local SOCKS5 bind address. Must be a loopback address — this
-    /// listener must never be reachable off this machine.
-    #[arg(long, default_value = "127.0.0.1:11080")]
+    /// listener must never be reachable off this machine. Ignored by the
+    /// `countries` subcommand.
+    #[arg(long, default_value = "127.0.0.1:1080")]
     bind: SocketAddr,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Connect to the edge, print the countries it can serve (one per
+    /// line), and exit. Never starts the local SOCKS5 listener.
+    Countries,
 }
 
 /// Standard L0 panic catcher (matches every other binary in this
@@ -61,6 +77,27 @@ fn install_panic_hook() {
     }));
 }
 
+fn read_and_validate_artefact(path: &PathBuf) -> Result<EntranceArtefact, ExitCode> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        error!(path = %path.display(), error = %e, "refusing: cannot read artefact file");
+        ExitCode::FAILURE
+    })?;
+
+    // Step 1: parse — never validates (`EntranceArtefact::from_json`).
+    let artefact = EntranceArtefact::from_json(&raw).map_err(|e| {
+        error!(error = %e, "refusing: artefact did not parse");
+        ExitCode::FAILURE
+    })?;
+
+    // Step 2: validate — refuses BY NAME, touches nothing else.
+    artefact.validate().map_err(|e| {
+        error!(error = %e, "refusing: artefact failed validation");
+        ExitCode::FAILURE
+    })?;
+
+    Ok(artefact)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -75,34 +112,68 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
-    if !args.bind.ip().is_loopback() {
-        error!(
-            bind = %args.bind,
-            "refusing: --bind must be a loopback address — this listener must never be reachable off this machine"
-        );
+    let artefact = match read_and_validate_artefact(&args.artefact) {
+        Ok(artefact) => artefact,
+        Err(code) => return code,
+    };
+
+    match args.command {
+        Some(Command::Countries) => run_countries(&artefact).await,
+        None => run_proxy(&artefact, args.bind).await,
+    }
+}
+
+/// Connect to the edge over its TCP-shaped entrances, print every country it
+/// can serve, and exit — no SOCKS5 listener, no supervisor, no reconnect
+/// loop; a single dial attempt is enough for this one-shot query.
+async fn run_countries(artefact: &EntranceArtefact) -> ExitCode {
+    let exit = match exit_preference_from_mode(&artefact.mode) {
+        Ok(exit) => exit,
+        Err(e) => {
+            error!(error = %e, "refusing: artefact mode does not map to a valid exit preference");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client_static_priv = match artefact.client_static_priv() {
+        Ok(key) => key,
+        Err(e) => {
+            error!(error = %e, "refusing: cannot decode the subscriber's private key");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mesh_id = artefact.mesh_id.as_bytes().to_vec();
+    let tcp_entrances: Vec<_> =
+        artefact.entrances.iter().filter(|e| !e.camouflage.is_udp()).cloned().collect();
+    if tcp_entrances.is_empty() {
+        error!("refusing: every entrance in the artefact is UDP-shaped, nothing to dial");
         return ExitCode::FAILURE;
     }
 
-    let raw = match std::fs::read_to_string(&args.artefact) {
-        Ok(raw) => raw,
-        Err(e) => {
-            error!(path = %args.artefact.display(), error = %e, "refusing: cannot read artefact file");
-            return ExitCode::FAILURE;
+    match EdgeSession::connect_first_available(&tcp_entrances, &mesh_id, client_static_priv, exit, 0)
+        .await
+    {
+        Ok((idx, session)) => {
+            info!(entrance = %tcp_entrances[idx].addr, "mirage-subscriber-client: connected to edge");
+            for cc in session.countries() {
+                println!("{cc}");
+            }
+            ExitCode::SUCCESS
         }
-    };
-
-    // Step 1: parse — never validates (`EntranceArtefact::from_json`).
-    let artefact = match EntranceArtefact::from_json(&raw) {
-        Ok(artefact) => artefact,
         Err(e) => {
-            error!(error = %e, "refusing: artefact did not parse");
-            return ExitCode::FAILURE;
+            error!(error = %e, "refusing: could not reach the edge");
+            ExitCode::FAILURE
         }
-    };
+    }
+}
 
-    // Step 2: validate — refuses BY NAME, touches nothing else.
-    if let Err(e) = artefact.validate() {
-        error!(error = %e, "refusing: artefact failed validation");
+/// Stand up the local SOCKS5 proxy over one persistent edge session — the
+/// default mode.
+async fn run_proxy(artefact: &EntranceArtefact, bind: SocketAddr) -> ExitCode {
+    if !bind.ip().is_loopback() {
+        error!(
+            bind = %bind,
+            "refusing: --bind must be a loopback address — this listener must never be reachable off this machine"
+        );
         return ExitCode::FAILURE;
     }
 
@@ -111,17 +182,13 @@ async fn main() -> ExitCode {
     info!(
         entrances = artefact.entrances.len(),
         mode = ?artefact.mode,
-        bind = %args.bind,
+        bind = %bind,
         "mirage-subscriber-client: artefact validated, assembling local proxy"
     );
 
-    let options = SubscriberClientOptions { socks5_bind: args.bind, ..Default::default() };
+    let options = SubscriberClientOptions { socks5_bind: bind, ..Default::default() };
 
-    // Step 3: assemble — only after a successful validate. `build()` itself
-    // re-validates (cheap, pure, no side effects) and, when the artefact
-    // carries `ArtefactMode::Country`, logs the named no-op warning per the
-    // crate's own module doc (`mirage_subscriber_client::assembly`).
-    let client = match SubscriberClient::build(&artefact, options).await {
+    let client = match SubscriberClient::build(artefact, options).await {
         Ok(client) => client,
         Err(e) => {
             error!(error = %e, "refusing: failed to assemble subscriber client");

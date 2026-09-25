@@ -2871,13 +2871,13 @@ dependencies = [
 name = "mirage-subscriber-client"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "clap",
- "dashmap",
  "hex",
  "mirage-client-core",
+ "mirage-control-plane",
  "mirage-core",
+ "mirage-mux",
  "mirage-protocol",
  "serde",
  "serde_json",
