@@ -1,30 +1,31 @@
 //! Fleet node inventory — the single source the planet scene and the menu both
 //! read. (Demo data baked from the morph reference; later fed from the live
 //! mesh / inventory.)
+//!
+//! Every node is a neutral label only — country code plus an index within
+//! that country (e.g. `"NL-1"`). No hoster-derived machine id, raw IP:port,
+//! provider name, or operator infra-role string is ever carried here or
+//! rendered by a consumer (`shell::menu`, `centerpiece::planet`) — see
+//! mirage2app `CLAUDE.md` "No operator names in client UI".
 
 /// One fleet node.
 #[derive(Clone, Copy)]
 pub struct FleetNode {
-    pub reg: &'static str,
-    pub city: &'static str,
-    pub ip: &'static str,
-    pub id: &'static str,
-    pub prov: &'static str,
-    pub roles: &'static str,
+    /// Neutral, customer-safe label: country code + index within that
+    /// country. Never a hoster-derived name, raw IP:port, or provider name.
+    pub label: &'static str,
     pub lat: f64,
     pub lon: f64,
 }
 
-const ROLES: &str = "monitor · node · sentry · mshd · db-worker";
-
 /// The 6 fleet nodes.
 pub static FLEET: &[FleetNode] = &[
-    FleetNode { reg: "RU", city: "Moscow", ip: "193.187.94.74", id: "ru-hostkey-094.74", prov: "HostKey", roles: ROLES, lat: 55.75, lon: 37.62 },
-    FleetNode { reg: "RU", city: "St Petersburg", ip: "91.218.245.247", id: "ru-hostkey-245.247", prov: "HostKey", roles: ROLES, lat: 59.93, lon: 30.34 },
-    FleetNode { reg: "TR", city: "Istanbul", ip: "82.26.94.247", id: "tr-hostkey-094.247", prov: "HostKey", roles: ROLES, lat: 41.01, lon: 28.98 },
-    FleetNode { reg: "NL", city: "Amsterdam", ip: "45.12.212.226", id: "nl-hosthatch-212.226", prov: "Omro", roles: ROLES, lat: 52.37, lon: 4.90 },
-    FleetNode { reg: "NL", city: "Rotterdam", ip: "151.243.173.104", id: "nl-hostkey-173.104", prov: "HostKey", roles: ROLES, lat: 51.92, lon: 4.48 },
-    FleetNode { reg: "CH", city: "Zurich", ip: "45.59.119.139", id: "ch-cloudzy-119.139", prov: "Cloudzy", roles: ROLES, lat: 47.37, lon: 8.54 },
+    FleetNode { label: "RU-1", lat: 55.75, lon: 37.62 },
+    FleetNode { label: "RU-2", lat: 59.93, lon: 30.34 },
+    FleetNode { label: "TR-1", lat: 41.01, lon: 28.98 },
+    FleetNode { label: "NL-1", lat: 52.37, lon: 4.90 },
+    FleetNode { label: "NL-2", lat: 51.92, lon: 4.48 },
+    FleetNode { label: "CH-1", lat: 47.37, lon: 8.54 },
 ];
 
 /// Links between fleet nodes (indices) — used by the planet mesh.

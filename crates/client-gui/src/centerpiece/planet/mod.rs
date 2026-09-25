@@ -75,12 +75,8 @@ struct GridPt {
 #[derive(Clone, Copy)]
 struct Node {
     p: [f64; 3],
-    reg: &'static str,
-    city: &'static str,
-    ip: &'static str,
-    id: &'static str,
-    prov: &'static str,
-    roles: &'static str,
+    /// Neutral, customer-safe label — see `crate::nodes::FleetNode::label`.
+    label: &'static str,
 }
 
 fn geo(lat: f64, lon: f64) -> [f64; 3] {
@@ -143,12 +139,7 @@ impl PlanetSkin {
             .iter()
             .map(|f| Node {
                 p: geo(f.lat, f.lon),
-                reg: f.reg,
-                city: f.city,
-                ip: f.ip,
-                id: f.id,
-                prov: f.prov,
-                roles: f.roles,
+                label: f.label,
             })
             .collect();
         let links = crate::nodes::LINKS.to_vec();
@@ -398,7 +389,7 @@ impl Skin for PlanetSkin {
                 ctx.fill();
                 ctx.set_fill_color("#FBB26A");
                 ctx.set_font("9px monospace");
-                ctx.fill_text(n.reg, s.0 + 9.0, s.1 - 3.0);
+                ctx.fill_text(n.label, s.0 + 9.0, s.1 - 3.0);
             }
             ctx.set_global_alpha(1.0);
             self.node_screen = screens;
@@ -466,20 +457,17 @@ impl Skin for PlanetSkin {
 }
 
 impl PlanetSkin {
-    /// Draw the floating node-info popup near `(sx, sy)`, clamped to the rect.
+    /// Draw the floating node-info popup near `(sx, sy)`, clamped to the
+    /// rect. Neutral label only — no IP, node id, provider name, or operator
+    /// infra-role string; see `crate::nodes` module doc.
     fn draw_popup(&self, ctx: &mut dyn RenderContext, n: &Node, sx: f64, sy: f64, rect: SkinRect) {
-        let rows = ["IP", "ID", "PROVIDER"];
-        let vals = [n.ip, n.id, n.prov];
         let header_h = 30.0;
-        let row_h = 18.0;
-        let roles_h = 30.0;
-        let ph = header_h + row_h * rows.len() as f64 + roles_h + 10.0;
+        let ph = header_h + 6.0;
 
-        // Width sized to the longest content line (ROLES) so nothing overflows.
-        ctx.set_font("9px monospace");
-        let roles_w = ctx.measure_text(n.roles);
-        let roles_w = if roles_w > 1.0 { roles_w } else { n.roles.len() as f64 * 5.4 };
-        let pw = (roles_w + 24.0).max(196.0).min(rect.w - 8.0);
+        ctx.set_font("11px monospace");
+        let label_w = ctx.measure_text(n.label);
+        let label_w = if label_w > 1.0 { label_w } else { n.label.len() as f64 * 6.4 };
+        let pw = (label_w + 24.0).max(96.0).min(rect.w - 8.0);
 
         let px = (sx + 14.0).clamp(rect.x + 4.0, rect.x + rect.w - pw - 4.0);
         let py = (sy - 12.0).clamp(rect.y + 4.0, rect.y + rect.h - ph - 4.0);
@@ -490,34 +478,11 @@ impl PlanetSkin {
         ctx.set_fill_color("#FBB26A");
         ctx.fill_rect(px, py, 2.0, ph);
 
-        // Header: REG · City.
+        // Header: neutral label only.
         ctx.set_fill_color("#FBB26A");
         ctx.set_font("11px monospace");
         ctx.set_text_align(uzor::render::TextAlign::Left);
         ctx.set_text_baseline(uzor::render::TextBaseline::Middle);
-        ctx.fill_text(&format!("{} · {}", n.reg, n.city), px + 12.0, py + 16.0);
-        ctx.set_fill_color("rgba(255,255,255,0.12)");
-        ctx.fill_rect(px + 12.0, py + header_h - 4.0, pw - 24.0, 1.0);
-
-        // Rows.
-        let mut ry = py + header_h + row_h / 2.0;
-        for (k, v) in rows.iter().zip(vals.iter()) {
-            ctx.set_fill_color("#878B91");
-            ctx.set_font("10px monospace");
-            ctx.set_text_align(uzor::render::TextAlign::Left);
-            ctx.fill_text(k, px + 12.0, ry);
-            ctx.set_fill_color("#C9CCD1");
-            ctx.set_text_align(uzor::render::TextAlign::Right);
-            ctx.fill_text(v, px + pw - 12.0, ry);
-            ry += row_h;
-        }
-
-        // Roles.
-        ctx.set_fill_color("#878B91");
-        ctx.set_font("9px monospace");
-        ctx.set_text_align(uzor::render::TextAlign::Left);
-        ctx.fill_text("ROLES", px + 12.0, ry + 2.0);
-        ctx.set_fill_color("#C9CCD1");
-        ctx.fill_text(n.roles, px + 12.0, ry + 16.0);
+        ctx.fill_text(n.label, px + 12.0, py + 16.0);
     }
 }

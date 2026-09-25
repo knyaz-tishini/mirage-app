@@ -395,7 +395,7 @@ fn draw_row(
                 "auto".to_string()
             } else {
                 selected
-                    .map(|i| format!("{} · {}", FLEET[i].reg, FLEET[i].city))
+                    .map(|i| FLEET[i].label.to_string())
                     .unwrap_or_else(|| "manual · не выбрана".to_string())
             };
             ctx.set_fill_color(FG);
@@ -520,11 +520,7 @@ fn draw_row(
             ctx.set_font("13px sans-serif");
             ctx.set_text_align(TextAlign::Left);
             ctx.set_text_baseline(TextBaseline::Middle);
-            ctx.fill_text(&format!("{} · {}", n.reg, n.city), 20.0, ry + lr.h / 2.0);
-            ctx.set_fill_color(DIMC);
-            ctx.set_font("10px monospace");
-            ctx.set_text_align(TextAlign::Right);
-            ctx.fill_text(n.ip, w - 20.0, ry + lr.h / 2.0);
+            ctx.fill_text(n.label, 20.0, ry + lr.h / 2.0);
         }
         MenuRow::Skin(s) => {
             let active = s == skin;
