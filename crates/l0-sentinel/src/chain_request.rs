@@ -129,6 +129,226 @@ pub fn is_unauthorized(err: &anyhow::Error) -> bool {
     err.to_string().contains("HTTP 401")
 }
 
+// ── K2 v2: identity-bearing sentinel registration ───────────────────────────
+//
+// A v2 (`access_packet::AccessPacketV2`) device registers via its
+// operator-declared identity — never anonymously, and there is no fallback
+// to the ordinary `register_with_failover` path above. `POST
+// /relay/clients/sentinel` mirrors `mirage2monitor::clients_api`'s existing
+// `/relay/clients/edge` route: the operator signature on `identity` proves
+// the OPERATOR vouched for this self_id/role/key set, and `possession_sig`
+// proves THIS CALLER holds the identity's own signing key, over a
+// nonce+timestamp so a captured proof cannot be replayed later.
+
+/// Body for `POST /relay/clients/sentinel`. Field-for-field the same shape as
+/// `mirage2monitor::clients_api::EdgeClientRegisterBody`, with `shortname`
+/// carried over from the ordinary (v1) `RegisterBody`.
+#[derive(Debug, Serialize)]
+struct SentinelRegisterBody<'a> {
+    identity: &'a mirage_core::identity::DeclaredIdentity,
+    nonce_hex: String,
+    ts_ms: u64,
+    possession_sig: mirage_core::identity::SignatureHex,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shortname: Option<&'a str>,
+}
+
+/// Domain-separated preimage bytes for [`SentinelRegisterBody::possession_sig`]
+/// — the SAME layout as `mirage2monitor::clients_api::
+/// edge_register_signing_bytes`, with the label swapped for this route's own
+/// domain separation. `monitor_self_id` is `AccessPacketV2Monitor::self_id`
+/// (the target monitor's own operator-declared identifier, carried in the
+/// packet alongside `wire_addr`/`wire_pubkey_hex`) — binding it into the
+/// preimage is what stops a proof minted for one monitor from verifying
+/// against a different monitor in the same mesh, mirroring the reasoning
+/// `edge_register_signing_bytes`'s own doc gives for its identical parameter.
+pub fn sentinel_register_signing_bytes(
+    self_id: uuid::Uuid,
+    mesh_id: &str,
+    monitor_self_id: &str,
+    nonce_hex: &str,
+    ts_ms: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"MIRAGE-SENTINEL-CLIENT-REGISTER-V1\0");
+    buf.extend_from_slice(self_id.to_string().as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(mesh_id.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(monitor_self_id.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(nonce_hex.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(ts_ms.to_string().as_bytes());
+    buf
+}
+
+/// Success body from `POST /relay/clients/sentinel` — `client_id` is always
+/// `identity.self_id` (never a freshly minted or caller-chosen id, mirroring
+/// the edge route's own rule).
+#[derive(Debug, Deserialize)]
+struct SentinelRegisterResponseBody {
+    client_id: String,
+    #[serde(default)]
+    client_token: Option<String>,
+}
+
+/// A refusal's `error`/`detail` JSON fields, when the monitor sends them
+/// (mirroring `EdgeClientRegisterError::label()`'s wire shape). Best-effort:
+/// a monitor that answers with a non-JSON or differently-shaped body still
+/// gets a reason string — the raw response body, lossily decoded.
+#[derive(Debug, Deserialize)]
+struct SentinelRegisterErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// Honest classification of a `POST /relay/clients/sentinel` answer —
+/// mirrors [`ChainAskOutcome`]'s own split between a granted 2xx and a named
+/// refusal.
+#[derive(Debug, Clone)]
+enum SentinelRegisterOutcome {
+    Registered { client_id: String, client_token: Option<String> },
+    Refused { reason: String, status: u16 },
+}
+
+/// Classify a `/relay/clients/sentinel` HTTP response. Pure — no I/O — so
+/// refusal-reason extraction is unit-testable without a wire dial, mirroring
+/// [`classify_chain_ask_response`]'s own shape.
+fn classify_sentinel_register_response(status: u16, body: &[u8]) -> Result<SentinelRegisterOutcome> {
+    if (200..300).contains(&status) {
+        let parsed: SentinelRegisterResponseBody =
+            serde_json::from_slice(body).context("parse sentinel register response JSON")?;
+        return Ok(SentinelRegisterOutcome::Registered {
+            client_id: parsed.client_id,
+            client_token: parsed.client_token,
+        });
+    }
+    let reason = serde_json::from_slice::<SentinelRegisterErrorBody>(body)
+        .ok()
+        .and_then(|b| b.error.or(b.detail))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    Ok(SentinelRegisterOutcome::Refused { reason, status })
+}
+
+/// One registration attempt: builds a fresh nonce + timestamp, signs
+/// [`sentinel_register_signing_bytes`] with the device's own Ed25519 signing
+/// key, and dials the monitor over the wire — pinning `monitor.wire_pubkey_hex`
+/// and presenting the device's X25519 identity key as the wire hello's
+/// static key (never an ephemeral one; see
+/// `mirage_client_core::monitor_link::wire_post_no_bearer_with_static_key`'s
+/// own doc for why).
+async fn try_register_sentinel_v2(
+    device: &crate::access_packet::AccessPacketV2,
+    shortname: Option<&str>,
+) -> Result<SentinelRegisterOutcome> {
+    use ed25519_dalek::Signer;
+
+    let self_id = uuid::Uuid::parse_str(&device.self_id)
+        .context("device self_id is not a valid UUID (checked at apply-time; should be unreachable)")?;
+
+    let signing_priv_bytes = hex::decode(&device.client_signing_private_key_hex)
+        .context("decode client_signing_private_key_hex")?;
+    let signing_priv_arr: [u8; 32] = signing_priv_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("client_signing_private_key_hex must be 32 bytes"))?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_priv_arr);
+
+    // 16 random bytes via a fresh UUID v4's own bytes — reuses the `uuid`
+    // dependency already in this crate rather than adding a general-purpose
+    // RNG crate for one nonce; a v4 UUID's randomness (122 bits) is ample
+    // freshness salt for an anti-replay nonce that already sits alongside a
+    // bounded `ts_ms` window.
+    let nonce_hex = hex::encode(*uuid::Uuid::new_v4().as_bytes());
+    let ts_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let preimage = sentinel_register_signing_bytes(
+        self_id,
+        &device.mesh_id,
+        &device.monitor.self_id,
+        &nonce_hex,
+        ts_ms,
+    );
+    let sig = signing_key.sign(&preimage);
+    let possession_sig = mirage_core::identity::SignatureHex::from_signature(&sig);
+
+    let body = SentinelRegisterBody {
+        identity: &device.declared_identity,
+        nonce_hex,
+        ts_ms,
+        possession_sig,
+        shortname,
+    };
+    let body_json = serde_json::to_vec(&body).context("serialize sentinel register body")?;
+
+    let client_priv_bytes =
+        hex::decode(&device.client_private_key_hex).context("decode client_private_key_hex")?;
+    let client_priv_arr: [u8; 32] = client_priv_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("client_private_key_hex must be 32 bytes"))?;
+
+    let (status, resp_body) = mirage_client_core::monitor_link::wire_post_no_bearer_with_static_key(
+        &device.monitor.wire_addr,
+        &device.monitor.wire_pubkey_hex,
+        &device.mesh_id,
+        &client_priv_arr,
+        "/relay/clients/sentinel",
+        &body_json,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("sentinel register wire_post: {e}"))?;
+
+    classify_sentinel_register_response(status, &resp_body)
+}
+
+/// Register a v2 (identity-bearing) sentinel with the monitor named in
+/// `device.monitor`. Loops with the SAME floor/cap backoff schedule
+/// [`Backoff`] gives the K1 chain-ask cycle (30s floor / 5min cap) on every
+/// refusal — named, logged, never a tight spin — because a v2 device has NO
+/// anonymous fallback: [`register_with_failover`]'s ordinary path is simply
+/// not available once identity-bearing registration is in play (see this
+/// module's own doc, "Register via identity, never anonymously"). Returns
+/// only on success; mirrors [`register_with_failover`]'s own return shape
+/// `(active_url, client_id, client_token)` so `lib.rs::run`'s subsequent
+/// subscribe/config/chain flow needs no v2-specific branching past this
+/// call.
+pub async fn register_sentinel_v2(
+    device: &crate::access_packet::AccessPacketV2,
+    shortname: Option<&str>,
+) -> Result<(String, String, Option<String>)> {
+    let mut backoff = Backoff::new(Duration::from_secs(30), Duration::from_secs(300));
+    loop {
+        match try_register_sentinel_v2(device, shortname).await {
+            Ok(SentinelRegisterOutcome::Registered { client_id, client_token }) => {
+                tracing::info!(
+                    client_id = %client_id,
+                    "[sentinel] v2 register: monitor accepted this device's identity"
+                );
+                return Ok((format!("wire://{}", device.monitor.wire_addr), client_id, client_token));
+            }
+            Ok(SentinelRegisterOutcome::Refused { reason, status }) => {
+                tracing::warn!(
+                    reason = %reason,
+                    status,
+                    "[sentinel] v2 register refused — backing off, never spinning"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[sentinel] v2 register failed (transport) — backing off, never spinning"
+                );
+            }
+        }
+        tokio::time::sleep(backoff.next()).await;
+    }
+}
+
 /// Persist `client_id` under `${state_dir}/client-id.txt` so a restart can
 /// confirm the registered id without a fresh round-trip to the monitor.
 pub fn persist_client_id(state_dir: &Path, client_id: &str) -> Result<()> {
@@ -974,6 +1194,81 @@ mod tests {
                 actions.is_empty(),
                 "must not warn again on poll {extra}: {actions:?}"
             );
+        }
+    }
+
+    // ── K2 v2: sentinel registration ─────────────────────────────────────
+
+    /// Byte-exact test vector for [`sentinel_register_signing_bytes`] — pins
+    /// the documented layout the same way
+    /// `mirage_core::identity::tests::signing_bytes_none_case_matches_the_
+    /// documented_encoding` pins `DeclaredIdentity::signing_bytes`'s own.
+    #[test]
+    fn sentinel_register_signing_bytes_matches_the_documented_encoding() {
+        let self_id = uuid::Uuid::nil();
+        let mesh_id = "MESH1";
+        let monitor_self_id = "monitor-self-id-1";
+        let nonce_hex = "bb".repeat(16);
+        let ts_ms: u64 = 1_700_000_000_000;
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"MIRAGE-SENTINEL-CLIENT-REGISTER-V1\0");
+        expected.extend_from_slice(self_id.to_string().as_bytes());
+        expected.push(0);
+        expected.extend_from_slice(mesh_id.as_bytes());
+        expected.push(0);
+        expected.extend_from_slice(monitor_self_id.as_bytes());
+        expected.push(0);
+        expected.extend_from_slice(nonce_hex.as_bytes());
+        expected.push(0);
+        expected.extend_from_slice(ts_ms.to_string().as_bytes());
+
+        let actual =
+            sentinel_register_signing_bytes(self_id, mesh_id, monitor_self_id, &nonce_hex, ts_ms);
+        assert_eq!(actual, expected, "must match the documented byte layout exactly");
+    }
+
+    #[test]
+    fn sentinel_register_signing_bytes_differ_by_monitor_self_id() {
+        let self_id = uuid::Uuid::new_v4();
+        let a = sentinel_register_signing_bytes(self_id, "MESH1", "monitor-a", "cc", 1);
+        let b = sentinel_register_signing_bytes(self_id, "MESH1", "monitor-b", "cc", 1);
+        assert_ne!(a, b, "binding to a different monitor must change the preimage");
+    }
+
+    #[test]
+    fn classify_sentinel_register_response_parses_a_success() {
+        let body = serde_json::json!({"client_id": "c0ffee00-0000-4000-8000-000000000001", "client_token": "tok-a"})
+            .to_string();
+        match classify_sentinel_register_response(200, body.as_bytes()).unwrap() {
+            SentinelRegisterOutcome::Registered { client_id, client_token } => {
+                assert_eq!(client_id, "c0ffee00-0000-4000-8000-000000000001");
+                assert_eq!(client_token, Some("tok-a".to_owned()));
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_sentinel_register_response_names_a_refusal() {
+        let body = serde_json::json!({"error": "revoked", "detail": "identity is revoked"}).to_string();
+        match classify_sentinel_register_response(401, body.as_bytes()).unwrap() {
+            SentinelRegisterOutcome::Refused { reason, status } => {
+                assert_eq!(reason, "revoked");
+                assert_eq!(status, 401);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_sentinel_register_response_falls_back_to_raw_body_when_unshaped() {
+        match classify_sentinel_register_response(503, b"service unavailable").unwrap() {
+            SentinelRegisterOutcome::Refused { reason, status } => {
+                assert_eq!(reason, "service unavailable");
+                assert_eq!(status, 503);
+            }
+            other => panic!("expected Refused, got {other:?}"),
         }
     }
 }

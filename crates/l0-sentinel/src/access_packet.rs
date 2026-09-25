@@ -36,6 +36,15 @@ use crate::monitor_wire;
 /// The only packet version this sentinel understands.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// The only [`AccessPacketV2`] version this sentinel understands. A
+/// separate namespace from [`CURRENT_VERSION`] — mirrors
+/// `mirage2panel::mesh_access_packet::MeshAccessPacket::CURRENT_VERSION`'s
+/// own doc: the two packet shapes are versioned independently, and this
+/// crate keeps its own copy of the v2 number rather than sharing one with
+/// v1's. The wire value is `2` (not `1`) — v2 packets self-identify by this
+/// field as well as by shape.
+pub const CURRENT_VERSION_V2: u32 = 2;
+
 /// Filename (under `state_dir`) for the default, unconsumed access packet —
 /// the entry point used when the sentinel is started with no `--access`
 /// flag.
@@ -55,6 +64,12 @@ const CAPABILITY_TOKENS_FILE: &str = "capability-tokens.txt";
 /// Filename (under `state_dir`) for a persisted `credential_params` seed.
 /// See [`load_persisted_credential_params`].
 const CREDENTIAL_PARAMS_SEED_FILE: &str = "credential-params-seed.json";
+
+/// Filename (under `state_dir`) for the v2 device identity — see
+/// [`AccessPacketV2::apply`]. Holds private key material, so it is written
+/// with owner-only permissions ([`write_owner_only_atomic`]) and must NEVER
+/// be logged.
+const DEVICE_IDENTITY_FILE: &str = "sentinel-device-identity.json";
 
 /// Expected decoded length, in bytes, of every plain 32-byte hex key/token
 /// field in the packet (`client_token`, `monitor.wire_pubkey_hex`,
@@ -80,6 +95,54 @@ pub fn capability_tokens_path(state_dir: &Path) -> PathBuf {
 
 fn credential_params_seed_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CREDENTIAL_PARAMS_SEED_FILE)
+}
+
+/// The full path a v2 device identity is persisted to. See
+/// [`AccessPacketV2::apply`] / [`load_device_identity`].
+pub fn device_identity_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(DEVICE_IDENTITY_FILE)
+}
+
+/// Load the device identity [`AccessPacketV2::apply`] persisted, if any.
+/// `lib.rs::run` calls this once, on every boot, to decide whether this
+/// sentinel registers via identity (v2) or anonymously (v1) — mirrors
+/// [`load_persisted_credential_params`]'s own "read the cache, not the
+/// original delivery file" shape.
+pub fn load_device_identity(state_dir: &Path) -> Option<AccessPacketV2> {
+    let raw = std::fs::read_to_string(device_identity_path(state_dir)).ok()?;
+    match serde_json::from_str(&raw) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                "[sentinel] {} parse failed: {e} — ignoring",
+                DEVICE_IDENTITY_FILE
+            );
+            None
+        }
+    }
+}
+
+/// Write `content` to `path` atomically (tmp + rename), same discipline as
+/// [`crate::write_atomic`], plus owner-only permissions on the tmp file
+/// before the rename (unix `0o600`; on Windows this relies on the default
+/// per-user-profile ACL of `state_dir`, matching the precedent in
+/// `mlc-updater::token_store::save_token`). Used only for files that carry
+/// private key material — never log the bytes passed here.
+fn write_owner_only_atomic(path: &Path, content: &str) -> Result<(), AccessPacketError> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)
+        .map_err(|e| AccessPacketError::Io(format!("write {:?}: {e}", tmp)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(&tmp, perms) {
+            tracing::warn!("[sentinel] chmod 0600 on {:?} failed: {e}", tmp);
+        }
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| AccessPacketError::Io(format!("rename {:?} -> {:?}: {e}", tmp, path)))?;
+    Ok(())
 }
 
 /// Load the `credential_params` seed [`AccessPacket::apply`] persisted, if
@@ -190,9 +253,46 @@ pub enum AccessPacketError {
 
     #[error("access packet apply: {0}")]
     Apply(String),
+
+    // ── v2-specific refusals ────────────────────────────────────────────
+
+    #[error("access packet v2: self_id {self_id:?} is not a valid UUID: {reason}")]
+    BadSelfId { self_id: String, reason: String },
+
+    #[error(
+        "access packet v2: self_id {packet_self_id} does not match declared_identity.self_id {identity_self_id}"
+    )]
+    SelfIdMismatch { packet_self_id: String, identity_self_id: String },
+
+    #[error("access packet v2: declared_identity.roles {roles:?} does not include Sentinel")]
+    RoleNotSentinel { roles: Vec<String> },
+
+    #[error(
+        "access packet v2: mesh_id {packet_mesh_id} does not match declared_identity.mesh_id {identity_mesh_id}"
+    )]
+    MeshMismatch { packet_mesh_id: String, identity_mesh_id: String },
+
+    #[error("access packet v2: monitor.self_id is empty")]
+    EmptyMonitorSelfId,
+
+    #[error("access packet v2: field '{field}' does not match its corresponding private key")]
+    KeyMismatch { field: String },
+
+    #[error("access packet: top-level value is not a JSON object")]
+    NotAnObject,
+
+    #[error(
+        "access packet: ambiguous shape — carries both v1's 'client_token' and v2's 'declared_identity'"
+    )]
+    AmbiguousVersion,
+
+    #[error(
+        "access packet: unrecognised shape — carries neither v1's 'client_token' nor v2's 'declared_identity'"
+    )]
+    UnknownVersion,
 }
 
-fn check_hex_field(field: &str, value: &str, expected_bytes: usize) -> Result<(), AccessPacketError> {
+fn check_hex_field(field: &str, value: &str, expected_bytes: usize) -> Result<Vec<u8>, AccessPacketError> {
     let bytes = hex::decode(value).map_err(|e| AccessPacketError::MalformedHex {
         field: field.to_owned(),
         reason: e.to_string(),
@@ -204,7 +304,47 @@ fn check_hex_field(field: &str, value: &str, expected_bytes: usize) -> Result<()
             got_bytes: bytes.len(),
         });
     }
-    Ok(())
+    Ok(bytes)
+}
+
+/// Convert an already-length-checked [`check_hex_field`] result into a fixed
+/// 32-byte array. `check_hex_field` already guarantees `v.len() ==
+/// HEX32_BYTES` on `Ok`, so the conversion cannot fail in practice — but the
+/// fallible path is kept (rather than an `expect`) so a future caller that
+/// forgets the length precondition gets a named refusal, never a panic.
+fn to_array32(v: Vec<u8>, field: &str) -> Result<[u8; 32], AccessPacketError> {
+    v.try_into().map_err(|got: Vec<u8>| AccessPacketError::WrongHexLength {
+        field: field.to_owned(),
+        expected_bytes: HEX32_BYTES,
+        got_bytes: got.len(),
+    })
+}
+
+/// Which `AccessPacket` shape a `DeliveryKind::Packet` file (per
+/// `entrance_artefact::detect_kind`) carries — decided purely by which
+/// discriminating field is present, mirroring `entrance_artefact::
+/// detect_kind`'s own technique: v2 carries an operator-signed
+/// `declared_identity` and no `client_token`; v1 carries `client_token` and
+/// no `declared_identity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketVersion {
+    V1,
+    V2,
+}
+
+/// Shape-sniff a `Packet`-kind delivery file to tell v1 from v2 — a cheap,
+/// generic pre-parse (`serde_json::Value`) purely to pick which typed parser
+/// to call next, exactly like `entrance_artefact::detect_kind`'s own role for
+/// `Artefact` vs `Packet`.
+pub fn detect_packet_version(raw: &str) -> Result<PacketVersion, AccessPacketError> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let obj = value.as_object().ok_or(AccessPacketError::NotAnObject)?;
+    match (obj.contains_key("declared_identity"), obj.contains_key("client_token")) {
+        (true, false) => Ok(PacketVersion::V2),
+        (false, true) => Ok(PacketVersion::V1),
+        (true, true) => Err(AccessPacketError::AmbiguousVersion),
+        (false, false) => Err(AccessPacketError::UnknownVersion),
+    }
 }
 
 /// `true` for a plain `host:port` pair — non-empty host, port parses as a
@@ -404,6 +544,282 @@ impl AccessPacket {
             mesh_id = %self.mesh_id,
             label = %self.label,
             "[sentinel] access packet applied"
+        );
+        Ok(())
+    }
+}
+
+// ── AccessPacket v2 ──────────────────────────────────────────────────────
+//
+// Carries an operator-signed Sentinel `DeclaredIdentity` and this device's
+// own X25519 (+ Ed25519 signing) keys, minted by mirage2panel's mode-3
+// private-mesh issuance (`mirage2panel::mesh_access_packet::MeshAccessPacket`
+// — the panel-side type this mirrors field-for-field). Unlike v1, a v2
+// packet never carries a `client_token`: the sentinel registers by proving
+// possession of the identity's own signing key
+// (`chain_request::register_sentinel_v2`), and the monitor mints the token
+// on that call, exactly as `mirage2monitor`'s existing `/relay/clients/edge`
+// route does for an Edge box (`clients_api::register_edge_client`).
+
+/// The monitor a v2 packet's Sentinel dials — adds `self_id` (the monitor's
+/// own operator-declared identifier) alongside the two fields
+/// [`AccessPacketMonitor`] carries. `self_id` is bound into
+/// `chain_request::sentinel_register_signing_bytes`'s preimage so a
+/// possession proof minted for one monitor cannot be replayed against a
+/// different monitor in the same mesh (mirrors the reasoning
+/// `mirage2monitor::clients_api::edge_register_signing_bytes`'s own doc
+/// gives for its `monitor_self_id` parameter).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessPacketV2Monitor {
+    /// `host:port` of the monitor's Mirage wire listener.
+    pub wire_addr: String,
+    /// 64-character hex of the monitor's static X25519 public key — what
+    /// [`AccessPacketV2`]'s registration dial PINS the wire connection to.
+    pub wire_pubkey_hex: String,
+    /// The monitor's own operator-declared identifier — carried into the
+    /// possession-sig preimage, never used to pin the wire dial (that is
+    /// `wire_pubkey_hex`'s job).
+    pub self_id: String,
+}
+
+/// The K2 v2 delivery unit — see this section's own doc for how it differs
+/// from [`AccessPacket`] (v1).
+///
+/// A custom [`std::fmt::Debug`] impl (below) redacts both private-key
+/// fields: this type MUST NEVER be logged whole — see [`AccessPacketV2::apply`]
+/// for the one place it is persisted (owner-only permissions) and the only
+/// fields that are safe to log individually.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AccessPacketV2 {
+    /// Packet format version. Only [`CURRENT_VERSION_V2`] is accepted — a
+    /// separate namespace from v1's [`CURRENT_VERSION`].
+    pub v: u32,
+    /// The FLEET mesh id this device joins — never a personal
+    /// per-subscriber identifier.
+    pub mesh_id: String,
+    /// The Sentinel's own identifier, minted by the panel — carried
+    /// unchanged into [`Self::declared_identity`]'s own `self_id`. Checked
+    /// for equality with it in [`Self::validate`].
+    pub self_id: String,
+    /// 64-hex X25519 static secret — this device's persistent identity key,
+    /// presented on the wire hello of every registration dial (never an
+    /// ephemeral key — see `chain_request::register_sentinel_v2`).
+    pub client_private_key_hex: String,
+    /// The public half of [`Self::client_private_key_hex`].
+    pub client_pubkey_hex: String,
+    /// 64-hex Ed25519 signing secret — always present in v2 (unlike the
+    /// panel's own optional field on older issuance paths): a v2 packet has
+    /// no way to register without one, since `possession_sig` is signed with
+    /// it.
+    pub client_signing_private_key_hex: String,
+    /// The public half of [`Self::client_signing_private_key_hex`].
+    pub client_signing_pubkey_hex: String,
+    /// opbox's signed `DeclaredIdentity` envelope for this device's
+    /// `ServiceRole::Sentinel` role. Unlike the panel's own module (which
+    /// keeps this opaque to avoid a `mirage-core` dependency it otherwise
+    /// has no use for), this crate already depends on `mirage-core` for
+    /// several other types, so this rides typed rather than as
+    /// `serde_json::Value` — [`Self::validate`] inspects it directly, and it
+    /// is sent verbatim as the `identity` field of
+    /// `chain_request::SentinelRegisterBody`.
+    pub declared_identity: mirage_core::identity::DeclaredIdentity,
+    pub monitor: AccessPacketV2Monitor,
+    /// The operator-signed `CredentialParams` this device presents, if the
+    /// mesh enforces one. `None` is a real state (an unenforced pilot mesh),
+    /// not an omission — same as v1's own field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_params: Option<mirage_core::crypto::credential::CredentialParams>,
+    pub issued_at_ms: u64,
+    /// A human tag for logs. Same rule as v1's own field: NEVER customer
+    /// identity.
+    pub label: String,
+}
+
+impl std::fmt::Debug for AccessPacketV2 {
+    /// Redacts [`Self::client_private_key_hex`] and
+    /// [`Self::client_signing_private_key_hex`] — every other field is
+    /// printed normally. This is what makes "never logged" a property of the
+    /// TYPE rather than only of code-review discipline at every call site.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessPacketV2")
+            .field("v", &self.v)
+            .field("mesh_id", &self.mesh_id)
+            .field("self_id", &self.self_id)
+            .field("client_private_key_hex", &"<redacted>")
+            .field("client_pubkey_hex", &self.client_pubkey_hex)
+            .field("client_signing_private_key_hex", &"<redacted>")
+            .field("client_signing_pubkey_hex", &self.client_signing_pubkey_hex)
+            .field("declared_identity", &self.declared_identity)
+            .field("monitor", &self.monitor)
+            .field("credential_params", &self.credential_params)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl AccessPacketV2 {
+    /// Parse a v2 packet from its JSON form. Does NOT validate — call
+    /// [`Self::validate`] (or rely on [`Self::apply`], which validates
+    /// first).
+    pub fn from_json(raw: &str) -> Result<Self, AccessPacketError> {
+        Ok(serde_json::from_str(raw)?)
+    }
+
+    /// Refuse a malformed v2 packet BY NAME. Never partially applies
+    /// anything — this only inspects `self`. Checks, in order: version,
+    /// mesh_id shape, `self_id` is a UUID matching
+    /// `declared_identity.self_id`, `declared_identity` names the Sentinel
+    /// role, `declared_identity.mesh_id` matches `self.mesh_id`, every hex
+    /// field's shape, `monitor.wire_addr` shape, `monitor.self_id`
+    /// non-empty, and finally that both key pairs (X25519 identity, Ed25519
+    /// signing) are actually pairs — the public half really is derived from
+    /// the private half.
+    ///
+    /// Deliberately does NOT verify `declared_identity.operator_sig` — this
+    /// crate has no pinned operator key at packet-apply time (unlike
+    /// `credential_params`, which IS verified downstream by `MonitorLink`
+    /// against `SentinelConfig::operator_pub_hex`). The signature is the
+    /// MONITOR's job at registration time, exactly as it is for the
+    /// existing `/relay/clients/edge` route
+    /// (`mirage2monitor::clients_api::verify_edge_client_registration`).
+    pub fn validate(&self) -> Result<(), AccessPacketError> {
+        if self.v != CURRENT_VERSION_V2 {
+            return Err(AccessPacketError::UnsupportedVersion {
+                found: self.v,
+                expected: CURRENT_VERSION_V2,
+            });
+        }
+        if self.mesh_id.trim().is_empty() {
+            return Err(AccessPacketError::EmptyMeshId);
+        }
+
+        let self_id = uuid::Uuid::parse_str(&self.self_id).map_err(|e| AccessPacketError::BadSelfId {
+            self_id: self.self_id.clone(),
+            reason: e.to_string(),
+        })?;
+        if self_id != self.declared_identity.self_id {
+            return Err(AccessPacketError::SelfIdMismatch {
+                packet_self_id: self.self_id.clone(),
+                identity_self_id: self.declared_identity.self_id.to_string(),
+            });
+        }
+        if !self.declared_identity.roles.contains(&mirage_core::identity::ServiceRole::Sentinel) {
+            return Err(AccessPacketError::RoleNotSentinel {
+                roles: self.declared_identity.roles.iter().map(|r| r.as_tag().to_string()).collect(),
+            });
+        }
+        if self.declared_identity.mesh_id.as_str() != self.mesh_id {
+            return Err(AccessPacketError::MeshMismatch {
+                packet_mesh_id: self.mesh_id.clone(),
+                identity_mesh_id: self.declared_identity.mesh_id.as_str().to_string(),
+            });
+        }
+
+        let priv_bytes = check_hex_field("client_private_key_hex", &self.client_private_key_hex, HEX32_BYTES)?;
+        let pub_bytes = check_hex_field("client_pubkey_hex", &self.client_pubkey_hex, HEX32_BYTES)?;
+        let signing_priv_bytes = check_hex_field(
+            "client_signing_private_key_hex",
+            &self.client_signing_private_key_hex,
+            HEX32_BYTES,
+        )?;
+        let signing_pub_bytes = check_hex_field(
+            "client_signing_pubkey_hex",
+            &self.client_signing_pubkey_hex,
+            HEX32_BYTES,
+        )?;
+        check_hex_field("monitor.wire_pubkey_hex", &self.monitor.wire_pubkey_hex, HEX32_BYTES)?;
+        if !looks_like_host_port(&self.monitor.wire_addr) {
+            return Err(AccessPacketError::BadMonitorAddr { addr: self.monitor.wire_addr.clone() });
+        }
+        if self.monitor.self_id.trim().is_empty() {
+            return Err(AccessPacketError::EmptyMonitorSelfId);
+        }
+
+        // X25519 identity key: pubkey must be derived from the private key.
+        let priv_arr = to_array32(priv_bytes, "client_private_key_hex")?;
+        let pub_arr = to_array32(pub_bytes, "client_pubkey_hex")?;
+        let derived_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(priv_arr));
+        if derived_pub.to_bytes() != pub_arr {
+            return Err(AccessPacketError::KeyMismatch { field: "client_pubkey_hex".to_owned() });
+        }
+
+        // Ed25519 signing key: same check.
+        let signing_priv_arr = to_array32(signing_priv_bytes, "client_signing_private_key_hex")?;
+        let signing_pub_arr = to_array32(signing_pub_bytes, "client_signing_pubkey_hex")?;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_priv_arr);
+        if signing_key.verifying_key().to_bytes() != signing_pub_arr {
+            return Err(AccessPacketError::KeyMismatch { field: "client_signing_pubkey_hex".to_owned() });
+        }
+
+        Ok(())
+    }
+
+    /// Apply this packet to `state_dir`. Validates first — a malformed
+    /// packet never touches disk. Unlike v1's [`AccessPacket::apply`], this
+    /// is naturally idempotent with no "consumed" dedup marker needed: every
+    /// field it writes is either a deterministic function of `self`
+    /// (rewriting the same content is a no-op in effect) or lives in a
+    /// SEPARATE file this fn never touches — the actual `client_token` a
+    /// registration mints, which `chain_request::register_sentinel_v2`
+    /// persists on ITS OWN, not here.
+    ///
+    /// Writes, in order:
+    /// 1. monitor wire coordinates (`monitor_wire::save`) — the SAME cache
+    ///    v1 populates, so `lib.rs::run`'s existing wire_coords resolution
+    ///    needs no v2-specific plumbing;
+    /// 2. `credential_params` (if present) to the SAME seed file v1 uses
+    ///    (`load_persisted_credential_params` reads it back unchanged);
+    /// 3. `client_id`/`sentinel_id` forced to `self.self_id` — a v2 device's
+    ///    `client_id` on registration success is ALWAYS
+    ///    `declared_identity.self_id`, mirroring the monitor's own Edge
+    ///    registration rule ("never a freshly minted or caller-chosen id");
+    /// 4. the device identity itself (this whole struct, private keys
+    ///    included) to [`device_identity_path`], with owner-only permissions
+    ///    ([`write_owner_only_atomic`]). NEVER logged — see this fn's own
+    ///    final INFO line for the only fields that are safe to log.
+    pub fn apply(&self, state_dir: &Path) -> Result<(), AccessPacketError> {
+        self.validate()?;
+
+        std::fs::create_dir_all(state_dir)
+            .map_err(|e| AccessPacketError::Io(format!("create state_dir {}: {e}", state_dir.display())))?;
+
+        let coords = monitor_wire::WireCoords {
+            monitor_addr: self.monitor.wire_addr.clone(),
+            monitor_pubkey_hex: self.monitor.wire_pubkey_hex.clone(),
+            mesh_id: self.mesh_id.clone(),
+        };
+        monitor_wire::save(state_dir, &coords)
+            .map_err(|e| AccessPacketError::Apply(format!("monitor_wire::save: {e}")))?;
+
+        match &self.credential_params {
+            Some(cp) => {
+                let body = serde_json::to_string(cp)?;
+                crate::write_atomic(&credential_params_seed_path(state_dir), &body).map_err(|e| {
+                    AccessPacketError::Apply(format!("write credential_params seed: {e}"))
+                })?;
+                tracing::info!("[sentinel] access packet v2: credential_params present — seeded");
+            }
+            None => {
+                tracing::info!(
+                    "[sentinel] access packet v2: no credential_params — applying without one"
+                );
+            }
+        }
+
+        chain_request::persist_client_id(state_dir, &self.self_id)
+            .map_err(|e| AccessPacketError::Apply(format!("persist_client_id: {e}")))?;
+        crate::sentinel_id::adopt_sentinel_id(state_dir, &self.self_id)
+            .map_err(|e| AccessPacketError::Apply(format!("adopt_sentinel_id: {e}")))?;
+
+        let body = serde_json::to_string_pretty(self)?;
+        write_owner_only_atomic(&device_identity_path(state_dir), &body)?;
+
+        tracing::info!(
+            self_id = %self.self_id,
+            mesh_id = %self.mesh_id,
+            label = %self.label,
+            "[sentinel] access packet v2 applied — device identity persisted"
         );
         Ok(())
     }
@@ -662,5 +1078,320 @@ mod tests {
             Some(p2.client_token.clone()),
             "a genuinely re-issued packet must apply, not be treated as a repeat"
         );
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    use mirage_core::crypto::credential::{CredentialParams, EpochEntry};
+    use mirage_core::identity::{DeclaredIdentity, RolePublicKeys, ServiceRole};
+    use mirage_core::ids::MachineId;
+    use mirage_core::mirage::wire::CredentialScheme;
+
+    fn op_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+    }
+
+    fn x25519_priv_bytes() -> [u8; 32] {
+        [7u8; 32]
+    }
+
+    fn x25519_pub_hex() -> String {
+        let secret = x25519_dalek::StaticSecret::from(x25519_priv_bytes());
+        hex::encode(x25519_dalek::PublicKey::from(&secret).to_bytes())
+    }
+
+    fn signing_priv_bytes() -> [u8; 32] {
+        [9u8; 32]
+    }
+
+    fn signing_pub_hex() -> String {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&signing_priv_bytes());
+        hex::encode(sk.verifying_key().to_bytes())
+    }
+
+    fn sample_self_id() -> uuid::Uuid {
+        uuid::Uuid::parse_str("c0ffee00-0000-4000-8000-000000000001").unwrap()
+    }
+
+    fn declared_identity(self_id: uuid::Uuid, mesh_id: &str, role: ServiceRole) -> DeclaredIdentity {
+        DeclaredIdentity::sign_new(
+            self_id,
+            MachineId::new("laptop-1").unwrap(),
+            mesh_id.parse().unwrap(),
+            vec![role],
+            vec![RolePublicKeys {
+                role,
+                wire_pubkey_hex: x25519_pub_hex(),
+                signing_pubkey_hex: Some(signing_pub_hex()),
+            }],
+            1_726_000_000_000,
+            &op_key(),
+        )
+    }
+
+    fn sample_v2() -> AccessPacketV2 {
+        let self_id = sample_self_id();
+        AccessPacketV2 {
+            v: CURRENT_VERSION_V2,
+            mesh_id: "MESH1".to_owned(),
+            self_id: self_id.to_string(),
+            client_private_key_hex: hex::encode(x25519_priv_bytes()),
+            client_pubkey_hex: x25519_pub_hex(),
+            client_signing_private_key_hex: hex::encode(signing_priv_bytes()),
+            client_signing_pubkey_hex: signing_pub_hex(),
+            declared_identity: declared_identity(self_id, "MESH1", ServiceRole::Sentinel),
+            monitor: AccessPacketV2Monitor {
+                wire_addr: "203.0.113.9:19444".to_owned(),
+                wire_pubkey_hex: "11".repeat(HEX32_BYTES),
+                self_id: "monitor-self-id-1".to_owned(),
+            },
+            credential_params: None,
+            issued_at_ms: 1_726_000_000_000,
+            label: "laptop-1".to_owned(),
+        }
+    }
+
+    // ── validate ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn valid_v2_packet_passes() {
+        assert!(sample_v2().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_refuses_unknown_version() {
+        let mut p = sample_v2();
+        p.v = 1;
+        assert!(matches!(
+            p.validate(),
+            Err(AccessPacketError::UnsupportedVersion { found: 1, expected: 2 })
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_empty_mesh_id() {
+        let mut p = sample_v2();
+        p.mesh_id = "  ".to_owned();
+        assert!(matches!(p.validate(), Err(AccessPacketError::EmptyMeshId)));
+    }
+
+    #[test]
+    fn validate_refuses_a_malformed_self_id() {
+        let mut p = sample_v2();
+        p.self_id = "not-a-uuid".to_owned();
+        assert!(matches!(p.validate(), Err(AccessPacketError::BadSelfId { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_self_id_identity_mismatch() {
+        let mut p = sample_v2();
+        p.self_id = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000099")
+            .unwrap()
+            .to_string();
+        assert!(matches!(p.validate(), Err(AccessPacketError::SelfIdMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_a_non_sentinel_role() {
+        let mut p = sample_v2();
+        p.declared_identity = declared_identity(sample_self_id(), "MESH1", ServiceRole::Edge);
+        assert!(matches!(p.validate(), Err(AccessPacketError::RoleNotSentinel { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_a_mesh_mismatch() {
+        let mut p = sample_v2();
+        p.declared_identity = declared_identity(sample_self_id(), "MESH2", ServiceRole::Sentinel);
+        assert!(matches!(p.validate(), Err(AccessPacketError::MeshMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_malformed_client_private_key_hex() {
+        let mut p = sample_v2();
+        p.client_private_key_hex = "not-hex".to_owned();
+        match p.validate() {
+            Err(AccessPacketError::MalformedHex { field, .. }) => {
+                assert_eq!(field, "client_private_key_hex")
+            }
+            other => panic!("expected MalformedHex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_refuses_wrong_length_signing_pubkey_hex() {
+        let mut p = sample_v2();
+        p.client_signing_pubkey_hex = "aa".repeat(10);
+        match p.validate() {
+            Err(AccessPacketError::WrongHexLength { field, .. }) => {
+                assert_eq!(field, "client_signing_pubkey_hex")
+            }
+            other => panic!("expected WrongHexLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_refuses_monitor_addr_without_port() {
+        let mut p = sample_v2();
+        p.monitor.wire_addr = "not-an-addr".to_owned();
+        assert!(matches!(p.validate(), Err(AccessPacketError::BadMonitorAddr { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_an_empty_monitor_self_id() {
+        let mut p = sample_v2();
+        p.monitor.self_id = String::new();
+        assert!(matches!(p.validate(), Err(AccessPacketError::EmptyMonitorSelfId)));
+    }
+
+    #[test]
+    fn validate_refuses_a_client_pubkey_that_does_not_match_the_private_key() {
+        let mut p = sample_v2();
+        p.client_pubkey_hex = "22".repeat(HEX32_BYTES);
+        match p.validate() {
+            Err(AccessPacketError::KeyMismatch { field }) => assert_eq!(field, "client_pubkey_hex"),
+            other => panic!("expected KeyMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_signing_pubkey_that_does_not_match_the_private_key() {
+        let mut p = sample_v2();
+        p.client_signing_pubkey_hex = "33".repeat(HEX32_BYTES);
+        match p.validate() {
+            Err(AccessPacketError::KeyMismatch { field }) => {
+                assert_eq!(field, "client_signing_pubkey_hex")
+            }
+            other => panic!("expected KeyMismatch, got {other:?}"),
+        }
+    }
+
+    // ── round trip / Debug redaction ────────────────────────────────────────
+
+    #[test]
+    fn round_trips_through_json() {
+        let p = sample_v2();
+        let json = serde_json::to_string(&p).unwrap();
+        let back = AccessPacketV2::from_json(&json).unwrap();
+        assert_eq!(serde_json::to_value(&p).unwrap(), serde_json::to_value(&back).unwrap());
+    }
+
+    #[test]
+    fn debug_impl_redacts_private_keys() {
+        let p = sample_v2();
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains(&p.client_private_key_hex));
+        assert!(!dbg.contains(&p.client_signing_private_key_hex));
+        assert!(dbg.contains("<redacted>"));
+    }
+
+    // ── detect_packet_version ────────────────────────────────────────────────
+
+    #[test]
+    fn detects_v1_by_client_token() {
+        let raw = serde_json::json!({"client_token": "aa", "mesh_id": "MESH1"}).to_string();
+        assert_eq!(detect_packet_version(&raw).unwrap(), PacketVersion::V1);
+    }
+
+    #[test]
+    fn detects_v2_by_declared_identity() {
+        let raw = serde_json::to_string(&sample_v2()).unwrap();
+        assert_eq!(detect_packet_version(&raw).unwrap(), PacketVersion::V2);
+    }
+
+    #[test]
+    fn detect_packet_version_refuses_ambiguous_shape() {
+        let mut v = serde_json::to_value(sample_v2()).unwrap();
+        v["client_token"] = serde_json::json!("aa");
+        assert!(matches!(
+            detect_packet_version(&v.to_string()),
+            Err(AccessPacketError::AmbiguousVersion)
+        ));
+    }
+
+    #[test]
+    fn detect_packet_version_refuses_unknown_shape() {
+        let raw = serde_json::json!({"mesh_id": "MESH1"}).to_string();
+        assert!(matches!(
+            detect_packet_version(&raw),
+            Err(AccessPacketError::UnknownVersion)
+        ));
+    }
+
+    // ── apply ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_refuses_an_invalid_packet_without_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = sample_v2();
+        p.mesh_id = String::new();
+        assert!(p.apply(dir.path()).is_err());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "no file must be written");
+    }
+
+    #[test]
+    fn apply_persists_monitor_wire_coords_and_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+
+        let coords = monitor_wire::load(dir.path()).expect("monitor_wire.json must be written");
+        assert_eq!(coords.monitor_addr, p.monitor.wire_addr);
+        assert_eq!(coords.monitor_pubkey_hex, p.monitor.wire_pubkey_hex);
+        assert_eq!(coords.mesh_id, p.mesh_id);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("client-id.txt")).unwrap(),
+            p.self_id
+        );
+    }
+
+    #[test]
+    fn apply_persists_the_device_identity_and_it_reloads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+
+        let loaded = load_device_identity(dir.path()).expect("device identity must be written");
+        assert_eq!(loaded.self_id, p.self_id);
+        assert_eq!(loaded.client_private_key_hex, p.client_private_key_hex);
+        assert_eq!(loaded.client_signing_private_key_hex, p.client_signing_private_key_hex);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_writes_the_device_identity_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+
+        let meta = std::fs::metadata(device_identity_path(dir.path())).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn apply_with_credential_params_seeds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = sample_v2();
+        p.credential_params = Some(CredentialParams::single(
+            1,
+            CredentialScheme::SignedCapability,
+            vec![EpochEntry::with_secret(1, u64::MAX, [0u8; 32])],
+        ));
+        p.apply(dir.path()).unwrap();
+        let seeded = load_persisted_credential_params(dir.path()).expect("credential_params must be seeded");
+        assert_eq!(seeded.generation, 1);
+    }
+
+    #[test]
+    fn apply_is_naturally_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+        p.apply(dir.path()).unwrap();
+        let loaded = load_device_identity(dir.path()).unwrap();
+        assert_eq!(loaded.self_id, p.self_id);
     }
 }

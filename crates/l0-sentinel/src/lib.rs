@@ -719,13 +719,28 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
                     }
                 }
                 Ok(entrance_artefact::DeliveryKind::Packet) => {
-                    match access_packet::AccessPacket::from_json(&raw) {
-                        Ok(packet) => {
-                            if let Err(e) = packet.apply(&state_dir) {
-                                error!("[sentinel] access packet at {:?} refused: {}", access_path, e);
+                    match access_packet::detect_packet_version(&raw) {
+                        Ok(access_packet::PacketVersion::V1) => {
+                            match access_packet::AccessPacket::from_json(&raw) {
+                                Ok(packet) => {
+                                    if let Err(e) = packet.apply(&state_dir) {
+                                        error!("[sentinel] access packet at {:?} refused: {}", access_path, e);
+                                    }
+                                }
+                                Err(e) => error!("[sentinel] access packet at {:?} invalid: {}", access_path, e),
                             }
                         }
-                        Err(e) => error!("[sentinel] access packet at {:?} invalid: {}", access_path, e),
+                        Ok(access_packet::PacketVersion::V2) => {
+                            match access_packet::AccessPacketV2::from_json(&raw) {
+                                Ok(packet) => {
+                                    if let Err(e) = packet.apply(&state_dir) {
+                                        error!("[sentinel] access packet v2 at {:?} refused: {}", access_path, e);
+                                    }
+                                }
+                                Err(e) => error!("[sentinel] access packet v2 at {:?} invalid: {}", access_path, e),
+                            }
+                        }
+                        Err(e) => error!("[sentinel] access packet at {:?} unrecognised version: {}", access_path, e),
                     }
                 }
                 Err(e) => error!("[sentinel] delivery file at {:?} refused: {}", access_path, e),
@@ -751,6 +766,17 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         );
         return entrance_artefact::run(binary, args).await;
     }
+
+    // K2 v2: whether this box has ever consumed a v2 (identity-bearing)
+    // access packet — read from the persisted cache
+    // (`access_packet::AccessPacketV2::apply`'s own file), not from THIS
+    // boot's `access_path` alone, so a restart with no fresh delivery file
+    // present still registers via identity. `Some` here is what routes the
+    // registration call below to `chain_request::register_sentinel_v2`
+    // instead of the ordinary anonymous path — see that function's own doc,
+    // "Register via identity, never anonymously".
+    let device_identity: Option<access_packet::AccessPacketV2> =
+        access_packet::load_device_identity(&state_dir);
 
     // Wire transport coordinates: explicit sentinel.toml fields win; otherwise
     // fall back to the last-run persisted coords (auto-seeded from peer_table
@@ -907,46 +933,59 @@ pub async fn run(cfg: SentinelConfig) -> Result<()> {
         .as_ref()
         .and_then(|wc| chain_request::load_client_token(&state_dir, wc.token_key()));
 
-    let reg_body = chain_request::RegisterBody {
-        sentinel_id: &sentinel,
-        role: &cfg.role,
-        shortname: &shortname_owned,
-        os: std::env::consts::OS,
-        version: env!("CARGO_PKG_VERSION"),
-        supported_transports: vec!["tcp", "udp"],
-        client_token: stored_client_token.as_deref(),
-    };
-
+    // K2 v2: an identity-bearing device registers via
+    // `chain_request::register_sentinel_v2` — never the ordinary anonymous
+    // `register_with_failover` path below. That function has no failure
+    // return on refusal (it backs off and retries internally, see its own
+    // doc), so this branch only ever produces `Ok` or a genuine bug
+    // (malformed persisted state — `?` propagates it as a boot failure,
+    // same as every other `Context`-wrapped step in this function).
     let (active_monitor_url, registered_client_id, registered_client_token) =
-        match chain_request::register_with_failover(
-            &reg_body,
-            wire_reg_coords_ref.as_ref(),
-        )
-        .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                // A 401 while we DID send a stored token means that token is
-                // stale (the monitor's registry was reset, or the row was
-                // re-minted elsewhere) — drop it so the next attempt (next
-                // process start; we do not retry in a loop here) registers
-                // as a first-timer instead of repeating the same refusal.
-                if stored_client_token.is_some() && chain_request::is_unauthorized(&e) {
-                    if let Some(wc) = wire_reg_coords_ref.as_ref() {
-                        warn!(
-                            monitor = %wc.monitor_addr,
-                            "[sentinel] register refused (401) with a stored client_token — \
-                             token is stale; dropping it for this monitor"
-                        );
-                        if let Err(drop_err) =
-                            chain_request::drop_client_token(&state_dir, wc.token_key())
-                        {
-                            warn!(error = %drop_err, "[sentinel] drop_client_token failed (non-fatal)");
+        if let Some(device) = device_identity.as_ref() {
+            chain_request::register_sentinel_v2(device, cfg.shortname.as_deref())
+                .await
+                .context("register_sentinel_v2 failed")?
+        } else {
+            let reg_body = chain_request::RegisterBody {
+                sentinel_id: &sentinel,
+                role: &cfg.role,
+                shortname: &shortname_owned,
+                os: std::env::consts::OS,
+                version: env!("CARGO_PKG_VERSION"),
+                supported_transports: vec!["tcp", "udp"],
+                client_token: stored_client_token.as_deref(),
+            };
+
+            match chain_request::register_with_failover(
+                &reg_body,
+                wire_reg_coords_ref.as_ref(),
+            )
+            .await
+            {
+                Ok(out) => out,
+                Err(e) => {
+                    // A 401 while we DID send a stored token means that token is
+                    // stale (the monitor's registry was reset, or the row was
+                    // re-minted elsewhere) — drop it so the next attempt (next
+                    // process start; we do not retry in a loop here) registers
+                    // as a first-timer instead of repeating the same refusal.
+                    if stored_client_token.is_some() && chain_request::is_unauthorized(&e) {
+                        if let Some(wc) = wire_reg_coords_ref.as_ref() {
+                            warn!(
+                                monitor = %wc.monitor_addr,
+                                "[sentinel] register refused (401) with a stored client_token — \
+                                 token is stale; dropping it for this monitor"
+                            );
+                            if let Err(drop_err) =
+                                chain_request::drop_client_token(&state_dir, wc.token_key())
+                            {
+                                warn!(error = %drop_err, "[sentinel] drop_client_token failed (non-fatal)");
+                            }
                         }
                     }
+                    error!(error = %e, "[sentinel] register failed across all monitor URLs");
+                    return Err(e);
                 }
-                error!(error = %e, "[sentinel] register failed across all monitor URLs");
-                return Err(e);
             }
         };
     if registered_client_id != sentinel {
