@@ -2694,6 +2694,97 @@ pub async fn wire_post(
     Ok((status_code, body_bytes))
 }
 
+/// Issue a raw `POST <path>` over the Mirage wire using a CALLER-SUPPLIED
+/// static X25519 key — never a freshly random ephemeral one — and no
+/// `Authorization` header.
+///
+/// Mirrors [`wire_post`]'s HTTP/1.0 framing exactly; the two differences are
+/// the two things named above. Used by an identity-bearing client (e.g. a
+/// mode-3 Sentinel device presenting its own operator-vouched X25519
+/// identity key) that must dial under a STABLE key instead of a per-call
+/// ephemeral one, and that has no bearer token yet — proving who it is is
+/// the whole point of the call this wire-dial backs (its own possession
+/// proof travels inside the request BODY, a layer above this wire dial, not
+/// as a header here).
+pub async fn wire_post_no_bearer_with_static_key(
+    monitor_addr: &str,
+    monitor_pubkey_hex: &str,
+    mesh_id: &str,
+    client_static_priv: &[u8; 32],
+    path: &str,
+    body_json: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let wire = WireParams {
+        monitor_addr: monitor_addr.to_owned(),
+        monitor_pubkey_hex: monitor_pubkey_hex.to_owned(),
+        mesh_id: mesh_id.to_owned(),
+        host_hint: None,
+    };
+
+    let host = wire
+        .monitor_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_owned())
+        .unwrap_or_else(|| wire.monitor_addr.clone());
+
+    let (mut io, _pump) = dial_monitor_wire_io(&wire, client_static_priv).await?;
+
+    let head = format!(
+        "POST {path} HTTP/1.0\r\n\
+         Host: {host}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_json.len()
+    );
+
+    io.write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("wire_post_no_bearer_with_static_key: send head: {e}"))?;
+    io.write_all(body_json)
+        .await
+        .map_err(|e| format!("wire_post_no_bearer_with_static_key: send body: {e}"))?;
+
+    let mut response = Vec::new();
+    io.read_to_end(&mut response)
+        .await
+        .map_err(|e| format!("wire_post_no_bearer_with_static_key: read response: {e}"))?;
+
+    if response.is_empty() {
+        return Err("wire_post_no_bearer_with_static_key: empty response from monitor".to_string());
+    }
+
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(response.len());
+
+    let status_line = response[..header_end.min(response.len())]
+        .split(|&b| b == b'\n')
+        .next()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .unwrap_or_default();
+
+    if !status_line.starts_with("HTTP/1.") {
+        return Err(format!(
+            "wire_post_no_bearer_with_static_key: unexpected response prefix: {:?}",
+            &status_line[..status_line.len().min(40)]
+        ));
+    }
+
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let body_bytes = response[(header_end + 4).min(response.len())..].to_vec();
+    Ok((status_code, body_bytes))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build the Wire WebSocket subscribe URL, appending `?client_id=X` and

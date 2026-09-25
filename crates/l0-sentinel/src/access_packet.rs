@@ -1080,3 +1080,318 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    use mirage_core::crypto::credential::{CredentialParams, EpochEntry};
+    use mirage_core::identity::{DeclaredIdentity, RolePublicKeys, ServiceRole};
+    use mirage_core::ids::MachineId;
+    use mirage_core::mirage::wire::CredentialScheme;
+
+    fn op_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+    }
+
+    fn x25519_priv_bytes() -> [u8; 32] {
+        [7u8; 32]
+    }
+
+    fn x25519_pub_hex() -> String {
+        let secret = x25519_dalek::StaticSecret::from(x25519_priv_bytes());
+        hex::encode(x25519_dalek::PublicKey::from(&secret).to_bytes())
+    }
+
+    fn signing_priv_bytes() -> [u8; 32] {
+        [9u8; 32]
+    }
+
+    fn signing_pub_hex() -> String {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&signing_priv_bytes());
+        hex::encode(sk.verifying_key().to_bytes())
+    }
+
+    fn sample_self_id() -> uuid::Uuid {
+        uuid::Uuid::parse_str("c0ffee00-0000-4000-8000-000000000001").unwrap()
+    }
+
+    fn declared_identity(self_id: uuid::Uuid, mesh_id: &str, role: ServiceRole) -> DeclaredIdentity {
+        DeclaredIdentity::sign_new(
+            self_id,
+            MachineId::new("laptop-1").unwrap(),
+            mesh_id.parse().unwrap(),
+            vec![role],
+            vec![RolePublicKeys {
+                role,
+                wire_pubkey_hex: x25519_pub_hex(),
+                signing_pubkey_hex: Some(signing_pub_hex()),
+            }],
+            1_726_000_000_000,
+            &op_key(),
+        )
+    }
+
+    fn sample_v2() -> AccessPacketV2 {
+        let self_id = sample_self_id();
+        AccessPacketV2 {
+            v: CURRENT_VERSION_V2,
+            mesh_id: "MESH1".to_owned(),
+            self_id: self_id.to_string(),
+            client_private_key_hex: hex::encode(x25519_priv_bytes()),
+            client_pubkey_hex: x25519_pub_hex(),
+            client_signing_private_key_hex: hex::encode(signing_priv_bytes()),
+            client_signing_pubkey_hex: signing_pub_hex(),
+            declared_identity: declared_identity(self_id, "MESH1", ServiceRole::Sentinel),
+            monitor: AccessPacketV2Monitor {
+                wire_addr: "203.0.113.9:19444".to_owned(),
+                wire_pubkey_hex: "11".repeat(HEX32_BYTES),
+                self_id: "monitor-self-id-1".to_owned(),
+            },
+            credential_params: None,
+            issued_at_ms: 1_726_000_000_000,
+            label: "laptop-1".to_owned(),
+        }
+    }
+
+    // ── validate ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn valid_v2_packet_passes() {
+        assert!(sample_v2().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_refuses_unknown_version() {
+        let mut p = sample_v2();
+        p.v = 1;
+        assert!(matches!(
+            p.validate(),
+            Err(AccessPacketError::UnsupportedVersion { found: 1, expected: 2 })
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_empty_mesh_id() {
+        let mut p = sample_v2();
+        p.mesh_id = "  ".to_owned();
+        assert!(matches!(p.validate(), Err(AccessPacketError::EmptyMeshId)));
+    }
+
+    #[test]
+    fn validate_refuses_a_malformed_self_id() {
+        let mut p = sample_v2();
+        p.self_id = "not-a-uuid".to_owned();
+        assert!(matches!(p.validate(), Err(AccessPacketError::BadSelfId { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_self_id_identity_mismatch() {
+        let mut p = sample_v2();
+        p.self_id = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000099")
+            .unwrap()
+            .to_string();
+        assert!(matches!(p.validate(), Err(AccessPacketError::SelfIdMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_a_non_sentinel_role() {
+        let mut p = sample_v2();
+        p.declared_identity = declared_identity(sample_self_id(), "MESH1", ServiceRole::Edge);
+        assert!(matches!(p.validate(), Err(AccessPacketError::RoleNotSentinel { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_a_mesh_mismatch() {
+        let mut p = sample_v2();
+        p.declared_identity = declared_identity(sample_self_id(), "MESH2", ServiceRole::Sentinel);
+        assert!(matches!(p.validate(), Err(AccessPacketError::MeshMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_malformed_client_private_key_hex() {
+        let mut p = sample_v2();
+        p.client_private_key_hex = "not-hex".to_owned();
+        match p.validate() {
+            Err(AccessPacketError::MalformedHex { field, .. }) => {
+                assert_eq!(field, "client_private_key_hex")
+            }
+            other => panic!("expected MalformedHex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_refuses_wrong_length_signing_pubkey_hex() {
+        let mut p = sample_v2();
+        p.client_signing_pubkey_hex = "aa".repeat(10);
+        match p.validate() {
+            Err(AccessPacketError::WrongHexLength { field, .. }) => {
+                assert_eq!(field, "client_signing_pubkey_hex")
+            }
+            other => panic!("expected WrongHexLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_refuses_monitor_addr_without_port() {
+        let mut p = sample_v2();
+        p.monitor.wire_addr = "not-an-addr".to_owned();
+        assert!(matches!(p.validate(), Err(AccessPacketError::BadMonitorAddr { .. })));
+    }
+
+    #[test]
+    fn validate_refuses_an_empty_monitor_self_id() {
+        let mut p = sample_v2();
+        p.monitor.self_id = String::new();
+        assert!(matches!(p.validate(), Err(AccessPacketError::EmptyMonitorSelfId)));
+    }
+
+    #[test]
+    fn validate_refuses_a_client_pubkey_that_does_not_match_the_private_key() {
+        let mut p = sample_v2();
+        p.client_pubkey_hex = "22".repeat(HEX32_BYTES);
+        match p.validate() {
+            Err(AccessPacketError::KeyMismatch { field }) => assert_eq!(field, "client_pubkey_hex"),
+            other => panic!("expected KeyMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_signing_pubkey_that_does_not_match_the_private_key() {
+        let mut p = sample_v2();
+        p.client_signing_pubkey_hex = "33".repeat(HEX32_BYTES);
+        match p.validate() {
+            Err(AccessPacketError::KeyMismatch { field }) => {
+                assert_eq!(field, "client_signing_pubkey_hex")
+            }
+            other => panic!("expected KeyMismatch, got {other:?}"),
+        }
+    }
+
+    // ── round trip / Debug redaction ────────────────────────────────────────
+
+    #[test]
+    fn round_trips_through_json() {
+        let p = sample_v2();
+        let json = serde_json::to_string(&p).unwrap();
+        let back = AccessPacketV2::from_json(&json).unwrap();
+        assert_eq!(serde_json::to_value(&p).unwrap(), serde_json::to_value(&back).unwrap());
+    }
+
+    #[test]
+    fn debug_impl_redacts_private_keys() {
+        let p = sample_v2();
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains(&p.client_private_key_hex));
+        assert!(!dbg.contains(&p.client_signing_private_key_hex));
+        assert!(dbg.contains("<redacted>"));
+    }
+
+    // ── detect_packet_version ────────────────────────────────────────────────
+
+    #[test]
+    fn detects_v1_by_client_token() {
+        let raw = serde_json::json!({"client_token": "aa", "mesh_id": "MESH1"}).to_string();
+        assert_eq!(detect_packet_version(&raw).unwrap(), PacketVersion::V1);
+    }
+
+    #[test]
+    fn detects_v2_by_declared_identity() {
+        let raw = serde_json::to_string(&sample_v2()).unwrap();
+        assert_eq!(detect_packet_version(&raw).unwrap(), PacketVersion::V2);
+    }
+
+    #[test]
+    fn detect_packet_version_refuses_ambiguous_shape() {
+        let mut v = serde_json::to_value(sample_v2()).unwrap();
+        v["client_token"] = serde_json::json!("aa");
+        assert!(matches!(
+            detect_packet_version(&v.to_string()),
+            Err(AccessPacketError::AmbiguousVersion)
+        ));
+    }
+
+    #[test]
+    fn detect_packet_version_refuses_unknown_shape() {
+        let raw = serde_json::json!({"mesh_id": "MESH1"}).to_string();
+        assert!(matches!(
+            detect_packet_version(&raw),
+            Err(AccessPacketError::UnknownVersion)
+        ));
+    }
+
+    // ── apply ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_refuses_an_invalid_packet_without_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = sample_v2();
+        p.mesh_id = String::new();
+        assert!(p.apply(dir.path()).is_err());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "no file must be written");
+    }
+
+    #[test]
+    fn apply_persists_monitor_wire_coords_and_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+
+        let coords = monitor_wire::load(dir.path()).expect("monitor_wire.json must be written");
+        assert_eq!(coords.monitor_addr, p.monitor.wire_addr);
+        assert_eq!(coords.monitor_pubkey_hex, p.monitor.wire_pubkey_hex);
+        assert_eq!(coords.mesh_id, p.mesh_id);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("client-id.txt")).unwrap(),
+            p.self_id
+        );
+    }
+
+    #[test]
+    fn apply_persists_the_device_identity_and_it_reloads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+
+        let loaded = load_device_identity(dir.path()).expect("device identity must be written");
+        assert_eq!(loaded.self_id, p.self_id);
+        assert_eq!(loaded.client_private_key_hex, p.client_private_key_hex);
+        assert_eq!(loaded.client_signing_private_key_hex, p.client_signing_private_key_hex);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_writes_the_device_identity_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+
+        let meta = std::fs::metadata(device_identity_path(dir.path())).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn apply_with_credential_params_seeds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = sample_v2();
+        p.credential_params = Some(CredentialParams::single(
+            1,
+            CredentialScheme::SignedCapability,
+            vec![EpochEntry::with_secret(1, u64::MAX, [0u8; 32])],
+        ));
+        p.apply(dir.path()).unwrap();
+        let seeded = load_persisted_credential_params(dir.path()).expect("credential_params must be seeded");
+        assert_eq!(seeded.generation, 1);
+    }
+
+    #[test]
+    fn apply_is_naturally_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample_v2();
+        p.apply(dir.path()).unwrap();
+        p.apply(dir.path()).unwrap();
+        let loaded = load_device_identity(dir.path()).unwrap();
+        assert_eq!(loaded.self_id, p.self_id);
+    }
+}

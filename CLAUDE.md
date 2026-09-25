@@ -273,6 +273,127 @@ respect_user_config = true
 
 **Marker `_managed_by`**: если файл уже существует **без** этого маркера и `respect_user_config=true` — sentinel **не перезаписывает**, просто спавнит cli с существующим файлом. Это для пользовательских конфигов (file/QR) — sentinel их не трогает.
 
+## AccessPacket v2 — identity-bearing sentinel registration (K2, 2026-09-25)
+
+`crates/l0-sentinel/src/access_packet.rs` now accepts a SECOND delivery
+shape at `access_path` (default `${state_dir}/access.json`, or `--access
+<path>`), alongside the original `AccessPacket` (v1, still parsed and
+applied exactly as before). `entrance_artefact::detect_kind` still tells an
+`EntranceArtefact` from a `Packet` (both v1 and v2 carry `monitor`, no
+`entrances`); WITHIN the `Packet` arm, `access_packet::detect_packet_version`
+tells v1 from v2 by shape — v2 carries `declared_identity` and no
+`client_token`, v1 the reverse.
+
+**`AccessPacketV2`** — minted by mirage2panel's mode-3 private-mesh issuance
+(`mirage2panel::mesh_access_packet::MeshAccessPacket`, mirrored field for
+field): `v` (`2` — its own version namespace, independent of v1's
+`CURRENT_VERSION`), `mesh_id`, `self_id`, `client_private_key_hex` /
+`client_pubkey_hex` (X25519 identity keypair), `client_signing_private_key_hex`
+/ `client_signing_pubkey_hex` (Ed25519 signing keypair — ALWAYS present in
+v2, unlike the panel's own optional field on other issuance paths: a v2
+device cannot register at all without one, since `possession_sig` is signed
+with it), `declared_identity` (the operator-signed `ServiceRole::Sentinel`
+`mirage_core::identity::DeclaredIdentity`, parsed as the real typed value —
+unlike the panel, which keeps it opaque, this crate already depends on
+`mirage-core` for other types), `monitor` (`AccessPacketV2Monitor`:
+`wire_addr` + `wire_pubkey_hex`, same as v1's monitor, PLUS `self_id` — the
+target monitor's own operator-declared identifier, needed for the
+registration preimage below), `credential_params` (nullable, same as v1),
+`issued_at_ms`, `label`.
+
+**`AccessPacketV2::validate`** checks, by name (`AccessPacketError` gains the
+v2-specific variants): version, non-empty `mesh_id`, `self_id` parses as a
+UUID AND equals `declared_identity.self_id`, `declared_identity.roles`
+contains `Sentinel`, `declared_identity.mesh_id` matches the packet's own
+`mesh_id`, every hex field's shape (32 bytes each), `monitor.wire_addr` is
+`host:port`, `monitor.self_id` is non-empty, and finally that BOTH key pairs
+are actually pairs — the X25519 public key is truly derived from the private
+key (`x25519_dalek`), and the Ed25519 verifying key is truly derived from the
+signing key (`ed25519_dalek`). Deliberately does NOT verify
+`declared_identity.operator_sig` — this crate has no pinned operator key at
+packet-apply time; that signature is the MONITOR's job at registration time,
+exactly as for the existing `/relay/clients/edge` route.
+
+**`AccessPacketV2::apply`** persists, in order: (1) monitor wire coordinates
+via the SAME `monitor_wire::save` v1 uses — so `lib.rs::run`'s existing
+`wire_coords` resolution needs no v2-specific plumbing at all; (2)
+`credential_params`, if present, to the SAME seed file v1 uses; (3)
+`client-id.txt` / `sentinel-id.txt` forced to `self.self_id` — a v2 device's
+`client_id` on registration success is ALWAYS `declared_identity.self_id`,
+mirroring the monitor's Edge-registration rule; (4) the packet itself
+(private keys included) to `${state_dir}/sentinel-device-identity.json`,
+via `write_owner_only_atomic` (unix `chmod 0600` on the tmp file before
+rename — same convention as `mlc-updater::token_store::save_token`; on
+Windows this relies on the state dir's default per-user-profile ACL, same
+precedent). **Never logged** — `AccessPacketV2` has a hand-written `Debug`
+impl that redacts both private-key fields, so even an accidental `{:?}`
+cannot leak them; the one INFO line `apply()` itself emits names only
+`self_id`/`mesh_id`/`label`.
+
+**Registration** (`lib.rs::run`): on every boot, `access_packet::
+load_device_identity(&state_dir)` reads the persisted v2 record back (`Some`
+regardless of whether THIS boot's `access_path` carried a fresh delivery —
+the cache is what decides, mirroring how `wire_coords` itself falls back to
+a persisted cache). When `Some`, the ordinary anonymous
+`chain_request::register_with_failover` (`POST /relay/clients`) is never
+called — instead `chain_request::register_sentinel_v2` calls `POST
+/relay/clients/sentinel`, pinning the wire dial to `monitor.wire_pubkey_hex`
+and presenting the device's OWN X25519 identity key as the V9 wire hello's
+static key (`mirage_client_core::monitor_link::
+wire_post_no_bearer_with_static_key` — new, mirrors `wire_post`'s HTTP/1.0
+framing exactly, the two differences being a caller-supplied static key
+instead of a fresh ephemeral one, and no `Authorization` header, since there
+is no bearer yet). Body `{identity, nonce_hex, ts_ms, possession_sig,
+shortname?}`:
+
+- `nonce_hex` — 16 random bytes, hex (32 lowercase chars). Sourced from a
+  fresh `uuid::Uuid::new_v4()`'s own bytes rather than adding a
+  general-purpose RNG crate for one nonce — ample freshness salt alongside a
+  bounded `ts_ms` window.
+- `possession_sig` — Ed25519 (`mirage_core::identity::SignatureHex`) by the
+  device's OWN signing key over `chain_request::
+  sentinel_register_signing_bytes(self_id, mesh_id, monitor.self_id,
+  nonce_hex, ts_ms)`:
+  ```text
+  b"MIRAGE-SENTINEL-CLIENT-REGISTER-V1\0"
+  self_id.to_string() 0x00
+  mesh_id             0x00
+  monitor.self_id     0x00
+  nonce_hex           0x00
+  ts_ms.to_string()
+  ```
+  Field-for-field the SAME layout as `mirage2monitor::clients_api::
+  edge_register_signing_bytes` (just this route's own label and this
+  packet's own `monitor.self_id` in the `monitor_self_id` slot) — the
+  monitor side (branch `sentinel-reg`) reproduces it byte-for-byte from its
+  own `ApiState.own_self_id`-equivalent for this route. Byte-exact test
+  vector: `chain_request::tests::
+  sentinel_register_signing_bytes_matches_the_documented_encoding`.
+
+On success (`{client_id, client_token}`, `client_id` always `self_id`) the
+tuple `(active_monitor_url, client_id, client_token)` feeds straight into the
+SAME code `register_with_failover` used to — the existing subscribe / config
+/ chain-ask flow (`MonitorLink`, `chain_request::spawn_chain_asker`, …) is
+completely unchanged and unaware a v2 device is behind it; those calls keep
+using MonitorLink's own existing (ephemeral-per-dial) wire transport,
+authenticated by the `client_token` bearer registration minted — the static
+identity key applies to the REGISTRATION dial only.
+
+On refusal (named `error`/`detail`, mirroring `EdgeClientRegisterError`'s own
+wire labels — `bad_operator_sig`, `role_not_edge`→`role_not_sentinel` once the
+monitor side lands, `revoked`, `mesh_mismatch`, …) or a transport failure,
+`register_sentinel_v2` logs the reason BY NAME and backs off (30s floor / 5min
+cap, the same schedule `chain_request::Backoff` already gives the K1
+chain-ask cycle) before retrying — **never a tight spin, and no anonymous
+fallback**: a v2 device has no `register_with_failover` escape hatch to fall
+back to. The call blocks `run()` until it succeeds, same as the existing
+`WaitingOnboard` gate blocks on missing wire coords.
+
+**Monitor side**: `POST /relay/clients/sentinel` is being built concurrently
+on `mirage2monitor` branch `sentinel-reg` against this exact contract — see
+`mirage2monitor/CLAUDE.md`'s own "Edge client registration" section for the
+closest existing precedent (`/relay/clients/edge`) this route mirrors.
+
 ## cli (`mirage-client-cli`) — 🔴 RETIRED 2026-06-14
 
 > **Legacy. Не использовать.** cli1 перенесён в `crates/_deprecated/cli/` и

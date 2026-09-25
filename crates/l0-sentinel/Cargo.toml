@@ -37,6 +37,13 @@ axum               = { workspace = true }
 reqwest            = { workspace = true }
 toml                 = "0.8"
 ed25519-dalek        = { workspace = true }
+# K2 v2: AccessPacketV2::validate derives the X25519 public key from the
+# device's private key to prove the pair actually matches. Pinned to the
+# same spec `mirage-core`'s own workspace declares (`version = "2", features
+# = ["static_secrets"]`), already resolved to 2.0.1 in this workspace's
+# Cargo.lock — this only makes it a DIRECT dependency of this crate too, no
+# new version enters the graph.
+x25519-dalek         = { version = "2", features = ["static_secrets"] }
 hex                  = "0.4"
 anyhow               = "1"
 rustls               = { version = "0.23", default-features = false, features = ["ring"] }
