@@ -24,7 +24,7 @@
 //! Wire (promoted back)
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -684,6 +684,37 @@ pub struct MonitorLink {
     /// Workers pass the config-file parent dir here; the sentinel leaves it
     /// `None` because the sentinel does not dial the data-plane directly.
     nf_counter_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+
+    /// Local opt-in for operator-triggered debug tunnels
+    /// (`WsServerFrame::DebugTunnelOpen`/`DebugTunnelClose`).
+    ///
+    /// Set exactly once at construction from the caller's own local config
+    /// (e.g. `mirage-l0-sentinel`'s `sentinel.toml#allow_operator_debug_shell`).
+    /// `false` by default. When `false`, an incoming `DebugTunnelOpen` /
+    /// `DebugTunnelClose` frame is refused before it ever reaches `frame_tx` —
+    /// no downstream consumer (l0-sentinel's debug-shell spawner) ever
+    /// observes it. Nothing pushed by the monitor (`AccessPacket`, `Config`,
+    /// or any other server frame) can change this value — it is immutable
+    /// for the lifetime of the link.
+    allow_operator_debug_shell: bool,
+    /// Monitor identities (Wire/OverChain address) already logged for a
+    /// refused `DebugTunnelOpen`/`DebugTunnelClose` frame — deduped so a
+    /// monitor that keeps pushing the frame does not spam the log.
+    debug_tunnel_refused_logged: std::sync::Mutex<HashSet<String>>,
+}
+
+/// Local, caller-owned link options — every field here is set once, at
+/// construction, from the caller's own local config (e.g. `sentinel.toml`).
+/// Bundled into one parameter so adding a local-only knob never grows a
+/// constructor's positional argument list; nothing in this struct is ever
+/// set from anything the monitor or an `AccessPacket` supplies.
+#[derive(Default)]
+pub struct MonitorLinkOptions {
+    /// Pinned operator Ed25519 verifying key — see [`MonitorLink::new_with_operator_pub`].
+    pub operator_pub: Option<ed25519_dalek::VerifyingKey>,
+    /// Local opt-in for operator-triggered debug tunnels — see the
+    /// `allow_operator_debug_shell` field doc on [`MonitorLink`].
+    pub allow_operator_debug_shell: bool,
 }
 
 impl MonitorLink {
@@ -705,6 +736,8 @@ impl MonitorLink {
     /// `mesh_id` — cluster/mesh identifier sent in FRAME_AUTH.
     ///
     /// `node_client_id` — local node/sentry identifier sent in FRAME_AUTH.
+    ///
+    /// `options` — see [`MonitorLinkOptions`].
     pub fn new(
         monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
@@ -712,6 +745,7 @@ impl MonitorLink {
         transports: Vec<MonitorTransport>,
         mesh_id: String,
         node_client_id: String,
+        options: MonitorLinkOptions,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         Self::new_with_operator_pub(
             monitor_api_key,
@@ -720,15 +754,16 @@ impl MonitorLink {
             transports,
             mesh_id,
             node_client_id,
-            None,
+            options,
         )
     }
 
-    /// Like [`new`] but also accepts a pinned operator [`ed25519_dalek::VerifyingKey`]
-    /// for verifying incoming `CredentialParams` frames before applying them.
+    /// Like [`new`] but the caller supplies [`MonitorLinkOptions::operator_pub`]
+    /// — a pinned operator [`ed25519_dalek::VerifyingKey`] used to verify
+    /// incoming `CredentialParams` frames before applying them.
     ///
-    /// When `operator_pub` is `Some`, every `CredentialParams` frame is verified
-    /// against the key.  Frames that fail verification are discarded; the previously
+    /// When `Some`, every `CredentialParams` frame is verified against the
+    /// key.  Frames that fail verification are discarded; the previously
     /// held params remain active.  When `None`, params are applied without
     /// operator-signature verification (transition state).
     pub fn new_with_operator_pub(
@@ -738,7 +773,7 @@ impl MonitorLink {
         transports: Vec<MonitorTransport>,
         mesh_id: String,
         node_client_id: String,
-        operator_pub: Option<ed25519_dalek::VerifyingKey>,
+        options: MonitorLinkOptions,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
         Self::new_with_credential_arc(
             monitor_api_key,
@@ -750,7 +785,7 @@ impl MonitorLink {
             transports,
             mesh_id,
             node_client_id,
-            operator_pub,
+            options,
         )
     }
 
@@ -785,6 +820,11 @@ impl MonitorLink {
     /// Use `link.credential_params()` / `link.token_pool()` /
     /// `link.ring_credential_cell()` to retrieve `Arc::clone`s from a link
     /// built with the ordinary [`new`] constructor.
+    ///
+    /// `options` — see [`MonitorLinkOptions`]; its
+    /// `allow_operator_debug_shell` field must come from the caller's own
+    /// local config only — never from anything the monitor or an
+    /// `AccessPacket` supplies.
     pub fn new_with_credential_arc(
         _monitor_api_key: Option<String>,
         peer_table: Arc<ArcSwap<PeerTable>>,
@@ -795,8 +835,9 @@ impl MonitorLink {
         transports: Vec<MonitorTransport>,
         mesh_id: String,
         node_client_id: String,
-        operator_pub: Option<ed25519_dalek::VerifyingKey>,
+        options: MonitorLinkOptions,
     ) -> (Arc<Self>, watch::Receiver<Option<MonitorConfig>>) {
+        let MonitorLinkOptions { operator_pub, allow_operator_debug_shell } = options;
         let (config_tx, config_rx) = watch::channel(None);
         let (frame_tx, _frame_rx) = watch::channel(None);
 
@@ -838,6 +879,8 @@ impl MonitorLink {
             ring_enrol_in_flight: AtomicBool::new(false),
             last_ring_epoch_requested: AtomicU64::new(0),
             nf_counter_dir: std::sync::Mutex::new(None),
+            allow_operator_debug_shell,
+            debug_tunnel_refused_logged: std::sync::Mutex::new(HashSet::new()),
         });
 
         (link, config_rx)
@@ -857,6 +900,38 @@ impl MonitorLink {
         if let Ok(mut guard) = self.nf_counter_dir.lock() {
             *guard = Some(dir);
         }
+    }
+
+    /// Decide whether a `DebugTunnelOpen`/`DebugTunnelClose` frame pushed by
+    /// `monitor` (its Wire or OverChain address) should be forwarded to
+    /// `frame_tx` — the single chokepoint both transports (Wire, OverChain)
+    /// call before acting on either frame kind.
+    ///
+    /// Returns `true` (admit) only when `allow_operator_debug_shell` was set
+    /// at construction from the caller's own local config (e.g.
+    /// `sentinel.toml#allow_operator_debug_shell`) — never from anything the
+    /// monitor or an `AccessPacket` supplies. Returns `false` (refuse)
+    /// otherwise, having logged a `warn!` naming `monitor` and `kind` once
+    /// per distinct `monitor` value for the lifetime of this link. A refused
+    /// frame is never forwarded — no consumer downstream (e.g. l0-sentinel's
+    /// debug-shell spawner) ever observes it.
+    fn admit_debug_tunnel_frame(&self, kind: &str, monitor: &str) -> bool {
+        if self.allow_operator_debug_shell {
+            return true;
+        }
+        let mut logged = match self.debug_tunnel_refused_logged.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if logged.insert(monitor.to_string()) {
+            warn!(
+                monitor,
+                kind,
+                "monitor_link: {kind} refused — allow_operator_debug_shell is not set \
+                 (local opt-in required; the monitor cannot enable this remotely)"
+            );
+        }
+        false
     }
 
     /// Return the shared ring-credential cell.
@@ -1877,6 +1952,9 @@ impl MonitorLink {
                                     self.apply_config(cfg);
                                 }
                                 Ok(TaggedServerFrame::DebugTunnelOpen(payload)) => {
+                                    if !self.admit_debug_tunnel_frame("DebugTunnelOpen", &wire.monitor_addr) {
+                                        continue;
+                                    }
                                     info!(
                                         "monitor_link: Wire DebugTunnelOpen (host={}, port={}, ttl={}s)",
                                         payload.monitor_ssh_host,
@@ -1886,6 +1964,9 @@ impl MonitorLink {
                                     let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelOpen(payload)));
                                 }
                                 Ok(TaggedServerFrame::DebugTunnelClose) => {
+                                    if !self.admit_debug_tunnel_frame("DebugTunnelClose", &wire.monitor_addr) {
+                                        continue;
+                                    }
                                     info!("monitor_link: Wire DebugTunnelClose received");
                                     let _ = self.frame_tx.send(Some(WsServerFrame::DebugTunnelClose));
                                 }
@@ -2033,9 +2114,9 @@ impl MonitorLink {
                 );
                 tokio::time::sleep(OVER_CHAIN_BACKOFF_INIT).await;
             }
-            Some(mut ch) => {
+            Some((mut ch, monitor_addr)) => {
                 info!("monitor_link: OverChain connected — entering receive loop");
-                self.run_over_chain_loop(&mut ch).await;
+                self.run_over_chain_loop(&mut ch, &monitor_addr.to_string()).await;
                 let _ = ch.close().await;
                 warn!("monitor_link: OverChain channel closed — returning to Wire retry");
             }
@@ -2043,8 +2124,9 @@ impl MonitorLink {
     }
 
     /// Try to open one OverChain connection.  Returns the first successful
-    /// channel, or `None` if all transports fail.
-    async fn try_connect_over_chain(&self) -> Option<OverChainChannel> {
+    /// channel plus the monitor address it dialed, or `None` if all
+    /// transports fail.
+    async fn try_connect_over_chain(&self) -> Option<(OverChainChannel, SocketAddr)> {
         // No bearer token — OverChain auth is provided by the Mirage tunnel.
         let bearer = "";
         let mesh_id = self.mesh_id.as_str();
@@ -2076,7 +2158,7 @@ impl MonitorLink {
                                     addr = %monitor_addr,
                                     "monitor_link: OverChain connected via tunnel"
                                 );
-                                return Some(ch);
+                                return Some((ch, *monitor_addr));
                             }
                             Ok(Err(e)) => {
                                 warn!(chain_id = %chain_id, "monitor_link: OverChain tunnel path failed: {e} — trying SOCKS5 fallback");
@@ -2101,7 +2183,7 @@ impl MonitorLink {
                             addr = %monitor_addr,
                             "monitor_link: OverChain connected via SOCKS5"
                         );
-                        return Some(ch);
+                        return Some((ch, *monitor_addr));
                     }
                     Ok(Err(e)) => {
                         warn!(
@@ -2124,7 +2206,10 @@ impl MonitorLink {
     }
 
     /// Drive the OverChain receive loop until the channel closes or errors.
-    async fn run_over_chain_loop(&self, channel: &mut OverChainChannel) {
+    ///
+    /// `monitor_addr` identifies which monitor this channel is connected to —
+    /// used only to name the monitor in a refused-`DebugTunnel*` log line.
+    async fn run_over_chain_loop(&self, channel: &mut OverChainChannel, monitor_addr: &str) {
         use crate::monitor_channel::MonitorChannel;
 
         let ping_interval_dur = Duration::from_secs(10);
@@ -2165,6 +2250,9 @@ impl MonitorLink {
                                     self.apply_config(cfg);
                                 }
                                 Ok(TaggedServerFrame::DebugTunnelOpen(dtp)) => {
+                                    if !self.admit_debug_tunnel_frame("DebugTunnelOpen", monitor_addr) {
+                                        continue;
+                                    }
                                     info!(
                                         "monitor_link: OverChain DebugTunnelOpen received"
                                     );
@@ -2173,6 +2261,9 @@ impl MonitorLink {
                                         .send(Some(WsServerFrame::DebugTunnelOpen(dtp)));
                                 }
                                 Ok(TaggedServerFrame::DebugTunnelClose) => {
+                                    if !self.admit_debug_tunnel_frame("DebugTunnelClose", monitor_addr) {
+                                        continue;
+                                    }
                                     info!("monitor_link: OverChain DebugTunnelClose received");
                                     let _ = self
                                         .frame_tx
@@ -2845,5 +2936,62 @@ mod tests {
             }
             other => panic!("unexpected frame variant: {other:?}"),
         }
+    }
+
+    // ── allow_operator_debug_shell gate ───────────────────────────────────────
+
+    /// Build a minimal [`MonitorLink`] for gate tests — no transports, no
+    /// live dial. Only `allow_operator_debug_shell` varies.
+    fn make_test_link(allow_operator_debug_shell: bool) -> Arc<MonitorLink> {
+        let (link, _rx) = MonitorLink::new_with_credential_arc(
+            None,
+            Arc::new(ArcSwap::from_pointee(PeerTable::default())),
+            Arc::new(ArcSwap::from_pointee(None::<CredentialParams>)),
+            Arc::new(ArcSwap::from_pointee(TokenPool::default())),
+            Arc::new(ArcSwap::from_pointee(None)),
+            ChainSet::empty(),
+            Vec::new(),
+            "test-mesh".to_string(),
+            "test-client".to_string(),
+            MonitorLinkOptions {
+                operator_pub: None,
+                allow_operator_debug_shell,
+            },
+        );
+        link
+    }
+
+    /// A `DebugTunnelOpen`/`DebugTunnelClose` frame is refused when the local
+    /// config did not opt in — the default for every mode-3/customer issuance.
+    #[test]
+    fn debug_tunnel_frame_refused_by_default() {
+        let link = make_test_link(false);
+        assert!(!link.admit_debug_tunnel_frame("DebugTunnelOpen", "monitor-a"));
+        assert!(!link.admit_debug_tunnel_frame("DebugTunnelClose", "monitor-a"));
+    }
+
+    /// The frame is honoured only when the local config explicitly opts in.
+    #[test]
+    fn debug_tunnel_frame_honoured_with_local_opt_in() {
+        let link = make_test_link(true);
+        assert!(link.admit_debug_tunnel_frame("DebugTunnelOpen", "monitor-a"));
+        assert!(link.admit_debug_tunnel_frame("DebugTunnelClose", "monitor-a"));
+    }
+
+    /// A refusal is logged once per monitor identity, not once per frame.
+    #[test]
+    fn debug_tunnel_refusal_logged_once_per_monitor() {
+        let link = make_test_link(false);
+        assert!(!link.admit_debug_tunnel_frame("DebugTunnelOpen", "monitor-a"));
+        assert!(!link.admit_debug_tunnel_frame("DebugTunnelClose", "monitor-a"));
+        assert!(!link.admit_debug_tunnel_frame("DebugTunnelOpen", "monitor-b"));
+
+        let logged = link
+            .debug_tunnel_refused_logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(logged.len(), 2, "expected one entry per distinct monitor: {logged:?}");
+        assert!(logged.contains("monitor-a"));
+        assert!(logged.contains("monitor-b"));
     }
 }

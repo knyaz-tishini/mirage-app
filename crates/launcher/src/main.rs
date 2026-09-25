@@ -676,15 +676,19 @@ fn draw_mesh_wheel(
 
     // ── Draw nodes ───────────────────────────────────────────────────────────
     //
-    // Build a merged node info map for rendering (active flag, role, display name).
+    // Build a merged node info map for rendering (active flag, role, neutral
+    // label). `addr` is used only as the map key (internal identity) — never
+    // rendered; `h.label` is the only hop text drawn (country-index, or
+    // role-index when no country is known — never a hoster-derived name or
+    // a raw address).
     let mut node_active: HashMap<String, bool> = HashMap::new();
-    let mut node_display: HashMap<String, Option<String>> = HashMap::new();
+    let mut node_label: HashMap<String, String> = HashMap::new();
     let mut node_role: HashMap<String, HopRole> = HashMap::new();
     for c in &chains {
         let active = c.bytes_per_sec >= ACTIVE_BYTES_PER_SEC || c.last_active_ms < ACTIVE_WINDOW_MS;
         for h in &c.hops {
             node_active.entry(h.addr.clone()).and_modify(|a| *a |= active).or_insert(active);
-            node_display.entry(h.addr.clone()).or_insert_with(|| h.display_name.clone());
+            node_label.entry(h.addr.clone()).or_insert_with(|| h.label.clone());
             node_role.entry(h.addr.clone()).or_insert(h.role);
         }
     }
@@ -739,9 +743,9 @@ fn draw_mesh_wheel(
         // Node label — placed to the SIDE of the node (toward the centre, where
         // there's room) instead of underneath where it collided with the
         // destination lines. Brighter than before; tied to the node position.
-        let label = node_display.get(addr)
-            .and_then(|d| d.as_deref())
-            .unwrap_or(addr.as_str());
+        // Never falls back to `addr` — a neutral role word if, somehow, no
+        // label was resolved for this node.
+        let label = node_label.get(addr).map(|s| s.as_str()).unwrap_or_else(|| role.word());
         let trimmed: String = label.chars().take(18).collect();
         let r = match role { HopRole::Exit => 11.0, _ => 8.0 };
         // Left-half node → label on its right; right-half → on its left.

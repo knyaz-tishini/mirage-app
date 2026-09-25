@@ -91,9 +91,23 @@ In this workspace `sentinel` always means the client-side L0 agent (`mirage-l0-s
 
 Type `mirage_core::ids::SentinelId` covers (1) only. No `SentryId` type exists on the client side.
 
-## Debug-shell + dynamic monitor URLs (Apr 2026)
+## Debug-shell + dynamic monitor URLs (Apr 2026; gated Sep 2026)
 
 New crate `crates/debug-shell/` (`mirage-debug-shell`) — operator-triggered reverse-SSH tunnel. Sentinel reacts to two new WS frames from monitor (`monitor_link::WsServerFrame::DebugTunnelOpen { ssh_priv_key_pem, monitor_ssh_host, reverse_port, ttl_secs, ... }` and `DebugTunnelClose`); on Open it writes `${state_dir}/debug-tunnel.json` and spawns `mirage-debug-shell --config <path>`, on Close it SIGTERMs the child. `sentinel.toml` gains optional `debug_shell_binary` and `state_dir` fields. Same `WsServerFrame::Config` carries a new `peer_lm_urls: Vec<String>` field — sentinel persists it atomically to `${state_dir}/monitor_urls.json` and bootstraps from that file on next start (preferring it over static `monitor_urls`); on every change while running it calls `MonitorLink::reconfigure(...)` to swap the internal URL list. WS frames use the tagged enum `{kind: "config" | "debug_tunnel_open" | "debug_tunnel_close"}` — old monitors that emit untagged config still work via deserializer fallback. WS subscribe URL now carries `?client_id=<id>` query so monitor can route per-client pushes.
+
+**Gated off by default (Sep 2026)** — a customer's own machine must never be
+remotely shellable by us. `MonitorLink` (`client-core/src/monitor_link.rs`)
+takes `allow_operator_debug_shell: bool` at construction (from
+`sentinel.toml#allow_operator_debug_shell`, `false` by default) and refuses
+every `DebugTunnelOpen`/`DebugTunnelClose` frame — on both the Wire and the
+OverChain transport — before it ever reaches `frame_tx`, logging a `warn!`
+once per monitor identity (`MonitorLink::admit_debug_tunnel_frame`). A
+refused frame never reaches l0-sentinel's `spawn_frame_watcher`, so
+`mirage-debug-shell` is never spawned regardless of whether
+`debug_shell_binary` is configured. Nothing pushed by the monitor, and no
+`AccessPacket` field, can turn this on — it is a purely local, hand-edited
+`sentinel.toml` opt-in. A mode-3/customer issuance of `sentinel.toml` never
+sets it.
 
 ## peer_lm_urls bootstrap order (sentinel)
 
@@ -123,6 +137,7 @@ respect_user_config = true
 # debug-shell + state (May 2026)
 state_dir          = "C:/ProgramData/mirage/state"     # required
 debug_shell_binary = "C:/Program Files/Mirage/mirage-probe.exe"  # optional override
+allow_operator_debug_shell = false  # default; local-only opt-in, see above
 ```
 
 `state_dir` is now **required** — sentinel writes:

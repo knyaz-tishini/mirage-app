@@ -10,7 +10,7 @@
 //! can read the latest snapshot lock-free every frame.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,13 +53,35 @@ pub struct DestView {
 
 #[derive(Clone, Debug)]
 pub struct HopView {
+    /// Dial address — internal node identity only, used to key grid
+    /// position and de-duplicate a node shared by several chains. NEVER
+    /// rendered: it is the operator's own routing address, not something a
+    /// customer's launcher may show them. Use [`Self::label`] for display.
     pub addr: String,              // e.g. "91.218.245.247:4700"
     pub role: HopRole,
-    pub display_name: Option<String>, // human-readable name from config, if present
+    /// Neutral, customer-safe display label: a country code plus an index
+    /// within that country (e.g. `"NL-1"`) when the mesh's peer-table
+    /// gossip names one, or role plus index when no country is known
+    /// (e.g. `"Relay-2"`). Never a hoster-derived name and never a raw
+    /// address — this is the only hop text the renderer may draw.
+    pub label: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HopRole { Entry, Middle, Exit }
+
+impl HopRole {
+    /// Neutral word used as the label fallback bucket when no country tag
+    /// is known for a hop, and as the human-readable name of the hop's
+    /// position in the chain generally.
+    pub fn word(self) -> &'static str {
+        match self {
+            HopRole::Entry => "Entry",
+            HopRole::Middle => "Relay",
+            HopRole::Exit => "Exit",
+        }
+    }
+}
 
 // ── client-config.json parsing — only the bits we need ───────────────────────
 
@@ -84,11 +106,136 @@ struct HopCfg {
     addr: String,
     #[serde(default)]
     role: Option<String>, // optional in flat l1/l2 schema
+    /// Mesh node id (`mirage_core::config::HopConfig::node_id`) — the
+    /// lookup key into the peer-table country tags, preferred over `addr`.
     #[serde(default)]
-    display_name: Option<String>,
+    node_id: Option<String>,
 }
 
-fn load_chain_topology(config_path: &std::path::Path) -> HashMap<String, Vec<HopView>> {
+/// One hop resolved out of `client-config.json`, before country/index
+/// labelling — an intermediate shape so the label pass can see every hop of
+/// every chain (in on-disk array order — deterministic, no hashing) before
+/// any [`HopView`] is built.
+struct RawHop {
+    addr: String,
+    role: HopRole,
+    node_id: Option<String>,
+}
+
+fn hops_from_chain(c: &ChainCfg) -> Vec<RawHop> {
+    let mut hops = Vec::new();
+    // Schema A: explicit `hops[]` with role strings.
+    if !c.hops.is_empty() {
+        for h in &c.hops {
+            let role = match h.role.as_deref() {
+                Some("entry") => HopRole::Entry,
+                Some("middle") => HopRole::Middle,
+                Some("exit") => HopRole::Exit,
+                _ => HopRole::Middle,
+            };
+            hops.push(RawHop { addr: h.addr.clone(), role, node_id: h.node_id.clone() });
+        }
+    } else {
+        // Schema B: flat l1/l2 fields (legacy).
+        if let Some(l1) = &c.l1 {
+            hops.push(RawHop { addr: l1.addr.clone(), role: HopRole::Entry, node_id: l1.node_id.clone() });
+        }
+        if let Some(l2) = &c.l2 {
+            hops.push(RawHop { addr: l2.addr.clone(), role: HopRole::Exit, node_id: l2.node_id.clone() });
+        }
+    }
+    hops
+}
+
+// ── last-peer-table.json parsing — country tags only ─────────────────────────
+//
+// Sentinel persists `mirage_core::mirage::mesh::PeerTable` verbatim
+// (`{"generation": N, "peers": [{"node_id", "addr", "labels": [...], ...}]}`)
+// to `${state_dir}/last-peer-table.json` on every config push (l0-sentinel's
+// R6 cold-start seed, `spawn_frame_watcher`'s `Config` arm). `labels` is
+// documented as "free-form region labels (NL / TR / RU / ch / ...)" on
+// `PeerTableEntry` — there is no dedicated `region`/`country` field anywhere
+// on the wire (`HopConfig`, the per-hop shape actually materialised into
+// `client-config.json`, carries none either). A label is treated as a
+// country tag using the same rule `subscriber-client::artefact::validate`
+// uses for `ArtefactMode::Country`: exactly two ASCII letters.
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawPeerTableFile {
+    peers: Vec<RawPeerTableEntry>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawPeerTableEntry {
+    node_id: String,
+    addr: String,
+    labels: Vec<String>,
+}
+
+/// The first `labels` entry that looks like a two-letter country code,
+/// upper-cased. `None` when no such label is present — callers must fall
+/// back to role, never invent a country.
+fn country_from_labels(labels: &[String]) -> Option<String> {
+    labels
+        .iter()
+        .find(|l| l.len() == 2 && l.chars().all(|c| c.is_ascii_alphabetic()))
+        .map(|l| l.to_uppercase())
+}
+
+/// Read `${state_dir}/last-peer-table.json` and return `(by_node_id,
+/// by_addr)` country lookup maps. Tolerant of a missing file (fresh
+/// install, or a mesh whose gossip carries no region labels yet) and of any
+/// parse error — both fall back to empty maps, which in turn makes every
+/// hop fall back to its role-based label.
+fn load_country_tags(state_dir: &Path) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut by_node_id = HashMap::new();
+    let mut by_addr = HashMap::new();
+
+    let raw = match std::fs::read_to_string(state_dir.join("last-peer-table.json")) {
+        Ok(s) => s,
+        Err(_) => return (by_node_id, by_addr),
+    };
+    let file: RawPeerTableFile = match serde_json::from_str(&raw) {
+        Ok(f) => f,
+        Err(_) => return (by_node_id, by_addr),
+    };
+
+    for p in file.peers {
+        let Some(cc) = country_from_labels(&p.labels) else { continue };
+        if !p.node_id.is_empty() {
+            by_node_id.insert(p.node_id, cc.clone());
+        }
+        if !p.addr.is_empty() {
+            by_addr.insert(p.addr, cc);
+        }
+    }
+    (by_node_id, by_addr)
+}
+
+/// Resolve the state directory the same way sentinel does
+/// (`l0-sentinel::debug_shell::resolve_state_dir`): `sentinel.toml#state_dir`
+/// when present, otherwise the directory `client-config.json` itself lives
+/// in. Mirrors `model.rs::resolve_paths` — kept as its own small copy rather
+/// than a shared helper, matching this crate's existing per-consumer
+/// resolution style.
+fn resolve_state_dir(exe_dir: &Path) -> PathBuf {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct SentinelTomlPartial {
+        state_dir: Option<PathBuf>,
+    }
+
+    let partial: SentinelTomlPartial = std::fs::read_to_string(exe_dir.join("sentinel.toml"))
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default();
+
+    partial.state_dir.unwrap_or_else(|| exe_dir.to_path_buf())
+}
+
+fn load_chain_topology(config_path: &Path) -> HashMap<String, Vec<HopView>> {
     let raw = match std::fs::read_to_string(config_path) {
         Ok(s) => s,
         Err(_) => return HashMap::new(),
@@ -98,44 +245,55 @@ fn load_chain_topology(config_path: &std::path::Path) -> HashMap<String, Vec<Hop
         Err(_) => return HashMap::new(),
     };
 
-    let mut out = HashMap::new();
-    for c in cfg.chains {
-        let mut hops = Vec::new();
+    let exe_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let state_dir = resolve_state_dir(exe_dir);
+    let (country_by_node_id, country_by_addr) = load_country_tags(&state_dir);
 
-        // Schema A: explicit `hops[]` with role strings.
-        if !c.hops.is_empty() {
-            for h in &c.hops {
-                let role = match h.role.as_deref() {
-                    Some("entry") => HopRole::Entry,
-                    Some("middle") => HopRole::Middle,
-                    Some("exit") => HopRole::Exit,
-                    _ => HopRole::Middle,
-                };
-                hops.push(HopView {
-                    addr: h.addr.clone(),
-                    role,
-                    display_name: h.display_name.clone(),
-                });
+    let per_chain_hops: Vec<(String, Vec<RawHop>)> = cfg
+        .chains
+        .iter()
+        .map(|c| (c.chain_id.clone(), hops_from_chain(c)))
+        .collect();
+
+    // Pass 1: assign a stable neutral label per unique addr, first-seen
+    // (on-disk array) order — the same physical node always gets the same
+    // label for the lifetime of this poller (topology is loaded once, at
+    // startup, same as before this change).
+    let mut label_by_addr: HashMap<String, String> = HashMap::new();
+    let mut next_index: HashMap<String, u32> = HashMap::new();
+    for (_, hops) in &per_chain_hops {
+        for h in hops {
+            if label_by_addr.contains_key(&h.addr) {
+                continue;
             }
-        } else {
-            // Schema B: flat l1/l2 fields (legacy).
-            if let Some(l1) = &c.l1 {
-                hops.push(HopView {
-                    addr: l1.addr.clone(),
-                    role: HopRole::Entry,
-                    display_name: l1.display_name.clone(),
-                });
-            }
-            if let Some(l2) = &c.l2 {
-                hops.push(HopView {
-                    addr: l2.addr.clone(),
-                    role: HopRole::Exit,
-                    display_name: l2.display_name.clone(),
-                });
-            }
+            let bucket = h
+                .node_id
+                .as_deref()
+                .and_then(|nid| country_by_node_id.get(nid))
+                .or_else(|| country_by_addr.get(&h.addr))
+                .cloned()
+                .unwrap_or_else(|| h.role.word().to_string());
+            let idx = next_index.entry(bucket.clone()).or_insert(0);
+            *idx += 1;
+            label_by_addr.insert(h.addr.clone(), format!("{bucket}-{idx}"));
         }
+    }
 
-        out.insert(c.chain_id, hops);
+    // Pass 2: build the render-safe view — addr survives only as the
+    // internal identity key, label is the only text.
+    let mut out = HashMap::new();
+    for (chain_id, hops) in per_chain_hops {
+        let views = hops
+            .into_iter()
+            .map(|h| {
+                let label = label_by_addr
+                    .get(&h.addr)
+                    .cloned()
+                    .unwrap_or_else(|| h.role.word().to_string());
+                HopView { addr: h.addr, role: h.role, label }
+            })
+            .collect();
+        out.insert(chain_id, views);
     }
     out
 }
@@ -187,10 +345,13 @@ fn mock_snapshot(tick: u64) -> MeshSnapshot {
         last_active_ms: 0.0,
         destinations: dests,
     };
-    let hop = |addr: &str, role: HopRole, name: &str| HopView {
+    // Demo labels only — illustrative country-index/role-index text, never
+    // a hoster name (mirrors what `load_chain_topology`'s labelling pass
+    // would produce from real peer-table country tags).
+    let hop = |addr: &str, role: HopRole, label: &str| HopView {
         addr: addr.to_string(),
         role,
-        display_name: Some(name.to_string()),
+        label: label.to_string(),
     };
     let dest = |ip: &str, port: u16, domain: &str, bytes: u64| DestView {
         ip: ip.to_string(),
@@ -203,8 +364,8 @@ fn mock_snapshot(tick: u64) -> MeshSnapshot {
             chain(
                 "auto-ru-direct",
                 vec![
-                    hop("91.218.245.247:4700", HopRole::Entry, "ru-hostkey-094.74"),
-                    hop("82.26.94.247:6700", HopRole::Exit, "tr-hostkey-094.247"),
+                    hop("91.218.245.247:4700", HopRole::Entry, "RU-1"),
+                    hop("82.26.94.247:6700", HopRole::Exit, "TR-1"),
                 ],
                 osc(0.0, 180_000.0),
                 vec![
@@ -215,9 +376,9 @@ fn mock_snapshot(tick: u64) -> MeshSnapshot {
             chain(
                 "auto-eu-onion",
                 vec![
-                    hop("151.243.173.104:4700", HopRole::Entry, "nl-hostkey-173.104"),
-                    hop("45.59.119.139:5700", HopRole::Middle, "ch-cloudzy-119.139"),
-                    hop("82.26.94.247:6701", HopRole::Exit, "tr-hostkey-094.247"),
+                    hop("151.243.173.104:4700", HopRole::Entry, "NL-1"),
+                    hop("45.59.119.139:5700", HopRole::Middle, "CH-1"),
+                    hop("82.26.94.247:6701", HopRole::Exit, "TR-2"),
                 ],
                 osc(2.1, 90_000.0),
                 vec![dest("142.250.74.78", 443, "google.com", 350_000)],
@@ -225,8 +386,8 @@ fn mock_snapshot(tick: u64) -> MeshSnapshot {
             chain(
                 "auto-ru-quic",
                 vec![
-                    hop("193.187.94.74:4700", HopRole::Entry, "ru-hostkey-245.247"),
-                    hop("45.59.119.139:6700", HopRole::Exit, "ch-cloudzy-119.139"),
+                    hop("193.187.94.74:4700", HopRole::Entry, "RU-2"),
+                    hop("45.59.119.139:6700", HopRole::Exit, "CH-2"),
                 ],
                 osc(4.2, 40_000.0),
                 vec![dest("1.1.1.1", 443, "one.one.one.one", 60_000)],
@@ -316,7 +477,7 @@ pub fn spawn_poller(
                     });
             }
             for v in conns_by_chain.values_mut() {
-                v.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+                v.sort_by_key(|d| std::cmp::Reverse(d.bytes));
                 v.truncate(8); // top 8 destinations per chain — keeps the UI uncluttered
             }
 
@@ -397,4 +558,73 @@ pub fn spawn_poller(
     });
 
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn country_from_labels_finds_two_letter_code_case_insensitively() {
+        assert_eq!(
+            country_from_labels(&["monitor".to_string(), "nl".to_string()]),
+            Some("NL".to_string())
+        );
+        assert_eq!(country_from_labels(&["RU".to_string()]), Some("RU".to_string()));
+        assert_eq!(country_from_labels(&["monitor".to_string()]), None);
+        assert_eq!(country_from_labels(&[]), None);
+    }
+
+    /// End-to-end through the public entry point: a hop whose `node_id`
+    /// resolves to a peer-table country label gets `"NL-1"`; a hop absent
+    /// from the peer table falls back to role + index (`"Exit-1"`) — never
+    /// the raw `addr`.
+    #[test]
+    fn load_chain_topology_labels_by_country_then_role_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "mirage-launcher-mesh-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let config_path = dir.join("client-config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "chains": [
+                    {
+                        "chain_id": "c1",
+                        "hops": [
+                            {"addr": "1.1.1.1:1", "role": "entry", "node_id": "n1"},
+                            {"addr": "2.2.2.2:2", "role": "exit", "node_id": "n2"}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("write client-config.json");
+        std::fs::write(
+            dir.join("last-peer-table.json"),
+            r#"{
+                "generation": 1,
+                "peers": [
+                    {"node_id": "n1", "addr": "1.1.1.1:1", "labels": ["monitor", "nl"]}
+                ]
+            }"#,
+        )
+        .expect("write last-peer-table.json");
+
+        let topology = load_chain_topology(&config_path);
+        let hops = topology.get("c1").expect("chain c1 present");
+        assert_eq!(hops[0].addr, "1.1.1.1:1");
+        assert_eq!(hops[0].label, "NL-1");
+        assert_eq!(hops[1].addr, "2.2.2.2:2");
+        assert_eq!(hops[1].label, "Exit-1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

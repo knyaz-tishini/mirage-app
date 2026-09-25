@@ -34,3 +34,11 @@ respect_user_config = true
 # <exe_dir>/mirage-chain-supervisor[.exe] when omitted.
 # supervisor_binary = "C:/Program Files/Mirage/mirage-chain-supervisor.exe"
 # supervisor_args   = ["{client_config_path}"]
+
+# ─── Debug shell (operator-fleet boxes only — leave unset for any customer) ───
+# `false` by default. Nothing server-side (monitor push, AccessPacket) can
+# turn this on — it is a local, hand-edited opt-in only. A mode-3/customer
+# issuance of this file must never set it. See l0-sentinel's `CLAUDE.md`
+# "Debug-shell + dynamic monitor URLs".
+# allow_operator_debug_shell = true
+# debug_shell_binary = "C:/Program Files/Mirage/mirage-probe.exe"
