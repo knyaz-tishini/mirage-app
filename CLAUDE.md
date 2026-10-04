@@ -157,10 +157,11 @@ mirage2app содержит **headless backend клиента**. Три проц
 | `crates/l0-sentinel/` (`mirage-l0-sentinel`) | Bootstrap: связь с монитором, материализация client-config, спавн cli. **Двойной крейт (lib + bin)** — `pub async fn run(SentinelConfig)` для embedded use из orchestrator |
 | `crates/cli2/` (`supervisor` + `worker`) | **Единственный data-plane.** Split-arch: один supervisor + N worker-процессов (по чейну) с reattach через named pipes — soft-restart на OTA. Supervisor читает sentinel-овский `ClientConfig` JSON через `Config::load_any`/`from_client_config` |
 | ~~`crates/cli/` (`mirage-client-cli`)~~ | 🔴 **RETIRED 2026-06-14** → `crates/_deprecated/cli/`. Legacy single-process data-plane (cli1). Полностью заменён cli2. НЕ использовать, НЕ собирать. Убран из workspace members, orchestrator dep, build-win-bins.sh, installer |
+| ~~`crates/launcher/` (`mirage-launcher`)~~ | 🔴 **RETIRED 2026-09-30** → `crates/_deprecated/launcher/`. Продуктовый GUI = `crates/client-gui/` (`mirage-client-gui`, свой workspace). НЕ использовать, НЕ собирать. Убран из workspace members |
 
 mirage2tun (отдельный submodule) — низкоуровневый TUN-перехватчик. Получает chains через `cli` POST. **Нельзя ходить в монитор напрямую из cli или tun** — только через sentinel. MonitorLink в самих cli/tun допустим только как fallback на случай мёртвого sentinel.
 
-GUI потом натянется на этот headless backend как отдельная обёртка.
+GUI — `crates/client-gui/` (`mirage-client-gui`), отдельная обёртка над этим headless backend.
 
 ## subscriber-client config (edge session)
 
@@ -603,7 +604,7 @@ GUI v2 (`crates/desktop/windows/v2/`) — экспериментальный, м
 
 ### Testers — target CPU compatibility
 
-- **tester1** = Win11 box (Intel Haswell, i5-4690K). **БЕЗ** AVX-512, **БЕЗ** SHA-NI. Бинарь, собранный с `target-cpu=native` на современной машине, **молча падает SIGILL** при старте (окно появляется и сразу пропадает, никаких логов). Симптом — лаунчер мигнул и ушёл.
+- **tester1** = Win11 box (Intel Haswell, i5-4690K). **БЕЗ** AVX-512, **БЕЗ** SHA-NI. Бинарь, собранный с `target-cpu=native` на современной машине, **молча падает SIGILL** при старте (окно появляется и сразу пропадает, никаких логов). Симптом — GUI-клиент мигнул и ушёл.
 - **tester2** = macOS (Intel Haswell). Та же проблема, тот же фикс.
 
 **Перед отправкой бинарей тестерам ОБЯЗАТЕЛЬНО** сбрасывать `target-cpu` до безопасного.
