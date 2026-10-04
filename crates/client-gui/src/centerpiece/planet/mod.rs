@@ -1,9 +1,9 @@
 //! PlanetSkin — morph scene: grid relief → fold into a real-continents globe →
-//! mesh of fleet nodes. Faithful port of `morph-scene.html`.
+//! exit nodes. Faithful port of `morph-scene.html`.
 //!
 //! Disconnected: flat grid relief (height-noise plane). Connecting: the grid
 //! folds into a sphere. Connected: dotted real continents (baked Natural-Earth
-//! land mask) + the 6 fleet nodes geo-pinned with great-circle mesh links.
+//! land mask) + the exit nodes of `crate::nodes::CATALOG` geo-pinned on it.
 //! Auto-rotates around the Y axis throughout.
 
 mod landmask;
@@ -75,7 +75,7 @@ struct GridPt {
 #[derive(Clone, Copy)]
 struct Node {
     p: [f64; 3],
-    /// Neutral, customer-safe label — see `crate::nodes::FleetNode::label`.
+    /// Country code — see `crate::nodes::ExitNode::code`.
     label: &'static str,
 }
 
@@ -89,7 +89,6 @@ fn geo(lat: f64, lon: f64) -> [f64; 3] {
 pub struct PlanetSkin {
     pts: Vec<GridPt>,
     nodes: Vec<Node>,
-    links: Vec<(usize, usize)>,
     t: f64,
     yaw: f64,
     pitch: f64,
@@ -134,20 +133,19 @@ impl PlanetSkin {
             }
         }
 
-        // Shared fleet inventory (single source — see crate::nodes).
-        let nodes = crate::nodes::FLEET
+        // Shared exit catalog (single source — see crate::nodes).
+        let nodes: Vec<Node> = crate::nodes::CATALOG
             .iter()
-            .map(|f| Node {
-                p: geo(f.lat, f.lon),
-                label: f.label,
+            .map(|n| Node {
+                p: geo(n.lat, n.lon),
+                label: n.code,
             })
             .collect();
-        let links = crate::nodes::LINKS.to_vec();
+        let node_screen = vec![(0.0, 0.0, false); nodes.len()];
 
         Self {
             pts,
             nodes,
-            links,
             t: 0.0,
             yaw: 0.5,
             pitch: 0.38,
@@ -159,7 +157,7 @@ impl PlanetSkin {
             amp: 0.16,
             col_t: 0.0,
             mesh: 0.0,
-            node_screen: vec![(0.0, 0.0, false); 6],
+            node_screen,
             sel: None,
         }
     }
@@ -321,45 +319,8 @@ impl Skin for PlanetSkin {
             }
         }
 
-        // ── Mesh (fleet nodes + great-circle links) ──────────────────────────────
+        // ── Exit nodes ───────────────────────────────────────────────────────────
         if mesh_a > 0.01 {
-            // Links.
-            ctx.set_stroke_width(1.4);
-            ctx.set_line_dash(&[]);
-            for &(a, b) in &self.links {
-                let ra = self.rot(self.nodes[a].p);
-                let rb = self.rot(self.nodes[b].p);
-                let mut path: Vec<[f64; 3]> = Vec::with_capacity(21);
-                for k in 0..=20 {
-                    let tt = k as f64 / 20.0;
-                    let mut mx = ra[0] + (rb[0] - ra[0]) * tt;
-                    let mut my = ra[1] + (rb[1] - ra[1]) * tt;
-                    let mut mz = ra[2] + (rb[2] - ra[2]) * tt;
-                    let l = (mx * mx + my * my + mz * mz).sqrt().max(1e-6);
-                    mx /= l;
-                    my /= l;
-                    mz /= l;
-                    let lift = 1.0 + 0.16 * (tt * PI).sin();
-                    path.push([cx + mx * lift * r_globe, cy - my * lift * r_globe, mz]);
-                }
-                ctx.set_stroke_color(&format!("rgba(255,217,176,{:.3})", 0.8 * mesh_a));
-                ctx.begin_path();
-                let mut started = false;
-                for pnt in &path {
-                    if pnt[2] >= -0.02 {
-                        if started {
-                            ctx.line_to(pnt[0], pnt[1]);
-                        } else {
-                            ctx.move_to(pnt[0], pnt[1]);
-                            started = true;
-                        }
-                    } else {
-                        started = false;
-                    }
-                }
-                ctx.stroke();
-            }
-
             // Nodes — project, record screen positions, draw.
             let mut screens = vec![(0.0_f64, 0.0_f64, false); self.nodes.len()];
             ctx.set_global_alpha(mesh_a);
@@ -458,8 +419,7 @@ impl Skin for PlanetSkin {
 
 impl PlanetSkin {
     /// Draw the floating node-info popup near `(sx, sy)`, clamped to the
-    /// rect. Neutral label only — no IP, node id, provider name, or operator
-    /// infra-role string; see `crate::nodes` module doc.
+    /// rect. Country code only — see `crate::nodes` module doc.
     fn draw_popup(&self, ctx: &mut dyn RenderContext, n: &Node, sx: f64, sy: f64, rect: SkinRect) {
         let header_h = 30.0;
         let ph = header_h + 6.0;
@@ -478,7 +438,7 @@ impl PlanetSkin {
         ctx.set_fill_color("#FBB26A");
         ctx.fill_rect(px, py, 2.0, ph);
 
-        // Header: neutral label only.
+        // Header: country code only.
         ctx.set_fill_color("#FBB26A");
         ctx.set_font("11px monospace");
         ctx.set_text_align(uzor::render::TextAlign::Left);

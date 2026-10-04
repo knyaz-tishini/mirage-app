@@ -25,7 +25,6 @@ use uzor::ui::widgets::composite::chrome::theme::ChromeTheme;
 use uzor::types::unsafe_widget_id;
 
 use crate::centerpiece::{make_skin, CenterpieceState, ConnPhase, Skin, SkinKind, SkinRect};
-use crate::prof::{parse_backend, ProfHandle};
 use crate::shell::menu::{self, MenuAction, MenuRow, MenuTab};
 
 // ── Chrome strip height ────────────────────────────────────────────────────────
@@ -107,9 +106,9 @@ pub struct MirageClientApp {
     skin_kind: SkinKind,
     current_phase: ConnPhase,
 
-    // Pending phase transitions (mock — no live backend).
+    /// When the optimistic "Connecting" phase began; it is abandoned if the
+    /// tunnel has not come up within the give-up window.
     pending_connect_at: Option<Instant>,
-    pending_disconnect_at: Option<Instant>,
 
     // Shell state.
     menu_open: bool,
@@ -125,23 +124,14 @@ pub struct MirageClientApp {
     menu_last_y: f64,
     /// Pointer-down state at the previous frame (for press-edge detection).
     prev_pointer_down: bool,
-    /// Chosen exit node (index into nodes::FLEET), if any. Honored only when
+    /// Chosen exit node (index into nodes::CATALOG), if any. Honored only when
     /// `exit_auto` is false.
     selected_node: Option<usize>,
     /// Exit-node selection mode. Auto (default) lets the mesh pick; Manual
-    /// exposes the fleet picker and honors `selected_node`.
+    /// exposes the exit picker and honors `selected_node`.
     exit_auto: bool,
 
-    /// Whether this account is the mesh admin. Sourced from `--admin` for now;
-    /// later from the authenticated account claim. Gates the Admin tab's
-    /// VISIBILITY only — the monitor is the authoritative policy enforcer
-    /// (a local bool can be flipped; server-side re-check is mandatory).
-    is_admin: bool,
-    /// Mesh policy: members may pick a manual exit (admin-controlled).
-    allow_manual_exit: bool,
-    /// Mesh policy: members may buy nodes into the mesh (admin-controlled).
-    members_can_buy: bool,
-    /// Transient menu feedback line (e.g. stubbed actions).
+    /// Transient menu feedback line (import result, scan state).
     menu_note: Option<String>,
     /// Raw JSON of the last successfully imported ClientConfig.
     imported: Option<String>,
@@ -167,42 +157,28 @@ pub struct MirageClientApp {
     /// Active camera QR scan (background thread + ASCII preview), if any.
     scan: Option<crate::camera::CameraScan>,
 
-    /// Runtime profiling control (hot-switch backend + scrape fps over HTTP).
-    prof: ProfHandle,
+    /// Backend link: owns the L0 tree + drives connect/disconnect over
+    /// sentinel HTTP.
+    engine: Box<dyn crate::backend::EngineLink>,
 
-    /// Live backend link (Some when `--live`): owns the L0 tree + drives
-    /// connect/disconnect over sentinel HTTP. None = mock mode (pure UI).
-    engine: Option<Box<dyn crate::backend::EngineLink>>,
+    /// Developer hooks (profiling sync, fps HUD) — `dev-tools` builds only.
+    #[cfg(feature = "dev-tools")]
+    dev: Option<crate::dev::DevHooks>,
 
     // Frame timing.
     last_frame: Instant,
-    /// Monotonic seconds accumulator driving menu graph animation.
-    anim: f64,
 }
 
 impl MirageClientApp {
-    /// Construct with an explicit initial skin + connection state (used by the
-    /// `--skin` / `--connected` CLI flags for deterministic screenshot capture).
-    pub fn with_skin(
-        skin_kind: SkinKind,
-        connected: bool,
-        is_admin: bool,
-        allow_manual_exit: bool,
-        members_can_buy: bool,
-        engine: Option<Box<dyn crate::backend::EngineLink>>,
-        prof: ProfHandle,
-    ) -> Self {
+    /// Construct with an explicit initial skin (the `--skin` CLI flag) and the
+    /// engine link that drives the connection state.
+    pub fn new(skin_kind: SkinKind, engine: Box<dyn crate::backend::EngineLink>) -> Self {
         Self {
             skin: make_skin(skin_kind),
-            prof,
             engine,
             skin_kind,
-            is_admin,
-            allow_manual_exit,
-            members_can_buy,
-            current_phase: if connected { ConnPhase::Connected } else { ConnPhase::Disconnected },
+            current_phase: ConnPhase::Disconnected,
             pending_connect_at: None,
-            pending_disconnect_at: None,
             menu_open: false,
             menu_tab: MenuTab::Connection,
             menu_frac: menu::DEFAULT_FRAC,
@@ -221,9 +197,20 @@ impl MirageClientApp {
             last_tap_ms: -1.0e9,
             pointer_in_window: true,
             scan: None,
+            #[cfg(feature = "dev-tools")]
+            dev: None,
             last_frame: Instant::now(),
-            anim: 0.0,
         }
+    }
+
+    /// Attach the developer hooks; honours their `--connected` start phase.
+    #[cfg(feature = "dev-tools")]
+    pub fn with_dev(mut self, dev: crate::dev::DevHooks) -> Self {
+        if dev.start_connected() {
+            self.current_phase = ConnPhase::Connected;
+        }
+        self.dev = Some(dev);
+        self
     }
 
     // ── Skin switching ────────────────────────────────────────────────────────
@@ -247,9 +234,7 @@ impl MirageClientApp {
     /// state). Grid → planet, off → bloom, etc.
     fn request_connect(&mut self) {
         if matches!(self.current_phase, ConnPhase::Disconnected) {
-            if let Some(e) = &self.engine {
-                e.connect();
-            }
+            self.engine.connect();
             self.current_phase = ConnPhase::Connecting;
             self.pending_connect_at = Some(Instant::now());
         }
@@ -271,11 +256,8 @@ impl MirageClientApp {
     /// Double tap → disconnect (only when connected). Planet → grid.
     fn request_disconnect(&mut self) {
         if matches!(self.current_phase, ConnPhase::Connected) {
-            if let Some(e) = &self.engine {
-                e.disconnect();
-            }
+            self.engine.disconnect();
             self.current_phase = ConnPhase::Disconnecting;
-            self.pending_disconnect_at = Some(Instant::now());
             self.skin.clear_selection();
         }
     }
@@ -295,47 +277,28 @@ impl App<NoPanel> for MirageClientApp {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64().min(0.1);
         self.last_frame = now;
-        self.anim += dt;
 
-        // ── Phase: live backend (tun.alive) drives it; else mock timers ───────
-        let live_status = self.engine.as_ref().map(|e| e.status());
-        if let Some(es) = live_status {
-            if es.tun_alive {
-                self.current_phase = ConnPhase::Connected;
-                self.pending_connect_at = None;
-                self.pending_disconnect_at = None;
-            } else {
-                match self.current_phase {
-                    // Hold the optimistic "Connecting" until tun comes up, but
-                    // give up after a generous window (mirrors launcher).
-                    ConnPhase::Connecting => {
-                        if self.pending_connect_at.map_or(true, |at| at.elapsed().as_millis() > 12_000) {
-                            self.current_phase = ConnPhase::Disconnected;
-                            self.pending_connect_at = None;
-                        }
-                    }
-                    ConnPhase::Disconnecting => {
-                        self.current_phase = ConnPhase::Disconnected;
-                        self.pending_disconnect_at = None;
-                    }
-                    // tun went down underneath us.
-                    ConnPhase::Connected => self.current_phase = ConnPhase::Disconnected,
-                    ConnPhase::Disconnected => {}
-                }
-            }
+        // ── Phase: the engine's tun.alive drives it ───────────────────────────
+        let es = self.engine.status();
+        if es.tun_alive {
+            self.current_phase = ConnPhase::Connected;
+            self.pending_connect_at = None;
         } else {
-            // Mock (no backend): fixed timers.
-            if let Some(at) = self.pending_connect_at {
-                if at.elapsed().as_millis() >= 700 {
-                    self.current_phase = ConnPhase::Connected;
-                    self.pending_connect_at = None;
+            match self.current_phase {
+                // Hold the optimistic "Connecting" until tun comes up, but
+                // give up after a generous window (mirrors launcher).
+                ConnPhase::Connecting => {
+                    if self.pending_connect_at.map_or(true, |at| at.elapsed().as_millis() > 12_000) {
+                        self.current_phase = ConnPhase::Disconnected;
+                        self.pending_connect_at = None;
+                    }
                 }
-            }
-            if let Some(at) = self.pending_disconnect_at {
-                if at.elapsed().as_millis() >= 400 {
+                ConnPhase::Disconnecting => {
                     self.current_phase = ConnPhase::Disconnected;
-                    self.pending_disconnect_at = None;
                 }
+                // tun went down underneath us.
+                ConnPhase::Connected => self.current_phase = ConnPhase::Disconnected,
+                ConnPhase::Disconnected => {}
             }
         }
 
@@ -366,43 +329,20 @@ impl App<NoPanel> for MirageClientApp {
             None
         };
 
-        // Profiling readout (backend + fps + frame time) + runtime backend
-        // hot-switch requested over the prof HTTP control.
-        let stats = format!(
-            "{}  {:.0}fps  {:.1}ms",
-            win.render_control.active_backend().label(),
-            win.render_control.measured_fps(),
-            win.render_control.last_frame_time_ms(),
-        );
-        {
-            let mut p = self.prof.lock().unwrap();
-            p.fps = win.render_control.measured_fps();
-            p.frame_ms = win.render_control.last_frame_time_ms();
-            p.backend = win.render_control.active_backend().label().to_string();
-            if let Some(name) = p.requested.take() {
-                if let Some(b) = parse_backend(&name) {
-                    win.render_control.set_backend(b);
-                }
-            }
-        }
+        // Dev-tools: profiling sync (+ requested backend hot-switch) and the
+        // HUD readout.
+        #[cfg(feature = "dev-tools")]
+        let hud = self.dev.as_ref().map(|d| d.frame(&mut *win.render_control));
 
         // ── Menu container (resizable / scrollable / tabbed) ──────────────────
         // Compute geometry + active-tab rows once per frame while open.
-        let policy = menu::MeshPolicy {
-            allow_manual_exit: self.allow_manual_exit,
-            members_can_buy: self.members_can_buy,
-        };
         let menu = if self.menu_open {
-            let tabs = menu::MenuTab::visible(self.is_admin);
-            // Never leave the active tab on one the account can't see.
-            if !tabs.contains(&self.menu_tab) {
-                self.menu_tab = menu::MenuTab::Connection;
-            }
+            let tabs: &[MenuTab] = &MenuTab::ALL;
             let area = (h - CHROME_H).max(1.0);
             let panel_h = (area * self.menu_frac)
                 .clamp(area * menu::MIN_FRAC, area * menu::MAX_FRAC);
             let g = menu::geom(w, h, panel_h, tabs.len());
-            let rows = menu::tab_rows(self.menu_tab, self.exit_auto, policy);
+            let rows = menu::tab_rows(self.menu_tab, self.exit_auto);
             let (laid, content_h) = menu::layout_rows(&rows);
             Some((g, tabs, laid, content_h))
         } else {
@@ -466,46 +406,14 @@ impl App<NoPanel> for MirageClientApp {
                         let pill_w = 140.0;
                         let px = w - 18.0 - pill_w;
                         let half = pill_w / 2.0;
-                        let want_auto = match pointer {
+                        self.exit_auto = match pointer {
                             Some((cxp, _)) if cxp >= px => cxp < px + half,
                             _ => !self.exit_auto,
                         };
-                        // Policy: members can't go manual when the admin forbade it.
-                        if !want_auto && !self.is_admin && !self.allow_manual_exit {
-                            self.menu_note = Some("ручной exit отключён админом".into());
-                        } else {
-                            self.exit_auto = want_auto;
-                        }
                     }
                     MenuRow::Node(n) => {
                         self.selected_node =
                             if self.selected_node == Some(n) { None } else { Some(n) };
-                    }
-                    MenuRow::Offer(n) => {
-                        // Policy: members can't buy unless the admin allows it.
-                        if !self.is_admin && !self.members_can_buy {
-                            self.menu_note = Some("покупка нод доступна только админу".into());
-                        } else {
-                            let o = &crate::nodes::OFFERS[n];
-                            self.menu_note = Some(format!(
-                                "покупка {} {} · {} — скоро",
-                                o.region, o.label, o.price
-                            ));
-                        }
-                    }
-                    MenuRow::Toggle(key, _) => {
-                        // Defense in depth: only the admin can flip policy, even
-                        // though non-admins never see this tab.
-                        if self.is_admin {
-                            match key {
-                                menu::PolicyKey::ManualExit => {
-                                    self.allow_manual_exit = !self.allow_manual_exit
-                                }
-                                menu::PolicyKey::MembersBuy => {
-                                    self.members_can_buy = !self.members_can_buy
-                                }
-                            }
-                        }
                     }
                     MenuRow::Skin(s) => {
                         self.switch_skin(s);
@@ -524,9 +432,6 @@ impl App<NoPanel> for MirageClientApp {
                     MenuRow::Action(MenuAction::ImportCamera) => {
                         self.scan = Some(crate::camera::CameraScan::start());
                         self.menu_note = Some("запускаю камеру…".into());
-                    }
-                    MenuRow::Action(MenuAction::Login) => {
-                        self.menu_note = Some("вход на m1r4g3.bid — скоро".into());
                     }
                     _ => {}
                 }
@@ -608,10 +513,7 @@ impl App<NoPanel> for MirageClientApp {
                 self.skin_kind,
                 self.selected_node,
                 self.exit_auto,
-                self.is_admin,
-                policy,
                 self.current_phase,
-                self.anim,
                 self.menu_note.as_deref(),
             );
         }
@@ -705,14 +607,10 @@ impl App<NoPanel> for MirageClientApp {
             render.fill_text("M", SLOT_W / 2.0, CHROME_H / 2.0 - 1.0);
         }
 
-        // ── Profiling overlay (top-right, under chrome; hidden when menu open) ─
-        if !self.menu_open {
-            let render = &mut *win.render;
-            render.set_fill_color("#6B6F7A");
-            render.set_font("11px monospace");
-            render.set_text_align(TextAlign::Right);
-            render.set_text_baseline(TextBaseline::Top);
-            render.fill_text(&stats, w - 8.0, CHROME_H + 5.0);
+        // ── fps HUD (dev-tools; top-right, under chrome; hidden when menu open)
+        #[cfg(feature = "dev-tools")]
+        if let (Some(text), false) = (&hud, self.menu_open) {
+            crate::dev::draw_hud(&mut *win.render, w, CHROME_H, text);
         }
     }
 

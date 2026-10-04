@@ -9,7 +9,7 @@ use uzor::core::types::Rect;
 use uzor::render::{RenderContext, TextAlign, TextBaseline};
 
 use crate::centerpiece::{ConnPhase, SkinKind};
-use crate::nodes::FLEET;
+use crate::nodes::CATALOG;
 
 pub const MENU_TOP: f64 = 32.0;
 pub const TABBAR_H: f64 = 32.0;
@@ -37,25 +37,11 @@ pub enum MenuTab {
     Nodes,
     Style,
     Setup,
-    /// Mesh administration — admin-account ONLY (hard policy gate).
-    Admin,
 }
 
 impl MenuTab {
-    /// Tabs every member sees.
-    pub const BASE: [MenuTab; 4] = [MenuTab::Connection, MenuTab::Nodes, MenuTab::Style, MenuTab::Setup];
-
-    /// Tabs visible to this account. The Admin tab is appended ONLY for the
-    /// admin account — non-admins never get it in the bar, so they can't even
-    /// navigate to it. (The authoritative check is server-side: the monitor
-    /// rejects admin operations from non-admin identities regardless of UI.)
-    pub fn visible(is_admin: bool) -> Vec<MenuTab> {
-        let mut v = Self::BASE.to_vec();
-        if is_admin {
-            v.push(MenuTab::Admin);
-        }
-        v
-    }
+    /// Every tab, in tab-bar order.
+    pub const ALL: [MenuTab; 4] = [MenuTab::Connection, MenuTab::Nodes, MenuTab::Style, MenuTab::Setup];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -63,83 +49,21 @@ impl MenuTab {
             MenuTab::Nodes => "Nodes",
             MenuTab::Style => "Style",
             MenuTab::Setup => "Setup",
-            MenuTab::Admin => "Admin",
-        }
-    }
-}
-
-/// Admin-controlled mesh policy. Members receive it from the mesh and cannot
-/// change it; only the admin account's Admin tab can flip it. (Mock state until
-/// the backend syncs it; server-side is authoritative.)
-#[derive(Clone, Copy)]
-pub struct MeshPolicy {
-    /// Members may manually pick an exit node (else exit is forced auto).
-    pub allow_manual_exit: bool,
-    /// Members may buy nodes into the mesh (else admin-only).
-    pub members_can_buy: bool,
-}
-
-/// Which policy a toggle row controls.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PolicyKey {
-    ManualExit,
-    MembersBuy,
-}
-
-impl PolicyKey {
-    fn label(self) -> &'static str {
-        match self {
-            PolicyKey::ManualExit => "Ручной выбор exit",
-            PolicyKey::MembersBuy => "Покупка нод участниками",
         }
     }
 }
 
 // ── Content rows ─────────────────────────────────────────────────────────────────
 
-/// A live metric sparkline kind.
-#[derive(Clone, Copy)]
-pub enum GraphKind {
-    Latency,
-    Throughput,
-}
-
-impl GraphKind {
-    /// (label, unit, low, high) for the value axis.
-    fn axis(self) -> (&'static str, &'static str, f64, f64) {
-        match self {
-            GraphKind::Latency => ("latency", "ms", 12.0, 48.0),
-            GraphKind::Throughput => ("throughput", "Mbps", 6.0, 38.0),
-        }
-    }
-    /// Seed offset so the two graphs animate independently.
-    fn seed(self) -> i64 {
-        match self {
-            GraphKind::Latency => 0,
-            GraphKind::Throughput => 9973,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub enum MenuRow {
     Status,
-    /// Live metric sparkline (synthetic until the backend is wired).
-    Graph(GraphKind),
-    /// Section header (non-clickable label).
-    Header(&'static str),
     /// Exit-node mode segmented control: Auto | Manual.
     ExitMode,
+    /// An exit node (index into nodes::CATALOG).
     Node(usize),
-    /// A catalog node offering (index into nodes::OFFERS).
-    Offer(usize),
-    /// Admin policy toggle (key + current value).
-    Toggle(PolicyKey, bool),
-    /// Mesh member row (index into nodes::MEMBERS).
-    Member(usize),
     Skin(SkinKind),
     Action(MenuAction),
-    Info(&'static str, &'static str),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,7 +72,6 @@ pub enum MenuAction {
     ImportText,
     ImportQrClip,
     ImportCamera,
-    Login,
 }
 
 pub struct LaidRow {
@@ -162,38 +85,23 @@ pub struct LaidRow {
 fn metrics(row: &MenuRow) -> (f64, bool) {
     match row {
         MenuRow::Status => (52.0, false),
-        MenuRow::Graph(_) => (66.0, false),
-        MenuRow::Header(_) => (30.0, false),
         MenuRow::ExitMode => (46.0, true),
         MenuRow::Node(_) => (34.0, true),
-        MenuRow::Offer(_) => (48.0, true),
-        MenuRow::Toggle(..) => (42.0, true),
-        MenuRow::Member(_) => (34.0, false),
         MenuRow::Skin(_) => (38.0, true),
         MenuRow::Action(_) => (40.0, true),
-        MenuRow::Info(..) => (26.0, false),
     }
 }
 
 /// Rows for the active tab. `exit_auto` controls whether the Nodes tab shows
-/// the manual exit-node picker; `policy` populates the Admin toggles.
-pub fn tab_rows(tab: MenuTab, exit_auto: bool, policy: MeshPolicy) -> Vec<MenuRow> {
+/// the manual exit-node picker.
+pub fn tab_rows(tab: MenuTab, exit_auto: bool) -> Vec<MenuRow> {
     match tab {
-        MenuTab::Connection => vec![
-            MenuRow::Status,
-            MenuRow::Graph(GraphKind::Latency),
-            MenuRow::Graph(GraphKind::Throughput),
-            MenuRow::Info("data-plane", "cli2"),
-            MenuRow::Info("credential", "RingMembership"),
-            MenuRow::Info("mesh", "staging-v2"),
-        ],
+        MenuTab::Connection => vec![MenuRow::Status],
         MenuTab::Nodes => {
             let mut rows = vec![MenuRow::ExitMode];
             if !exit_auto {
-                rows.extend((0..FLEET.len()).map(MenuRow::Node));
+                rows.extend((0..CATALOG.len()).map(MenuRow::Node));
             }
-            rows.push(MenuRow::Header("Купить ноду в мэш"));
-            rows.extend((0..crate::nodes::OFFERS.len()).map(MenuRow::Offer));
             rows
         }
         MenuTab::Style => [SkinKind::Bloom, SkinKind::Planet, SkinKind::Radar, SkinKind::Aurora]
@@ -205,18 +113,7 @@ pub fn tab_rows(tab: MenuTab, exit_auto: bool, policy: MeshPolicy) -> Vec<MenuRo
             MenuRow::Action(MenuAction::ImportText),
             MenuRow::Action(MenuAction::ImportQrClip),
             MenuRow::Action(MenuAction::ImportCamera),
-            MenuRow::Action(MenuAction::Login),
         ],
-        MenuTab::Admin => {
-            let mut rows = vec![
-                MenuRow::Header("Политика меша"),
-                MenuRow::Toggle(PolicyKey::ManualExit, policy.allow_manual_exit),
-                MenuRow::Toggle(PolicyKey::MembersBuy, policy.members_can_buy),
-                MenuRow::Header("Участники"),
-            ];
-            rows.extend((0..crate::nodes::MEMBERS.len()).map(MenuRow::Member));
-            rows
-        }
     }
 }
 
@@ -288,10 +185,7 @@ pub fn draw_menu(
     skin: SkinKind,
     selected: Option<usize>,
     exit_auto: bool,
-    is_admin: bool,
-    policy: MeshPolicy,
     phase: ConnPhase,
-    t: f64,
     note: Option<&str>,
 ) {
     // Scrim over the rest of the app.
@@ -332,7 +226,7 @@ pub fn draw_menu(
         if ry + lr.h < g.content.y || ry > g.content.y + g.content.height {
             continue; // culled
         }
-        draw_row(ctx, w, lr, ry, skin, selected, exit_auto, is_admin, policy, phase, t);
+        draw_row(ctx, w, lr, ry, skin, selected, exit_auto, phase);
     }
     ctx.restore();
 
@@ -370,13 +264,9 @@ fn draw_row(
     skin: SkinKind,
     selected: Option<usize>,
     exit_auto: bool,
-    is_admin: bool,
-    policy: MeshPolicy,
     phase: ConnPhase,
-    t: f64,
 ) {
     match lr.row {
-        MenuRow::Graph(kind) => draw_graph(ctx, w, lr, ry, kind, t),
         MenuRow::Status => {
             let (lbl, col) = phase_label(phase);
             ctx.set_fill_color(MUTED);
@@ -395,21 +285,13 @@ fn draw_row(
                 "auto".to_string()
             } else {
                 selected
-                    .map(|i| FLEET[i].label.to_string())
+                    .and_then(|i| CATALOG.get(i))
+                    .map(|n| n.code.to_string())
                     .unwrap_or_else(|| "manual · не выбрана".to_string())
             };
             ctx.set_fill_color(FG);
             ctx.set_text_align(TextAlign::Right);
             ctx.fill_text(&exit, w - 18.0, ry + 36.0);
-        }
-        MenuRow::Header(ht) => {
-            ctx.set_fill_color(DIMC);
-            ctx.set_font("10px sans-serif");
-            ctx.set_text_align(TextAlign::Left);
-            ctx.set_text_baseline(TextBaseline::Bottom);
-            ctx.fill_text(&ht.to_uppercase(), 18.0, ry + lr.h - 8.0);
-            ctx.set_fill_color(LINE);
-            ctx.fill_rect(18.0, ry + lr.h - 3.0, w - 36.0, 1.0);
         }
         MenuRow::ExitMode => {
             ctx.set_fill_color(MUTED);
@@ -434,83 +316,11 @@ fn draw_row(
             ctx.set_text_align(TextAlign::Center);
             ctx.set_fill_color(if exit_auto { AMBER } else { MUTED });
             ctx.fill_text("Auto", px + half / 2.0, py + pill_h / 2.0);
-            // Manual is locked off for members when policy forbids it.
-            let manual_locked = !is_admin && !policy.allow_manual_exit;
-            let manual_col = if manual_locked {
-                "#4A4D55"
-            } else if exit_auto {
-                MUTED
-            } else {
-                AMBER
-            };
-            ctx.set_fill_color(manual_col);
+            ctx.set_fill_color(if exit_auto { MUTED } else { AMBER });
             ctx.fill_text("Manual", px + half + half / 2.0, py + pill_h / 2.0);
         }
-        MenuRow::Offer(i) => {
-            let o = &crate::nodes::OFFERS[i];
-            ctx.set_fill_color(FG);
-            ctx.set_font("13px sans-serif");
-            ctx.set_text_align(TextAlign::Left);
-            ctx.set_text_baseline(TextBaseline::Top);
-            ctx.fill_text(&format!("{} · {}", o.region, o.label), 20.0, ry + 8.0);
-            ctx.set_fill_color(DIMC);
-            ctx.set_font("10px monospace");
-            ctx.set_text_baseline(TextBaseline::Bottom);
-            ctx.fill_text(&format!("{} · {}", o.specs, o.prov), 20.0, ry + lr.h - 7.0);
-            ctx.set_fill_color(AMBER);
-            ctx.set_font("12px sans-serif");
-            ctx.set_text_align(TextAlign::Right);
-            ctx.set_text_baseline(TextBaseline::Middle);
-            ctx.fill_text(o.price, w - 38.0, ry + lr.h / 2.0);
-            ctx.set_fill_color(DIMC);
-            ctx.set_font("16px sans-serif");
-            ctx.fill_text("+", w - 20.0, ry + lr.h / 2.0);
-        }
-        MenuRow::Toggle(key, on) => {
-            ctx.set_fill_color(FG);
-            ctx.set_font("13px sans-serif");
-            ctx.set_text_align(TextAlign::Left);
-            ctx.set_text_baseline(TextBaseline::Middle);
-            ctx.fill_text(key.label(), 20.0, ry + lr.h / 2.0);
-            // iOS-style switch on the right.
-            let sw_w = 40.0;
-            let sw_h = 22.0;
-            let sx = w - 20.0 - sw_w;
-            let sy = ry + (lr.h - sw_h) / 2.0;
-            ctx.set_fill_color(if on { "rgba(251,178,106,0.85)" } else { "rgba(255,255,255,0.10)" });
-            ctx.fill_rounded_rect(sx, sy, sw_w, sw_h, sw_h / 2.0);
-            let knob = sw_h - 6.0;
-            let kx = if on { sx + sw_w - knob - 3.0 } else { sx + 3.0 };
-            ctx.set_fill_color("#0B0B0E");
-            ctx.begin_path();
-            ctx.arc(kx + knob / 2.0, sy + sw_h / 2.0, knob / 2.0, 0.0, std::f64::consts::TAU);
-            ctx.fill();
-        }
-        MenuRow::Member(i) => {
-            let m = &crate::nodes::MEMBERS[i];
-            let is_admin_row = m.role == "admin";
-            ctx.set_fill_color(FG);
-            ctx.set_font("13px sans-serif");
-            ctx.set_text_align(TextAlign::Left);
-            ctx.set_text_baseline(TextBaseline::Middle);
-            ctx.fill_text(m.name, 20.0, ry + lr.h / 2.0);
-            ctx.set_fill_color(if is_admin_row { AMBER } else { DIMC });
-            ctx.set_font("10px monospace");
-            ctx.set_text_align(TextAlign::Right);
-            ctx.fill_text(m.role, w - 20.0, ry + lr.h / 2.0);
-        }
-        MenuRow::Info(k, v) => {
-            ctx.set_fill_color(MUTED);
-            ctx.set_font("11px monospace");
-            ctx.set_text_align(TextAlign::Left);
-            ctx.set_text_baseline(TextBaseline::Middle);
-            ctx.fill_text(k, 18.0, ry + lr.h / 2.0);
-            ctx.set_fill_color(FG);
-            ctx.set_text_align(TextAlign::Right);
-            ctx.fill_text(v, w - 18.0, ry + lr.h / 2.0);
-        }
         MenuRow::Node(i) => {
-            let n = &FLEET[i];
+            let Some(n) = CATALOG.get(i) else { return };
             let sel = selected == Some(i);
             if sel {
                 ctx.set_fill_color("rgba(251,178,106,0.10)");
@@ -520,7 +330,7 @@ fn draw_row(
             ctx.set_font("13px sans-serif");
             ctx.set_text_align(TextAlign::Left);
             ctx.set_text_baseline(TextBaseline::Middle);
-            ctx.fill_text(n.label, 20.0, ry + lr.h / 2.0);
+            ctx.fill_text(n.code, 20.0, ry + lr.h / 2.0);
         }
         MenuRow::Skin(s) => {
             let active = s == skin;
@@ -552,7 +362,6 @@ fn draw_row(
                 MenuAction::ImportText => "Import  ·  paste text",
                 MenuAction::ImportQrClip => "Import  ·  paste QR",
                 MenuAction::ImportCamera => "Import  ·  scan camera",
-                MenuAction::Login => "Log in to m1r4g3.bid",
             };
             ctx.set_fill_color(AMBER);
             ctx.set_font("14px sans-serif");
@@ -565,76 +374,4 @@ fn draw_row(
             ctx.fill_text("›", w - 18.0, ry + lr.h / 2.0);
         }
     }
-}
-
-// ── Live metric sparklines ───────────────────────────────────────────────────────
-
-/// Deterministic pseudo-noise in 0..1 for a sample index (no RNG — `Math.random`
-/// equivalents are unavailable; this keeps the graph reproducible per frame).
-fn pnoise(i: i64) -> f64 {
-    let x = (i.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9) as u64;
-    ((x >> 17) & 0xffff) as f64 / 65535.0
-}
-
-/// Normalized (0..1) sample for a graph at integer index — a slow wave plus two
-/// noise octaves for an organic-looking trace.
-fn gsample(kind: GraphKind, idx: i64) -> f64 {
-    let i = idx + kind.seed();
-    let wave = 0.5 + 0.5 * ((i as f64) * 0.45).sin();
-    let n = 0.5 * pnoise(i) + 0.5 * pnoise(i.div_euclid(2));
-    (0.45 * wave + 0.55 * n).clamp(0.0, 1.0)
-}
-
-/// Draw a scrolling sparkline (filled area + amber curve) with label + current
-/// value. `t` (seconds) drives the scroll; data is synthetic until the backend
-/// is wired.
-fn draw_graph(ctx: &mut dyn RenderContext, w: f64, lr: &LaidRow, ry: f64, kind: GraphKind, t: f64) {
-    let (label, unit, lo, hi) = kind.axis();
-    const N: usize = 56;
-    let rate = 6.0; // samples per second
-    let idx0 = (t * rate) as i64;
-
-    let x0 = 18.0;
-    let x1 = w - 18.0;
-    let plot_w = (x1 - x0).max(1.0);
-    let top = ry + 22.0;
-    let bottom = ry + lr.h - 8.0;
-    let plot_h = (bottom - top).max(1.0);
-
-    let mut pts = Vec::with_capacity(N);
-    let mut cur_n = 0.0;
-    for x in 0..N {
-        let idx = idx0 - (N as i64 - 1 - x as i64);
-        let n = gsample(kind, idx);
-        if x == N - 1 {
-            cur_n = n;
-        }
-        let px = x0 + plot_w * (x as f64 / (N as f64 - 1.0));
-        let py = bottom - n * plot_h;
-        pts.push((px, py));
-    }
-
-    // Filled area under the curve.
-    ctx.begin_path();
-    ctx.move_to(x0, bottom);
-    for &(px, py) in &pts {
-        ctx.line_to(px, py);
-    }
-    ctx.line_to(x1, bottom);
-    ctx.close_path();
-    ctx.set_fill_color("rgba(251,178,106,0.08)");
-    ctx.fill();
-    // Curve.
-    ctx.stroke_polyline(&pts, AMBER, 1.5);
-
-    // Label + current value.
-    ctx.set_fill_color(MUTED);
-    ctx.set_font("10px monospace");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Top);
-    ctx.fill_text(label, x0, ry + 6.0);
-    let cur = lo + cur_n * (hi - lo);
-    ctx.set_fill_color(AMBER);
-    ctx.set_text_align(TextAlign::Right);
-    ctx.fill_text(&format!("{:.0} {}", cur, unit), x1, ry + 6.0);
 }
