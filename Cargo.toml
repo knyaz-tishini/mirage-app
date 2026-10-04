@@ -14,7 +14,7 @@ members = [
     # "crates/desktop-cli",  # legacy pre-orchestrator launcher (spawned cli1) — RETIRED 2026-06-14 → crates/_deprecated/desktop-cli
     "crates/runtime-guard",
     "crates/debug-shell",
-    "crates/launcher",
+    # "crates/launcher",  # mirage GUI launcher RETIRED 2026-09-30 → crates/_deprecated/launcher (product GUI = crates/client-gui)
     # "crates/client-gui",  # uses vello-gpu + wgpu 29; windows-core version conflicts with launcher workspace — own workspace root
     # "crates/mobile",  # cdylib — skip on Windows build
     # "crates/mirage-pt-adapter",  # arc3 Phase-0 Tor PT+bridge spike — DELETED 2026-07-31.
