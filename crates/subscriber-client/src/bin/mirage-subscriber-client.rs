@@ -16,13 +16,14 @@
 //! hop, a node, or a chain composition; that is all the edge's own job.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use mirage_control_plane::ExitPreference;
 use mirage_subscriber_client::{
-    exit_preference_from_mode, EdgeSession, EntranceArtefact, SubscriberClient,
-    SubscriberClientOptions,
+    exit_preference_from_mode, publish_fatal, EdgeReason, EdgeSession, EntranceArtefact,
+    SubscriberClient, SubscriberClientError, SubscriberClientOptions,
 };
 use tracing::{error, info};
 
@@ -42,6 +43,14 @@ struct Args {
     /// `countries` subcommand.
     #[arg(long, default_value = "127.0.0.1:1080")]
     bind: SocketAddr,
+
+    /// Keep this JSON file current with the connector's state (connecting /
+    /// connected / reconnecting / refused / fatal, a closed reason code, the
+    /// requested and granted exit, the edge's country list). Rewritten
+    /// atomically on every transition and every 5 s; removed on a clean
+    /// shutdown. Ignored by the `countries` subcommand.
+    #[arg(long)]
+    status_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -114,12 +123,31 @@ async fn main() -> ExitCode {
 
     let artefact = match read_and_validate_artefact(&args.artefact) {
         Ok(artefact) => artefact,
-        Err(code) => return code,
+        Err(code) => {
+            if args.command.is_none() {
+                report_fatal(
+                    args.status_file.as_deref(),
+                    &ExitPreference::Auto,
+                    Some(EdgeReason::BadArtefact),
+                );
+            }
+            return code;
+        }
     };
 
     match args.command {
         Some(Command::Countries) => run_countries(&artefact).await,
-        None => run_proxy(&artefact, args.bind).await,
+        None => run_proxy(&artefact, args.bind, args.status_file).await,
+    }
+}
+
+/// Best effort: leave a `fatal` status document for a connector that cannot
+/// start, so its supervisor learns why without parsing logs. A failure to
+/// write it is logged and otherwise ignored — the process is exiting anyway.
+fn report_fatal(status_file: Option<&Path>, requested: &ExitPreference, reason: Option<EdgeReason>) {
+    let Some(path) = status_file else { return };
+    if let Err(e) = publish_fatal(path, requested, reason) {
+        error!(path = %path.display(), error = %e, "cannot write the fatal status file");
     }
 }
 
@@ -168,12 +196,21 @@ async fn run_countries(artefact: &EntranceArtefact) -> ExitCode {
 
 /// Stand up the local SOCKS5 proxy over one persistent edge session — the
 /// default mode.
-async fn run_proxy(artefact: &EntranceArtefact, bind: SocketAddr) -> ExitCode {
+async fn run_proxy(
+    artefact: &EntranceArtefact,
+    bind: SocketAddr,
+    status_file: Option<PathBuf>,
+) -> ExitCode {
+    // `validate()` already accepted the mode, so the fallback is unreachable;
+    // it only keeps the fatal document well-formed if that ever changes.
+    let requested = exit_preference_from_mode(&artefact.mode).unwrap_or(ExitPreference::Auto);
+
     if !bind.ip().is_loopback() {
         error!(
             bind = %bind,
             "refusing: --bind must be a loopback address — this listener must never be reachable off this machine"
         );
+        report_fatal(status_file.as_deref(), &requested, None);
         return ExitCode::FAILURE;
     }
 
@@ -186,12 +223,21 @@ async fn run_proxy(artefact: &EntranceArtefact, bind: SocketAddr) -> ExitCode {
         "mirage-subscriber-client: artefact validated, assembling local proxy"
     );
 
-    let options = SubscriberClientOptions { socks5_bind: bind, ..Default::default() };
+    let options = SubscriberClientOptions {
+        socks5_bind: bind,
+        status_file: status_file.clone(),
+        ..Default::default()
+    };
 
     let client = match SubscriberClient::build(artefact, options).await {
         Ok(client) => client,
         Err(e) => {
             error!(error = %e, "refusing: failed to assemble subscriber client");
+            // A status-file failure has no reason code and nowhere to be
+            // reported; every other refusal is published as `fatal`.
+            if !matches!(e, SubscriberClientError::StatusFile { .. }) {
+                report_fatal(status_file.as_deref(), &requested, e.status_reason());
+            }
             return ExitCode::FAILURE;
         }
     };

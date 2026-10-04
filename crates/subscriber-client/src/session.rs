@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use crate::artefact::{ArtefactEntrance, ArtefactError, ArtefactMode};
 use crate::dial::StaticKeyProtocol;
+use crate::status::{EdgeReason, EdgeStatusFile};
 
 /// This client's own edge-session wire version — see [`EdgeHello::version`].
 /// No edge box exists to negotiate against yet (`mirage-edge`, unbuilt per
@@ -325,13 +326,54 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// "wait until closed" — the driver polls at this interval.
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// One way to obtain a fresh [`EdgeSession`] — the dial the supervisor loop
+/// repeats. The production impl dials the artefact's entrances; the seam
+/// exists so the loop's published state is testable without a live edge.
+#[async_trait::async_trait]
+pub(crate) trait EdgeDialer: Send + Sync + 'static {
+    /// Dial, starting at entrance `start_idx`. Returns the index of the
+    /// entrance that accepted together with the live session.
+    async fn dial(&self, start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError>;
+}
+
+/// [`EdgeDialer`] over the artefact's own TCP-shaped entrances.
+struct EntranceDialer {
+    entrances: Vec<ArtefactEntrance>,
+    mesh_id: Vec<u8>,
+    client_static_priv: [u8; 32],
+    exit: ExitPreference,
+}
+
+#[async_trait::async_trait]
+impl EdgeDialer for EntranceDialer {
+    async fn dial(&self, start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError> {
+        EdgeSession::connect_first_available(
+            &self.entrances,
+            &self.mesh_id,
+            self.client_static_priv,
+            self.exit,
+            start_idx,
+        )
+        .await
+    }
+}
+
 /// Reconnect-with-backoff wrapper around [`EdgeSession`]. Holds the current
 /// live session (if any) behind a [`tokio::sync::watch`] channel so every
 /// caller (the SOCKS5 listener, the TUN feed) sees the same session and the
-/// same reconnects.
+/// same reconnects. A second `watch` publishes the connector's
+/// [`EdgeStatusFile`] on every transition (see [`Self::status`]).
 pub struct EdgeSessionSupervisor {
     slot: tokio::sync::watch::Sender<Option<Arc<EdgeSession>>>,
-    _driver: tokio::task::JoinHandle<()>,
+    status: tokio::sync::watch::Sender<EdgeStatusFile>,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for EdgeSessionSupervisor {
+    /// The dial loop lives exactly as long as its supervisor.
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
 }
 
 impl EdgeSessionSupervisor {
@@ -343,46 +385,23 @@ impl EdgeSessionSupervisor {
         client_static_priv: [u8; 32],
         exit: ExitPreference,
     ) -> Arc<Self> {
-        let (tx, _rx) = tokio::sync::watch::channel(None);
-        let driver_tx = tx.clone();
-        let driver = tokio::spawn(async move {
-            let mut start_idx = 0usize;
-            let mut backoff = INITIAL_BACKOFF;
-            loop {
-                match EdgeSession::connect_first_available(
-                    &entrances,
-                    &mesh_id,
-                    client_static_priv,
-                    exit,
-                    start_idx,
-                )
-                .await
-                {
-                    Ok((idx, session)) => {
-                        info!(entrance = %session.entrance_label(), "edge session: connected");
-                        backoff = INITIAL_BACKOFF;
-                        start_idx = (idx + 1) % entrances.len();
-                        let session = Arc::new(session);
-                        let _ = driver_tx.send(Some(Arc::clone(&session)));
-                        while !session.is_closed() {
-                            tokio::time::sleep(LIVENESS_POLL_INTERVAL).await;
-                        }
-                        warn!("edge session: session closed, reconnecting");
-                        let _ = driver_tx.send(None);
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            backoff_secs = backoff.as_secs(),
-                            "edge session: every entrance refused or unreachable, backing off"
-                        );
-                    }
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-        });
-        Arc::new(Self { slot: tx, _driver: driver })
+        Self::spawn_with_dialer(EntranceDialer { entrances, mesh_id, client_static_priv, exit }, exit)
+    }
+
+    /// [`Self::spawn`] over any [`EdgeDialer`]; `requested` is the exit the
+    /// status file reports as asked-for.
+    pub(crate) fn spawn_with_dialer(dialer: impl EdgeDialer, requested: ExitPreference) -> Arc<Self> {
+        let (slot, _slot_rx) = tokio::sync::watch::channel(None);
+        let (status, _status_rx) =
+            tokio::sync::watch::channel(EdgeStatusFile::connecting(&requested));
+        let driver = tokio::spawn(drive(dialer, slot.clone(), status.clone()));
+        Arc::new(Self { slot, status, driver })
+    }
+
+    /// A receiver for the connector's published state. Its current value is
+    /// always the latest transition; see `crate::status`.
+    pub fn status(&self) -> tokio::sync::watch::Receiver<EdgeStatusFile> {
+        self.status.subscribe()
     }
 
     /// The current live session, if any — does not wait.
@@ -420,6 +439,51 @@ impl EdgeSessionSupervisor {
     }
 }
 
+/// The supervisor's dial/reconnect loop: keep one session up, publish every
+/// transition to `status`, back off exponentially between failed rounds.
+async fn drive(
+    dialer: impl EdgeDialer,
+    slot: tokio::sync::watch::Sender<Option<Arc<EdgeSession>>>,
+    status: tokio::sync::watch::Sender<EdgeStatusFile>,
+) {
+    let mut start_idx = 0usize;
+    let mut backoff = INITIAL_BACKOFF;
+    let mut ever_connected = false;
+    loop {
+        match dialer.dial(start_idx).await {
+            Ok((idx, session)) => {
+                info!(entrance = %session.entrance_label(), "edge session: connected");
+                backoff = INITIAL_BACKOFF;
+                start_idx = idx.saturating_add(1);
+                ever_connected = true;
+                let session = Arc::new(session);
+                // `send_replace`, not `send`: `send` drops the value when no
+                // receiver is subscribed at that instant, which would lose a
+                // session dialed before the first SOCKS5 client arrived.
+                slot.send_replace(Some(Arc::clone(&session)));
+                status.send_modify(|s| s.set_connected(session.accepted_exit(), session.countries()));
+                while !session.is_closed() {
+                    tokio::time::sleep(LIVENESS_POLL_INTERVAL).await;
+                }
+                warn!("edge session: session closed, reconnecting");
+                slot.send_replace(None);
+                status.send_modify(EdgeStatusFile::set_reconnecting);
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "edge session: every entrance refused or unreachable, backing off"
+                );
+                let reason = EdgeReason::from(&e);
+                status.send_modify(|s| s.set_dial_failed(reason, ever_connected));
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
 #[cfg(test)]
 impl EdgeSessionSupervisor {
     /// Test-only: a supervisor whose slot already holds a live `session`,
@@ -428,9 +492,11 @@ impl EdgeSessionSupervisor {
     /// dial. The driver task never completes; the test process ending is
     /// the only cleanup this needs.
     pub(crate) fn for_test(session: Arc<EdgeSession>) -> Arc<Self> {
-        let (tx, _rx) = tokio::sync::watch::channel(Some(session));
+        let (slot, _rx) = tokio::sync::watch::channel(Some(session));
+        let (status, _status_rx) =
+            tokio::sync::watch::channel(EdgeStatusFile::connecting(&ExitPreference::Auto));
         let driver = tokio::spawn(std::future::pending());
-        Arc::new(Self { slot: tx, _driver: driver })
+        Arc::new(Self { slot, status, driver })
     }
 }
 

@@ -259,6 +259,19 @@ rewrite:
 - `mirage-subscriber-client countries --artefact <path>` — connects, prints
   every country the edge can serve (one per line), exits. Never starts the
   SOCKS5 listener.
+- `--status-file <path>` (proxy mode; ignored by `countries`) — `crate::status`
+  keeps `edge-status.json` current: a single-line JSON document written
+  atomically (temp file in the same directory, then rename; `0600` on unix)
+  on every supervisor transition and every 5 s, removed on a clean shutdown.
+  `{"v":1,"updated_at_ms":…,"state":"connecting|connected|reconnecting|refused|fatal",
+  "reason":null,"exit":{"requested":"auto|NL","accepted":"auto|NL|null"},
+  "countries":["NL","DE"]}`. `reason` is the closed enum `EdgeReason`
+  (`unreachable | handshake_failed | closed_before_welcome | malformed_welcome |
+  refused_country_unavailable | refused_unsupported_version | bad_artefact`),
+  produced only by `EdgeReason::from(&EdgeDialError)` — never free text, never
+  an address. A startup failure (unreadable/invalid artefact, refused bind)
+  leaves `state:"fatal"` (with `bad_artefact` where it applies). A reader
+  judges liveness by `updated_at_ms`; a killed connector leaves a stale file.
 
 ### TUN over subscriber-client's SOCKS5 (UDP)
 

@@ -8,7 +8,7 @@
 //! knows only its edge, and every downstream choice (which chain, which
 //! exit, which node) is the edge's own job.
 //!
-//! Four things:
+//! Five things:
 //! 1. Parse and validate the delivery artefact — [`artefact`]. The artefact
 //!    IS the config shape the operator hands the customer: the edge's
 //!    faces (`host:port` + camouflage), the edge's own static key (one per
@@ -29,6 +29,10 @@
 //!    per RFC 1928 §7 — see `mirage2app/CLAUDE.md` "subscriber-client config
 //!    (edge session)".
 //! 4. Optionally drive the existing TUN bridge — [`tun_feed`].
+//! 5. Optionally publish `edge-status.json` — [`status`] — the connector's
+//!    state (`connecting`/`connected`/`reconnecting`/`refused`/`fatal`) with a
+//!    closed reason code, the requested and granted exit, and the edge's
+//!    country list, rewritten atomically on every transition.
 //!
 //! **What must not be in this crate, and why it structurally cannot be**:
 //! no dependency on `mirage_core::crypto::credential` (no ring membership,
@@ -49,6 +53,7 @@ pub mod assembly;
 pub mod dial;
 pub mod session;
 pub mod socks5;
+pub mod status;
 pub mod tun_feed;
 pub mod udp_associate;
 pub mod udp_flow;
@@ -57,6 +62,9 @@ pub use artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefa
 pub use assembly::{SubscriberClient, SubscriberClientError, SubscriberClientOptions};
 pub use session::{
     exit_preference_from_mode, EdgeDialError, EdgeSession, EdgeSessionSupervisor, EdgeStreamError,
+};
+pub use status::{
+    exit_label, publish_fatal, EdgeReason, EdgeState, EdgeStatusFile, ExitStatus, StatusWriter,
 };
 pub use udp_associate::{serve_udp_association, UdpAssociateError};
 pub use udp_flow::EdgeUdpFlow;

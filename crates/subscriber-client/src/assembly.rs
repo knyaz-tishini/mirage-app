@@ -20,7 +20,9 @@
 //! peer table anywhere — an edge session dials the artefact's own entrance
 //! faces directly, by the address and public key the artefact carries.
 
+use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -28,6 +30,7 @@ use tracing::{info, warn};
 
 use crate::artefact::{ArtefactError, EntranceArtefact};
 use crate::session::{exit_preference_from_mode, EdgeDialError, EdgeSessionSupervisor};
+use crate::status::{EdgeReason, StatusWriter};
 use crate::tun_feed::TunFeed;
 
 /// Every way [`SubscriberClient::build`] refuses.
@@ -44,6 +47,22 @@ pub enum SubscriberClientError {
          dial only speaks TCP-shaped faces today"
     )]
     NoUsableEntrance,
+
+    #[error("subscriber client: cannot write the status file {}: {source}", path.display())]
+    StatusFile { path: PathBuf, source: io::Error },
+}
+
+impl SubscriberClientError {
+    /// The closed [`EdgeReason`] this refusal maps to in the status file, if
+    /// it has one. A status-file failure has none: the file it would be
+    /// written to is the thing that failed.
+    pub fn status_reason(&self) -> Option<EdgeReason> {
+        match self {
+            Self::Artefact(_) | Self::NoUsableEntrance => Some(EdgeReason::BadArtefact),
+            Self::EdgeDial(e) => Some(EdgeReason::from(e)),
+            Self::StatusFile { .. } => None,
+        }
+    }
 }
 
 /// Tunable knobs for [`SubscriberClient::build`]. Everything else this
@@ -55,11 +74,18 @@ pub struct SubscriberClientOptions {
     /// When `Some`, also feed `client-core`'s `TunBridge` — see
     /// `crate::tun_feed`. `None` (default) leaves TUN untouched.
     pub tun_api_url: Option<String>,
+    /// When `Some`, keep `edge-status.json` (see `crate::status`) current at
+    /// this path. `None` (default) publishes nothing.
+    pub status_file: Option<PathBuf>,
 }
 
 impl Default for SubscriberClientOptions {
     fn default() -> Self {
-        Self { socks5_bind: SocketAddr::from(([127, 0, 0, 1], 1080)), tun_api_url: None }
+        Self {
+            socks5_bind: SocketAddr::from(([127, 0, 0, 1], 1080)),
+            tun_api_url: None,
+            status_file: None,
+        }
     }
 }
 
@@ -69,6 +95,7 @@ pub struct SubscriberClient {
     pub supervisor: Arc<EdgeSessionSupervisor>,
     pub socks5_bind: SocketAddr,
     socks5_task: tokio::task::JoinHandle<()>,
+    status_writer: Option<StatusWriter>,
     _tun_feed: Option<TunFeed>,
 }
 
@@ -112,6 +139,17 @@ impl SubscriberClient {
         let supervisor =
             EdgeSessionSupervisor::spawn(tcp_entrances, mesh_id, client_static_priv, exit);
 
+        // Started before anything else is bound so an unwritable path refuses
+        // the build (dropping `supervisor` aborts its dial loop) instead of
+        // leaving a connector running that nobody can observe.
+        let status_writer = match options.status_file {
+            Some(path) => Some(
+                StatusWriter::start(path.clone(), supervisor.status())
+                    .map_err(|source| SubscriberClientError::StatusFile { path, source })?,
+            ),
+            None => None,
+        };
+
         let socks5_bind = options.socks5_bind;
         let socks5_supervisor = Arc::clone(&supervisor);
         info!(bind = %socks5_bind, "subscriber-client: SOCKS5 listener starting");
@@ -129,15 +167,18 @@ impl SubscriberClient {
             None => None,
         };
 
-        Ok(Self { supervisor, socks5_bind, socks5_task, _tun_feed: tun_feed })
+        Ok(Self { supervisor, socks5_bind, socks5_task, status_writer, _tun_feed: tun_feed })
     }
 
-    /// Abort the SOCKS5 accept loop. The edge-session supervisor's
-    /// background driver task (and the TUN feed's watcher, if any) are
-    /// detached rather than aborted — they stop mattering once every `Arc`
-    /// referencing this `SubscriberClient` drops.
+    /// Abort the SOCKS5 accept loop and, if a status file is kept, stop
+    /// rewriting it and remove it. The edge-session supervisor's dial loop
+    /// stops when the last `Arc` to it drops; the TUN feed's watcher (if any)
+    /// is detached.
     pub fn shutdown(&self) {
         self.socks5_task.abort();
+        if let Some(writer) = &self.status_writer {
+            writer.stop();
+        }
     }
 }
 
