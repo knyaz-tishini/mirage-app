@@ -1,19 +1,21 @@
 //! Tiny runtime profiling control — hot-switch the render backend and scrape
-//! metrics over HTTP, no relaunch needed.
+//! metrics over HTTP, no relaunch needed. Dev-tools only.
 //!
 //!   GET  /            → {"backend":"Vello GPU","fps":221.0,"frame_ms":4.6}
 //!   POST /backend/<name>  → request a backend switch (applied next frame)
 //!
-//! `name` ∈ vello_gpu | vello_hybrid | vello_cpu | instanced_wgpu | urx_wgpu |
-//! urx_wgpu_full | urx_hybrid | urx_cpu | tiny_skia. The app thread reads
-//! `requested` each frame, calls `render_control.set_backend`, and writes the
-//! live fps/frame_ms/backend back here.
+//! `name` is anything [`crate::render_backend::parse_backend`] accepts. The app
+//! thread calls [`tick`] each frame: it reads `requested`, calls
+//! `render_control.set_backend`, and writes the live fps/frame_ms/backend back
+//! here.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use uzor::platform::types::RenderBackend;
+use uzor::framework::render_control::RenderControl;
+
+use crate::render_backend::parse_backend;
 
 #[derive(Default)]
 pub struct ProfState {
@@ -26,20 +28,28 @@ pub struct ProfState {
 
 pub type ProfHandle = Arc<Mutex<ProfState>>;
 
-/// Map a backend name to a [`RenderBackend`].
-pub fn parse_backend(name: &str) -> Option<RenderBackend> {
-    match name.trim() {
-        "vello_gpu" => Some(RenderBackend::VelloGpu),
-        "vello_hybrid" => Some(RenderBackend::VelloHybrid),
-        "vello_cpu" => Some(RenderBackend::VelloCpu),
-        "instanced_wgpu" => Some(RenderBackend::InstancedWgpu),
-        "urx_wgpu" => Some(RenderBackend::UrxWgpu),
-        "urx_wgpu_full" => Some(RenderBackend::UrxWgpuFull),
-        "urx_hybrid" => Some(RenderBackend::UrxHybrid),
-        "urx_cpu" => Some(RenderBackend::UrxCpu),
-        "tiny_skia" => Some(RenderBackend::TinySkia),
-        _ => None,
+fn lock(state: &ProfHandle) -> MutexGuard<'_, ProfState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Per-frame sync with the app thread: publish the live render stats, apply a
+/// pending backend switch, and return the one-line HUD readout
+/// (`<backend>  <fps>fps  <ms>ms`).
+pub fn tick(state: &ProfHandle, render_control: &mut dyn RenderControl) -> String {
+    let backend = render_control.active_backend().label().to_string();
+    let fps = render_control.measured_fps();
+    let frame_ms = render_control.last_frame_time_ms();
+    let requested = {
+        let mut p = lock(state);
+        p.fps = fps;
+        p.frame_ms = frame_ms;
+        p.backend.clone_from(&backend);
+        p.requested.take()
+    };
+    if let Some(b) = requested.as_deref().and_then(parse_backend) {
+        render_control.set_backend(b);
     }
+    format!("{backend}  {fps:.0}fps  {frame_ms:.1}ms")
 }
 
 /// Spawn the control server on `127.0.0.1:port`.
@@ -66,11 +76,11 @@ pub fn serve(state: ProfHandle, port: u16) {
                 let name = path.trim_start_matches("/backend/").to_string();
                 let ok = parse_backend(&name).is_some();
                 if ok {
-                    state.lock().unwrap().requested = Some(name);
+                    lock(&state).requested = Some(name);
                 }
                 format!("{{\"ok\":{ok}}}")
             } else {
-                let st = state.lock().unwrap();
+                let st = lock(&state);
                 format!(
                     "{{\"backend\":\"{}\",\"fps\":{:.1},\"frame_ms\":{:.2}}}",
                     st.backend, st.fps, st.frame_ms

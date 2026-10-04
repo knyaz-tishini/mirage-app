@@ -8,8 +8,9 @@
 //! tokio tasks inside the NE extension) will satisfy the same trait for
 //! iOS / Mac App Store without touching the GUI.
 //!
-//! Off by default — only constructed when `--live` is passed (so a plain
-//! UI-development run never spawns the backend or opens sockets).
+//! The customer build always constructs it. A `dev-tools` build constructs it
+//! only with `--live`; without that flag a mock engine stands in (see
+//! `crate::dev`).
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -247,7 +248,7 @@ fn ensure_client_template_cli2() {
     let exe = std::env::consts::EXE_SUFFIX;
     let worker_bin = format!("{dir_str}/mirage-chain-worker{exe}");
     let content = format!(
-        "{{\n  \"client_id\": \"mirage-desktop\",\n  \"mesh_id\": \"v3-staging\",\n  \
+        "{{\n  \"client_id\": \"mirage-desktop\",\n  \
          \"chains\": [],\n  \"routing\": {{}},\n  \"psk\": null,\n  \
          \"supervisor\": {{\n    \"worker_binary\": \"{worker_bin}\",\n    \
          \"reload_poll_secs\": 5\n  }}\n}}\n"

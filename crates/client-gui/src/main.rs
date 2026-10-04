@@ -1,7 +1,9 @@
 //! mirage-client-gui — Mirage client GUI.
 //!
-//! Entry point: drives the app via the uzor AppBuilder runtime, which gives
-//! the agent-API + `/screenshot` endpoint for free.
+//! Entry point: drives the app via the uzor AppBuilder runtime. The customer
+//! build always owns and drives the real L0 backend; everything developer-only
+//! (agent API, profiling server, fps HUD, mock engine) lives in `src/dev/`
+//! behind the `dev-tools` feature, which is off by default.
 
 // No console window on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -11,11 +13,11 @@ mod backend;
 mod camera;
 mod centerpiece;
 mod config_import;
+#[cfg(feature = "dev-tools")]
+mod dev;
 mod nodes;
-mod prof;
+mod render_backend;
 mod shell;
-
-use std::sync::{Arc, Mutex};
 
 use uzor::framework::builder::AppBuilder;
 use uzor::framework::multi_window::{WindowKey, WindowSpec};
@@ -48,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }));
 
-    // --skin bloom|planet|radar + --connected (deterministic screenshot capture).
+    // --skin bloom|planet|radar|aurora picks the initial skin.
     let args: Vec<String> = std::env::args().collect();
     let skin = match args
         .iter()
@@ -61,49 +63,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("aurora") => centerpiece::SkinKind::Aurora,
         _ => centerpiece::SkinKind::Bloom,
     };
-    let connected = args.iter().any(|a| a == "--connected");
-    // --admin reveals the admin-only mesh-settings tab (UI gate; the monitor
-    // re-checks the account role server-side regardless).
-    let is_admin = args.iter().any(|a| a == "--admin");
-    // Initial mesh policy (later supplied by the mesh; these flags simulate a
-    // restricted member for testing the member-side enforcement).
-    let allow_manual_exit = !args.iter().any(|a| a == "--no-manual-exit");
-    let members_can_buy = !args.iter().any(|a| a == "--no-buy");
 
-    // --live owns + drives the real L0 backend (spawns the orchestrator tree,
-    // polls sentinel :19420). Absent → pure UI (no spawn, no sockets) for
-    // UI-development on the main box.
-    let engine: Option<Box<dyn backend::EngineLink>> = if args.iter().any(|a| a == "--live") {
-        Some(Box::new(backend::LocalHttp::start()))
-    } else {
-        None
-    };
-
-    // --backend <name> for the initial backend; absent → autodetect (VelloGpu).
-    let backend = args
+    // --backend <name> for the initial render backend (support fallback for a
+    // broken GPU driver: `--backend tiny_skia`); absent → autodetect.
+    let initial_backend = args
         .iter()
         .position(|a| a == "--backend")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| prof::parse_backend(s));
+        .and_then(|s| render_backend::parse_backend(s));
 
-    // Runtime profiling control: hot-switch backend + scrape fps over HTTP.
-    let prof_state = Arc::new(Mutex::new(prof::ProfState::default()));
-    prof::serve(prof_state.clone(), 17472);
+    // The customer build owns + drives the real L0 backend (spawns the
+    // orchestrator tree, polls sentinel :19420).
+    #[cfg(not(feature = "dev-tools"))]
+    let engine: Box<dyn backend::EngineLink> = Box::new(backend::LocalHttp::start());
+    #[cfg(feature = "dev-tools")]
+    let (engine, dev_hooks) = dev::launch(&args);
 
-    let mut builder = AppBuilder::new(MirageClientApp::with_skin(
-        skin,
-        connected,
-        is_admin,
-        allow_manual_exit,
-        members_can_buy,
-        engine,
-        prof_state,
-    ))
-        .agent_api(17471)
-        // render-hub builds vello area-only AA; default msaa_samples=8 would
-        // request the absent Msaa8 shader and panic on the first frame.
-        .msaa(0);
-    if let Some(b) = backend {
+    let app = MirageClientApp::new(skin, engine);
+    #[cfg(feature = "dev-tools")]
+    let app = app.with_dev(dev_hooks);
+
+    // render-hub builds vello area-only AA; default msaa_samples=8 would
+    // request the absent Msaa8 shader and panic on the first frame.
+    let mut builder = AppBuilder::new(app).msaa(0);
+    #[cfg(feature = "dev-tools")]
+    {
+        builder = dev::attach(builder);
+    }
+    if let Some(b) = initial_backend {
         builder = builder.backend(b);
     }
     builder
