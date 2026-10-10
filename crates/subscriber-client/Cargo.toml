@@ -22,6 +22,11 @@ thiserror            = { workspace = true }
 async-trait          = "0.1"
 hex                  = "0.4"
 reqwest              = { workspace = true }
+# Same QR decoder the desktop GUI already ships (client-gui, rqrr 0.7.1).
+# `image` 0.25 reads the PNG or JPEG. Neither crate is new to this repo.
+rqrr                 = "=0.7.1"
+image                = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+qrcode = { version = "=0.14.1", default-features = false, features = ["image"] }

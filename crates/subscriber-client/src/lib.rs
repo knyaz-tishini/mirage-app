@@ -50,6 +50,7 @@
 
 pub mod artefact;
 pub mod assembly;
+pub mod claim_image;
 pub mod dial;
 pub mod http_connect;
 pub mod scope;

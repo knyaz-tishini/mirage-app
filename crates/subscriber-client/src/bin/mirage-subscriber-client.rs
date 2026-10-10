@@ -102,6 +102,10 @@ enum Command {
         /// Connection code or `/c/` link. One successful redeem burns it.
         #[arg(long)]
         claim: Option<String>,
+        /// PNG or JPEG of the same claim's QR. A photograph of the code is
+        /// enough. The text inside the picture is redeemed, not the file.
+        #[arg(long)]
+        qr: Option<PathBuf>,
         /// Poll code returned by a redeem that has not finished yet.
         #[arg(long)]
         poll: Option<String>,
@@ -169,8 +173,24 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
-    if let Some(Command::Claim { panel, claim, poll, out }) = &args.command {
-        return run_claim(panel, claim.as_deref(), poll.as_deref(), out).await;
+    if let Some(Command::Claim { panel, claim, qr, poll, out }) = &args.command {
+        if qr.is_some() && claim.is_some() {
+            error!("refusing: pass a code, a link, or one qr image");
+            return ExitCode::FAILURE;
+        }
+        let from_image = if let Some(path) = qr {
+            match read_qr_claim(path) {
+                Ok(text) => Some(text),
+                Err(err) => {
+                    error!(error = %err, "refusing: qr image");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            None
+        };
+        let claim_text = claim.clone().or(from_image);
+        return run_claim(panel, claim_text.as_deref(), poll.as_deref(), out).await;
     }
 
     let Some(artefact_path) = args.artefact.as_ref() else {
@@ -711,6 +731,11 @@ fn write_credential(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn read_qr_claim(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    mirage_subscriber_client::claim_image::claim_text_from_image(&bytes)
+}
+
 /// Redeem `--claim` and/or poll until the artefact is ready, then write it.
 /// Prints the path and the device id. Never prints the private key.
 async fn run_claim(panel: &str, claim: Option<&str>, poll: Option<&str>, out: &Path) -> ExitCode {
@@ -751,7 +776,7 @@ async fn run_claim(panel: &str, claim: Option<&str>, poll: Option<&str>, out: &P
         poll_code = Some(returned.to_string());
     }
     let Some(poll_code) = poll_code else {
-        error!("refusing: claim needs --claim or --poll");
+        error!("refusing: claim needs --claim, --qr, or --poll");
         return ExitCode::FAILURE;
     };
 
