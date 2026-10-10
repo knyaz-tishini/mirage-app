@@ -923,6 +923,13 @@ async fn issue_ask(
         return;
     };
     let spec = default_chain_ask_spec(ask_cfg.hops, ask_cfg.exit_region.clone());
+    tracing::info!(
+        hops = spec.hops,
+        exit_region = spec.anchor.exit_region.as_deref().unwrap_or("-"),
+        transport = spec.transport,
+        camouflage = spec.camouflage,
+        "[sentinel] chain_ask: sending"
+    );
     let now = Instant::now();
     match ask_for_chain(&wrc, &bearer, client_id, &spec).await {
         Ok(outcome) => {
