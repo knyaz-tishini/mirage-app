@@ -36,10 +36,10 @@ use tracing::{error, info};
     about = "Mirage commercial subscriber client — local proxy over one persistent edge session"
 )]
 struct Args {
-    /// Path to the delivery artefact (JSON) issued by the operator.
-    /// This file decides where traffic goes. Nothing below does.
+    /// Path to the delivery artefact (JSON). This file decides where traffic
+    /// goes. Required except for `claim`, which writes the file and exits.
     #[arg(long)]
-    artefact: PathBuf,
+    artefact: Option<PathBuf>,
 
     /// Local SOCKS5 bind address. Must be a loopback address — this
     /// listener must never be reachable off this machine. Ignored by the
@@ -92,6 +92,23 @@ enum Command {
     /// Connect to the edge, print the countries it can serve (one per
     /// line), and exit. Never starts the local SOCKS5 listener.
     Countries,
+    /// Redeem a cabinet connection claim, write the artefact, and exit.
+    /// Does not open a session and does not choose a port, a face, or an exit.
+    Claim {
+        /// Panel origin, for example `https://panel.m1r4g3.bid`. One trailing
+        /// slash is stripped.
+        #[arg(long)]
+        panel: String,
+        /// Connection code or `/c/` link. One successful redeem burns it.
+        #[arg(long)]
+        claim: Option<String>,
+        /// Poll code returned by a redeem that has not finished yet.
+        #[arg(long)]
+        poll: Option<String>,
+        /// Artefact JSON destination. Created mode 0600 on unix.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 /// Standard L0 panic catcher (matches every other binary in this
@@ -152,7 +169,15 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
-    let artefact = match read_and_validate_artefact(&args.artefact) {
+    if let Some(Command::Claim { panel, claim, poll, out }) = &args.command {
+        return run_claim(panel, claim.as_deref(), poll.as_deref(), out).await;
+    }
+
+    let Some(artefact_path) = args.artefact.as_ref() else {
+        error!("refusing: --artefact is required");
+        return ExitCode::FAILURE;
+    };
+    let artefact = match read_and_validate_artefact(artefact_path) {
         Ok(artefact) => artefact,
         Err(code) => {
             if args.command.is_none() {
@@ -166,8 +191,9 @@ async fn main() -> ExitCode {
         }
     };
 
-    match args.command {
+    match &args.command {
         Some(Command::Countries) => run_countries(&artefact).await,
+        Some(Command::Claim { .. }) => ExitCode::FAILURE,
         None => run_proxy(&artefact, &args).await,
     }
 }
@@ -638,4 +664,174 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn panel_origin(panel: &str) -> &str {
+    panel.trim().strip_suffix('/').unwrap_or(panel.trim())
+}
+
+fn exit_for_http(status: u16) -> Option<ExitCode> {
+    match status {
+        404 => Some(ExitCode::from(2)),
+        409 => Some(ExitCode::from(3)),
+        200 | 202 => None,
+        _ => Some(ExitCode::FAILURE),
+    }
+}
+
+async fn post_panel(client: &reqwest::Client, url: &str, body: serde_json::Value) -> Result<(u16, serde_json::Value), String> {
+    let response = client.post(url).json(&body).send().await.map_err(|err| err.to_string())?;
+    let status = response.status().as_u16();
+    let text = response.text().await.map_err(|err| err.to_string())?;
+    let value = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+    };
+    Ok((status, value))
+}
+
+fn write_credential(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Redeem `--claim` and/or poll until the artefact is ready, then write it.
+/// Prints the path and the device id. Never prints the private key.
+async fn run_claim(panel: &str, claim: Option<&str>, poll: Option<&str>, out: &Path) -> ExitCode {
+    let origin = panel_origin(panel);
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(20)).build() {
+        Ok(client) => client,
+        Err(err) => {
+            error!(error = %err, "refusing: cannot build the panel client");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut poll_code = poll.map(str::to_string);
+    if let Some(code) = claim {
+        let (status, body) = match post_panel(
+            &client,
+            &format!("{origin}/public/claims/redeem"),
+            serde_json::json!({ "claim": code }),
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                error!(error = %err, "redeem failed");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(code) = exit_for_http(status) {
+            if status != 404 && status != 409 {
+                error!(status, "redeem refused");
+            }
+            return code;
+        }
+        let Some(returned) = body.get("poll").and_then(|value| value.as_str()) else {
+            error!(status, "redeem did not return a poll code");
+            return ExitCode::FAILURE;
+        };
+        poll_code = Some(returned.to_string());
+    }
+    let Some(poll_code) = poll_code else {
+        error!("refusing: claim needs --claim or --poll");
+        return ExitCode::FAILURE;
+    };
+
+    let started = std::time::Instant::now();
+    let budget = Duration::from_secs(90);
+    loop {
+        if started.elapsed() >= budget {
+            println!("{poll_code}");
+            return ExitCode::from(4);
+        }
+        let (status, body) = match post_panel(
+            &client,
+            &format!("{origin}/public/claims/poll"),
+            serde_json::json!({ "poll": poll_code }),
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                error!(error = %err, "poll failed");
+                return ExitCode::FAILURE;
+            }
+        };
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let rest = budget.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                println!("{poll_code}");
+                return ExitCode::from(4);
+            }
+            tokio::time::sleep(Duration::from_secs(2).min(rest)).await;
+            continue;
+        }
+        if let Some(code) = exit_for_http(status) {
+            if status != 404 && status != 409 {
+                error!(status, "poll refused");
+            }
+            return code;
+        }
+        let state = body.get("status").and_then(|value| value.as_str()).unwrap_or("");
+        if state == "ready" {
+            let document = body.get("artefact").cloned().filter(|value| !value.is_null()).or_else(|| {
+                body.get("packet").cloned().filter(|value| !value.is_null())
+            });
+            let Some(document) = document else {
+                error!("ready response carried no credential");
+                return ExitCode::FAILURE;
+            };
+            let Some(device_id) = body.get("device_id").and_then(|value| value.as_str()) else {
+                error!("ready response carried no device id");
+                return ExitCode::FAILURE;
+            };
+            let mut bytes = match serde_json::to_vec(&document) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error!(error = %err, "cannot encode the credential");
+                    return ExitCode::FAILURE;
+                }
+            };
+            bytes.push(b'\n');
+            if let Err(err) = write_credential(out, &bytes) {
+                error!(path = %out.display(), error = %err, "cannot write the credential");
+                return ExitCode::FAILURE;
+            }
+            println!("wrote {} device {device_id}", out.display());
+            return ExitCode::SUCCESS;
+        }
+        if state == "pending" {
+            let rest = budget.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                println!("{poll_code}");
+                return ExitCode::from(4);
+            }
+            tokio::time::sleep(Duration::from_secs(1).min(rest)).await;
+            continue;
+        }
+        if state == "failed" {
+            error!(status = state, "issuance failed");
+            return ExitCode::FAILURE;
+        }
+        error!(status = state, "credential was already delivered");
+        return ExitCode::FAILURE;
+    }
 }

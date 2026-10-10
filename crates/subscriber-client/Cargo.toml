@@ -21,6 +21,7 @@ serde_json           = { workspace = true }
 thiserror            = { workspace = true }
 async-trait          = "0.1"
 hex                  = "0.4"
+reqwest              = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
