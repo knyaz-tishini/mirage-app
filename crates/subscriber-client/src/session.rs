@@ -14,12 +14,15 @@
 //! one-single-hop-dial-per-flow path (`crate::chain_build`, retired to
 //! `crate::_deprecated`).
 //!
-//! [`EdgeSessionSupervisor`] holds the session up across the artefact's
-//! several entrance faces (round-robin failover, matching the face sharding
-//! this crate already had) and reconnects with exponential backoff whenever
-//! the live session closes.
+//! [`EdgeSessionSupervisor`] holds one session up and reconnects with
+//! exponential backoff whenever it closes. The edge assigns the session
+//! face (hello version 2). This client only picks a TCP probe, and fails
+//! that probe over onto another TCP face when the probe itself cannot
+//! connect. An edge that refuses version 2 falls back to version-1
+//! [`EdgeSession::connect_first_available`] from index 0.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,10 +43,14 @@ use crate::artefact::{ArtefactEntrance, ArtefactError, ArtefactMode};
 use crate::dial::StaticKeyProtocol;
 use crate::status::{EdgeReason, EdgeStatusFile};
 
-/// This client's own edge-session wire version — see [`EdgeHello::version`].
-/// No edge box exists to negotiate against yet (`mirage-edge`, unbuilt per
-/// the plan's PART ONE); `1` is the only version this client ever sends.
+/// Version 1 of this client's edge-session wire — see [`EdgeHello::version`].
+/// A version-2 dial is a separate path ([`EntranceDialer`]); this constant
+/// stays the version an old edge still understands.
 const EDGE_SESSION_WIRE_VERSION: u8 = 1;
+const EDGE_SESSION_WIRE_VERSION_V2: u8 = 2;
+
+/// Mix input for the probe-face start. Not a `rand` source.
+static PROBE_DRAW: AtomicU64 = AtomicU64::new(0);
 
 /// A refusal reason with a human-readable [`std::fmt::Display`] impl —
 /// `mirage_control_plane::EdgeRefusal` itself only derives `Debug`.
@@ -90,6 +97,15 @@ pub enum EdgeDialError {
 
     #[error("edge session: no entrances to dial")]
     NoEntrances,
+
+    #[error("edge session: EdgeHello encode: {0}")]
+    MalformedHello(WireError),
+
+    #[error("edge session: edge assigned port {port} which is not a tcp entrance on the artefact")]
+    AssignedFaceMissing { port: u16 },
+
+    #[error("edge session: {count} tcp entrances exceeds the {max} a version-2 hello can offer")]
+    TooManyFaces { count: usize, max: usize },
 }
 
 /// Every way opening a mux stream on a live [`EdgeSession`] fails.
@@ -142,23 +158,7 @@ impl EdgeSession {
         client_static_priv: [u8; 32],
         exit: ExitPreference,
     ) -> Result<Self, EdgeDialError> {
-        let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
-            EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
-        })?;
-        let server_pubkey = entrance.server_pubkey()?;
-
-        let ep_config = MirageEndpointConfig {
-            transport: TransportKind::Tcp,
-            auth: AuthMode::Blake3,
-            camouflage: entrance.camouflage.clone(),
-            byte_cipher: None,
-            byte_cipher_mode: None,
-        };
-        let proto = StaticKeyProtocol::new(ep_config, mesh_id.to_vec(), client_static_priv);
-        let mut tunnel: Box<dyn Tunnel> = proto
-            .connect_with_credential(addr, &server_pubkey, "", Some(entrance.camouflage.clone()), None)
-            .await?;
-
+        let mut tunnel = open_entrance_tunnel(entrance, mesh_id, client_static_priv).await?;
         let welcome = match send_hello_and_read_welcome(tunnel.as_mut(), exit).await {
             Ok(welcome) => welcome,
             Err(e) => {
@@ -181,18 +181,14 @@ impl EdgeSession {
             "edge session: accepted, upgrading to mux"
         );
 
-        let compat = TunnelCompat::wrap(tunnel);
-        let session = SessionHandle::client(compat);
-
-        Ok(Self { session, welcome, entrance_label: entrance.addr.clone() })
+        Ok(upgrade_session(tunnel, welcome, entrance.addr.clone()))
     }
 
-    /// Dial across `entrances` round-robin, starting at `start_idx` — the
-    /// face sharding this crate already had, applied to picking a dial path
-    /// for the ONE persistent session rather than to spreading independent
-    /// flows across independent chains. Returns the first entrance that
-    /// accepts; on total failure, the LAST entrance's refusal/error (most
-    /// informative for a single-entrance artefact, still useful for many).
+    /// Version-1 walk across `entrances`, starting at `start_idx`. This is
+    /// the fallback for an edge that does not speak version 2. It is not how
+    /// a version-2 session picks its face — the edge assigns that. Returns
+    /// the first entrance that accepts; on total failure, the LAST
+    /// entrance's refusal/error.
     pub async fn connect_first_available(
         entrances: &[ArtefactEntrance],
         mesh_id: &[u8],
@@ -277,15 +273,137 @@ impl EdgeSession {
     }
 }
 
-/// Send [`EdgeHello`] and read back the (possibly split-across-reads)
-/// [`EdgeWelcome`] — pure transport-level plumbing, factored out so it is
-/// testable against a mock [`Tunnel`] with no live V9 handshake.
+/// Open the V9 tunnel to one entrance. Camouflage stays on this dial; it is
+/// not something the edge-session hello carries.
+async fn open_entrance_tunnel(
+    entrance: &ArtefactEntrance,
+    mesh_id: &[u8],
+    client_static_priv: [u8; 32],
+) -> Result<Box<dyn Tunnel>, EdgeDialError> {
+    let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| EdgeDialError::BadAddr {
+        addr: entrance.addr.clone(),
+        reason: e.to_string(),
+    })?;
+    let server_pubkey = entrance.server_pubkey()?;
+    let ep_config = MirageEndpointConfig {
+        transport: TransportKind::Tcp,
+        auth: AuthMode::Blake3,
+        camouflage: entrance.camouflage.clone(),
+        byte_cipher: None,
+        byte_cipher_mode: None,
+    };
+    let proto = StaticKeyProtocol::new(ep_config, mesh_id.to_vec(), client_static_priv);
+    Ok(proto
+        .connect_with_credential(addr, &server_pubkey, "", Some(entrance.camouflage.clone()), None)
+        .await?)
+}
+
+fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label: String) -> EdgeSession {
+    let compat = TunnelCompat::wrap(tunnel);
+    let session = SessionHandle::client(compat);
+    EdgeSession { session, welcome, entrance_label }
+}
+
+fn entrance_tcp_port(entrance: &ArtefactEntrance) -> Result<u16, EdgeDialError> {
+    let Some((_, port)) = entrance.addr.rsplit_once(':') else {
+        return Err(EdgeDialError::BadAddr {
+            addr: entrance.addr.clone(),
+            reason: "missing port".to_owned(),
+        });
+    };
+    port.parse::<u16>().map_err(|e| EdgeDialError::BadAddr {
+        addr: entrance.addr.clone(),
+        reason: e.to_string(),
+    })
+}
+
+/// TCP faces only, in artefact order, as `(index, port)`. UDP-shaped faces,
+/// including `raw_udp`, are not offered and not probed.
+fn offered_tcp_ports(entrances: &[ArtefactEntrance]) -> Result<Vec<(usize, u16)>, EdgeDialError> {
+    let mut offered = Vec::new();
+    for (idx, entrance) in entrances.iter().enumerate() {
+        if entrance.camouflage.is_udp() {
+            continue;
+        }
+        offered.push((idx, entrance_tcp_port(entrance)?));
+    }
+    Ok(offered)
+}
+
+fn probe_origin(len: usize) -> usize {
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = PROBE_DRAW.fetch_add(1, Ordering::Relaxed);
+    let mixed = tick.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(seq);
+    (mixed as usize) % len
+}
+
+/// Version-2 hello on one face. Does not upgrade to mux: the caller keeps
+/// the tunnel only when this face is the session.
+async fn dial_v2_face(
+    entrance: &ArtefactEntrance,
+    mesh_id: &[u8],
+    client_static_priv: [u8; 32],
+    exit: ExitPreference,
+    commit: bool,
+    offered: &[u16],
+) -> Result<(Box<dyn Tunnel>, EdgeWelcome), EdgeDialError> {
+    let mut tunnel = open_entrance_tunnel(entrance, mesh_id, client_static_priv).await?;
+    let hello = EdgeHello {
+        version: EDGE_SESSION_WIRE_VERSION_V2,
+        exit,
+        flags: if commit { EdgeHello::FLAG_COMMIT } else { 0 },
+        offered_ports: offered.to_vec(),
+    };
+    let bytes = match hello.encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = tunnel.close().await;
+            return Err(EdgeDialError::MalformedHello(e));
+        }
+    };
+    if let Err(e) = tunnel.send(&bytes).await {
+        let _ = tunnel.close().await;
+        return Err(e.into());
+    }
+    let welcome = match read_welcome(tunnel.as_mut()).await {
+        Ok(welcome) => welcome,
+        Err(e) => {
+            let _ = tunnel.close().await;
+            return Err(e);
+        }
+    };
+    match interpret_welcome(welcome) {
+        Ok(welcome) => Ok((tunnel, welcome)),
+        Err(e) => {
+            let _ = tunnel.close().await;
+            Err(e)
+        }
+    }
+}
+
+fn log_assigned(probe: &str, session: &EdgeSession) {
+    info!(probe = %probe, entrance = %session.entrance_label(), "edge session: face assigned");
+}
+
+/// Send a version-1 [`EdgeHello`] and read back the (possibly
+/// split-across-reads) [`EdgeWelcome`] — pure transport-level plumbing,
+/// factored out so it is testable against a mock [`Tunnel`] with no live
+/// V9 handshake.
 async fn send_hello_and_read_welcome(
     tunnel: &mut dyn Tunnel,
     exit: ExitPreference,
 ) -> Result<EdgeWelcome, EdgeDialError> {
-    let hello = EdgeHello { version: EDGE_SESSION_WIRE_VERSION, exit };
-    tunnel.send(&hello.encode()).await?;
+    let hello = EdgeHello {
+        version: EDGE_SESSION_WIRE_VERSION,
+        exit,
+        flags: 0,
+        offered_ports: Vec::new(),
+    };
+    let bytes = hello.encode().map_err(EdgeDialError::MalformedHello)?;
+    tunnel.send(&bytes).await?;
     read_welcome(tunnel).await
 }
 
@@ -331,8 +449,9 @@ const LIVENESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// exists so the loop's published state is testable without a live edge.
 #[async_trait::async_trait]
 pub(crate) trait EdgeDialer: Send + Sync + 'static {
-    /// Dial, starting at entrance `start_idx`. Returns the index of the
-    /// entrance that accepted together with the live session.
+    /// Dial a session. `start_idx` is not the session policy: the production
+    /// dialer ignores it and lets the edge assign the face. Returns the
+    /// index of the entrance that carries the live session.
     async fn dial(&self, start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError>;
 }
 
@@ -346,15 +465,86 @@ struct EntranceDialer {
 
 #[async_trait::async_trait]
 impl EdgeDialer for EntranceDialer {
-    async fn dial(&self, start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError> {
-        EdgeSession::connect_first_available(
-            &self.entrances,
-            &self.mesh_id,
-            self.client_static_priv,
-            self.exit,
-            start_idx,
-        )
-        .await
+    async fn dial(&self, _start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError> {
+        let offered = offered_tcp_ports(&self.entrances)?;
+        if offered.is_empty() {
+            return Err(EdgeDialError::NoEntrances);
+        }
+        if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
+            return Err(EdgeDialError::TooManyFaces {
+                count: offered.len(),
+                max: EdgeHello::MAX_OFFERED_PORTS,
+            });
+        }
+        let ports: Vec<u16> = offered.iter().map(|(_, port)| *port).collect();
+        let start = probe_origin(offered.len());
+        let mut last_err = EdgeDialError::NoEntrances;
+        for offset in 0..offered.len() {
+            let slot = (start + offset) % offered.len();
+            let (idx, probe_port) = offered[slot];
+            let probe_addr = self.entrances[idx].addr.clone();
+            match dial_v2_face(
+                &self.entrances[idx],
+                &self.mesh_id,
+                self.client_static_priv,
+                self.exit,
+                false,
+                &ports,
+            )
+            .await
+            {
+                Ok((mut tunnel, welcome)) => {
+                    if let Some(port) = welcome.assigned_face_port {
+                        if port != probe_port {
+                            let _ = tunnel.close().await;
+                            let Some(target) = offered.iter().copied().find(|(_, face_port)| *face_port == port) else {
+                                return Err(EdgeDialError::AssignedFaceMissing { port });
+                            };
+                            let (tunnel, welcome) = dial_v2_face(
+                                &self.entrances[target.0],
+                                &self.mesh_id,
+                                self.client_static_priv,
+                                self.exit,
+                                true,
+                                &ports,
+                            )
+                            .await?;
+                            let session = upgrade_session(tunnel, welcome, self.entrances[target.0].addr.clone());
+                            log_assigned(&probe_addr, &session);
+                            return Ok((target.0, session));
+                        }
+                    }
+                    let session = upgrade_session(tunnel, welcome, probe_addr.clone());
+                    log_assigned(&probe_addr, &session);
+                    return Ok((idx, session));
+                }
+                Err(e) => match e {
+                    EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. })) => {
+                        info!(probe = %probe_addr, "edge session: edge refused version 2, falling back to version 1");
+                        let (fallback_idx, session) = EdgeSession::connect_first_available(
+                            &self.entrances,
+                            &self.mesh_id,
+                            self.client_static_priv,
+                            self.exit,
+                            0,
+                        )
+                        .await?;
+                        log_assigned(&probe_addr, &session);
+                        return Ok((fallback_idx, session));
+                    }
+                    refused @ EdgeDialError::Refused(_) => return Err(refused),
+                    other => {
+                        debug!(
+                            entrance = %probe_addr,
+                            error = %other,
+                            "edge session: probe failed, trying next tcp face"
+                        );
+                        last_err = other;
+                    }
+                },
+            }
+        }
+        Err(last_err)
     }
 }
 
@@ -446,15 +636,14 @@ async fn drive(
     slot: tokio::sync::watch::Sender<Option<Arc<EdgeSession>>>,
     status: tokio::sync::watch::Sender<EdgeStatusFile>,
 ) {
-    let mut start_idx = 0usize;
     let mut backoff = INITIAL_BACKOFF;
     let mut ever_connected = false;
     loop {
-        match dialer.dial(start_idx).await {
-            Ok((idx, session)) => {
+        // The edge assigns the session face. Probe choice lives inside `dial`.
+        match dialer.dial(0).await {
+            Ok((_idx, session)) => {
                 info!(entrance = %session.entrance_label(), "edge session: connected");
                 backoff = INITIAL_BACKOFF;
-                start_idx = idx.saturating_add(1);
                 ever_connected = true;
                 let session = Arc::new(session);
                 // `send_replace`, not `send`: `send` drops the value when no
@@ -566,6 +755,7 @@ mod tests {
                 CountryCode::new("DE").expect("valid"),
             ],
             outcome,
+            assigned_face_port: None,
         }
     }
 
@@ -587,7 +777,14 @@ mod tests {
         assert_eq!(sent.len(), 1, "exactly one EdgeHello must be sent");
         assert_eq!(
             sent[0],
-            EdgeHello { version: EDGE_SESSION_WIRE_VERSION, exit: ExitPreference::Auto }.encode()
+            EdgeHello {
+                version: EDGE_SESSION_WIRE_VERSION,
+                exit: ExitPreference::Auto,
+                flags: 0,
+                offered_ports: Vec::new(),
+            }
+            .encode()
+            .expect("version-1 hello encodes")
         );
     }
 
@@ -659,6 +856,40 @@ mod tests {
     #[test]
     fn exit_preference_from_mode_maps_full_auto() {
         assert_eq!(exit_preference_from_mode(&ArtefactMode::FullAuto).expect("ok"), ExitPreference::Auto);
+    }
+
+    #[test]
+    fn offered_tcp_ports_skip_udp_faces() {
+        use mirage_core::config::TransportCamouflage;
+        let face = |addr: &str, camouflage: TransportCamouflage| ArtefactEntrance {
+            addr: addr.to_owned(),
+            server_pubkey_hex: "ab".repeat(32),
+            camouflage,
+        };
+        let entrances = vec![
+            face(
+                "203.0.113.10:80",
+                TransportCamouflage::WebSocket { path: "/".to_owned(), host: "h".to_owned() },
+            ),
+            face(
+                "203.0.113.10:5060",
+                TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:5060".parse().expect("addr") },
+            ),
+            face(
+                "203.0.113.10:443",
+                TransportCamouflage::TlsReal { sni: "ex".to_owned(), alpn: Vec::new() },
+            ),
+            face(
+                "203.0.113.10:853",
+                TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:853".parse().expect("addr") },
+            ),
+            face(
+                "203.0.113.10:8080",
+                TransportCamouflage::Xhttp { path: "/".to_owned(), host: "h".to_owned() },
+            ),
+        ];
+        let offered = offered_tcp_ports(&entrances).expect("ports");
+        assert_eq!(offered, vec![(0, 80), (2, 443), (4, 8080)]);
     }
 
     #[test]

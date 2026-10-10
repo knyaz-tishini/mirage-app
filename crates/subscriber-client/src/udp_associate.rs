@@ -38,6 +38,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tracing::debug;
 
+use crate::scope::EgressScope;
 use crate::session::{EdgeSessionSupervisor, EdgeStreamError};
 use crate::socks5;
 use crate::udp_flow::EdgeUdpFlow;
@@ -122,17 +123,29 @@ struct UdpAssociation {
     client_addr: watch::Sender<Option<SocketAddr>>,
     stats: UdpAssociationStats,
     idle_timeout: Duration,
+    scope: Arc<EgressScope>,
 }
 
 impl UdpAssociation {
+    #[cfg(test)]
     fn new(relay_socket: Arc<UdpSocket>, supervisor: Arc<EdgeSessionSupervisor>) -> Self {
         Self::with_idle_timeout(relay_socket, supervisor, UDP_FLOW_IDLE_TIMEOUT)
     }
 
+    #[cfg(test)]
     fn with_idle_timeout(
         relay_socket: Arc<UdpSocket>,
         supervisor: Arc<EdgeSessionSupervisor>,
         idle_timeout: Duration,
+    ) -> Self {
+        Self::with_scope(relay_socket, supervisor, idle_timeout, Arc::new(EgressScope::all()))
+    }
+
+    fn with_scope(
+        relay_socket: Arc<UdpSocket>,
+        supervisor: Arc<EdgeSessionSupervisor>,
+        idle_timeout: Duration,
+        scope: Arc<EgressScope>,
     ) -> Self {
         let (client_addr, _rx) = watch::channel(None);
         Self {
@@ -142,6 +155,7 @@ impl UdpAssociation {
             client_addr,
             stats: UdpAssociationStats::default(),
             idle_timeout,
+            scope,
         }
     }
 
@@ -208,6 +222,13 @@ impl UdpAssociation {
     /// Forward one already-validated request to its destination's flow,
     /// opening a fresh mux stream on first sight of that destination.
     async fn route_to_flow(self: &Arc<Self>, request: socks5::Socks5UdpRequest) -> Result<(), UdpAssociateError> {
+        if !self.scope.allows(&request.target) {
+            debug!(
+                target = %request.target,
+                "socks5 udp: destination outside the selected services — dropping"
+            );
+            return Ok(());
+        }
         let mut flows = self.flows.lock().await;
         if let Some(sender) = flows.get(&request.target) {
             let _ = sender.try_send(request.data);
@@ -307,6 +328,7 @@ async fn run_flow(
 pub async fn serve_udp_association(
     mut control_stream: TcpStream,
     supervisor: Arc<EdgeSessionSupervisor>,
+    scope: Arc<EgressScope>,
 ) -> std::io::Result<()> {
     let relay_socket = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await {
         Ok(socket) => socket,
@@ -318,7 +340,12 @@ pub async fn serve_udp_association(
     let bound = relay_socket.local_addr()?;
     socks5::write_udp_associate_reply(&mut control_stream, socks5::REP_SUCCESS, bound).await?;
 
-    let association = Arc::new(UdpAssociation::new(Arc::new(relay_socket), supervisor));
+    let association = Arc::new(UdpAssociation::with_scope(
+        Arc::new(relay_socket),
+        supervisor,
+        UDP_FLOW_IDLE_TIMEOUT,
+        scope,
+    ));
 
     tokio::select! {
         _ = read_control_stream_to_close(&mut control_stream) => {
@@ -356,6 +383,7 @@ mod tests {
             version: 1,
             countries: vec![CountryCode::new("US").expect("valid")],
             outcome: EdgeOutcome::Accepted { exit: ExitPreference::Auto },
+            assigned_face_port: None,
         }
     }
 

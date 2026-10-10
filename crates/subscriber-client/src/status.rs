@@ -105,7 +105,9 @@ impl From<&EdgeDialError> for EdgeReason {
             EdgeDialError::BadAddr { .. }
             | EdgeDialError::BadServerPubkey(_)
             | EdgeDialError::BadCountryCode(_)
-            | EdgeDialError::NoEntrances => Self::BadArtefact,
+            | EdgeDialError::NoEntrances
+            | EdgeDialError::AssignedFaceMissing { .. }
+            | EdgeDialError::TooManyFaces { .. } => Self::BadArtefact,
             EdgeDialError::Mirage(e) => match e {
                 MirageError::Io(_)
                 | MirageError::NodeUnreachable(_)
@@ -115,7 +117,7 @@ impl From<&EdgeDialError> for EdgeReason {
                 // not complete (crypto, auth, protocol, handshake timeout, …).
                 _ => Self::HandshakeFailed,
             },
-            EdgeDialError::MalformedWelcome(_) => Self::MalformedWelcome,
+            EdgeDialError::MalformedWelcome(_) | EdgeDialError::MalformedHello(_) => Self::MalformedWelcome,
             EdgeDialError::ClosedBeforeWelcome => Self::ClosedBeforeWelcome,
             EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::CountryUnavailable { .. })) => {
                 Self::RefusedCountryUnavailable
@@ -707,6 +709,7 @@ mod tests {
             version: 1,
             countries: countries.iter().map(|c| cc(c)).collect(),
             outcome: EdgeOutcome::Accepted { exit: granted },
+            assigned_face_port: None,
         };
         (EdgeSession::for_test(client, welcome), server)
     }

@@ -51,15 +51,20 @@
 pub mod artefact;
 pub mod assembly;
 pub mod dial;
+pub mod http_connect;
+pub mod scope;
 pub mod session;
 pub mod socks5;
 pub mod status;
 pub mod tun_feed;
+pub mod tun_mode;
 pub mod udp_associate;
 pub mod udp_flow;
 
 pub use artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefact};
 pub use assembly::{SubscriberClient, SubscriberClientError, SubscriberClientOptions};
+pub use scope::EgressScope;
+pub use tun_mode::TunMode;
 pub use session::{
     exit_preference_from_mode, EdgeDialError, EdgeSession, EdgeSessionSupervisor, EdgeStreamError,
 };

@@ -29,6 +29,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::artefact::{ArtefactError, EntranceArtefact};
+use crate::scope::EgressScope;
 use crate::session::{exit_preference_from_mode, EdgeDialError, EdgeSessionSupervisor};
 use crate::status::{EdgeReason, StatusWriter};
 use crate::tun_feed::TunFeed;
@@ -77,6 +78,12 @@ pub struct SubscriberClientOptions {
     /// When `Some`, keep `edge-status.json` (see `crate::status`) current at
     /// this path. `None` (default) publishes nothing.
     pub status_file: Option<PathBuf>,
+    /// Destinations the local proxy will open a mux stream for. Default is
+    /// every destination.
+    pub scope: EgressScope,
+    /// SOCKS5 is the local feed for `--transport socks` and for TUN. HTTP
+    /// CONNECT has its own listener and leaves this false.
+    pub start_socks: bool,
 }
 
 impl Default for SubscriberClientOptions {
@@ -85,6 +92,8 @@ impl Default for SubscriberClientOptions {
             socks5_bind: SocketAddr::from(([127, 0, 0, 1], 1080)),
             tun_api_url: None,
             status_file: None,
+            scope: EgressScope::all(),
+            start_socks: true,
         }
     }
 }
@@ -94,7 +103,7 @@ impl Default for SubscriberClientOptions {
 pub struct SubscriberClient {
     pub supervisor: Arc<EdgeSessionSupervisor>,
     pub socks5_bind: SocketAddr,
-    socks5_task: tokio::task::JoinHandle<()>,
+    socks5_task: Option<tokio::task::JoinHandle<()>>,
     status_writer: Option<StatusWriter>,
     _tun_feed: Option<TunFeed>,
 }
@@ -151,13 +160,18 @@ impl SubscriberClient {
         };
 
         let socks5_bind = options.socks5_bind;
-        let socks5_supervisor = Arc::clone(&supervisor);
-        info!(bind = %socks5_bind, "subscriber-client: SOCKS5 listener starting");
-        let socks5_task = tokio::spawn(async move {
-            if let Err(e) = crate::socks5::serve(socks5_bind, socks5_supervisor).await {
-                tracing::error!(error = %e, "subscriber-client: SOCKS5 listener exited");
-            }
-        });
+        let scope = Arc::new(options.scope);
+        let socks5_task = if options.start_socks {
+            let socks5_supervisor = Arc::clone(&supervisor);
+            info!(bind = %socks5_bind, "subscriber-client: SOCKS5 listener starting");
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::socks5::serve(socks5_bind, socks5_supervisor, scope).await {
+                    tracing::error!(error = %e, "subscriber-client: SOCKS5 listener exited");
+                }
+            }))
+        } else {
+            None
+        };
 
         let tun_feed = match options.tun_api_url {
             Some(url) => {
@@ -175,7 +189,9 @@ impl SubscriberClient {
     /// stops when the last `Arc` to it drops; the TUN feed's watcher (if any)
     /// is detached.
     pub fn shutdown(&self) {
-        self.socks5_task.abort();
+        if let Some(task) = &self.socks5_task {
+            task.abort();
+        }
         if let Some(writer) = &self.status_writer {
             writer.stop();
         }

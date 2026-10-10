@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use crate::scope::EgressScope;
 use crate::session::EdgeSessionSupervisor;
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -43,6 +44,9 @@ const ATYP_IPV6: u8 = 0x04;
 
 pub(crate) const REP_SUCCESS: u8 = 0x00;
 pub(crate) const REP_GENERAL_FAILURE: u8 = 0x01;
+/// RFC 1928: connection not allowed by ruleset. Used when the destination
+/// is outside the services the user selected.
+pub(crate) const REP_NOT_ALLOWED: u8 = 0x02;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
@@ -69,20 +73,29 @@ pub(crate) enum Socks5RequestError {
 /// listener errors. Bind happens INSIDE this async fn (not before it is
 /// spawned) — matches this crate's established pattern of standing up the
 /// listener from within its own driving task.
-pub async fn serve(bind: SocketAddr, supervisor: Arc<EdgeSessionSupervisor>) -> std::io::Result<()> {
+pub async fn serve(
+    bind: SocketAddr,
+    supervisor: Arc<EdgeSessionSupervisor>,
+    scope: Arc<EgressScope>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "subscriber-client: SOCKS5 listener ready");
     loop {
         let (stream, peer) = listener.accept().await?;
         debug!(%peer, "socks5: accepted connection");
         let supervisor = Arc::clone(&supervisor);
+        let scope = Arc::clone(&scope);
         tokio::spawn(async move {
-            handle_connection(stream, supervisor).await;
+            handle_connection(stream, supervisor, scope).await;
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, supervisor: Arc<EdgeSessionSupervisor>) {
+async fn handle_connection(
+    mut stream: TcpStream,
+    supervisor: Arc<EdgeSessionSupervisor>,
+    scope: Arc<EgressScope>,
+) {
     let (cmd, target) = match read_request(&mut stream).await {
         Ok(v) => v,
         Err(Socks5RequestError::UnsupportedAddressType(atyp)) => {
@@ -97,9 +110,11 @@ async fn handle_connection(mut stream: TcpStream, supervisor: Arc<EdgeSessionSup
     };
 
     match cmd {
-        CMD_CONNECT => handle_connect(stream, target, supervisor).await,
+        CMD_CONNECT => handle_connect(stream, target, supervisor, scope).await,
         CMD_UDP_ASSOCIATE => {
-            if let Err(e) = crate::udp_associate::serve_udp_association(stream, supervisor).await {
+            if let Err(e) =
+                crate::udp_associate::serve_udp_association(stream, supervisor, scope).await
+            {
                 debug!(error = %e, "socks5: udp associate ended with an io error");
             }
         }
@@ -110,7 +125,17 @@ async fn handle_connection(mut stream: TcpStream, supervisor: Arc<EdgeSessionSup
     }
 }
 
-async fn handle_connect(mut stream: TcpStream, target: String, supervisor: Arc<EdgeSessionSupervisor>) {
+async fn handle_connect(
+    mut stream: TcpStream,
+    target: String,
+    supervisor: Arc<EdgeSessionSupervisor>,
+    scope: Arc<EgressScope>,
+) {
+    if !scope.allows(&target) {
+        debug!(target = %target, "socks5: destination outside the selected services");
+        let _ = write_reply(&mut stream, REP_NOT_ALLOWED).await;
+        return;
+    }
     let session = match supervisor.wait_for_session(CONNECT_SESSION_WAIT).await {
         Some(session) => session,
         None => {
@@ -455,7 +480,7 @@ mod tests {
             EdgeSessionSupervisor::spawn(Vec::new(), b"MESH2".to_vec(), [0x11u8; 32], ExitPreference::Auto);
         tokio::spawn(async move {
             let (stream, _peer) = listener.accept().await.expect("accept");
-            handle_connection(stream, supervisor).await;
+            handle_connection(stream, supervisor, std::sync::Arc::new(EgressScope::all())).await;
         });
 
         let mut client = TcpStream::connect(bind).await.expect("connect");
