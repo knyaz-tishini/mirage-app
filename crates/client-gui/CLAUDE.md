@@ -7,8 +7,9 @@ with `--manifest-path mirage2app/crates/client-gui/Cargo.toml`, never
 
 ## Customer build vs dev-tools
 
-- The **customer build** (default features) always owns and drives the real L0
-  backend (`backend::LocalHttp`: orchestrator -> sentinel :19420). It has no
+- The **customer build** (default features): LocalHttp spawns one
+  mirage-subscriber-client child and drives it at http://127.0.0.1:19421
+  (session on/off, SOCKS, HTTP, TUN wish). It has no
   fleet/operator/demo content and no developer control endpoint.
 - Everything developer-only lives in `src/dev/` behind the Cargo feature
   `dev-tools` (**off by default**): the uzor agent API (:17471), the profiling
@@ -17,7 +18,7 @@ with `--manifest-path mirage2app/crates/client-gui/Cargo.toml`, never
   `--live` is passed.
 - Dev loop: `cargo run --release --features dev-tools --manifest-path
   mirage2app/crates/client-gui/Cargo.toml -- --skin planet`.
-- Kept CLI flags in the customer build: `--skin bloom|planet|radar|aurora` and
+- Kept CLI flags in the customer build: `--skin bloom|planet` (default planet) and
   `--backend <name>` (support fallback for a broken GPU driver, e.g.
   `--backend tiny_skia`).
 
@@ -39,4 +40,6 @@ runtime flag in customer code.
 ## Exit catalog
 
 `nodes::CATALOG` is empty by design: the customer build carries no baked-in
-exit list. Skins and the menu size themselves from `CATALOG.len()`.
+exit list. The Connect tab lists `egress_countries` from the cabinet catalog
+(`GET /api/public/catalog`). The edge welcome is not that list. The planet
+still sizes itself from `CATALOG.len()`.

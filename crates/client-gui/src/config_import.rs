@@ -47,6 +47,40 @@ pub fn from_file() -> Result<Imported, String> {
     parse(&raw)
 }
 
+/// One name per line, or several separated by commas. `*` and `all` are ignored.
+pub fn list_from_file() -> Result<Vec<String>, String> {
+    let path = rfd::FileDialog::new()
+        .add_filter("List", &["txt", "csv", "list"])
+        .set_title("Sites or apps")
+        .pick_file()
+        .ok_or_else(|| "отменено".to_string())?;
+    names_from_path(&path)
+}
+
+/// Names typed or pasted. Comma, semicolon, and newline separate them.
+pub fn names_from_text(raw: &str) -> Vec<String> {
+    parse_name_list(raw)
+}
+
+pub fn names_from_path(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("чтение файла: {e}"))?;
+    Ok(parse_name_list(&raw))
+}
+
+/// Clipboard text for the list field. `None` when the clipboard is empty.
+pub fn clipboard_text() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    cb.get_text().ok()
+}
+
+fn parse_name_list(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == '\n' || c == '\r' || c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "*" && !line.eq_ignore_ascii_case("all"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Read the clipboard text and parse it.
 pub fn from_clipboard_text() -> Result<Imported, String> {
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("буфер недоступен: {e}"))?;

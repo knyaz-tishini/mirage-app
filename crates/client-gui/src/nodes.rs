@@ -1,10 +1,8 @@
-//! Exit-node catalog — the single source the planet scene and the menu both
-//! read.
+//! Exit-node catalog for the planet scene.
 //!
-//! The customer build ships NO baked-in inventory: the catalog is empty until
-//! the engine reports the exits the customer's own subscription can reach.
-//! Consumers (`shell::menu`, `centerpiece::planet`) render only what is in
-//! [`CATALOG`], sized by its length — never a fixed node count.
+//! The customer build ships no baked-in inventory. The Connect menu does not
+//! read this: it lists countries from the cabinet catalog. The planet draws
+//! only what is in [`CATALOG`].
 
 /// One exit the customer can route through.
 #[derive(Clone, Copy)]

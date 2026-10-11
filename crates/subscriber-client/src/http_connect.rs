@@ -59,8 +59,9 @@ async fn handle_connection(
         return Ok(());
     };
     let target = format!("{host}:{port}");
-    if !scope.allows(&target) {
-        debug!(target = %target, "http: destination outside the selected services");
+    let exe = crate::peer::owning_exe(&stream);
+    if !scope.allows_flow(&target, exe.as_deref()) {
+        debug!(target = %target, "http: destination outside the selected sites or apps");
         write_status(&mut stream, 403, "Forbidden").await?;
         return Ok(());
     }

@@ -124,6 +124,8 @@ struct UdpAssociation {
     stats: UdpAssociationStats,
     idle_timeout: Duration,
     scope: Arc<EgressScope>,
+    /// Process that opened the TCP control connection. `None` if it could not be named.
+    exe: Option<String>,
 }
 
 impl UdpAssociation {
@@ -138,7 +140,7 @@ impl UdpAssociation {
         supervisor: Arc<EdgeSessionSupervisor>,
         idle_timeout: Duration,
     ) -> Self {
-        Self::with_scope(relay_socket, supervisor, idle_timeout, Arc::new(EgressScope::all()))
+        Self::with_scope(relay_socket, supervisor, idle_timeout, Arc::new(EgressScope::all()), None)
     }
 
     fn with_scope(
@@ -146,6 +148,7 @@ impl UdpAssociation {
         supervisor: Arc<EdgeSessionSupervisor>,
         idle_timeout: Duration,
         scope: Arc<EgressScope>,
+        exe: Option<String>,
     ) -> Self {
         let (client_addr, _rx) = watch::channel(None);
         Self {
@@ -156,6 +159,7 @@ impl UdpAssociation {
             stats: UdpAssociationStats::default(),
             idle_timeout,
             scope,
+            exe,
         }
     }
 
@@ -222,7 +226,7 @@ impl UdpAssociation {
     /// Forward one already-validated request to its destination's flow,
     /// opening a fresh mux stream on first sight of that destination.
     async fn route_to_flow(self: &Arc<Self>, request: socks5::Socks5UdpRequest) -> Result<(), UdpAssociateError> {
-        if !self.scope.allows(&request.target) {
+        if !self.scope.allows_flow(&request.target, self.exe.as_deref()) {
             debug!(
                 target = %request.target,
                 "socks5 udp: destination outside the selected services — dropping"
@@ -340,11 +344,13 @@ pub async fn serve_udp_association(
     let bound = relay_socket.local_addr()?;
     socks5::write_udp_associate_reply(&mut control_stream, socks5::REP_SUCCESS, bound).await?;
 
+    let exe = crate::peer::owning_exe(&control_stream);
     let association = Arc::new(UdpAssociation::with_scope(
         Arc::new(relay_socket),
         supervisor,
         UDP_FLOW_IDLE_TIMEOUT,
         scope,
+        exe,
     ));
 
     tokio::select! {
@@ -380,10 +386,11 @@ mod tests {
 
     fn sample_welcome() -> EdgeWelcome {
         EdgeWelcome {
-            version: 1,
+            version: 3,
             countries: vec![CountryCode::new("US").expect("valid")],
             outcome: EdgeOutcome::Accepted { exit: ExitPreference::Auto },
-            assigned_face_port: None,
+            assigned_face_port: Some(1),
+            carries_datagrams: Some(true),
         }
     }
 

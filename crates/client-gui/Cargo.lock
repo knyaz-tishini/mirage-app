@@ -5337,7 +5337,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uzor"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "ahash 0.8.12",
  "bitflags 2.13.0",
@@ -5357,7 +5357,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-agent-api"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "axum",
  "serde",
@@ -5368,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-desktop"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "image",
  "objc2 0.5.2",
@@ -5391,11 +5391,11 @@ dependencies = [
 
 [[package]]
 name = "uzor-fonts"
-version = "1.5.2"
+version = "1.6.0-dev"
 
 [[package]]
 name = "uzor-render-canvas2d"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "js-sys",
  "uzor",
@@ -5405,7 +5405,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-hub"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "js-sys",
  "metrics",
@@ -5440,7 +5440,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-tiny-skia"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -5449,7 +5449,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-urx"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "kurbo",
  "metrics",
@@ -5461,7 +5461,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-cpu"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -5470,7 +5470,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-gpu"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -5479,7 +5479,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-hybrid"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "glifo",
  "skrifa 0.42.1",
@@ -5491,7 +5491,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-wgpu-instanced"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -5505,7 +5505,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-text"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "fastrand",
  "hypher",
@@ -5515,7 +5515,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-3d"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "bytemuck",
  "glam",
@@ -5525,7 +5525,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-core"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "kurbo",
  "metrics",
@@ -5535,7 +5535,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-cpu"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "bumpalo",
  "bytemuck",
@@ -5551,7 +5551,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-engine"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "metrics",
  "uzor-urx-core",
@@ -5564,7 +5564,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-glyph"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "metrics",
  "swash 0.2.10",
@@ -5574,7 +5574,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-hybrid"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "bytemuck",
  "etagere",
@@ -5587,21 +5587,21 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-image"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "uzor-urx-core",
 ]
 
 [[package]]
 name = "uzor-urx-physics"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "glam",
 ]
 
 [[package]]
 name = "uzor-urx-wgpu"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "bytemuck",
  "etagere",
@@ -5621,7 +5621,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-wgpu-full"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "bytemuck",
  "kurbo",
@@ -5633,7 +5633,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-desktop"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "arboard",
  "dark-light",
@@ -5644,7 +5644,7 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-web"
-version = "1.5.2"
+version = "1.6.0-dev"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

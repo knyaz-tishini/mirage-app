@@ -51,8 +51,10 @@
 pub mod artefact;
 pub mod assembly;
 pub mod claim_image;
+pub mod control;
 pub mod dial;
 pub mod http_connect;
+pub mod peer;
 pub mod scope;
 pub mod session;
 pub mod socks5;

@@ -4,10 +4,8 @@
 //! via `App::on_event`. No skin-specific code lives outside this module tree
 //! or the shell dispatcher.
 
-pub mod aurora;
 pub mod bloom;
 pub mod planet;
-pub mod radar;
 
 use uzor::render::RenderContext;
 
@@ -50,9 +48,6 @@ pub struct CenterpieceState {
     pub phase: ConnPhase,
     /// Available paint rect (below titlebar / above bottom sheet).
     pub rect: SkinRect,
-    /// Current pointer position in window-logical px, if known. Skins that
-    /// react to the cursor (radar) read it; others ignore it.
-    pub pointer: Option<(f64, f64)>,
 }
 
 // ── Skin trait ────────────────────────────────────────────────────────────────
@@ -75,8 +70,15 @@ pub trait Skin: Send + 'static {
 
     /// A tap (press+release without dragging) at logical window coords.
     /// Returns `true` if the skin consumed it (e.g. selected a node and opened
-    /// its info popup), `false` if the shell should treat it as a connect tap.
+    /// its info popup), `false` if the shell should toggle connect.
     fn tap(&mut self, _x: f64, _y: f64) -> bool {
+        false
+    }
+
+    /// Second tap inside the double-click window. Planet uses this to close
+    /// the open node: a single click there is a rotate. Other skins return
+    /// false and the shell toggles connect on that click too.
+    fn double_tap(&mut self, _x: f64, _y: f64) -> bool {
         false
     }
 
@@ -86,23 +88,19 @@ pub trait Skin: Send + 'static {
 
 // ── Skin kind + registry ──────────────────────────────────────────────────────
 
-/// The three available visual skins.
+/// The two visual skins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkinKind {
     Bloom,
     Planet,
-    Radar,
-    Aurora,
 }
 
 impl SkinKind {
-    /// Cycle to the next skin (Bloom → Planet → Radar → Aurora → Bloom).
+    /// Cycle to the next skin (Bloom → Planet → Bloom).
     pub fn next(self) -> Self {
         match self {
-            Self::Bloom  => Self::Planet,
-            Self::Planet => Self::Radar,
-            Self::Radar  => Self::Aurora,
-            Self::Aurora => Self::Bloom,
+            Self::Bloom => Self::Planet,
+            Self::Planet => Self::Bloom,
         }
     }
 }
@@ -110,9 +108,7 @@ impl SkinKind {
 /// Instantiate the requested skin.
 pub fn make_skin(kind: SkinKind) -> Box<dyn Skin> {
     match kind {
-        SkinKind::Bloom  => Box::new(bloom::BloomSkin::new()),
+        SkinKind::Bloom => Box::new(bloom::BloomSkin::new()),
         SkinKind::Planet => Box::new(planet::PlanetSkin::new()),
-        SkinKind::Radar  => Box::new(radar::RadarSkin::new()),
-        SkinKind::Aurora => Box::new(aurora::AuroraSkin::new()),
     }
 }

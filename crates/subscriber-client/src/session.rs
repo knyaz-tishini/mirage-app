@@ -16,14 +16,16 @@
 //!
 //! [`EdgeSessionSupervisor`] holds one session up and reconnects with
 //! exponential backoff whenever it closes. The edge assigns the session
-//! face (hello version 2). This client only picks a TCP probe, and fails
-//! that probe over onto another TCP face when the probe itself cannot
-//! connect. An edge that refuses version 2 falls back to version-1
-//! [`EdgeSession::connect_first_available`] from index 0.
+//! face. This client speaks hello version 3 first, version 2 when the edge
+//! refuses version 3, and version 1 when the edge refuses version 2. It
+//! only picks a TCP probe, and fails that probe over onto another TCP face
+//! when the probe itself cannot connect. The version-1 fallback is
+//! [`EdgeSession::connect_first_available`] from index 0. A version-3
+//! refusal does not skip version 2.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mirage_client_core::relay::TunnelCompat;
@@ -48,6 +50,7 @@ use crate::status::{EdgeReason, EdgeStatusFile};
 /// stays the version an old edge still understands.
 const EDGE_SESSION_WIRE_VERSION: u8 = 1;
 const EDGE_SESSION_WIRE_VERSION_V2: u8 = 2;
+const EDGE_SESSION_WIRE_VERSION_V3: u8 = 3;
 
 /// Mix input for the probe-face start. Not a `rand` source.
 static PROBE_DRAW: AtomicU64 = AtomicU64::new(0);
@@ -122,6 +125,9 @@ pub enum EdgeStreamError {
 
     #[error("edge stream: udp datagram frame codec error: {0}")]
     Codec(WireError),
+
+    #[error("edge stream: this exit does not carry datagrams")]
+    DatagramsRefused,
 }
 
 /// Map an artefact's [`ArtefactMode`] onto the wire's [`ExitPreference`].
@@ -257,8 +263,13 @@ impl EdgeSession {
     /// `kind: StreamKind::Udp` instead, wrapped in
     /// [`crate::udp_flow::EdgeUdpFlow`]'s `[2B len][payload]` datagram
     /// framing. `target` is this flow's ONE fixed destination for its whole
-    /// life — see `crate::udp_associate`.
+    /// life — see `crate::udp_associate`. Returns
+    /// [`EdgeStreamError::DatagramsRefused`] before any stream is opened
+    /// when this session's welcome does not say the exit carries datagrams.
     pub async fn open_udp_flow(&self, target: &str) -> Result<crate::udp_flow::EdgeUdpFlow, EdgeStreamError> {
+        if self.welcome.carries_datagrams != Some(true) {
+            return Err(EdgeStreamError::DatagramsRefused);
+        }
         let target = StreamTarget::new(target).map_err(EdgeStreamError::BadTarget)?;
         let stream = self.session.open_stream().await?;
         let mut stream = TokioMuxStream(stream);
@@ -340,8 +351,8 @@ fn probe_origin(len: usize) -> usize {
     (mixed as usize) % len
 }
 
-/// Version-2 hello on one face. Does not upgrade to mux: the caller keeps
-/// the tunnel only when this face is the session.
+/// Hello on one face at `version` (2 or 3). Does not upgrade to mux: the
+/// caller keeps the tunnel only when this face is the session.
 async fn dial_v2_face(
     entrance: &ArtefactEntrance,
     mesh_id: &[u8],
@@ -349,10 +360,11 @@ async fn dial_v2_face(
     exit: ExitPreference,
     commit: bool,
     offered: &[u16],
+    version: u8,
 ) -> Result<(Box<dyn Tunnel>, EdgeWelcome), EdgeDialError> {
     let mut tunnel = open_entrance_tunnel(entrance, mesh_id, client_static_priv).await?;
     let hello = EdgeHello {
-        version: EDGE_SESSION_WIRE_VERSION_V2,
+        version,
         exit,
         flags: if commit { EdgeHello::FLAG_COMMIT } else { 0 },
         offered_ports: offered.to_vec(),
@@ -453,6 +465,38 @@ pub(crate) trait EdgeDialer: Send + Sync + 'static {
     /// dialer ignores it and lets the edge assign the face. Returns the
     /// index of the entrance that carries the live session.
     async fn dial(&self, start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError>;
+
+    /// Bumped when the requested exit changes. The production dialer
+    /// overrides this; a test dialer stays at 0 so a live session is not
+    /// torn down.
+    fn exit_generation(&self) -> u64 {
+        0
+    }
+}
+
+/// Requested exit, shared by the dialer and [`EdgeSessionSupervisor::set_exit`].
+struct ExitCtrl {
+    pref: Mutex<ExitPreference>,
+    generation: AtomicU64,
+}
+
+impl ExitCtrl {
+    fn new(exit: ExitPreference) -> Self {
+        Self { pref: Mutex::new(exit), generation: AtomicU64::new(0) }
+    }
+
+    fn get(&self) -> ExitPreference {
+        *self.pref.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, exit: ExitPreference) {
+        *self.pref.lock().unwrap_or_else(|e| e.into_inner()) = exit;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
 }
 
 /// [`EdgeDialer`] over the artefact's own TCP-shaped entrances.
@@ -460,23 +504,20 @@ struct EntranceDialer {
     entrances: Vec<ArtefactEntrance>,
     mesh_id: Vec<u8>,
     client_static_priv: [u8; 32],
-    exit: ExitPreference,
+    exit: Arc<ExitCtrl>,
 }
 
-#[async_trait::async_trait]
-impl EdgeDialer for EntranceDialer {
-    async fn dial(&self, _start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError> {
-        let offered = offered_tcp_ports(&self.entrances)?;
-        if offered.is_empty() {
-            return Err(EdgeDialError::NoEntrances);
-        }
-        if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
-            return Err(EdgeDialError::TooManyFaces {
-                count: offered.len(),
-                max: EdgeHello::MAX_OFFERED_PORTS,
-            });
-        }
-        let ports: Vec<u16> = offered.iter().map(|(_, port)| *port).collect();
+impl EntranceDialer {
+    /// Probe TCP faces at `version` (2 or 3). A version-2 unsupported-version
+    /// refusal falls back to version 1. A version-3 refusal is returned so
+    /// the caller can retry at version 2 — it does not skip to version 1.
+    async fn dial_at(
+        &self,
+        version: u8,
+        offered: &[(usize, u16)],
+        ports: &[u16],
+        exit: ExitPreference,
+    ) -> Result<(usize, EdgeSession), EdgeDialError> {
         let start = probe_origin(offered.len());
         let mut last_err = EdgeDialError::NoEntrances;
         for offset in 0..offered.len() {
@@ -487,9 +528,10 @@ impl EdgeDialer for EntranceDialer {
                 &self.entrances[idx],
                 &self.mesh_id,
                 self.client_static_priv,
-                self.exit,
+                exit,
                 false,
-                &ports,
+                ports,
+                version,
             )
             .await
             {
@@ -504,9 +546,10 @@ impl EdgeDialer for EntranceDialer {
                                 &self.entrances[target.0],
                                 &self.mesh_id,
                                 self.client_static_priv,
-                                self.exit,
+                                exit,
                                 true,
-                                &ports,
+                                ports,
+                                version,
                             )
                             .await?;
                             let session = upgrade_session(tunnel, welcome, self.entrances[target.0].addr.clone());
@@ -519,13 +562,15 @@ impl EdgeDialer for EntranceDialer {
                     return Ok((idx, session));
                 }
                 Err(e) => match e {
-                    EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. })) => {
+                    EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. }))
+                        if version == EDGE_SESSION_WIRE_VERSION_V2 =>
+                    {
                         info!(probe = %probe_addr, "edge session: edge refused version 2, falling back to version 1");
                         let (fallback_idx, session) = EdgeSession::connect_first_available(
                             &self.entrances,
                             &self.mesh_id,
                             self.client_static_priv,
-                            self.exit,
+                            exit,
                             0,
                         )
                         .await?;
@@ -548,6 +593,35 @@ impl EdgeDialer for EntranceDialer {
     }
 }
 
+#[async_trait::async_trait]
+impl EdgeDialer for EntranceDialer {
+    async fn dial(&self, _start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError> {
+        let offered = offered_tcp_ports(&self.entrances)?;
+        if offered.is_empty() {
+            return Err(EdgeDialError::NoEntrances);
+        }
+        if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
+            return Err(EdgeDialError::TooManyFaces {
+                count: offered.len(),
+                max: EdgeHello::MAX_OFFERED_PORTS,
+            });
+        }
+        let ports: Vec<u16> = offered.iter().map(|(_, port)| *port).collect();
+        let exit = self.exit.get();
+        match self.dial_at(EDGE_SESSION_WIRE_VERSION_V3, &offered, &ports, exit).await {
+            Err(EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. }))) => {
+                info!("edge session: edge refused version 3, falling back to version 2");
+                self.dial_at(EDGE_SESSION_WIRE_VERSION_V2, &offered, &ports, exit).await
+            }
+            other => other,
+        }
+    }
+
+    fn exit_generation(&self) -> u64 {
+        self.exit.generation()
+    }
+}
+
 /// Reconnect-with-backoff wrapper around [`EdgeSession`]. Holds the current
 /// live session (if any) behind a [`tokio::sync::watch`] channel so every
 /// caller (the SOCKS5 listener, the TUN feed) sees the same session and the
@@ -557,6 +631,8 @@ pub struct EdgeSessionSupervisor {
     slot: tokio::sync::watch::Sender<Option<Arc<EdgeSession>>>,
     status: tokio::sync::watch::Sender<EdgeStatusFile>,
     driver: tokio::task::JoinHandle<()>,
+    /// Present on the production supervisor. Test dialers leave this empty.
+    exit: Option<Arc<ExitCtrl>>,
 }
 
 impl Drop for EdgeSessionSupervisor {
@@ -575,17 +651,44 @@ impl EdgeSessionSupervisor {
         client_static_priv: [u8; 32],
         exit: ExitPreference,
     ) -> Arc<Self> {
-        Self::spawn_with_dialer(EntranceDialer { entrances, mesh_id, client_static_priv, exit }, exit)
+        let exit_ctrl = Arc::new(ExitCtrl::new(exit));
+        Self::spawn_with_dialer_exit(
+            EntranceDialer {
+                entrances,
+                mesh_id,
+                client_static_priv,
+                exit: Arc::clone(&exit_ctrl),
+            },
+            exit,
+            Some(exit_ctrl),
+        )
     }
 
     /// [`Self::spawn`] over any [`EdgeDialer`]; `requested` is the exit the
     /// status file reports as asked-for.
+    #[cfg(test)]
     pub(crate) fn spawn_with_dialer(dialer: impl EdgeDialer, requested: ExitPreference) -> Arc<Self> {
+        Self::spawn_with_dialer_exit(dialer, requested, None)
+    }
+
+    fn spawn_with_dialer_exit(
+        dialer: impl EdgeDialer,
+        requested: ExitPreference,
+        exit: Option<Arc<ExitCtrl>>,
+    ) -> Arc<Self> {
         let (slot, _slot_rx) = tokio::sync::watch::channel(None);
         let (status, _status_rx) =
             tokio::sync::watch::channel(EdgeStatusFile::connecting(&requested));
         let driver = tokio::spawn(drive(dialer, slot.clone(), status.clone()));
-        Arc::new(Self { slot, status, driver })
+        Arc::new(Self { slot, status, driver, exit })
+    }
+
+    /// Next dial uses `exit`. A live session is dropped so the loop redials.
+    pub fn set_exit(&self, exit: ExitPreference) {
+        let Some(ctrl) = &self.exit else { return };
+        let label = crate::status::exit_label(&exit);
+        ctrl.set(exit);
+        self.status.send_modify(|status| status.exit.requested = label.clone());
     }
 
     /// A receiver for the connector's published state. Its current value is
@@ -651,8 +754,13 @@ async fn drive(
                 // session dialed before the first SOCKS5 client arrived.
                 slot.send_replace(Some(Arc::clone(&session)));
                 status.send_modify(|s| s.set_connected(session.accepted_exit(), session.countries()));
+                let exit_gen = dialer.exit_generation();
                 while !session.is_closed() {
                     tokio::time::sleep(LIVENESS_POLL_INTERVAL).await;
+                    if dialer.exit_generation() != exit_gen {
+                        info!("edge session: exit changed, redialing");
+                        break;
+                    }
                 }
                 warn!("edge session: session closed, reconnecting");
                 slot.send_replace(None);
@@ -685,7 +793,7 @@ impl EdgeSessionSupervisor {
         let (status, _status_rx) =
             tokio::sync::watch::channel(EdgeStatusFile::connecting(&ExitPreference::Auto));
         let driver = tokio::spawn(std::future::pending());
-        Arc::new(Self { slot, status, driver })
+        Arc::new(Self { slot, status, driver, exit: None })
     }
 }
 
@@ -756,7 +864,28 @@ mod tests {
             ],
             outcome,
             assigned_face_port: None,
+            carries_datagrams: None,
         }
+    }
+
+    #[tokio::test]
+    async fn udp_flow_is_refused_when_welcome_does_not_carry_datagrams() {
+        use mirage_mux::tokio_compat::TokioIoCompat;
+
+        let (client_io, server_io) = tokio::io::duplex(64);
+        let client = SessionHandle::client(TokioIoCompat(client_io));
+        let server = SessionHandle::server(TokioIoCompat(server_io));
+        let session = EdgeSession::for_test(
+            client,
+            sample_welcome(EdgeOutcome::Accepted { exit: ExitPreference::Auto }),
+        );
+        let opened = session.open_udp_flow("203.0.113.9:53").await;
+        let err = match opened {
+            Err(err) => err,
+            Ok(_) => panic!("a welcome without datagrams must refuse before opening a stream"),
+        };
+        assert!(matches!(err, EdgeStreamError::DatagramsRefused));
+        drop(server);
     }
 
     // ── send_hello_and_read_welcome ─────────────────────────────────────

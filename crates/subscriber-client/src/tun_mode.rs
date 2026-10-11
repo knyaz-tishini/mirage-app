@@ -33,31 +33,35 @@ fn tun_device_name() -> &'static str {
 
 /// Policy document. Bypass CIDRs are NOT repeated here: mirage2tun appends
 /// `bypass.cidrs` itself, and CIDR rules are first-match.
-pub fn policy_json(mode: TunMode, services: &[String]) -> Result<Value, String> {
+///
+/// Split inclusions are the same lists SOCKS uses: a site rule or an app
+/// rule sends that flow to the chain. Anything else stays direct.
+pub fn policy_json(
+    mode: TunMode,
+    services: &[String],
+    apps: &[String],
+    bypass_services: &[String],
+    bypass_apps: &[String],
+) -> Result<Value, String> {
     match mode {
         TunMode::Full => {
-            if !services.is_empty() {
-                return Err("tun full does not take --service".into());
+            if !services.is_empty() || !apps.is_empty() {
+                return Err("tun full does not take a site or an app".into());
             }
+            let mut rules = Vec::new();
+            push_named(&mut rules, bypass_services, bypass_apps, "bypass")?;
             Ok(json!({
                 "default_action": format!("chain:{CHAIN_NAME}"),
-                "rules": [],
+                "rules": rules,
             }))
         }
         TunMode::Split => {
-            if services.is_empty() {
-                return Err("tun split needs at least one --service".into());
+            if services.is_empty() && apps.is_empty() {
+                return Err("tun split needs a site or an app".into());
             }
-            let mut rules = Vec::with_capacity(services.len());
-            for spec in services {
-                let (kind, value) = tun_service_action(spec)?;
-                let rule = if kind == "dest_cidr" {
-                    json!({"type": "dest_cidr", "cidr": value, "action": format!("chain:{CHAIN_NAME}")})
-                } else {
-                    json!({"type": "dest_domain", "domain": value, "action": format!("chain:{CHAIN_NAME}")})
-                };
-                rules.push(rule);
-            }
+            let mut rules = Vec::new();
+            push_named(&mut rules, bypass_services, bypass_apps, "bypass")?;
+            push_named(&mut rules, services, apps, &format!("chain:{CHAIN_NAME}"))?;
             Ok(json!({
                 "default_action": "bypass",
                 "rules": rules,
@@ -66,14 +70,42 @@ pub fn policy_json(mode: TunMode, services: &[String]) -> Result<Value, String> 
     }
 }
 
+fn push_named(rules: &mut Vec<Value>, services: &[String], apps: &[String], action: &str) -> Result<(), String> {
+    for spec in services {
+        let (kind, value) = tun_service_action(spec)?;
+        let rule = if kind == "dest_cidr" {
+            json!({"type": "dest_cidr", "cidr": value, "action": action})
+        } else {
+            json!({"type": "dest_domain", "domain": value, "action": action})
+        };
+        rules.push(rule);
+    }
+    for spec in apps {
+        let path = spec.trim().to_ascii_lowercase().replace('\\', "/");
+        if path.is_empty() || path.ends_with('/') {
+            return Err(format!("empty app in --app {spec}"));
+        }
+        rules.push(json!({
+            "type": "dest_app_path",
+            "path": path,
+            "action": action,
+        }));
+    }
+    Ok(())
+}
+
 pub fn write_config(
     path: &Path,
     socks_bind: SocketAddr,
     bypass_cidrs: &[String],
     mode: TunMode,
     services: &[String],
+    apps: &[String],
+    bypass_services: &[String],
+    bypass_apps: &[String],
+    relay_addrs: &[String],
 ) -> Result<(), String> {
-    let policy = policy_json(mode, services)?;
+    let policy = policy_json(mode, services, apps, bypass_services, bypass_apps)?;
     let doc = json!({
         "tun_name": tun_device_name(),
         "tun_addr": "10.77.0.1/24",
@@ -84,7 +116,7 @@ pub fn write_config(
         }],
         "bypass": { "cidrs": bypass_cidrs },
         "policy": policy,
-        "relay_addrs": [],
+        "relay_addrs": relay_addrs,
     });
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     let mut file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
@@ -97,15 +129,30 @@ pub fn spawn(bin: &Path, config: &Path) -> io::Result<Child> {
     let log_path = config.with_file_name("mirage-tun.log");
     let log = File::options().create(true).append(true).open(&log_path)?;
     let err = log.try_clone()?;
-    Command::new(bin)
-        .arg("--config")
-        .arg(config)
-        .arg("--log-level")
-        .arg("info")
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(bin);
+    // The Windows binary is a foreground process (`debug-run`). It reads
+    // `tun.json` beside itself. Other systems take `--config`.
+    #[cfg(windows)]
+    {
+        let dir = bin.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "mirage2tun has no directory")
+        })?;
+        std::fs::copy(config, dir.join("tun.json"))?;
+        cmd.arg("debug-run");
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.arg("--config").arg(config).arg("--log-level").arg("info");
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err))
-        .spawn()
+        .stderr(Stdio::from(err));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd.spawn()
 }
 
 #[cfg(test)]
@@ -114,13 +161,13 @@ mod tests {
 
     #[test]
     fn full_policy_has_no_service_rules_and_no_relay() {
-        let policy = policy_json(TunMode::Full, &[]).unwrap();
+        let policy = policy_json(TunMode::Full, &[], &[], &[], &[]).unwrap();
         assert_eq!(policy["default_action"], "chain:edge");
         assert!(policy["rules"].as_array().unwrap().is_empty());
         let dir = std::env::temp_dir().join(format!("mirage-tun-cfg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("tun.json");
-        write_config(&path, "127.0.0.1:1080".parse().unwrap(), &["192.168.0.0/21".into()], TunMode::Full, &[])
+        write_config(&path, "127.0.0.1:1080".parse().unwrap(), &["192.168.0.0/21".into()], TunMode::Full, &[], &[], &[], &[], &[])
             .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"relay_addrs\": []"));
@@ -131,13 +178,26 @@ mod tests {
 
     #[test]
     fn split_policy_defaults_to_bypass() {
-        let policy = policy_json(TunMode::Split, &["1.1.1.1:443".into(), "api.ipify.org".into()]).unwrap();
+        let policy = policy_json(
+            TunMode::Split,
+            &["1.1.1.1:443".into(), "api.ipify.org".into()],
+            &["chrome.exe".into()],
+            &["direct.example".into()],
+            &["notepad.exe".into()],
+        )
+        .unwrap();
         assert_eq!(policy["default_action"], "bypass");
         let rules = policy["rules"].as_array().unwrap();
-        assert_eq!(rules[0]["type"], "dest_cidr");
-        assert_eq!(rules[0]["cidr"], "1.1.1.1/32");
-        assert_eq!(rules[0]["action"], "chain:edge");
-        assert_eq!(rules[1]["type"], "dest_domain");
-        assert_eq!(rules[1]["domain"], "api.ipify.org");
+        assert_eq!(rules[0]["type"], "dest_domain");
+        assert_eq!(rules[0]["domain"], "direct.example");
+        assert_eq!(rules[0]["action"], "bypass");
+        assert_eq!(rules[1]["type"], "dest_app_path");
+        assert_eq!(rules[1]["path"], "notepad.exe");
+        assert_eq!(rules[1]["action"], "bypass");
+        assert_eq!(rules[2]["type"], "dest_cidr");
+        assert_eq!(rules[2]["action"], "chain:edge");
+        assert_eq!(rules[4]["type"], "dest_app_path");
+        assert_eq!(rules[4]["path"], "chrome.exe");
+        assert_eq!(rules[4]["action"], "chain:edge");
     }
 }

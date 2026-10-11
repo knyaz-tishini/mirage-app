@@ -710,6 +710,7 @@ mod tests {
             countries: countries.iter().map(|c| cc(c)).collect(),
             outcome: EdgeOutcome::Accepted { exit: granted },
             assigned_face_port: None,
+            carries_datagrams: None,
         };
         (EdgeSession::for_test(client, welcome), server)
     }

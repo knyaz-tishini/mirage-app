@@ -201,7 +201,9 @@ impl Skin for PlanetSkin {
         self.t += dt;
 
         // ── Targets by phase ───────────────────────────────────────────────────
-        let folding = matches!(frame.phase, ConnPhase::Connecting | ConnPhase::Connected);
+        // Fold is the "on" picture. Connecting is only the dial; the globe
+        // stays open until the selected carry is actually up.
+        let folding = matches!(frame.phase, ConnPhase::Connected);
         let warm = folding;
         let meshed = matches!(frame.phase, ConnPhase::Connected);
         let tf = if folding { 1.0 } else { 0.0 };
@@ -382,6 +384,33 @@ impl Skin for PlanetSkin {
     }
 
     fn tap(&mut self, x: f64, y: f64) -> bool {
+        // A click on the globe is a rotate, not a connect toggle, once a node
+        // is open. Closing that node is `double_tap`.
+        if let Some(i) = self.hit_node(x, y) {
+            if self.sel != Some(i) {
+                self.sel = Some(i);
+            }
+            return true;
+        }
+        self.sel.is_some()
+    }
+
+    fn double_tap(&mut self, _x: f64, _y: f64) -> bool {
+        if self.sel.is_some() {
+            self.sel = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.sel = None;
+    }
+}
+
+impl PlanetSkin {
+    fn hit_node(&self, x: f64, y: f64) -> Option<usize> {
         let mut best: Option<usize> = None;
         let mut best_d = 16.0 * 16.0;
         for (i, &(sx, sy, front)) in self.node_screen.iter().enumerate() {
@@ -394,26 +423,7 @@ impl Skin for PlanetSkin {
                 best = Some(i);
             }
         }
-        match best {
-            Some(i) => {
-                self.sel = if self.sel == Some(i) { None } else { Some(i) };
-                true
-            }
-            // Missed all nodes: if a popup is open, a tap-outside closes it
-            // (consumed). Otherwise let the shell treat it as a connect tap.
-            None => {
-                if self.sel.is_some() {
-                    self.sel = None;
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    fn clear_selection(&mut self) {
-        self.sel = None;
+        best
     }
 }
 

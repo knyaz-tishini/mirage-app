@@ -23,8 +23,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use mirage_control_plane::ExitPreference;
 use mirage_subscriber_client::{
-    exit_preference_from_mode, http_connect, publish_fatal, tun_mode, EdgeReason, EdgeSession,
-    EdgeState, EgressScope, EntranceArtefact, SubscriberClient, SubscriberClientError,
+    control, exit_preference_from_mode, http_connect, publish_fatal, tun_mode, EdgeReason,
+    EdgeSession, EdgeState, EgressScope, EntranceArtefact, SubscriberClient, SubscriberClientError,
     SubscriberClientOptions, TunMode,
 };
 use tracing::{error, info};
@@ -55,6 +55,11 @@ struct Args {
     #[arg(long)]
     status_file: Option<PathBuf>,
 
+    /// Loopback control API. When set, `--transport` is ignored.
+    /// Listeners stay down until POST /v1/session and POST /v1/listeners.
+    #[arg(long)]
+    control: Option<SocketAddr>,
+
     /// How this machine enters Mirage: `socks`, `http`, or `tun`.
     #[arg(long, default_value = "socks")]
     transport: String,
@@ -65,9 +70,14 @@ struct Args {
 
     /// Destination the proxy (or split TUN) may send. Repeat for several.
     /// `HOST` or `HOST:PORT`. Absent means every destination, except TUN
-    /// split which requires at least one.
+    /// split which requires at least one site or one app.
     #[arg(long = "service")]
     service: Vec<String>,
+
+    /// Local program the proxy (or split TUN) may carry. Repeat for several.
+    /// A file name (`chrome.exe`) or a full path. Absent means every program.
+    #[arg(long = "app")]
+    app: Vec<String>,
 
     /// `full` sends every non-bypass destination into Mirage. `split` sends
     /// only `--service`. Required for `--transport tun`.
@@ -479,6 +489,43 @@ async fn wait_for_socks(bind: SocketAddr) -> bool {
 /// Stand up the local proxy the user asked for, over one persistent edge
 /// session. The artefact picks the edge. These flags only pick the local
 /// capture.
+fn relay_hosts(artefact: &EntranceArtefact) -> Vec<String> {
+    let mut out = Vec::new();
+    for entrance in &artefact.entrances {
+        let host = entrance
+            .addr
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(entrance.addr.as_str());
+        let host = host.trim_matches(|ch| ch == '[' || ch == ']');
+        if host.parse::<std::net::IpAddr>().is_ok() && !out.iter().any(|have| have == host) {
+            out.push(host.to_owned());
+        }
+    }
+    out
+}
+
+fn discover_tun_bin() -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os("MIRAGE_TUN_BIN") {
+        let path = PathBuf::from(raw);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = format!("mirage2tun{}", std::env::consts::EXE_SUFFIX);
+    let sibling = dir.join(&name);
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+    let nested = dir.join("../../../mirage2tun/target/release").join(name);
+    if nested.is_file() {
+        return Some(nested);
+    }
+    None
+}
+
 async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
     // `validate()` already accepted the mode, so the fallback is unreachable;
     // it only keeps the fatal document well-formed if that ever changes.
@@ -487,6 +534,62 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
         report_fatal(args.status_file.as_deref(), &requested, reason);
         ExitCode::FAILURE
     };
+
+    // `--transport` is ignored. The control API starts the selected listener,
+    // and starts mirage2tun when that mode is selected and the binary is set.
+    if let Some(addr) = args.control {
+        if !control::ensure_loopback(addr) {
+            error!("refusing: --control must be loopback");
+            return fail(None);
+        }
+        let scope = match EgressScope::from_lists(&args.service, &args.app) {
+            Ok(scope) => scope,
+            Err(e) => {
+                error!(error = %e, "refusing");
+                return fail(None);
+            }
+        };
+        info!(
+            entrances = artefact.entrances.len(),
+            mode = ?artefact.mode,
+            control = %addr,
+            "mirage-subscriber-client: artefact validated, control api"
+        );
+        let options = SubscriberClientOptions {
+            socks5_bind: args.bind,
+            status_file: args.status_file.clone(),
+            scope: scope.clone(),
+            start_socks: false,
+            ..Default::default()
+        };
+        let client = match SubscriberClient::build(artefact, options).await {
+            Ok(client) => client,
+            Err(e) => {
+                error!(error = %e, "refusing: failed to assemble subscriber client");
+                if !matches!(e, SubscriberClientError::StatusFile { .. }) {
+                    report_fatal(args.status_file.as_deref(), &requested, e.status_reason());
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+        info!(control = %addr, "mirage-subscriber-client: control api ready — Ctrl-C to stop");
+        tokio::select! {
+            result = control::serve(
+                addr,
+                client.supervisor.clone(),
+                std::sync::Arc::new(scope),
+                args.tun_bin.clone().or_else(discover_tun_bin),
+                relay_hosts(artefact),
+            ) => {
+                if let Err(e) = result {
+                    error!(error = %e, "control listener exited");
+                }
+            }
+            _ = wait_for_stop() => {}
+        }
+        client.shutdown();
+        return ExitCode::SUCCESS;
+    }
 
     let transport = match parse_transport(&args.transport) {
         Ok(t) => t,
@@ -507,7 +610,7 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
         return fail(None);
     }
 
-    let scope = match EgressScope::from_services(&args.service) {
+    let scope = match EgressScope::from_lists(&args.service, &args.app) {
         Ok(scope) => scope,
         Err(e) => {
             error!(error = %e, "refusing");
@@ -531,12 +634,12 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
             return fail(None);
         }
         match mode {
-            TunMode::Full if !args.service.is_empty() => {
-                error!("refusing: --tun-mode full does not take --service");
+            TunMode::Full if !args.service.is_empty() || !args.app.is_empty() => {
+                error!("refusing: --tun-mode full does not take --service or --app");
                 return fail(None);
             }
-            TunMode::Split if args.service.is_empty() => {
-                error!("refusing: --tun-mode split requires --service");
+            TunMode::Split if args.service.is_empty() && args.app.is_empty() => {
+                error!("refusing: --tun-mode split requires --service or --app");
                 return fail(None);
             }
             _ => {}
@@ -551,6 +654,9 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
             Ok(iface) => {
                 info!(iface = %iface, "pinning the edge carrier to the physical NIC");
                 mirage_protocol::driver::set_carrier_interface(Some(iface));
+            }
+            Err(_) if cfg!(windows) => {
+                info!("windows keeps the edge off the tun with relay routes");
             }
             Err(e) => {
                 error!(error = %e, "refusing: cannot find the physical NIC for the edge carrier");
@@ -632,7 +738,18 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
             .as_ref()
             .map(|p| p.with_file_name("mirage-tun.json"))
             .unwrap_or_else(|| PathBuf::from("mirage-tun.json"));
-        if let Err(e) = tun_mode::write_config(&config_path, args.bind, &args.bypass_cidr, mode, &args.service)
+        let relays = if cfg!(windows) { relay_hosts(artefact) } else { Vec::new() };
+        if let Err(e) = tun_mode::write_config(
+            &config_path,
+            args.bind,
+            &args.bypass_cidr,
+            mode,
+            &args.service,
+            &args.app,
+            &[],
+            &[],
+            &relays,
+        )
         {
             error!(error = %e, "refusing: cannot write the tun config");
             client.shutdown();

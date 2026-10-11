@@ -131,8 +131,9 @@ async fn handle_connect(
     supervisor: Arc<EdgeSessionSupervisor>,
     scope: Arc<EgressScope>,
 ) {
-    if !scope.allows(&target) {
-        debug!(target = %target, "socks5: destination outside the selected services");
+    let exe = crate::peer::owning_exe(&stream);
+    if !scope.allows_flow(&target, exe.as_deref()) {
+        debug!(target = %target, "socks5: destination outside the selected sites or apps");
         let _ = write_reply(&mut stream, REP_NOT_ALLOWED).await;
         return;
     }

@@ -10,7 +10,6 @@
 
 mod app;
 mod backend;
-mod camera;
 mod centerpiece;
 mod config_import;
 #[cfg(feature = "dev-tools")]
@@ -50,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }));
 
-    // --skin bloom|planet|radar|aurora picks the initial skin.
+    // --skin bloom|planet picks the initial skin. Default is planet.
     let args: Vec<String> = std::env::args().collect();
     let skin = match args
         .iter()
@@ -58,10 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
     {
-        Some("planet") => centerpiece::SkinKind::Planet,
-        Some("radar") => centerpiece::SkinKind::Radar,
-        Some("aurora") => centerpiece::SkinKind::Aurora,
-        _ => centerpiece::SkinKind::Bloom,
+        Some("bloom") => centerpiece::SkinKind::Bloom,
+        _ => centerpiece::SkinKind::Planet,
     };
 
     // --backend <name> for the initial render backend (support fallback for a
@@ -72,8 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| render_backend::parse_backend(s));
 
-    // The customer build owns + drives the real L0 backend (spawns the
-    // orchestrator tree, polls sentinel :19420).
+    // The customer build spawns one subscriber-client child and polls 127.0.0.1:19421.
     #[cfg(not(feature = "dev-tools"))]
     let engine: Box<dyn backend::EngineLink> = Box::new(backend::LocalHttp::start());
     #[cfg(feature = "dev-tools")]

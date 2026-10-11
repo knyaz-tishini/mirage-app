@@ -51,6 +51,8 @@ impl EngineLink for MockEngine {
         EngineStatus {
             online: true,
             tun_alive: st.alive,
+            socks: st.alive,
+            mode: "socks".to_owned(),
             ..EngineStatus::default()
         }
     }
@@ -66,5 +68,13 @@ impl EngineLink for MockEngine {
         let mut st = self.lock();
         st.alive = false;
         st.connecting_since = None;
+    }
+
+    fn is_bound(&self) -> bool {
+        true
+    }
+
+    fn bound_name(&self) -> Option<String> {
+        Some("device".to_owned())
     }
 }
