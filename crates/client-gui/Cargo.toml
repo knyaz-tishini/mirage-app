@@ -15,12 +15,16 @@ members = ["."]
 
 [package]
 name = "mirage-client-gui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [[bin]]
 name = "mirage-client-gui"
 path = "src/main.rs"
+
+[[bin]]
+name = "mirage-ota-publish"
+path = "src/bin/mirage-ota-publish.rs"
 
 [features]
 default = []
@@ -56,5 +60,10 @@ arboard                 = "3"            # image-data feature is on by default â
 rqrr                    = "0.7"
 # Live backend link (loopback HTTP to sentinel :19420). rustls (no OpenSSL),
 # same as mirage-launcher; co-resolves fine with vello's windows-core 0.62.
-reqwest                 = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+reqwest                 = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+serde                   = { version = "1", features = ["derive"] }
+semver                  = "1"
+sha2                    = "0.10"
+base64                  = "0.22"
+ed25519-dalek           = "2"
 nokhwa = { version = "0.10.11", features = ["input-native"] }

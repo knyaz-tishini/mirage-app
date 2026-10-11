@@ -137,6 +137,16 @@ fn id_log() -> uzor::types::WidgetId {
     unsafe_widget_id("mirage:log")
 }
 
+fn id_restart() -> uzor::types::WidgetId {
+    unsafe_widget_id("mirage:restart")
+}
+
+/// The update control sits just under the chrome, on top of the menu, so a
+/// ready install stays visible while Setup is open.
+fn restart_rect(w: f64) -> Rect {
+    Rect { x: 12.0, y: CHROME_H + 6.0, width: (w - 24.0).max(0.0), height: 28.0 }
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 /// Main application state.
@@ -904,6 +914,12 @@ impl App<NoPanel> for MirageClientApp {
         self.last_pointer = pointer;
         self.prev_pointer_down = self.pointer_down;
 
+        if win.layout.was_clicked(&id_restart()) {
+            if matches!(mirage_client_gui::ota::status(), mirage_client_gui::ota::UpdateStatus::RestartPending { .. }) {
+                mirage_client_gui::ota::restart();
+            }
+        }
+
         if !self.menu_open {
             // Tap on the centerpiece (menu closed). Drag-rotate and wheel-zoom
             // are handled in `on_event`. A tap barely moved (`drag_moved < TAP_SLOP`).
@@ -1080,6 +1096,15 @@ impl App<NoPanel> for MirageClientApp {
                     height: (h - CHROME_H).max(0.0),
                 });
             }
+            if matches!(
+                mirage_client_gui::ota::status(),
+                mirage_client_gui::ota::UpdateStatus::Downloading { .. }
+                    | mirage_client_gui::ota::UpdateStatus::Verifying
+                    | mirage_client_gui::ota::UpdateStatus::Installing
+                    | mirage_client_gui::ota::UpdateStatus::RestartPending { .. }
+            ) {
+                register_hit(layout, id_restart(), restart_rect(w));
+            }
         }
 
         // ── Plain "M" menu glyph + kill the chrome's bottom separator line ────
@@ -1103,6 +1128,30 @@ impl App<NoPanel> for MirageClientApp {
         #[cfg(feature = "dev-tools")]
         if let (Some(text), false) = (&hud, self.menu_open) {
             crate::dev::draw_hud(&mut *win.render, w, CHROME_H, text);
+        }
+
+        // Painted last so an installed update stays on top of the open menu.
+        // The accent reading is the restart control. A download only reports
+        // progress; it does not ask for a click.
+        let update = mirage_client_gui::ota::status();
+        let banner: Option<(String, bool)> = match &update {
+            mirage_client_gui::ota::UpdateStatus::Downloading { percent } => Some((format!("загрузка {percent}%"), false)),
+            mirage_client_gui::ota::UpdateStatus::Verifying | mirage_client_gui::ota::UpdateStatus::Installing => {
+                Some(("установка".to_owned(), false))
+            }
+            mirage_client_gui::ota::UpdateStatus::RestartPending { .. } => Some(("Перезагрузить".to_owned(), true)),
+            _ => None,
+        };
+        if let Some((label, ready)) = banner {
+            let rect = restart_rect(w);
+            let render = &mut *win.render;
+            render.set_fill_color(if ready { "#FBB26A" } else { "#1A1A22" });
+            render.fill_rect(rect.x, rect.y, rect.width, rect.height);
+            render.set_fill_color(if ready { "#0C0C10" } else { "#F4F4F5" });
+            render.set_font("14px sans-serif");
+            render.set_text_align(TextAlign::Center);
+            render.set_text_baseline(TextBaseline::Middle);
+            render.fill_text(&label, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
         }
     }
 

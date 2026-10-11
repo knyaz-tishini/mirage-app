@@ -24,8 +24,12 @@ use uzor::platform::types::CornerStyle;
 use uzor_desktop::AppRun as _;
 
 use app::MirageClientApp;
+use mirage_client_gui::ota;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ota::wait_for_parent_exit();
+    ota::clear_rollback_copy();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -75,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dev-tools")]
     let (engine, dev_hooks) = dev::launch(&args);
 
+    ota::start();
     let app = MirageClientApp::new(skin, engine);
     #[cfg(feature = "dev-tools")]
     let app = app.with_dev(dev_hooks);
@@ -91,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     builder
         .window(
-            WindowSpec::new(WindowKey::new("main"), "Mirage")
+            WindowSpec::new(WindowKey::new("main"), concat!("Mirage ", env!("CARGO_PKG_VERSION")))
                 .size(380, 540)
                 .min_size(280, 400)
                 .decorations(false)
