@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-const CONTROL: &str = "http://127.0.0.1:19421";
+/// Lab and older installs listen here. A second window must not adopt that process.
+const DEFAULT_CONTROL_PORT: u16 = 19421;
 /// Cabinet catalog. Same route the cabinet order form uses for exit countries.
 /// The edge welcome is not this list.
 const CABINET_CATALOG: &str = "https://m1r4g3.bid/api/public/catalog";
@@ -106,6 +107,9 @@ pub struct LocalHttp {
     bind_note: Arc<Mutex<Option<String>>>,
     /// Set when the child was started from the redeemed device file.
     bound: Arc<AtomicBool>,
+    /// `http://127.0.0.1:<port>` of the child this process spawned. `None` until then,
+    /// so a foreign subscriber already on 19421 cannot paint this window as up.
+    control: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalHttp {
@@ -113,27 +117,40 @@ impl LocalHttp {
     /// file. A launch script cannot supply that file.
     pub fn start() -> Self {
         let bound = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(Mutex::new(None));
         let child = match bound_device_path() {
-            Ok(path) if path.is_file() => match spawn_child_with(&path) {
-                Ok(child) => {
-                    bound.store(true, Ordering::Relaxed);
-                    Some(child)
+            Ok(path) if path.is_file() => {
+                let url = pick_control_url();
+                match spawn_child_with(&path, &url) {
+                    Ok(child) => {
+                        *control.lock().unwrap_or_else(PoisonError::into_inner) = Some(url);
+                        bound.store(true, Ordering::Relaxed);
+                        Some(child)
+                    }
+                    Err(e) => {
+                        tracing::warn!("subscriber-client spawn failed: {e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("subscriber-client spawn failed: {e}");
-                    None
-                }
-            },
+            }
             _ => None,
         };
         let status = Arc::new(Mutex::new(EngineStatus::default()));
-        spawn_poller(status.clone());
+        spawn_poller(status.clone(), Arc::clone(&control));
         spawn_cabinet_countries(status.clone());
         Self {
             status,
             child: Arc::new(Mutex::new(child)),
             bind_note: Arc::new(Mutex::new(None)),
             bound,
+            control,
+        }
+    }
+
+    fn fire_here(&self, path: &'static str, body: serde_json::Value) {
+        let base = self.control.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(base) = base {
+            fire(&base, path, body);
         }
     }
 }
@@ -146,10 +163,10 @@ impl EngineLink for LocalHttp {
         if !self.is_bound() {
             return;
         }
-        fire("/v1/session", serde_json::json!({"up": true}));
+        self.fire_here("/v1/session", serde_json::json!({"up": true}));
     }
     fn disconnect(&self) {
-        fire("/v1/session", serde_json::json!({"up": false}));
+        self.fire_here("/v1/session", serde_json::json!({"up": false}));
     }
     fn set_listeners(&self, socks: bool, http: bool) {
         let pick_socks = socks;
@@ -166,10 +183,10 @@ impl EngineLink for LocalHttp {
                 guard.mode = "socks".to_owned();
             }
         }
-        fire("/v1/listeners", serde_json::json!({"socks": pick_socks, "http": pick_http}));
+        self.fire_here("/v1/listeners", serde_json::json!({"socks": pick_socks, "http": pick_http}));
     }
     fn set_exit(&self, exit: &str) {
-        fire("/v1/exit", serde_json::json!({"exit": exit}));
+        self.fire_here("/v1/exit", serde_json::json!({"exit": exit}));
     }
     fn set_tun(&self, enabled: bool) {
         {
@@ -186,7 +203,7 @@ impl EngineLink for LocalHttp {
             guard.error = None;
         }
         // Lists stay on /v1/scope. An absent key must not clear them.
-        fire("/v1/tun", serde_json::json!({"enabled": enabled, "mode": "split"}));
+        self.fire_here("/v1/tun", serde_json::json!({"enabled": enabled, "mode": "split"}));
     }
     fn set_scope(
         &self,
@@ -202,7 +219,7 @@ impl EngineLink for LocalHttp {
             guard.bypass_services = bypass_services.to_vec();
             guard.bypass_apps = bypass_apps.to_vec();
         }
-        fire(
+        self.fire_here(
             "/v1/scope",
             serde_json::json!({
                 "services": services,
@@ -221,8 +238,9 @@ impl EngineLink for LocalHttp {
         let note = Arc::clone(&self.bind_note);
         let child = Arc::clone(&self.child);
         let bound = Arc::clone(&self.bound);
+        let control = Arc::clone(&self.control);
         std::thread::spawn(move || {
-            let line = redeem_and_respawn(&text, &child, &bound);
+            let line = redeem_and_respawn(&text, &child, &bound, &control);
             *note.lock().unwrap_or_else(PoisonError::into_inner) = Some(line);
         });
     }
@@ -268,6 +286,59 @@ impl EngineLink for LocalHttp {
     }
 }
 
+impl LocalHttp {
+    /// Spawn the subscriber on a standalone entrance artefact. The cabinet
+    /// device file is not read and not written. `json` must be the artefact
+    /// document the server put in `client.link`.
+    pub fn adopt_artefact(&self, json: &str) -> Result<(), String> {
+        let json = json.trim();
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|_| "ссылка не артефакт")?;
+        if !value.is_object() {
+            return Err("ссылка не артефакт".into());
+        }
+        let dir = exe_dir().map_err(|e| e.to_string())?.join("standalone");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join("artefact.json");
+        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+        let url = {
+            let mut slot = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(pick_control_url());
+            }
+            slot.clone().unwrap_or_else(|| format!("http://127.0.0.1:{DEFAULT_CONTROL_PORT}"))
+        };
+        replace_child(&self.child, &path, &url).map_err(|e| format!("клиент: {e}"))?;
+        self.bound.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Cabinet page in the machine browser. No token. Only an install that has
+/// the empty `cabinet-open` marker beside the exe.
+pub(crate) fn open_marked_cabinet() {
+    if !cabinet_marker_present() {
+        return;
+    }
+    const CABINET_URL: &str = "https://m1r4g3.bid/cabinet/";
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", CABINET_URL])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(CABINET_URL).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = Command::new("xdg-open").arg(CABINET_URL).spawn();
+    }
+}
+
 impl Drop for LocalHttp {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.lock().unwrap_or_else(PoisonError::into_inner).take() {
@@ -277,7 +348,7 @@ impl Drop for LocalHttp {
     }
 }
 
-fn spawn_poller(status: Arc<Mutex<EngineStatus>>) {
+fn spawn_poller(status: Arc<Mutex<EngineStatus>>, control: Arc<Mutex<Option<String>>>) {
     std::thread::Builder::new()
         .name("mirage-engine-poll".into())
         .spawn(move || {
@@ -288,7 +359,12 @@ fn spawn_poller(status: Arc<Mutex<EngineStatus>>) {
                 return;
             };
             loop {
-                let fetched = match client.get(format!("{CONTROL}/v1/status")).send() {
+                let base = control.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                let Some(base) = base else {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                };
+                let fetched = match client.get(format!("{base}/v1/status")).send() {
                     Ok(response) if response.status().is_success() => response
                         .text()
                         .map(|body| parse_status(&body))
@@ -324,7 +400,7 @@ fn spawn_poller(status: Arc<Mutex<EngineStatus>>) {
         .ok();
 }
 
-fn spawn_cabinet_countries(status: Arc<Mutex<EngineStatus>>) {
+pub(crate) fn spawn_cabinet_countries(status: Arc<Mutex<EngineStatus>>) {
     std::thread::Builder::new()
         .name("mirage-cabinet-countries".into())
         .spawn(move || {
@@ -365,18 +441,19 @@ fn control_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
         .build()
 }
 
-fn fire(path: &'static str, body: serde_json::Value) {
+fn fire(base: &str, path: &'static str, body: serde_json::Value) {
+    let base = base.to_owned();
     std::thread::spawn(move || {
         if let Ok(client) = control_client() {
-            post_json(&client, path, body);
+            post_json(&client, &base, path, body);
         }
     });
 }
 
-fn post_json(client: &reqwest::blocking::Client, path: &str, body: serde_json::Value) {
+fn post_json(client: &reqwest::blocking::Client, base: &str, path: &str, body: serde_json::Value) {
     let Ok(bytes) = serde_json::to_vec(&body) else { return };
     let _ = client
-        .post(format!("{CONTROL}{path}"))
+        .post(format!("{base}{path}"))
         .header("content-type", "application/json")
         .body(bytes)
         .send();
@@ -478,7 +555,23 @@ pub(crate) fn cabinet_marker_present() -> bool {
     bound_device_path().map(|path| path.with_file_name("cabinet-open").is_file()).unwrap_or(false)
 }
 
-fn spawn_child_with(artefact: &std::path::Path) -> std::io::Result<Child> {
+/// First loopback port that is not already taken. Skips the lab subscriber on 19421.
+fn pick_control_url() -> String {
+    for port in DEFAULT_CONTROL_PORT..DEFAULT_CONTROL_PORT + 20 {
+        let address = format!("127.0.0.1:{port}");
+        let occupied = std::net::TcpStream::connect_timeout(
+            &address.parse().expect("loopback address"),
+            Duration::from_millis(150),
+        )
+        .is_ok();
+        if !occupied {
+            return format!("http://{address}");
+        }
+    }
+    format!("http://127.0.0.1:{DEFAULT_CONTROL_PORT}")
+}
+
+fn spawn_child_with(artefact: &std::path::Path, control_url: &str) -> std::io::Result<Child> {
     let dir = exe_dir()?;
     let bin = subscriber_bin()?;
     let log = std::fs::OpenOptions::new()
@@ -487,11 +580,12 @@ fn spawn_child_with(artefact: &std::path::Path) -> std::io::Result<Child> {
         .open(dir.join("mirage-subscriber-client.log"))?;
     let log_err = log.try_clone()?;
     let tun = find_tun_bin(&bin);
+    let host_port = control_url.trim_start_matches("http://");
     let mut cmd = Command::new(bin);
     cmd.arg("--artefact")
         .arg(artefact)
         .arg("--control")
-        .arg("127.0.0.1:19421");
+        .arg(host_port);
     if let Some(tun) = tun {
         cmd.arg("--tun-bin").arg(tun);
     }
@@ -510,7 +604,12 @@ fn spawn_child_with(artefact: &std::path::Path) -> std::io::Result<Child> {
     }
 }
 
-fn redeem_and_respawn(text: &str, child: &Mutex<Option<Child>>, bound: &AtomicBool) -> String {
+fn redeem_and_respawn(
+    text: &str,
+    child: &Mutex<Option<Child>>,
+    bound: &AtomicBool,
+    control: &Mutex<Option<String>>,
+) -> String {
     let bin = match subscriber_bin() {
         Ok(bin) => bin,
         Err(err) => return format!("привязка: нет клиента ({err})"),
@@ -540,10 +639,16 @@ fn redeem_and_respawn(text: &str, child: &Mutex<Option<Child>>, bound: &AtomicBo
     if !output.status.success() || !out.is_file() {
         return bind_failure(&output, text);
     }
-    // A claim redeemed here is a cabinet device. It must not keep an admin mark
-    // that belonged to a previous file in this directory.
-    let _ = std::fs::remove_file(out.with_file_name("cabinet-open"));
-    match replace_child(child, &out) {
+    // An existing cabinet-open beside this exe stays. A customer directory has
+    // none, so redeeming a claim there still does not grow the button.
+    let url = {
+        let mut slot = control.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(pick_control_url());
+        }
+        slot.clone().unwrap_or_else(|| format!("http://127.0.0.1:{DEFAULT_CONTROL_PORT}"))
+    };
+    match replace_child(child, &out, &url) {
         Ok(()) => {
             bound.store(true, Ordering::Relaxed);
             bind_ok(&output.stdout)
@@ -552,13 +657,17 @@ fn redeem_and_respawn(text: &str, child: &Mutex<Option<Child>>, bound: &AtomicBo
     }
 }
 
-fn replace_child(slot: &Mutex<Option<Child>>, artefact: &std::path::Path) -> std::io::Result<()> {
+fn replace_child(
+    slot: &Mutex<Option<Child>>,
+    artefact: &std::path::Path,
+    control_url: &str,
+) -> std::io::Result<()> {
     let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(mut old) = guard.take() {
         let _ = old.kill();
         let _ = old.wait();
     }
-    *guard = Some(spawn_child_with(artefact)?);
+    *guard = Some(spawn_child_with(artefact, control_url)?);
     Ok(())
 }
 

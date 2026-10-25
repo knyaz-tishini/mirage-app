@@ -15,7 +15,7 @@ members = ["."]
 
 [package]
 name = "mirage-client-gui"
-version = "0.1.2"
+version = "0.1.8"
 edition = "2021"
 
 [[bin]]
@@ -25,6 +25,10 @@ path = "src/main.rs"
 [[bin]]
 name = "mirage-ota-publish"
 path = "src/bin/mirage-ota-publish.rs"
+
+[lib]
+name = "mirage_client_gui"
+crate-type = ["rlib", "staticlib"]
 
 [features]
 default = []
@@ -41,21 +45,19 @@ dev-tools = []
 # No-op on non-Windows targets. Mirrors mirage2mshd/crates/mshd/build.rs.
 [build-dependencies]
 embed-manifest = "1"
+winresource = "0.1"
 
-# ── uzor desktop runtime (AppBuilder + agent-API + screenshot) ────────────────
+# ── uzor 1.5.12: framework window + QuickJS scene ─────────────────────────────
 [dependencies]
 uzor          = { path = "../../../uzor/uzor" }
-uzor-desktop  = { path = "../../../uzor/uzor-desktop" }
 uzor-text     = { path = "../../../uzor/uzor-text" }
 
-tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "io-util"] }
 tracing                 = "0.1"
 tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
 
 # Config import: parse/validate, file picker, clipboard (text + image).
 serde_json              = "1"
-rfd                     = "0.14"
-arboard                 = "3"            # image-data feature is on by default → get_image()
 # QR decode (pure Rust, no platform deps — safe for the isolated workspace).
 rqrr                    = "0.7"
 # Live backend link (loopback HTTP to sentinel :19420). rustls (no OpenSSL),
@@ -66,4 +68,28 @@ semver                  = "1"
 sha2                    = "0.10"
 base64                  = "0.22"
 ed25519-dalek           = "2"
+# Same russh 0.49 line as mirage2operator and d-watchdog. The desktop
+# standalone mode SSHs to the user's server, plants a key, and starts Docker.
+russh                   = "0.49"
+russh-keys              = "0.49"
+russh-sftp              = "2"
+async-trait             = "0.1"
+ssh-key                 = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "std"] }
+rand                    = "0.8"
+hex                     = "0.4"
+# Paint the issued link. No image backend.
+qrcode                  = { version = "0.14", default-features = false }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+uzor-framework = { path = "../../../uzor/uzor-framework", features = ["native"] }
+uzor-anim-js = { path = "../../../uzor/uzor-anim-js", features = ["quickjs"] }
+rfd = "0.14"
+arboard = "3"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+uzor-render-tiny-skia = { path = "../../../uzor/uzor-render-tiny-skia" }
+tiny-skia = "0.11"
+
+[patch.crates-io]
+winit = { path = "third-party/winit" }

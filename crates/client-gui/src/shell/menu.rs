@@ -98,6 +98,13 @@ fn metrics(row: &MenuRow, country_count: usize, services: usize, apps: usize) ->
     }
 }
 
+/// Cabinet sheet: the claim field only. Exit, transport, sites, apps, skins
+/// and import are not rows. The desktop shell applies exit and transport itself.
+#[cfg(not(target_os = "ios"))]
+pub fn cabinet_rows() -> Vec<MenuRow> {
+    vec![MenuRow::Bind]
+}
+
 /// Rows for the active tab. Manual mode on Connect opens one country grid.
 pub fn tab_rows(tab: MenuTab, exit_auto: bool, country_count: usize) -> Vec<MenuRow> {
     match tab {
@@ -360,24 +367,29 @@ pub struct Geom {
 }
 
 /// Compute container rects for a panel of height `panel_h` (px, below chrome)
-/// with `ntabs` equal-width tab columns.
-pub fn geom(w: f64, h: f64, panel_h: f64, ntabs: usize) -> Geom {
-    let panel = Rect::new(0.0, MENU_TOP, w, panel_h);
-    let tabbar = Rect::new(0.0, MENU_TOP, w, TABBAR_H);
+/// with `ntabs` equal-width tab columns. `top` is the sheet's top edge.
+/// `tab_h` is the tab row. iOS keeps [`TABBAR_H`] via [`geom`].
+pub fn geom_at(w: f64, h: f64, panel_h: f64, ntabs: usize, top: f64, tab_h: f64) -> Geom {
+    let panel = Rect::new(0.0, top, w, panel_h);
+    let tabbar = Rect::new(0.0, top, w, tab_h);
     let content = Rect::new(
         0.0,
-        MENU_TOP + TABBAR_H,
+        top + tab_h,
         w,
-        (panel_h - TABBAR_H - SEP_H).max(0.0),
+        (panel_h - tab_h - SEP_H).max(0.0),
     );
-    let sep = Rect::new(0.0, MENU_TOP + panel_h - SEP_H, w, SEP_H);
+    let sep = Rect::new(0.0, top + panel_h - SEP_H, w, SEP_H);
     let n = ntabs.max(1);
     let tw = w / n as f64;
     let tabs = (0..n)
-        .map(|i| Rect::new(tw * i as f64, MENU_TOP, tw, TABBAR_H))
+        .map(|i| Rect::new(tw * i as f64, top, tw, tab_h))
         .collect();
     let _ = h;
     Geom { panel, tabbar, content, sep, tabs }
+}
+
+pub fn geom(w: f64, h: f64, panel_h: f64, ntabs: usize) -> Geom {
+    geom_at(w, h, panel_h, ntabs, MENU_TOP, TABBAR_H)
 }
 
 // ── Draw ───────────────────────────────────────────────────────────────────────
@@ -720,7 +732,7 @@ fn draw_row(
             // The row picks where traffic goes. The globe is the up/down signal.
             let _ = (socks_on, http_on, tun_on);
             let (label, picked) = match lr.row {
-                MenuRow::ToggleSocks => ("SOCKS5", mode != "http" && mode != "tun"),
+                MenuRow::ToggleSocks => ("SOCKS5", mode == "socks"),
                 MenuRow::ToggleHttp => ("HTTP", mode == "http"),
                 MenuRow::ToggleTun => ("TUN", mode == "tun"),
                 _ => return,
