@@ -1,24 +1,27 @@
 //! m1r4g3 desktop shell. The oasis scene fills the window. Chrome is a
 //! transparent overlay: a stroked amber palm (no fill) on the left, and
 //! minimize / close on the right drawn like a system caption. The empty
-//! band drags the window through uzor's floating controls; no strip is painted.
-//! An open sheet starts at the top of the window, so its tab row is the
-//! chrome band. A click below the band eases the link over 0.55s.
+//! band drags the window while the sheet is closed. An open sheet fills
+//! from the top, including the chrome band, and does not dim the scene.
+//! Cabinet and standalone sit on that fill, level with the palm and the
+//! caption buttons, and only while the sheet is open. Text rows are
+//! framework text fields. A click on the
+//! scene eases the link over 0.55s.
 
 use std::collections::HashMap;
 
 use uzor::input::keyboard::KeyCode;
 use uzor::input::{Sense, WidgetKind};
 use uzor::layout::docking::DockPanel;
-use uzor::render::{AnimParams, AnimScript, RenderContext};
+use uzor::render::{AnimParams, AnimScript, RenderContext, TextAlign, TextBaseline};
 use uzor::tokens::{BuiltinSet, Tokens};
-use uzor::{Rect, RgbaIcon, WidgetId};
+use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
 use uzor_framework::host::native::{NativeOptions, TraySpec, run_native};
 use uzor_framework::{
     App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
     KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig, SizePx,
-    Spec, UnhandledInput, WindowCmd, WindowControlsStyle, WindowId, WindowIntent, WindowSpec,
+    Spec, TextIntent, UnhandledInput, WindowCmd, WindowControlsStyle, WindowId, WindowIntent, WindowSpec,
 };
 
 use crate::backend::{EngineLink, LocalHttp};
@@ -36,6 +39,7 @@ const SCALE: f64 = 1.75 * 0.75;
 const CHROME_H: f64 = 32.0 * SCALE;
 const MARK: f64 = 28.0 * SCALE;
 const GLYPH: f64 = 22.0 * SCALE;
+const LIP: f64 = 1.0;
 const PALM_W: u32 = 256;
 const PALM: &[u8] = include_bytes!("palm256.rgba");
 const PALM_TRAY_W: u32 = 32;
@@ -114,6 +118,12 @@ struct Oasis {
     stand: Stand,
     /// Last standalone link handed to the subscriber. Stops a re-spawn every frame.
     adopted: String,
+    pending_submit: Option<String>,
+    /// Bumped when BIND clears the draft. Each window wipes its own field store once.
+    bind_reset_epoch: u64,
+    bind_reset_seen: HashMap<WindowId, u64>,
+    /// Windows that already applied [`Stand::pass_epoch`].
+    pass_reset_seen: HashMap<WindowId, u64>,
 }
 
 impl Oasis {
@@ -194,32 +204,39 @@ impl App for Oasis {
 
         let mut ui = self.ui.get(&win).cloned().unwrap_or_default();
         let panel_h = self.sheet_panel_h(h);
-        let g = menu::geom_at(w, h, panel_h, 1, 0.0, CHROME_H);
+        let g = open_geom(w, h, panel_h);
+        let (mode_cab, mode_std) = mode_pair(w);
 
         if ui.menu {
-            // Nothing is registered on the chrome band except the palm and the
-            // caption buttons, so the band stays a window drag.
+            // Hover only: blocks window-drag on the sheet, and does not take
+            // the click. Text fields and buttons register after this.
+            cx.widgets.coord.register_atomic(
+                "sheet",
+                WidgetKind::Custom,
+                at(g.panel),
+                Sense::HOVER,
+                &layer,
+            );
             let bottom = g.panel.y + g.panel.height;
             if bottom < h {
                 hit(cx.widgets.coord, "scrim", at(Rect::new(0.0, bottom, w, (h - bottom).max(0.0))));
             }
             if self.product == Product::Cabinet {
-                let rows = menu::cabinet_rows();
-                let (laid, _) = menu::layout_rows(&rows, 0, 0, 0);
-                if let Some(lr) = laid.first() {
-                    let ry = g.content.y + lr.y;
-                    hit(cx.widgets.coord, "row:0", at(Rect::new(0.0, ry, w, lr.h)));
-                    if cx.view.clicked(&WidgetId::from("row:0")) {
-                        let x = cx.view.raw_pointer().map(|(px, _)| px - rect.x).unwrap_or(0.0);
-                        self.on_bind_row(x, w);
-                    }
-                }
+                self.register_bind(cx.widgets.coord, &cx.view, &layer, &at, &g, w);
             } else {
                 stand::register(cx.widgets.coord, &cx.view, &layer, &at, &g, &mut self.stand);
             }
             if cx.view.clicked(&WidgetId::from("scrim")) {
                 ui.menu = false;
                 self.bind_focused = false;
+            }
+            hit(cx.widgets.coord, "mode-cab", at(mode_cab));
+            hit(cx.widgets.coord, "mode-std", at(mode_std));
+            if cx.view.clicked(&WidgetId::from("mode-cab")) {
+                self.set_mode(Product::Cabinet);
+            }
+            if cx.view.clicked(&WidgetId::from("mode-std")) {
+                self.set_mode(Product::Standalone);
             }
         } else {
             hit(cx.widgets.coord, HIT_SCENE, at(Rect::new(0.0, CHROME_H, w, scene_h)));
@@ -273,6 +290,7 @@ impl App for Oasis {
         let menu_now = self.ui.get(&win).cloned().unwrap_or_default();
         let panel_h = self.sheet_panel_h(h);
         let pointer = cx.view.raw_pointer().map(|(x, y)| (x - rect.x, y - rect.y));
+        let bind_hot = cx.view.is_focused(&WidgetId::from("bind"));
         cx.out.request_frame();
 
         let render: &mut dyn RenderContext = cx.render;
@@ -290,7 +308,7 @@ impl App for Oasis {
         }
         render.restore();
         if menu_now.menu {
-            let g = menu::geom_at(w, h, panel_h, 1, 0.0, CHROME_H);
+            let g = open_geom(w, h, panel_h);
             if self.product == Product::Cabinet {
                 let rows = menu::cabinet_rows();
                 let (laid, content_h) = menu::layout_rows(&rows, 0, 0, 0);
@@ -322,8 +340,8 @@ impl App for Oasis {
                     false,
                     false,
                     "",
-                    self.bind_focused,
-                    &self.bind_draft,
+                    false,
+                    "",
                     self.engine.is_bound(),
                     self.unlink_armed,
                     self.engine.cabinet_open(),
@@ -334,10 +352,28 @@ impl App for Oasis {
                     false,
                     pointer,
                 );
+                if !self.engine.is_bound() {
+                    if let Some(field) = bind_field_local(&g, w) {
+                        render.set_fill_color(if bind_hot {
+                            "rgba(251,178,106,0.10)"
+                        } else {
+                            "rgba(255,255,255,0.05)"
+                        });
+                        render.fill_rect(field.x, field.y, field.width, field.height);
+                        if bind_hot {
+                            render.set_fill_color("#FBB26A");
+                            render.fill_rect(field.x, field.y + field.height - 2.0, field.width, 2.0);
+                        }
+                    }
+                }
             } else {
                 let note = if self.note.is_empty() { None } else { Some(self.note.as_str()) };
                 stand::paint(render, &g, &self.stand, false, note);
             }
+        }
+        if menu_now.menu {
+            let (mode_cab, mode_std) = mode_pair(w);
+            paint_modes(render, mode_cab, mode_std, self.product);
         }
         if let Err(err) = paint_menu(render, &self.host, &mut self.scratch, now) {
             if !self.paint_err {
@@ -347,6 +383,13 @@ impl App for Oasis {
         }
         paint_controls(render, w, pointer);
         render.restore();
+        if menu_now.menu {
+            if let Some(id) = self.pending_submit.take() {
+                self.on_submit(&id);
+            }
+            let g = open_geom(w, h, panel_h);
+            self.mount_fields(cx, rect, &g);
+        }
     }
 
     fn overlay_body(&mut self, cx: &mut OverlayCx<'_, Vocab>) {
@@ -387,11 +430,12 @@ impl App for Oasis {
                 }
                 if key.code == KeyCode::Escape {
                     cx.command(AppCommand::Shutdown);
-                    return;
                 }
-                self.on_key(&key);
             }
             Intent::Unhandled(UnhandledInput::Paste { text, .. }) => self.on_paste(&text),
+            Intent::Text(TextIntent::Submitted { field, .. }) => {
+                self.pending_submit = Some(field.as_str().to_string());
+            }
             _ => {}
         }
     }
@@ -436,6 +480,10 @@ impl Oasis {
         self.engine.bind_claim(&text);
         self.bind_draft.clear();
         self.bind_focused = false;
+        self.bind_reset_epoch = self.bind_reset_epoch.wrapping_add(1);
+        if self.bind_reset_epoch == 0 {
+            self.bind_reset_epoch = 1;
+        }
     }
 
     fn raise_link(&mut self) {
@@ -469,8 +517,7 @@ impl Oasis {
         }
     }
 
-    /// Sheet height is the chrome band plus the rows plus the lip. It does not
-    /// grow past that content, and it does not keep a fraction of the window.
+    /// Sheet height is the chrome band, the rows, and a 1px lip.
     fn sheet_panel_h(&self, window_h: f64) -> f64 {
         let body = if self.product == Product::Cabinet {
             let (_, content_h) = menu::layout_rows(&menu::cabinet_rows(), 0, 0, 0);
@@ -478,59 +525,40 @@ impl Oasis {
         } else {
             stand::content_height(!self.stand.link.is_empty())
         };
-        (CHROME_H + body + menu::SEP_H).min(window_h * menu::MAX_FRAC)
+        (CHROME_H + body + LIP).min(window_h * menu::MAX_FRAC)
+    }
+
+    fn on_submit(&mut self, id: &str) {
+        match id {
+            "bind" => self.submit_bind(),
+            "st-link" => self.stand.save_link(),
+            "st-host" | "st-user" | "st-pass" | "st-stack" => self.stand.install(),
+            _ => {}
+        }
+    }
+
+    fn set_mode(&mut self, product: Product) {
+        if self.product == product {
+            return;
+        }
+        self.product = product;
+        self.bind_focused = false;
+        self.stand.focus = stand::Focus::None;
+        let Some(path) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("client-mode")))
+        else {
+            return;
+        };
+        let text = match product {
+            Product::Standalone => "standalone\n",
+            Product::Cabinet => "cabinet\n",
+        };
+        let _ = std::fs::write(path, text);
     }
 
     fn sheet_open(&self) -> bool {
         self.ui.values().any(|ui| ui.menu)
-    }
-
-    fn on_key(&mut self, key: &KeyInput) {
-        if !self.sheet_open() {
-            return;
-        }
-        if key.code == KeyCode::Backspace {
-            if self.product == Product::Cabinet && self.bind_focused {
-                self.bind_draft.pop();
-            } else if self.product == Product::Standalone {
-                self.stand.backspace();
-                if self.stand.focus == stand::Focus::Link {
-                    self.stand.save_link();
-                    self.adopted.clear();
-                }
-            }
-            return;
-        }
-        if key.code == KeyCode::Enter {
-            if self.product == Product::Cabinet && self.bind_focused {
-                self.submit_bind();
-            } else if self.product == Product::Standalone {
-                if self.stand.focus == stand::Focus::Link {
-                    self.stand.save_link();
-                    self.stand.focus = stand::Focus::None;
-                } else {
-                    self.stand.install();
-                }
-            }
-            return;
-        }
-        let Some(text) = key.text.as_deref() else {
-            return;
-        };
-        if text.chars().any(|c| c.is_control()) {
-            return;
-        }
-        if self.product == Product::Cabinet && self.bind_focused {
-            if self.bind_draft.len() + text.len() <= 512 {
-                self.bind_draft.push_str(text);
-            }
-        } else if self.product == Product::Standalone {
-            let editing_link = self.stand.focus == stand::Focus::Link;
-            self.stand.type_text(text);
-            if editing_link {
-                self.adopted.clear();
-            }
-        }
     }
 
     fn on_paste(&mut self, text: &str) {
@@ -558,6 +586,277 @@ impl Oasis {
             Product::Cabinet => {}
         }
     }
+
+    fn register_bind(
+        &mut self,
+        coord: &mut uzor::input::InputCoordinator,
+        view: &uzor_framework::VisualView<Vocab>,
+        layer: &uzor::input::LayerId,
+        at: &impl Fn(Rect) -> Rect,
+        g: &menu::Geom,
+        w: f64,
+    ) {
+        let (laid, _) = menu::layout_rows(&menu::cabinet_rows(), 0, 0, 0);
+        let Some(row) = laid.iter().find(|lr| matches!(lr.row, menu::MenuRow::Bind)) else {
+            return;
+        };
+        let ry = g.content.y + row.y;
+        let field_h = 32.0;
+        let by = ry + (row.h - field_h) / 2.0;
+        if self.engine.is_bound() {
+            let unlink_x = menu::unlink_button_x(w);
+            let unlink_w = (w - 16.0 - unlink_x).max(0.0);
+            let unlink = Rect::new(unlink_x, by, unlink_w, field_h);
+            coord.register_atomic("bind-unlink", WidgetKind::Button, at(unlink), Sense::CLICK, layer);
+            if view.clicked(&WidgetId::from("bind-unlink")) {
+                if self.unlink_armed {
+                    self.engine.unlink();
+                    self.unlink_armed = false;
+                    self.bind_focused = false;
+                    self.note.clear();
+                } else {
+                    self.unlink_armed = true;
+                }
+            }
+            if self.engine.cabinet_open() {
+                let cabinet_x = menu::cabinet_button_x(w);
+                let cabinet_w = (unlink_x - 6.0 - cabinet_x).max(0.0);
+                let cabinet = Rect::new(cabinet_x, by, cabinet_w, field_h);
+                coord.register_atomic(
+                    "bind-cabinet",
+                    WidgetKind::Button,
+                    at(cabinet),
+                    Sense::CLICK,
+                    layer,
+                );
+                if view.clicked(&WidgetId::from("bind-cabinet")) {
+                    crate::backend::open_marked_cabinet();
+                }
+            }
+            return;
+        }
+        let button_x = menu::bind_button_x(w);
+        let go = Rect::new(button_x, by, 60.0, field_h);
+        coord.register_atomic("bind-go", WidgetKind::Button, at(go), Sense::CLICK, layer);
+        if view.clicked(&WidgetId::from("bind-go")) {
+            self.submit_bind();
+        }
+    }
+
+    fn mount_fields(&mut self, cx: &mut PanelCx<'_, Vocab>, origin: Rect, g: &menu::Geom) {
+        let at = |local: Rect| Rect::new(origin.x + local.x, origin.y + local.y, local.width, local.height);
+        match self.product {
+            Product::Cabinet => self.mount_bind(cx, &at, g),
+            Product::Standalone => self.mount_stand(cx, &at, g),
+        }
+    }
+
+    fn mount_bind(
+        &mut self,
+        cx: &mut PanelCx<'_, Vocab>,
+        at: &impl Fn(Rect) -> Rect,
+        g: &menu::Geom,
+    ) {
+        if self.engine.is_bound() {
+            self.bind_focused = false;
+            return;
+        }
+        let Some(local) = bind_field_local(g, g.panel.width) else {
+            return;
+        };
+        let win = cx.window;
+        let epoch = self.bind_reset_epoch;
+        let reset = epoch_due(&mut self.bind_reset_seen, win, epoch);
+        let (focused, _) = sync_field(
+            cx,
+            "bind",
+            at(local),
+            "claim or /c/ link",
+            512,
+            false,
+            &mut self.bind_draft,
+            reset,
+        );
+        self.bind_focused = focused;
+    }
+
+    fn mount_stand(
+        &mut self,
+        cx: &mut PanelCx<'_, Vocab>,
+        at: &impl Fn(Rect) -> Rect,
+        g: &menu::Geom,
+    ) {
+        let win = cx.window;
+        let epoch = self.stand.pass_epoch;
+        let wipe_pass = epoch_due(&mut self.pass_reset_seen, win, epoch);
+        let stack_auto = self.stand.stack_auto;
+        let rows = stand::field_rects(g.content);
+        let mut focus = stand::Focus::None;
+        let mut profile = false;
+        let mut link_changed = false;
+        for (id, rect, _) in rows {
+            let kind = match id {
+                "st-host" => stand::Focus::Host,
+                "st-user" => stand::Focus::User,
+                "st-pass" => stand::Focus::Pass,
+                "st-stack" if !stack_auto => stand::Focus::Stack,
+                "st-link" => stand::Focus::Link,
+                _ => continue,
+            };
+            let (placeholder, max, masked) = match kind {
+                stand::Focus::Host => ("хост", 240usize, false),
+                stand::Focus::User => ("логин", 240, false),
+                stand::Focus::Pass => ("пароль", 240, true),
+                stand::Focus::Stack => ("стек", 64, false),
+                stand::Focus::Link => ("вставить", 256 * 1024, false),
+                stand::Focus::None => continue,
+            };
+            let local = Rect::new(rect.x + 72.0, rect.y, (rect.width - 72.0).max(0.0), rect.height);
+            let reset = masked && wipe_pass;
+            let value = match kind {
+                stand::Focus::Host => &mut self.stand.host,
+                stand::Focus::User => &mut self.stand.user,
+                stand::Focus::Pass => &mut self.stand.pass,
+                stand::Focus::Stack => &mut self.stand.stack,
+                stand::Focus::Link => &mut self.stand.link,
+                stand::Focus::None => continue,
+            };
+            let (focused, changed) = sync_field(cx, id, at(local), placeholder, max, masked, value, reset);
+            if focused {
+                focus = kind;
+            }
+            if changed {
+                match kind {
+                    stand::Focus::Host | stand::Focus::User | stand::Focus::Stack => profile = true,
+                    stand::Focus::Link => link_changed = true,
+                    stand::Focus::Pass | stand::Focus::None => {}
+                }
+            }
+        }
+        self.stand.focus = focus;
+        if profile {
+            self.stand.save_profile();
+        }
+        if link_changed {
+            self.adopted.clear();
+            self.stand.save_link();
+        }
+    }
+}
+
+fn epoch_due(seen: &mut HashMap<WindowId, u64>, win: WindowId, epoch: u64) -> bool {
+    if epoch == 0 || seen.get(&win).copied() == Some(epoch) {
+        return false;
+    }
+    seen.insert(win, epoch);
+    true
+}
+
+fn bind_field_local(g: &menu::Geom, w: f64) -> Option<Rect> {
+    let (laid, _) = menu::layout_rows(&menu::cabinet_rows(), 0, 0, 0);
+    let row = laid.iter().find(|lr| matches!(lr.row, menu::MenuRow::Bind))?;
+    let ry = g.content.y + row.y;
+    let field_h = 32.0;
+    let field_y = ry + (row.h - field_h) / 2.0;
+    let field_x = 108.0;
+    let button_x = menu::bind_button_x(w);
+    let field_w = (button_x - 8.0 - field_x).max(0.0);
+    Some(Rect::new(field_x, field_y, field_w, field_h))
+}
+
+/// Push the model into the store while the field is idle. While it is focused,
+/// the store is the text and the model follows it. `reset` clears both.
+fn sync_field(
+    cx: &mut PanelCx<'_, Vocab>,
+    id: &str,
+    rect: Rect,
+    placeholder: &str,
+    max: usize,
+    masked: bool,
+    value: &mut String,
+    reset: bool,
+) -> (bool, bool) {
+    let wid = WidgetId::from(id);
+    let push = !reset && !cx.view.is_focused(&wid);
+    if reset {
+        cx.widgets.coord.text_fields_mut().clear(&wid);
+        value.clear();
+    } else if push {
+        let differs = {
+            let fields = cx.widgets.coord.text_fields();
+            fields.has_field(&wid) && fields.text(&wid) != value.as_str()
+        };
+        if differs {
+            cx.widgets.coord.text_fields_mut().set_text(&wid, value);
+        }
+    }
+    let text_r = Rect::new(rect.x + 8.0, rect.y, (rect.width - 16.0).max(0.0), rect.height);
+    let config = if masked {
+        TextFieldConfig::password().with_max_len(max)
+    } else {
+        TextFieldConfig::text().with_max_len(max)
+    };
+    let resp = uzor_framework::widgets::kit::field(id, rect)
+        .placeholder(placeholder)
+        .font(14.0, "sans-serif")
+        .colors("#F4F4F5", "#6B6F7A")
+        .clip(true)
+        .text_rect(text_r)
+        .masked(masked)
+        .config(config)
+        .build(cx);
+    let changed = resp.focused && !reset && resp.text != *value;
+    if changed {
+        *value = resp.text;
+    }
+    (resp.focused, changed)
+}
+
+/// Open sheet from the top of the window. The chrome band is part of the
+/// sheet fill. Mode buttons are painted on that fill.
+fn open_geom(w: f64, h: f64, panel_h: f64) -> menu::Geom {
+    menu::geom_at(w, h, panel_h, 1, 0.0, CHROME_H, LIP)
+}
+
+fn mode_pair(width: f64) -> (Rect, Rect) {
+    let left = 4.0 + MARK + 8.0;
+    let right = width - 6.0 - GLYPH * 2.0 - 6.0 - 8.0;
+    let gap = 6.0;
+    let h = 26.0;
+    let y = (CHROME_H - h) / 2.0;
+    let w = ((right - left - gap) / 2.0).max(0.0);
+    (Rect::new(left, y, w, h), Rect::new(left + w + gap, y, w, h))
+}
+
+fn paint_modes(render: &mut dyn RenderContext, cab: Rect, solo: Rect, product: Product) {
+    paint_mode(render, cab, "кабинет", product == Product::Cabinet, true);
+    paint_mode(render, solo, "стенделон", product == Product::Standalone, false);
+}
+
+fn paint_mode(render: &mut dyn RenderContext, r: Rect, label: &str, on: bool, cabinet: bool) {
+    let color = if on { "#FBB26A" } else { "#878B91" };
+    render.set_stroke_color(color);
+    render.set_stroke_width(1.25);
+    render.set_line_dash(&[]);
+    render.stroke_rect(r.x + 0.5, r.y + 0.5, (r.width - 1.0).max(0.0), (r.height - 1.0).max(0.0));
+    let ix = r.x + 10.0;
+    let iy = r.y + (r.height - 14.0) / 2.0;
+    if cabinet {
+        render.stroke_rect(ix + 1.0, iy + 4.0, 12.0, 10.0);
+        render.begin_path();
+        render.move_to(ix, iy + 5.0);
+        render.line_to(ix + 7.0, iy);
+        render.line_to(ix + 14.0, iy + 5.0);
+        render.stroke();
+    } else {
+        render.stroke_rect(ix + 1.0, iy + 1.0, 12.0, 5.0);
+        render.stroke_rect(ix + 1.0, iy + 8.0, 12.0, 5.0);
+    }
+    render.set_fill_color(color);
+    render.set_font("13px sans-serif");
+    render.set_text_align(TextAlign::Center);
+    render.set_text_baseline(TextBaseline::Middle);
+    render.fill_text(label, r.x + r.width / 2.0 + 6.0, r.y + r.height / 2.0);
 }
 
 fn menu_rect() -> Rect {
@@ -691,6 +990,10 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             fell_back: false,
             stand: Stand::load(),
             adopted: String::new(),
+            pending_submit: None,
+            bind_reset_epoch: 0,
+            bind_reset_seen: HashMap::new(),
+            pass_reset_seen: HashMap::new(),
         },
         cfg,
         NativeOptions {

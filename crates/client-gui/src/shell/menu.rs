@@ -20,7 +20,6 @@ pub const MAX_FRAC: f64 = 0.96;
 
 // ── Palette ──────────────────────────────────────────────────────────────────────
 const BG: &str = "rgba(14,14,17,0.98)";
-const SCRIM: &str = "rgba(0,0,0,0.5)";
 const AMBER: &str = "#FBB26A";
 const FG: &str = "#F4F4F5";
 const MUTED: &str = "#878B91";
@@ -368,17 +367,18 @@ pub struct Geom {
 
 /// Compute container rects for a panel of height `panel_h` (px, below chrome)
 /// with `ntabs` equal-width tab columns. `top` is the sheet's top edge.
-/// `tab_h` is the tab row. iOS keeps [`TABBAR_H`] via [`geom`].
-pub fn geom_at(w: f64, h: f64, panel_h: f64, ntabs: usize, top: f64, tab_h: f64) -> Geom {
+/// `tab_h` is the tab row. `lip` is the bottom edge. iOS keeps [`TABBAR_H`]
+/// and [`SEP_H`] via [`geom`].
+pub fn geom_at(w: f64, h: f64, panel_h: f64, ntabs: usize, top: f64, tab_h: f64, lip: f64) -> Geom {
     let panel = Rect::new(0.0, top, w, panel_h);
     let tabbar = Rect::new(0.0, top, w, tab_h);
     let content = Rect::new(
         0.0,
         top + tab_h,
         w,
-        (panel_h - tab_h - SEP_H).max(0.0),
+        (panel_h - tab_h - lip).max(0.0),
     );
-    let sep = Rect::new(0.0, top + panel_h - SEP_H, w, SEP_H);
+    let sep = Rect::new(0.0, top + panel_h - lip, w, lip);
     let n = ntabs.max(1);
     let tw = w / n as f64;
     let tabs = (0..n)
@@ -389,7 +389,7 @@ pub fn geom_at(w: f64, h: f64, panel_h: f64, ntabs: usize, top: f64, tab_h: f64)
 }
 
 pub fn geom(w: f64, h: f64, panel_h: f64, ntabs: usize) -> Geom {
-    geom_at(w, h, panel_h, ntabs, MENU_TOP, TABBAR_H)
+    geom_at(w, h, panel_h, ntabs, MENU_TOP, TABBAR_H, SEP_H)
 }
 
 // ── Draw ───────────────────────────────────────────────────────────────────────
@@ -434,15 +434,9 @@ pub fn draw_menu(
     file_hover: bool,
     pointer: Option<(f64, f64)>,
 ) {
-    // Scrim over the rest of the app.
-    ctx.set_fill_color(SCRIM);
-    ctx.fill_rect(0.0, MENU_TOP, w, (h - MENU_TOP).max(0.0));
-
-    // Panel.
+    // Panel. The scene under the sheet stays as it is. No logo-color stripe.
     ctx.set_fill_color(BG);
     ctx.fill_rect(g.panel.x, g.panel.y, g.panel.width, g.panel.height);
-    ctx.set_fill_color(AMBER);
-    ctx.fill_rect(g.panel.x, g.panel.y, 2.0, g.panel.height);
 
     // ── Tab bar ──────────────────────────────────────────────────────────────
     for (i, tb) in tabs.iter().enumerate() {
@@ -492,11 +486,9 @@ pub fn draw_menu(
         ctx.fill_rect(w - 4.0, ty, 3.0, thumb_h);
     }
 
-    // ── Separator handle ────────────────────────────────────────────────────────
-    ctx.set_fill_color("rgba(255,255,255,0.06)");
-    ctx.fill_rect(g.sep.x, g.sep.y, g.sep.width, g.sep.height);
-    ctx.set_fill_color(DIMC);
-    ctx.fill_rect(w / 2.0 - 14.0, g.sep.y + g.sep.height / 2.0 - 1.0, 28.0, 2.0);
+    // Same hairline as the rule under the chrome. Not a drag handle.
+    ctx.set_fill_color(LINE);
+    ctx.fill_rect(0.0, g.panel.y + g.panel.height - 1.0, w, 1.0);
 
     if let Some(n) = note {
         draw_ticker(ctx, w, g, n, marquee, log, log_open);

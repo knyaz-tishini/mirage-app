@@ -36,6 +36,8 @@ pub struct Stand {
     pub focus: Focus,
     pub link: String,
     pub bus: Arc<InstallBus>,
+    /// Bumped when an install takes the password, so each window clears that field once.
+    pub pass_epoch: u64,
 }
 
 impl Stand {
@@ -49,6 +51,7 @@ impl Stand {
             focus: Focus::None,
             link: String::new(),
             bus: Arc::new(InstallBus::new()),
+            pass_epoch: 0,
         };
         if let Some(dir) = dir() {
             if let Ok(text) = std::fs::read_to_string(dir.join("host.json")) {
@@ -125,6 +128,10 @@ impl Stand {
         } else {
             self.stack.trim().to_owned()
         };
+        self.pass_epoch = self.pass_epoch.wrapping_add(1);
+        if self.pass_epoch == 0 {
+            self.pass_epoch = 1;
+        }
         provision::start(
             Job {
                 host,
@@ -237,19 +244,28 @@ pub fn register<S: uzor_framework::Spec>(
     stand: &mut Stand,
 ) {
     let rows = field_rects(g.content);
-    for (id, rect, focus) in &rows {
-        coord.register_atomic((*id).to_string(), WidgetKind::Button, at(*rect), Sense::CLICK, layer);
-        if view.clicked(&WidgetId::from(*id)) {
-            match *id {
+    for (id, rect, _) in &rows {
+        let hit = match *id {
+            "st-go" | "st-export" | "st-copy" => Some((*id, *rect)),
+            "st-stack" if stand.stack_auto => Some((*id, *rect)),
+            "st-stack" => Some((*id, Rect::new(rect.x, rect.y, 72.0, rect.height))),
+            _ => None,
+        };
+        let Some((hit_id, hit_rect)) = hit else {
+            continue;
+        };
+        coord.register_atomic(hit_id, WidgetKind::Button, at(hit_rect), Sense::CLICK, layer);
+        if view.clicked(&WidgetId::from(hit_id)) {
+            match hit_id {
                 "st-go" => stand.install(),
                 "st-export" => stand.export(),
                 "st-copy" => stand.copy_link(),
                 "st-stack" => {
                     stand.stack_auto = !stand.stack_auto;
-                    stand.focus = if stand.stack_auto { Focus::None } else { Focus::Stack };
+                    stand.focus = Focus::None;
                     stand.save_profile();
                 }
-                _ => stand.focus = *focus,
+                _ => {}
             }
         }
     }
@@ -261,7 +277,7 @@ pub fn content_height(has_link: bool) -> f64 {
     if has_link { fields + 12.0 + 168.0 } else { fields }
 }
 
-fn field_rects(content: Rect) -> Vec<(&'static str, Rect, Focus)> {
+pub fn field_rects(content: Rect) -> Vec<(&'static str, Rect, Focus)> {
     let mut y = content.y + 8.0;
     let x = content.x + 16.0;
     let w = (content.width - 32.0).max(0.0);
@@ -284,16 +300,12 @@ fn field_rects(content: Rect) -> Vec<(&'static str, Rect, Focus)> {
     out
 }
 
-pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, hot_sep: bool, note: Option<&str>) {
-    ctx.set_fill_color("rgba(0,0,0,0.5)");
-    let below = g.panel.y + g.panel.height;
-    ctx.fill_rect(0.0, below, g.panel.width, 4000.0);
+pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, _hot_sep: bool, note: Option<&str>) {
     ctx.set_fill_color("rgba(14,14,17,0.98)");
     ctx.fill_rect(g.panel.x, g.panel.y, g.panel.width, g.panel.height);
-    ctx.set_fill_color(AMBER);
-    ctx.fill_rect(g.panel.x, g.panel.y, 2.0, g.panel.height);
-    ctx.set_fill_color(if hot_sep { AMBER } else { "rgba(255,255,255,0.35)" });
-    ctx.fill_rect(g.sep.x + g.sep.width / 2.0 - 18.0, g.sep.y + g.sep.height / 2.0 - 1.0, 36.0, 2.0);
+    ctx.set_fill_color("rgba(255,255,255,0.08)");
+    ctx.fill_rect(0.0, g.tabbar.y + g.tabbar.height - 1.0, g.panel.width, 1.0);
+    ctx.fill_rect(0.0, g.panel.y + g.panel.height - 1.0, g.panel.width, 1.0);
 
     let rows = field_rects(g.content);
     let status = stand.status();
@@ -303,7 +315,7 @@ pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, hot_sep: bool
     ctx.set_text_align(TextAlign::Left);
     ctx.set_fill_color(DIM);
     if !line.is_empty() {
-        ctx.fill_text(&line, g.content.x + 16.0, g.tabbar.y + g.tabbar.height / 2.0);
+        ctx.fill_text(&line, g.content.x + 16.0, g.content.y + 4.0);
     }
     for (id, rect, _) in &rows {
         let (label, value, secret) = match *id {
@@ -339,17 +351,11 @@ pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, hot_sep: bool
         } else {
             ctx.set_fill_color(DIM);
             ctx.fill_text(label, rect.x + 8.0, rect.y + rect.height / 2.0);
-            ctx.set_fill_color(FG);
-            let shown: String = if secret {
-                "•".repeat(stand.pass.chars().count().min(24))
-            } else if *id == "st-stack" && !stand.stack_auto && !stand.stack.is_empty() {
-                stand.stack.clone()
-            } else if *id == "st-link" {
-                link_preview(&stand.link)
-            } else {
-                value.to_owned()
-            };
-            ctx.fill_text(&shown, rect.x + 72.0, rect.y + rect.height / 2.0);
+            if *id == "st-stack" && stand.stack_auto {
+                ctx.set_fill_color(FG);
+                ctx.fill_text(value, rect.x + 72.0, rect.y + rect.height / 2.0);
+            }
+            let _ = secret;
         }
     }
     if !stand.link.is_empty() {
