@@ -1464,8 +1464,8 @@
       if (sun && sun.alt <= 3) {
         var look = eyeLook(sun);
         ctx.globalAlpha = BASE;
-        paintEye(ctx, EYE_AT[0][0], EYE_AT[0][1], look);
-        paintEye(ctx, EYE_AT[1][0], EYE_AT[1][1], look);
+        // One baked stamp. A live ellipse is retessellated every frame and the slit changes shape.
+        ctx.drawImage(eyeStamp(skin, look), 0, 0);
       }
       ember(ctx, t, Math.max(a, 0.55), 621, 119, 0.55);
     }
