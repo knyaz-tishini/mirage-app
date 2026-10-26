@@ -17,6 +17,8 @@ mod dev;
 mod ios_host;
 mod nodes;
 #[cfg(not(target_os = "ios"))]
+mod camera;
+#[cfg(not(target_os = "ios"))]
 mod oasis;
 #[cfg(target_os = "ios")]
 mod render_backend;

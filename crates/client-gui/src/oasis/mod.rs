@@ -126,6 +126,9 @@ struct Oasis {
     pass_reset_seen: HashMap<WindowId, u64>,
     /// Windows that already applied [`Stand::clear_epoch`].
     clear_seen: HashMap<WindowId, u64>,
+    /// Windows that already pushed [`Stand::link_epoch`] into the link field.
+    link_force_seen: HashMap<WindowId, u64>,
+    scan: Option<crate::camera::CameraScan>,
 }
 
 impl Oasis {
@@ -202,7 +205,10 @@ impl App for Oasis {
             self.note = line;
         }
         self.stand.pull_bus();
-        self.sync_standalone_link();
+        self.poll_scan();
+        if !self.take_entrance() {
+            self.sync_standalone_link();
+        }
 
         let mut ui = self.ui.get(&win).cloned().unwrap_or_default();
         let panel_h = self.sheet_panel_h(h);
@@ -227,9 +233,13 @@ impl App for Oasis {
                 self.register_bind(cx.widgets.coord, &cx.view, &layer, &at, &g, w);
             } else {
                 stand::register(cx.widgets.coord, &cx.view, &layer, &at, &g, &mut self.stand);
+                if self.stand.take_scan_request() {
+                    self.scan = Some(crate::camera::CameraScan::start());
+                }
                 if self.stand.take_scope() {
                     self.apply_scope();
                 }
+                self.take_entrance();
             }
             if cx.view.clicked(&WidgetId::from("scrim")) {
                 ui.menu = false;
@@ -249,10 +259,24 @@ impl App for Oasis {
         hit(cx.widgets.coord, &id_menu, at(menu_r));
         hit(cx.widgets.coord, &id_min, at(min_r));
         hit(cx.widgets.coord, &id_close, at(close_r));
+        let mut scan_cancel = false;
+        if self.scan.is_some() {
+            hit(
+                cx.widgets.coord,
+                "scan-cancel",
+                at(Rect::new(0.0, CHROME_H, w, (h - CHROME_H).max(0.0))),
+            );
+            if cx.view.clicked(&WidgetId::from("scan-cancel")) {
+                scan_cancel = true;
+                self.scan = None;
+            }
+        }
         let menu_click = cx.view.clicked(&WidgetId::from(id_menu.as_str()));
         let min_click = cx.view.clicked(&WidgetId::from(id_min.as_str()));
         let close_click = cx.view.clicked(&WidgetId::from(id_close.as_str()));
-        if !ui.menu
+        if !scan_cancel
+            && self.scan.is_none()
+            && !ui.menu
             && cx.view.clicked(&WidgetId::from(HIT_SCENE))
             && !menu_click
             && !min_click
@@ -387,11 +411,15 @@ impl App for Oasis {
             }
         }
         paint_controls(render, w, pointer);
+        if let Some(scan) = self.scan.as_ref() {
+            crate::camera::draw_overlay(render, w, h, CHROME_H, scan);
+        }
         render.restore();
         if menu_now.menu {
             if let Some(id) = self.pending_submit.take() {
                 self.on_submit(&id);
             }
+            self.take_entrance();
             let g = open_geom(w, h, panel_h);
             self.mount_fields(cx, rect, &g);
         }
@@ -502,6 +530,48 @@ impl Oasis {
         self.engine.connect();
     }
 
+    fn poll_scan(&mut self) {
+        let outcome = self.scan.as_ref().map(|scan| scan.outcome());
+        match outcome {
+            Some(crate::camera::ScanOutcome::Done(raw)) => {
+                self.scan = None;
+                self.stand.accept_raw(&raw);
+            }
+            Some(crate::camera::ScanOutcome::Failed(err)) => {
+                self.scan = None;
+                self.note = err;
+            }
+            _ => {}
+        }
+    }
+
+    /// A camera, file, clipboard, or Enter replaced the link. JSON connects.
+    /// Anything else stays on the sheet as text and a QR.
+    fn take_entrance(&mut self) -> bool {
+        if !self.stand.take_relink() {
+            return false;
+        }
+        self.note.clear();
+        self.adopted.clear();
+        self.sync_standalone_link();
+        if !self.note.is_empty() {
+            let err = self.note.clone();
+            self.stand.say(&err);
+        }
+        let link = self.stand.link.trim();
+        if self.product == Product::Standalone
+            && !link.is_empty()
+            && link == self.adopted
+            && self.note.is_empty()
+        {
+            self.target = 1.0;
+            self.style = (self.toggles % 6) as f64;
+            self.toggles = self.toggles.wrapping_add(1);
+            self.raise_link();
+        }
+        true
+    }
+
     fn sync_standalone_link(&mut self) {
         if self.product != Product::Standalone {
             return;
@@ -539,7 +609,7 @@ impl Oasis {
     fn on_submit(&mut self, id: &str) {
         match id {
             "bind" => self.submit_bind(),
-            "st-link" => self.stand.save_link(),
+            "st-link" => self.stand.mark_relink(),
             "st-host" | "st-user" | "st-pass" => self.stand.install(),
             "st-site" => {
                 self.stand.commit_site();
@@ -699,6 +769,7 @@ impl Oasis {
             false,
             &mut self.bind_draft,
             reset,
+            false,
         );
         self.bind_focused = focused;
     }
@@ -718,6 +789,9 @@ impl Oasis {
         let mut wipe_clear =
             clear_epoch != 0 && self.clear_seen.get(&win).copied() != Some(clear_epoch);
         let specs = stand::fields(&self.stand, g.content);
+        let link_epoch = self.stand.link_epoch();
+        let mut force_link =
+            link_epoch != 0 && self.link_force_seen.get(&win).copied() != Some(link_epoch);
         let mut focus = stand::Focus::None;
         let mut profile = false;
         let mut link_changed = false;
@@ -733,6 +807,11 @@ impl Oasis {
                 self.clear_seen.insert(win, clear_epoch);
                 reset = true;
             }
+            let overwrite = spec.focus == stand::Focus::Link && force_link;
+            if overwrite {
+                force_link = false;
+                self.link_force_seen.insert(win, link_epoch);
+            }
             let Some(value) = self.stand.field_mut(spec.focus) else {
                 continue;
             };
@@ -745,6 +824,7 @@ impl Oasis {
                 spec.masked,
                 value,
                 reset,
+                overwrite,
             );
             if focused {
                 focus = spec.focus;
@@ -804,16 +884,17 @@ fn sync_field(
     masked: bool,
     value: &mut String,
     reset: bool,
+    overwrite: bool,
 ) -> (bool, bool) {
     let wid = WidgetId::from(id);
-    let push = !reset && !cx.view.is_focused(&wid);
+    let push = !reset && !overwrite && !cx.view.is_focused(&wid);
     if reset {
         cx.widgets.coord.text_fields_mut().clear(&wid);
         value.clear();
-    } else if push {
+    } else if overwrite || push {
         let differs = {
             let fields = cx.widgets.coord.text_fields();
-            fields.has_field(&wid) && fields.text(&wid) != value.as_str()
+            fields.has_field(&wid) && (overwrite || fields.text(&wid) != value.as_str())
         };
         if differs {
             cx.widgets.coord.text_fields_mut().set_text(&wid, value);
@@ -834,6 +915,10 @@ fn sync_field(
         .masked(masked)
         .config(config)
         .build(cx);
+    if overwrite {
+        cx.widgets.coord.text_fields_mut().set_text(&wid, value);
+        return (resp.focused, false);
+    }
     let changed = resp.focused && !reset && resp.text != *value;
     if changed {
         *value = resp.text;
@@ -1024,6 +1109,8 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             bind_reset_seen: HashMap::new(),
             pass_reset_seen: HashMap::new(),
             clear_seen: HashMap::new(),
+            link_force_seen: HashMap::new(),
+            scan: None,
         },
         cfg,
         NativeOptions {

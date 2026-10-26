@@ -1,8 +1,10 @@
 //! Standalone sheet. Four sections under the chrome divider: server, protocols,
-//! access (link, guests), connection (kill switch, dns, split). The install
-//! itself is [`super::provision`]. Password is never written. Kill switch and
-//! the split lists live in the profile; ports, MTU, stack, and dns go out in
-//! `server.env` on install. Guest shares are local files, not a server call.
+//! access (link, guests, camera / file / clipboard), connection (kill switch,
+//! dns, split). The install itself is [`super::provision`]. Password is never
+//! written. Kill switch and the split lists live in the profile; ports, MTU,
+//! stack, and dns go out in `server.env` on install. Guest shares are local
+//! files, not a server call. A raw link or config is stored as text. A JSON
+//! object is what the shell hands to the subscriber.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -111,6 +113,12 @@ pub struct Stand {
     pub clear_epoch: u64,
     /// Sites, apps, or the split side changed. The shell pushes `set_scope` and clears this.
     pub scope_dirty: bool,
+    /// The shell should drop the last adopt and read `link` again.
+    relink: bool,
+    /// Bumped when `link` is replaced from outside the field, so each window pushes it once.
+    link_epoch: u64,
+    /// The shell opens the camera on the next frame.
+    scan_request: bool,
 }
 
 impl Stand {
@@ -141,6 +149,9 @@ impl Stand {
             clear_which: Focus::None,
             clear_epoch: 0,
             scope_dirty: false,
+            relink: false,
+            link_epoch: 0,
+            scan_request: false,
         };
         if let Some(dir) = dir() {
             if let Ok(text) = std::fs::read_to_string(dir.join("host.json")) {
@@ -283,18 +294,27 @@ impl Stand {
     }
 
     pub fn pull_bus(&mut self) {
-        if let Some(link) = self.bus.link.lock().unwrap_or_else(|p| p.into_inner()).clone() {
-            if self.link != link {
-                self.link = link;
-            }
+        let published = self.bus.link.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let Some(link) = published else {
+            return;
+        };
+        if self.link == link {
+            return;
         }
+        self.link = link;
+        self.bump_link_epoch();
+        self.save_link();
+    }
+
+    pub fn link_epoch(&self) -> u64 {
+        self.link_epoch
     }
 
     pub fn status(&self) -> String {
         self.bus.text.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    fn say(&self, line: &str) {
+    pub fn say(&self, line: &str) {
         *self.bus.text.lock().unwrap_or_else(|p| p.into_inner()) = line.to_owned();
     }
 
@@ -594,7 +614,86 @@ impl Stand {
         }
         self.link = link.to_owned();
         self.focus = Focus::Link;
+        self.qr_guest = None;
+        self.relink = true;
+        self.bump_link_epoch();
         self.save_link();
+    }
+
+    pub fn mark_relink(&mut self) {
+        self.relink = true;
+    }
+
+    pub fn take_relink(&mut self) -> bool {
+        let relink = self.relink;
+        self.relink = false;
+        relink
+    }
+
+    pub fn request_scan(&mut self) {
+        self.scan_request = true;
+    }
+
+    pub fn take_scan_request(&mut self) -> bool {
+        let requested = self.scan_request;
+        self.scan_request = false;
+        requested
+    }
+
+    /// Store a link or a config as text. Empty and oversized payloads stay out of the field.
+    pub fn accept_raw(&mut self, raw: &str) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            self.say("пусто");
+            return;
+        }
+        if raw.len() > 256 * 1024 {
+            self.say("слишком длинно");
+            return;
+        }
+        if self.section != Section::Access {
+            self.section = Section::Access;
+            self.save_profile();
+        }
+        self.set_link(raw);
+        self.say(if raw.starts_with('{') { "конфиг принят" } else { "ссылка принята" });
+    }
+
+    pub fn import_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Конфиг или ссылка")
+            .add_filter("конфиг", &["json", "txt", "mirage", "conf", "vpn"])
+            .pick_file()
+        else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => self.accept_raw(&raw),
+            Err(_) => self.say("файл не читается"),
+        }
+    }
+
+    pub fn import_clipboard(&mut self) {
+        let mut clip = match arboard::Clipboard::new() {
+            Ok(clip) => clip,
+            Err(_) => {
+                self.say("буфер недоступен");
+                return;
+            }
+        };
+        if let Ok(text) = clip.get_text() {
+            if !text.trim().is_empty() {
+                self.accept_raw(&text);
+                return;
+            }
+        }
+        match clip.get_image() {
+            Ok(img) => match decode_qr_rgba(&img.bytes, img.width, img.height) {
+                Ok(raw) => self.accept_raw(&raw),
+                Err(err) => self.say(&err),
+            },
+            Err(_) => self.say("в буфере пусто"),
+        }
     }
 
     pub fn save_link(&self) {
@@ -677,6 +776,13 @@ impl Stand {
         }
     }
 
+    fn bump_link_epoch(&mut self) {
+        self.link_epoch = self.link_epoch.wrapping_add(1);
+        if self.link_epoch == 0 {
+            self.link_epoch = 1;
+        }
+    }
+
     fn copy_text(&self, text: &str) {
         if let Ok(mut clip) = arboard::Clipboard::new() {
             let _ = clip.set_text(text.to_owned());
@@ -729,6 +835,21 @@ fn dir() -> Option<std::path::PathBuf> {
     Some(exe.parent()?.join("standalone"))
 }
 
+fn decode_qr_rgba(rgba: &[u8], w: usize, h: usize) -> Result<String, String> {
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return Err("битый буфер картинки".into());
+    }
+    let mut prep = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| {
+        let i = (y * w + x) * 4;
+        let (r, g, b) = (rgba[i] as u32, rgba[i + 1] as u32, rgba[i + 2] as u32);
+        ((r * 299 + g * 587 + b * 114) / 1000) as u8
+    });
+    let grids = prep.detect_grids();
+    let grid = grids.first().ok_or("QR-код не найден на картинке")?;
+    let (_meta, content) = grid.decode().map_err(|e| format!("QR не читается: {e}"))?;
+    Ok(content)
+}
+
 fn split_host(raw: &str) -> Option<(String, u16)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -769,6 +890,9 @@ enum ButtonText {
     Remove,
     Export,
     Copy,
+    Scan,
+    File,
+    Clip,
     InviteConn,
     InviteFull,
 }
@@ -794,6 +918,9 @@ enum HitKind {
     Remove,
     Export,
     Copy,
+    Scan,
+    File,
+    Clip,
     Stack,
     Kill,
     Split,
@@ -876,6 +1003,27 @@ impl Lay {
         self.hit(right.0.to_owned(), b, right.2);
     }
 
+    fn thirds(
+        &mut self,
+        a: (&'static str, ButtonText, HitKind),
+        b: (&'static str, ButtonText, HitKind),
+        c: (&'static str, ButtonText, HitKind),
+    ) {
+        let y = self.y;
+        let gap = 8.0;
+        let w = ((self.w - gap * 2.0) / 3.0).max(0.0);
+        let ra = Rect::new(self.x, y, w, ROW_H);
+        let rb = Rect::new(self.x + w + gap, y, w, ROW_H);
+        let rc = Rect::new(self.x + (w + gap) * 2.0, y, w, ROW_H);
+        self.y += ROW;
+        self.rows.push(Row::Button { rect: ra, text: a.1 });
+        self.rows.push(Row::Button { rect: rb, text: b.1 });
+        self.rows.push(Row::Button { rect: rc, text: c.1 });
+        self.hit(a.0.to_owned(), ra, a.2);
+        self.hit(b.0.to_owned(), rb, b.2);
+        self.hit(c.0.to_owned(), rc, c.2);
+    }
+
     fn choice(&mut self, id: &'static str, label: &'static str, which: Choice, kind: HitKind) {
         let rect = self.row_rect();
         self.rows.push(Row::Choice { rect, label, which });
@@ -947,6 +1095,11 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
             lay.pair(
                 ("st-export", ButtonText::Export, HitKind::Export),
                 ("st-copy", ButtonText::Copy, HitKind::Copy),
+            );
+            lay.thirds(
+                ("st-scan", ButtonText::Scan, HitKind::Scan),
+                ("st-file", ButtonText::File, HitKind::File),
+                ("st-clip", ButtonText::Clip, HitKind::Clip),
             );
             lay.field("st-guest", "гость", Focus::Guest, "имя", 64, false);
             lay.pair(
@@ -1036,6 +1189,9 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Remove => stand.remove_remote(),
         HitKind::Export => stand.export(),
         HitKind::Copy => stand.copy_link(),
+        HitKind::Scan => stand.request_scan(),
+        HitKind::File => stand.import_file(),
+        HitKind::Clip => stand.import_clipboard(),
         HitKind::Stack => stand.toggle_stack(),
         HitKind::Kill => stand.cycle_kill(),
         HitKind::Split => stand.toggle_split(),
@@ -1236,6 +1392,9 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
         }
         ButtonText::Export => "экспорт",
         ButtonText::Copy => "копировать",
+        ButtonText::Scan => "сканер",
+        ButtonText::File => "файл",
+        ButtonText::Clip => "буфер",
         ButtonText::InviteConn => "подключение",
         ButtonText::InviteFull => "полный",
     }
