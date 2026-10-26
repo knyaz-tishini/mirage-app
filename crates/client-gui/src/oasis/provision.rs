@@ -594,6 +594,12 @@ const COMPOSE: &str = concat!(
     "      - server.env\n",
     "    volumes:\n",
     "      - m1r4g3-data:/data\n",
+    // The server reads its faces from the FILE, and the file lives next to
+    // this compose file. `env_file` only injects the variables into the
+    // process environment — the container never sees the file itself, and
+    // docker would create a directory in its place. So the file is mounted
+    // read-only at the path the server expects.
+    "      - /opt/m1r4g3/server.env:/opt/m1r4g3/server.env:ro\n",
     "volumes:\n",
     "  m1r4g3-data:\n",
 );
