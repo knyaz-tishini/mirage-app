@@ -1077,14 +1077,10 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     let (palm, pw, ph) = decode_png(include_bytes!("toon/palm-tall.png"))?;
     host.bind_bitmap("m1r4g3Skin", &rider, rw, rh, 0, true)?;
     host.bind_bitmap("m1r4g3PalmImage", &palm, pw, ph, 1, false)?;
-    // Logical points of the devices. Portraits on the primary work area.
-    // Landscapes on the monitor above it (work origin y = -1080).
+    // One phone. Each window builds its own wgpu device and vello Renderer.
     let phone = app_window("phone", 390, 844, 16, 16);
-    let ipad = app_window("ipad", 768, 1024, 422, 8);
-    let phone_land = app_window("phone-land", 844, 390, 16, -1064);
-    let ipad_land = app_window("ipad-land", 1024, 768, 876, -1064);
     let cfg = RuntimeConfig {
-        windows: vec![phone, ipad, phone_land, ipad_land],
+        windows: vec![phone],
         tokens: Tokens::builtin(BuiltinSet::Dark),
         dark: true,
         ..RuntimeConfig::default()
