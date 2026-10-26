@@ -17,7 +17,7 @@ use uzor::render::{AnimParams, AnimScript, RenderContext, TextAlign, TextBaselin
 use uzor::tokens::{BuiltinSet, Tokens};
 use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
-use uzor_framework::host::native::{NativeOptions, TraySpec, run_native};
+use uzor_framework::host::native::{NativeOptions, RenderPreference, TraySpec, run_native};
 use uzor_framework::{
     App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
     KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig, SizePx,
@@ -1115,6 +1115,11 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         },
         cfg,
         NativeOptions {
+            // Autodetect on a discrete GPU stays VelloGpu. TinySkia is the
+            // native canvas: calls land in one pixmap, the GPU only presents it.
+            render: RenderPreference {
+                backend: Some(uzor::RenderBackend::TinySkia),
+            },
             tray: Some(TraySpec {
                 tooltip: Some("m1r4g3".into()),
                 icon: Some(palm_icon(PALM_TRAY_W, PALM_TRAY)),
