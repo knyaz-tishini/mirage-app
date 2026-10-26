@@ -1185,8 +1185,9 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     run_native(
         Oasis {
             host,
-            link: 1.0,
-            target: 1.0,
+            // Off is the empty desert. The rider is the connection, not the boot picture.
+            link: 0.0,
+            target: 0.0,
             style: 0.0,
             toggles: 0,
             scratch: Vec::new(),

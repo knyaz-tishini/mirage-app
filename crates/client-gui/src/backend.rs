@@ -538,10 +538,24 @@ fn find_tun_bin(subscriber: &std::path::Path) -> Option<PathBuf> {
 }
 
 fn subscriber_bin() -> std::io::Result<PathBuf> {
+    let name = format!("mirage-subscriber-client{}", std::env::consts::EXE_SUFFIX);
+    if let Some(path) = env_path("MIRAGE_SUBSCRIBER_CLIENT") {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
     let dir = exe_dir()?;
-    Ok(env_path("MIRAGE_SUBSCRIBER_CLIENT").unwrap_or_else(|| {
-        dir.join(format!("mirage-subscriber-client{}", std::env::consts::EXE_SUFFIX))
-    }))
+    let sibling = dir.join(&name);
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    // The GUI binary sits in crates/client-gui/target/release. The subscriber
+    // build is the workspace release, four levels up.
+    let nested = dir.join("../../../../target/release").join(&name);
+    if nested.is_file() {
+        return Ok(nested);
+    }
+    Ok(sibling)
 }
 
 /// Redeemed device file next to the GUI. This is the only credential the child gets.
