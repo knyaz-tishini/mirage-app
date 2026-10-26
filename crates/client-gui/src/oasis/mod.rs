@@ -1115,10 +1115,10 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         },
         cfg,
         NativeOptions {
-            // Autodetect on a discrete GPU stays VelloGpu. TinySkia is the
-            // native canvas: calls land in one pixmap, the GPU only presents it.
+            // UrxWgpu draws fillRect as quads and drawImage as textured
+            // quads or triangles. The GPU assembles the scene.
             render: RenderPreference {
-                backend: Some(uzor::RenderBackend::TinySkia),
+                backend: Some(uzor::RenderBackend::UrxWgpu),
             },
             tray: Some(TraySpec {
                 tooltip: Some("m1r4g3".into()),
