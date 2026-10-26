@@ -1,6 +1,6 @@
 //! m1r4g3 desktop shell. The oasis scene fills the window. Chrome is a
-//! transparent overlay: a stroked amber palm (no fill) on the left, and
-//! minimize / close on the right drawn like a system caption. The empty
+//! transparent overlay: the palm logo on the left, drawn from assets/palm.svg,
+//! and minimize / close on the right drawn like a system caption. The empty
 //! band drags the window while the sheet is closed. An open sheet fills
 //! from the top, including the chrome band, and does not dim the scene.
 //! Cabinet and standalone sit on that fill, level with the palm and the
@@ -27,6 +27,7 @@ use uzor_framework::{
 use crate::backend::{EngineLink, LocalHttp};
 use crate::shell::menu::{self, MenuTab};
 
+mod palm_mark;
 mod provision;
 mod stand;
 
@@ -39,10 +40,12 @@ const CHROME_H: f64 = 32.0 * SCALE;
 const MARK: f64 = 28.0 * SCALE;
 const GLYPH: f64 = 22.0 * SCALE;
 const LIP: f64 = 1.0;
-const PALM_W: u32 = 256;
-const PALM: &[u8] = include_bytes!("palm256.rgba");
-const PALM_TRAY_W: u32 = 32;
-const PALM_TRAY: &[u8] = include_bytes!("palm32.rgba");
+// Straight RGBA of assets/palm.svg at 64. The caption slot is ICON_SMALL:
+// a 256 bitmap there is what Windows crushes. The exe icon carries
+// 16/32/48/64/128/256 from the same vectors for the taskbar and Alt-Tab.
+// The menu mark itself is the SVG, not this bitmap.
+const PALM_W: u32 = 64;
+const PALM: &[u8] = include_bytes!("palm64.rgba");
 
 #[derive(Clone, Copy, Debug)]
 struct Scene;
@@ -405,12 +408,7 @@ impl App for Oasis {
             let (mode_cab, mode_std) = mode_pair(w);
             paint_modes(render, mode_cab, mode_std, self.product);
         }
-        if let Err(err) = paint_menu(render, &self.host, &mut self.scratch, now) {
-            if !self.paint_err {
-                eprintln!("menu paint: {err}");
-                self.paint_err = true;
-            }
-        }
+        paint_menu(render);
         paint_controls(render, w, pointer);
         if let Some(scan) = self.scan.as_ref() {
             crate::camera::draw_overlay(render, w, h, CHROME_H, scan);
@@ -1084,24 +1082,9 @@ fn palm_icon(px: u32, bytes: &[u8]) -> RgbaIcon {
     RgbaIcon::from_rgba(px, px, bytes.to_vec())
 }
 
-fn paint_menu(
-    render: &mut dyn RenderContext,
-    host: &JsAnimHost,
-    scratch: &mut Vec<f64>,
-    now: f64,
-) -> Result<(), uzor::render::AnimScriptError> {
+fn paint_menu(render: &mut dyn RenderContext) {
     let r = menu_rect();
-    render.save();
-    render.translate(r.x, r.y);
-    let mut anim = host.anim("chrome");
-    let painted = anim.paint(
-        render,
-        now,
-        &AnimParams { w: r.width, h: r.height, seed: 3, mouse: None, args: [0.0; 8] },
-        scratch,
-    );
-    render.restore();
-    painted
+    palm_mark::paint(render, r.x, r.y, r.width, r.height);
 }
 
 fn paint_controls(render: &mut dyn RenderContext, width: f64, pointer: Option<(f64, f64)>) {
@@ -1163,12 +1146,8 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     host.load(include_str!("figures.js"))?;
     host.load(include_str!("toon/toon-skin.js"))?;
     host.load(include_str!("toon/scene.js"))?;
-    host.load(include_str!("chrome.js"))?;
     if !host.has("desert") {
         return Err("oasis: desert anim was not registered".into());
-    }
-    if !host.has("chrome") {
-        return Err("oasis: chrome anim was not registered".into());
     }
     let (rider, rw, rh) = decode_png(include_bytes!("toon/rider-toon.png"))?;
     let (palm, pw, ph) = decode_png(include_bytes!("toon/palm-tall.png"))?;
@@ -1221,7 +1200,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             },
             tray: Some(TraySpec {
                 tooltip: Some("m1r4g3".into()),
-                icon: Some(palm_icon(PALM_TRAY_W, PALM_TRAY)),
+                icon: Some(palm_icon(PALM_W, PALM)),
                 items: Vec::new(),
             }),
             ..NativeOptions::default()
