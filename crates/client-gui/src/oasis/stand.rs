@@ -41,11 +41,18 @@ const REVOKE_W: f64 = 72.0;
 /// Two rules the server enforces on this list, and the menu has to honour
 /// them or the install fails on the box:
 ///
-/// * **No two entries share a port.** The server binds one face per port and
-///   refuses a duplicate, so the defaults are distinct: a user who switches
-///   two protocols on gets two faces, not a collision.
+/// * **No two entries share a port ON THE SAME TRANSPORT.** The server binds
+///   one face per port and refuses a duplicate. The same port NUMBER on TCP
+///   and on UDP is not a duplicate — those are separate socket spaces, and an
+///   ordinary server serves HTTPS on TCP 443 and QUIC on UDP 443.
 /// * **At least one TCP face.** The subscriber client dials TCP entrances
 ///   only — a box with nothing but datagram faces has nothing to dial.
+///
+/// `quic` is the UDP id for the port where QUIC usually lives. It is named
+/// after the PORT's neighbourhood, not after the wire shape: with no mask
+/// named it is the perimeter's datagram door, and with a QUIC mask named
+/// (`{ID}_MASK`) it is an endpoint the node holds, speaking real QUIC
+/// outside and Mirage inside.
 const CATALOG: &[(&str, &str, &str, bool)] = &[
     ("cloak", "443", "", true),
     ("xray", "8443", "", false),
@@ -55,6 +62,29 @@ const CATALOG: &[(&str, &str, &str, bool)] = &[
     ("wireguard", "3478", "1420", false),
     ("openvpn", "5060", "", false),
     ("ikev2", "5349", "", false),
+    ("quic", "443", "", false),
+];
+
+/// Which catalogue id each kind of proposed face wears.
+///
+/// The id is a SLOT NAME, not a description: the mask written next to it in
+/// `server.env` is what the traffic actually looks like. The pools are the
+/// catalogue's own ids, grouped by the kind of face they name, so a proposal
+/// lands on ids the server already knows.
+///
+/// The kinds are the mask's own serde tag — `web_socket`, `wire_guard` and
+/// the rest are spelled the way `TransportCamouflage` serializes them, not
+/// the way its `label()` prints them.
+const ID_POOLS: &[(&str, &[&str])] = &[
+    ("tls_real", &["cloak", "xray"]),
+    ("web_socket", &["shadowsocks"]),
+    ("xhttp", &["socks5"]),
+    ("quic", &["quic"]),
+    ("http3", &["quic"]),
+    ("web_transport", &["quic"]),
+    ("wire_guard", &["quic"]),
+    ("hysteria2", &["quic"]),
+    ("raw_udp", &["quic", "awg", "wireguard", "openvpn", "ikev2"]),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +123,17 @@ pub struct Proto {
     pub on: bool,
     pub port: String,
     pub mtu: String,
+    /// The mask this face wears, as the JSON the server reads it back from.
+    ///
+    /// Empty means "no mask named" — the server derives one from the port,
+    /// the way it always did. Filled means the person (or the box's own
+    /// proposal) named the mask, and it is written into `server.env` as it
+    /// stands.
+    pub mask: String,
+    /// Why this face is offered, in the operator's language.
+    ///
+    /// The box's own proposal says it; the catalogue's own rows have none.
+    pub why: String,
 }
 
 struct Guest {
@@ -136,6 +177,9 @@ pub struct Stand {
     link_epoch: u64,
     /// The shell opens the camera on the next frame.
     scan_request: bool,
+    /// The box has offered its faces, and the list on screen is the
+    /// person's answer to that offer.
+    pub faces_from_box: bool,
 }
 
 impl Stand {
@@ -169,6 +213,7 @@ impl Stand {
             relink: false,
             link_epoch: 0,
             scan_request: false,
+            faces_from_box: false,
         };
         if let Some(dir) = dir() {
             if let Ok(text) = std::fs::read_to_string(dir.join("host.json")) {
@@ -209,6 +254,9 @@ impl Stand {
                             }
                             if let Some(mtu) = item.get("mtu").and_then(|s| s.as_str()) {
                                 proto.mtu = mtu.to_owned();
+                            }
+                            if let Some(mask) = item.get("mask").and_then(|s| s.as_str()) {
+                                proto.mask = mask.to_owned();
                             }
                         }
                     }
@@ -273,6 +321,7 @@ impl Stand {
                     "on": p.on,
                     "port": p.port,
                     "mtu": p.mtu,
+                    "mask": p.mask,
                 })
             })
             .collect();
@@ -311,6 +360,10 @@ impl Stand {
     }
 
     pub fn pull_bus(&mut self) {
+        let faces = self.bus.faces.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(faces) = faces {
+            self.apply_faces(&faces);
+        }
         let published = self.bus.link.lock().unwrap_or_else(|p| p.into_inner()).take();
         let Some(link) = published else {
             return;
@@ -321,6 +374,56 @@ impl Stand {
         self.link = link;
         self.bump_link_epoch();
         self.save_link();
+    }
+
+    /// Put the box's proposal into the protocol list.
+    ///
+    /// The box says what it COULD publish; this is where the person looks at
+    /// it. Every proposed face lands in the list switched ON — the box
+    /// checked these ports, and the person turns off what they do not want.
+    /// The catalogue's own rows that the proposal did not name stay in the
+    /// list, switched OFF, for a person who wants something else.
+    pub fn apply_faces(&mut self, faces: &[provision::ProposedFace]) {
+        let mut taken: Vec<&'static str> = Vec::new();
+        let mut applied = Vec::new();
+        for face in faces {
+            let Some(id) = id_for_face(face, &taken) else {
+                continue;
+            };
+            taken.push(id);
+            applied.push(Proto {
+                id,
+                on: true,
+                port: face.port.to_string(),
+                mtu: String::new(),
+                mask: face.mask.clone(),
+                why: face.why.clone(),
+            });
+        }
+        if applied.is_empty() {
+            self.say("бокс не предложил ни одного лица");
+            return;
+        }
+        // The proposed rows go first — they are what the box can do now —
+        // and the catalogue's own rows follow, switched off, for a person
+        // who wants something else.
+        let mut ordered = applied;
+        for proto in &self.protocols {
+            if ordered.iter().any(|p| p.id == proto.id) {
+                continue;
+            }
+            ordered.push(Proto {
+                id: proto.id,
+                on: false,
+                port: proto.port.clone(),
+                mtu: proto.mtu.clone(),
+                mask: String::new(),
+                why: String::new(),
+            });
+        }
+        self.protocols = ordered;
+        self.faces_from_box = true;
+        self.save_profile();
     }
 
     pub fn link_epoch(&self) -> u64 {
@@ -386,6 +489,11 @@ impl Stand {
             if !proto.mtu.trim().is_empty() {
                 lines.push(format!("{key}_MTU={}", proto.mtu.trim()));
             }
+            // The mask, when one was named. The server reads it back as the
+            // JSON the box wrote, and points it at this face's own port.
+            if !proto.mask.trim().is_empty() {
+                lines.push(format!("{key}_MASK={}", proto.mask.trim()));
+            }
         }
         if !self.dns.trim().is_empty() {
             lines.push(format!("DNS={}", self.dns.trim()));
@@ -425,6 +533,9 @@ impl Stand {
                 password: std::mem::take(&mut self.pass),
                 stack,
                 env,
+                // The first press asks the box what it could publish; the
+                // second one installs with the faces the person chose.
+                ask_faces: !self.faces_from_box,
             },
             Arc::clone(&self.bus),
         );
@@ -789,6 +900,27 @@ impl Stand {
         self.protocols.iter().position(|p| p.id == self.stack)
     }
 
+    /// Why the box offered the face the person is looking at.
+    ///
+    /// The face the person is on, if there is one; otherwise the first
+    /// proposed face that is switched on. Only proposed faces carry a
+    /// reason — the catalogue's own rows do not, and there is nothing to
+    /// say about them.
+    fn active_why(&self) -> Option<String> {
+        let proto = match self.active_index() {
+            Some(index) => self.protocols.get(index),
+            None => self
+                .protocols
+                .iter()
+                .find(|p| p.on && !p.why.trim().is_empty()),
+        }?;
+        let why = proto.why.trim();
+        if why.is_empty() {
+            return None;
+        }
+        Some(why.to_owned())
+    }
+
     fn bump_clear(&mut self, which: Focus) {
         self.clear_which = which;
         self.clear_epoch = self.clear_epoch.wrapping_add(1);
@@ -819,8 +951,32 @@ fn default_protocols() -> Vec<Proto> {
             on: *on,
             port: (*port).to_owned(),
             mtu: (*mtu).to_owned(),
+            mask: String::new(),
+            why: String::new(),
         })
         .collect()
+}
+
+/// The catalogue id a proposed face wears.
+///
+/// The mask's own kind picks the pool (`tls_real` wears `cloak` or `xray`,
+/// and so on), and the first id in that pool that nobody has taken yet is
+/// the one. A kind the pools do not know falls back to the first free
+/// catalogue id of all, so a face is never dropped for want of a name.
+fn id_for_face(face: &provision::ProposedFace, taken: &[&'static str]) -> Option<&'static str> {
+    let kind = serde_json::from_str::<serde_json::Value>(&face.mask)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+        .unwrap_or_default();
+    if let Some((_, pool)) = ID_POOLS.iter().find(|(name, _)| *name == kind) {
+        if let Some(id) = pool.iter().copied().find(|id| !taken.contains(id)) {
+            return Some(id);
+        }
+    }
+    CATALOG
+        .iter()
+        .map(|(id, ..)| *id)
+        .find(|id| !taken.contains(id))
 }
 
 fn section_key(section: Section) -> &'static str {
@@ -829,6 +985,59 @@ fn section_key(section: Section) -> &'static str {
         Section::Protocols => "protocols",
         Section::Access => "access",
         Section::Link => "link",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A proposed face, as the box would write it.
+    fn face(mask: &str, port: u16) -> provision::ProposedFace {
+        provision::ProposedFace {
+            port,
+            transport: "tcp".to_owned(),
+            mask: mask.to_owned(),
+            why: "why".to_owned(),
+        }
+    }
+
+    /// The two TLS faces take the two TLS ids, in order.
+    #[test]
+    fn two_tls_faces_take_the_two_tls_ids() {
+        let first = face(r#"{"type":"tls_real","sni":"a.example","alpn":["h2"]}"#, 443);
+        let second = face(r#"{"type":"tls_real","sni":"a.example","alpn":["h2"]}"#, 8443);
+        let mut taken: Vec<&'static str> = Vec::new();
+        let one = id_for_face(&first, &taken).expect("an id");
+        taken.push(one);
+        let two = id_for_face(&second, &taken).expect("an id");
+        assert_eq!((one, two), ("cloak", "xray"));
+    }
+
+    /// The mask's kind picks the id — a WebSocket face is not a TLS face,
+    /// whatever port it sits on.
+    #[test]
+    fn the_kind_picks_the_id() {
+        let websocket = face(r#"{"type":"web_socket","path":"/","host":"a.example"}"#, 80);
+        let xhttp = face(r#"{"type":"xhttp","path":"/","host":"a.example"}"#, 8080);
+        let quic = face(r#"{"type":"quic","alpn":["h3"],"bind_addr":"0.0.0.0:443"}"#, 443);
+        let taken: Vec<&'static str> = Vec::new();
+        assert_eq!(id_for_face(&websocket, &taken), Some("shadowsocks"));
+        assert_eq!(id_for_face(&xhttp, &taken), Some("socks5"));
+        assert_eq!(id_for_face(&quic, &taken), Some("quic"));
+    }
+
+    /// Every id a face can get is one the server already knows.
+    #[test]
+    fn every_id_is_a_catalogue_id() {
+        for (_, pool) in ID_POOLS {
+            for id in *pool {
+                assert!(
+                    CATALOG.iter().any(|(catalog, ..)| catalog == id),
+                    "{id} is not in the catalogue"
+                );
+            }
+        }
     }
 }
 
@@ -929,6 +1138,7 @@ enum Row {
     Button { rect: Rect, text: ButtonText },
     Choice { rect: Rect, label: &'static str, which: Choice },
     Proto { rect: Rect, index: usize, toggle: Rect },
+    Note { rect: Rect, text: String },
     Guest { rect: Rect, index: usize, revoke: Rect },
     Entry { rect: Rect, index: usize, site: bool },
     Line { x: f64, y: f64 },
@@ -1061,6 +1271,13 @@ impl Lay {
         self.hit(format!("st-p{index}-on"), toggle, HitKind::ProtoOn(index));
     }
 
+    /// A line of explanation under the list — the box's own reason for the
+    /// face the person is looking at.
+    fn note(&mut self, text: String) {
+        let rect = self.row_rect();
+        self.rows.push(Row::Note { rect, text });
+    }
+
     fn guest(&mut self, index: usize) {
         let rect = self.row_rect();
         let revoke_w = REVOKE_W.min(rect.width);
@@ -1109,6 +1326,13 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
             if stand.active_index().is_some() {
                 lay.field("st-port", "порт", Focus::Port, "порт", 8, false);
                 lay.field("st-mtu", "mtu", Focus::Mtu, "mtu", 5, false);
+                // The box's own reason for the face the person is on. It is
+                // the sentence that says what this port looks like from
+                // outside — and, when the port was not the one first in
+                // mind, what happened to it.
+                if let Some(why) = stand.active_why() {
+                    lay.note(why);
+                }
             }
         }
         Section::Access => {
@@ -1344,10 +1568,25 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             ctx.set_text_align(TextAlign::Left);
             ctx.set_fill_color(if active { AMBER } else { FG });
             ctx.fill_text(proto.id, rect.x + 8.0, rect.y + rect.height / 2.0);
+            // The port this face is on — the thing the person is choosing.
+            if !proto.port.trim().is_empty() {
+                ctx.set_fill_color(DIM);
+                let port = format!(":{}", proto.port.trim());
+                ctx.fill_text(&port, rect.x + LABEL_W, rect.y + rect.height / 2.0);
+            }
             ctx.set_text_align(TextAlign::Center);
             ctx.set_fill_color(if proto.on { AMBER } else { DIM });
             let word = if proto.on { "вкл" } else { "выкл" };
             ctx.fill_text(word, toggle.x + toggle.width / 2.0, toggle.y + toggle.height / 2.0);
+        }
+        Row::Note { rect, text } => {
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_fill_color(DIM);
+            ctx.fill_text(
+                &short(text, 96),
+                rect.x + 8.0,
+                rect.y + rect.height / 2.0,
+            );
         }
         Row::Guest { rect, index, revoke } => {
             let Some(guest) = stand.guests.get(*index) else {

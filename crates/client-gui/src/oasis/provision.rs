@@ -11,6 +11,20 @@
 //!
 //! The password is moved into the worker and dropped after the key is on
 //! the host. It is not written to disk and not put in the status line.
+//!
+//! # Two steps, in this order
+//!
+//! The set of faces a box publishes is a **human** decision, so the install
+//! is two steps and not one:
+//!
+//! 1. **Ask.** The box is asked what it could publish — which ports are
+//!    free on it — and answers with a proposal. Nothing is published yet.
+//! 2. **Choose.** The person looks at the proposal, turns the faces they do
+//!    not want off, and the install goes on with what is left.
+//!
+//! The first press of "install" does step 1 and stops there; the second one
+//! does step 2. The image, the compose file, the volume and the
+//! `m1r4g3-link <LINK>` line are the same in both.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,10 +43,43 @@ use tokio::io::AsyncWriteExt;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// The marker the face proposal is printed between, so that whatever else
+/// the box says on stdout cannot be mistaken for a proposal.
+const FACES_BEGIN: &str = "m1r4g3-faces-begin";
+/// The closing marker of the proposal block.
+const FACES_END: &str = "m1r4g3-faces-end";
+
+/// One face the box offered, as read from the box's proposal file.
+///
+/// The mask is the JSON the server's `TransportCamouflage` serializes to,
+/// kept as text: the client does not need to understand it, it only writes
+/// it back into `server.env` unchanged.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProposedFace {
+    /// The port the face would sit on.
+    pub port: u16,
+    /// The transport: `tcp` or `udp`.
+    pub transport: String,
+    /// The mask, as JSON.
+    pub mask: String,
+    /// Why the box offered this face.
+    pub why: String,
+}
+
+/// The proposal file the box writes.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FaceProposal {
+    /// One entry per face.
+    #[serde(rename = "face")]
+    faces: Vec<ProposedFace>,
+}
+
 pub struct InstallBus {
     pub running: std::sync::atomic::AtomicBool,
     pub text: Mutex<String>,
     pub link: Mutex<Option<String>>,
+    /// The faces the box offered, waiting for the person to choose.
+    pub faces: Mutex<Option<Vec<ProposedFace>>>,
 }
 
 impl InstallBus {
@@ -41,6 +88,7 @@ impl InstallBus {
             running: std::sync::atomic::AtomicBool::new(false),
             text: Mutex::new(String::new()),
             link: Mutex::new(None),
+            faces: Mutex::new(None),
         }
     }
 }
@@ -53,6 +101,19 @@ pub struct Job {
     pub stack: String,
     /// Full `server.env` body. Empty keeps the single `STACK=` line.
     pub env: String,
+    /// Ask the box what it could publish and stop there.
+    ///
+    /// The first press of "install" asks; the second one installs with the
+    /// faces the person chose.
+    pub ask_faces: bool,
+}
+
+/// What one install step ended with.
+enum Outcome {
+    /// The box answered what it could offer. The person now chooses.
+    Faces(Vec<ProposedFace>),
+    /// The box is up, and this is the customer's link.
+    Link(String),
 }
 
 pub fn start(job: Job, bus: Arc<InstallBus>) {
@@ -67,7 +128,11 @@ pub fn start(job: Job, bus: Arc<InstallBus>) {
             Err(err) => Err(format!("runtime: {err}")),
         };
         match outcome {
-            Ok(link) => {
+            Ok(Outcome::Faces(faces)) => {
+                *bus.faces.lock().unwrap_or_else(|p| p.into_inner()) = Some(faces);
+                set_text(&bus, "бокс предложил лица — проверьте их и нажмите «установить» ещё раз");
+            }
+            Ok(Outcome::Link(link)) => {
                 *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(link);
                 set_text(&bus, "сервер поднят");
             }
@@ -124,7 +189,7 @@ fn set_text(bus: &InstallBus, line: &str) {
     *bus.text.lock().unwrap_or_else(|p| p.into_inner()) = line.to_owned();
 }
 
-async fn install(job: Job, bus: &InstallBus) -> Result<String, String> {
+async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
     let dir = state_dir()?;
     let key_path = dir.join("server.key");
     let pub_path = dir.join("server.pub");
@@ -163,11 +228,61 @@ async fn install(job: Job, bus: &InstallBus) -> Result<String, String> {
     };
     upload(&session, env.as_bytes(), &format!("{remote}/server.env")).await?;
     upload(&session, INSTALL_SH.as_bytes(), &format!("{remote}/install.sh")).await?;
+
+    // The image goes up once. The second press of "install" must not push a
+    // hundred megabytes again to change one port.
     if let Some(tar) = image_tar() {
         set_text(bus, "образ");
-        let bytes = fs::read(&tar).map_err(|e| format!("image tar: {e}"))?;
-        upload(&session, &bytes, &format!("{remote}/image.tar")).await?;
+        if !remote_has(&session, &format!("{remote}/image.tar")).await {
+            let bytes = fs::read(&tar).map_err(|e| format!("image tar: {e}"))?;
+            upload(&session, &bytes, &format!("{remote}/image.tar")).await?;
+        }
     }
+
+    if job.ask_faces {
+        // Step one: the box is asked what it could publish. Nothing is
+        // published yet — the person chooses, and the second press carries
+        // the choice out.
+        upload(&session, FACES_SH.as_bytes(), &format!("{remote}/faces.sh")).await?;
+        set_text(bus, "бокс смотрит свои порты");
+        let out = tokio::time::timeout(
+            INSTALL_TIMEOUT,
+            exec(&session, &format!("sh {remote}/faces.sh")),
+        )
+        .await
+        .map_err(|_| "предложение лиц дольше 15 минут".to_owned())??;
+        let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+        if out.exit.unwrap_or(1) != 0 {
+            let err = out
+                .stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            return Err(if err.is_empty() {
+                format!("бокс не ответил предложением (exit {:?})", out.exit)
+            } else {
+                format!("бокс не ответил предложением: {err}")
+            });
+        }
+        return Ok(Outcome::Faces(parse_faces(&out.stdout).map_err(|err| {
+            // The box's own words about WHY it could not answer are more
+            // useful than the client's summary of an empty answer.
+            let last = out
+                .stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            if last.is_empty() {
+                err
+            } else {
+                format!("{err}: {last}")
+            }
+        })?));
+    }
+
+    // Step two: the box comes up with the faces the person chose.
     set_text(bus, "контейнер");
     let out = tokio::time::timeout(
         INSTALL_TIMEOUT,
@@ -190,7 +305,54 @@ async fn install(job: Job, bus: &InstallBus) -> Result<String, String> {
             }
         })?;
     fs::write(dir.join("link.txt"), link).map_err(|e| format!("save link: {e}"))?;
-    Ok(link.to_owned())
+    Ok(Outcome::Link(link.to_owned()))
+}
+
+/// Read the proposal out of the box's answer.
+///
+/// The proposal is printed between two markers, because the box says other
+/// things on the same stream — `docker load` writes to stdout too, and a
+/// proposal that swallowed a docker banner would be a proposal nobody could
+/// trust.
+fn parse_faces(stdout: &str) -> Result<Vec<ProposedFace>, String> {
+    let mut inside = false;
+    let mut body = String::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == FACES_BEGIN {
+            inside = true;
+            continue;
+        }
+        if line == FACES_END {
+            break;
+        }
+        if inside {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if body.trim().is_empty() {
+        return Err("бокс не прислал предложение лиц".into());
+    }
+    parse_proposal(&body)
+}
+
+/// Read the proposal file the box writes.
+fn parse_proposal(text: &str) -> Result<Vec<ProposedFace>, String> {
+    let proposal: FaceProposal =
+        toml::from_str(text).map_err(|e| format!("предложение лиц не прочитано: {e}"))?;
+    if proposal.faces.is_empty() {
+        return Err("бокс не прислал ни одного лица".into());
+    }
+    Ok(proposal.faces)
+}
+
+/// Whether the box already has that file.
+async fn remote_has(session: &client::Handle<Handler>, path: &str) -> bool {
+    match exec(session, &format!("test -f {path}")).await {
+        Ok(out) => out.exit == Some(0),
+        Err(_) => false,
+    }
 }
 
 fn state_dir() -> Result<PathBuf, String> {
@@ -436,7 +598,13 @@ const COMPOSE: &str = concat!(
     "  m1r4g3-data:\n",
 );
 
-const INSTALL_SH: &str = r#"#!/bin/sh
+/// Step one: ask the box what it could publish.
+///
+/// The proposal is printed between two markers, because the box says other
+/// things on the same stream. `docker load` writes to stdout as well, and a
+/// proposal that swallowed a docker banner would be a proposal nobody could
+/// trust.
+const FACES_SH: &str = r#"#!/bin/sh
 set -eu
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 if ! command -v docker >/dev/null 2>&1; then
@@ -456,6 +624,34 @@ if ! command -v docker >/dev/null 2>&1; then
   fi
 fi
 cd /opt/m1r4g3
+# The compose file names its env file, and compose refuses to run without
+# it — even for a one-off run that reads nothing from it.
+[ -f server.env ] || printf 'STACK=auto\n' > server.env
+if [ -f image.tar ]; then
+  $SUDO docker load -i image.tar >&2
+fi
+echo "m1r4g3-faces-begin"
+if $SUDO docker compose version >/dev/null 2>&1; then
+  $SUDO docker compose run --rm -T --entrypoint /bin/sh mirage -c 'm1r4g3-server propose --dir /data --format toml'
+else
+  $SUDO docker-compose run --rm -T --entrypoint /bin/sh mirage -c 'm1r4g3-server propose --dir /data --format toml'
+fi
+echo "m1r4g3-faces-end"
+"#;
+
+/// Step two: bring the box up with the faces the person chose, and read the
+/// one line the customer needs.
+///
+/// The contract is unchanged: the same image, the same compose file, the same
+/// volume, and the same `m1r4g3-link <LINK>` line on stdout.
+const INSTALL_SH: &str = r#"#!/bin/sh
+set -eu
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+if ! command -v docker >/dev/null 2>&1; then
+  echo "no docker and no apt-get or dnf" >&2
+  exit 20
+fi
+cd /opt/m1r4g3
 if [ -f image.tar ]; then
   $SUDO docker load -i image.tar
 fi
@@ -468,8 +664,57 @@ else
 fi
 if [ -z "$LINK" ]; then
   echo "client.link is empty; image must be m1r4g3-server:1 and write /data/client.link" >&2
+  # The box's own words — a refused port, a bad mask — are in the container's
+  # log, and the operator is the one who has to read them.
+  $SUDO docker compose logs --tail 40 >&2 || true
   $SUDO docker ps >&2 || true
   exit 21
 fi
 printf 'm1r4g3-link %s\n' "$LINK"
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The proposal exactly as the box writes it — the file
+    /// `m1r4g3-server propose` puts in the box's data directory.
+    const SAMPLE: &str = r#"[[face]]
+port = 443
+transport = "tcp"
+mask = '{"type":"tls_real","sni":"srv7451.coreserve.cloud","alpn":["h2"]}'
+why = "443/TCP — главный HTTPS-порт."
+
+[[face]]
+port = 443
+transport = "udp"
+mask = '{"type":"quic","alpn":["h3"],"bind_addr":"0.0.0.0:443"}'
+why = "443/UDP — там обычно весит QUIC."
+"#;
+
+    #[test]
+    fn the_proposal_the_box_writes_is_read() {
+        let faces = parse_proposal(SAMPLE).expect("the proposal reads");
+        assert_eq!(faces.len(), 2);
+        assert_eq!(faces[0].port, 443);
+        assert_eq!(faces[0].transport, "tcp");
+        assert!(faces[0].mask.contains("tls_real"));
+        assert_eq!(faces[1].transport, "udp");
+        assert!(faces[1].mask.contains("\"bind_addr\":\"0.0.0.0:443\""));
+    }
+
+    #[test]
+    fn the_proposal_is_read_out_of_the_markers() {
+        let stdout = format!(
+            "Loaded image: m1r4g3-server:1\n{FACES_BEGIN}\n{SAMPLE}{FACES_END}\nsomething else\n"
+        );
+        let faces = parse_faces(&stdout).expect("the proposal reads");
+        assert_eq!(faces.len(), 2);
+    }
+
+    #[test]
+    fn a_stream_without_a_proposal_is_refused() {
+        let err = parse_faces("Loaded image: m1r4g3-server:1\n").expect_err("nothing to read");
+        assert!(err.contains("не прислал"), "{err}");
+    }
+}
