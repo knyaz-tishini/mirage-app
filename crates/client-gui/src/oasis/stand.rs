@@ -1,6 +1,10 @@
-//! Standalone sheet. Host, account, password, stack, install, the issued
-//! link as a QR, export. The install itself is [`super::provision`].
+//! Standalone sheet. Four sections under the chrome divider: server, protocols,
+//! access (link, guests), connection (kill switch, dns, split). The install
+//! itself is [`super::provision`]. Password is never written. Kill switch and
+//! the split lists live in the profile; ports, MTU, stack, and dns go out in
+//! `server.env` on install. Guest shares are local files, not a server call.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use qrcode::{Color, QrCode};
@@ -15,7 +19,32 @@ use crate::shell::menu::Geom;
 const AMBER: &str = "#FBB26A";
 const FG: &str = "#F4F4F5";
 const DIM: &str = "#6B6F7A";
+const IDLE: &str = "#878B91";
 const ROW: f64 = 40.0;
+const ROW_H: f64 = 32.0;
+const NAV_H: f64 = 44.0;
+const LABEL_W: f64 = 108.0;
+const TOGGLE_W: f64 = 64.0;
+const REVOKE_W: f64 = 72.0;
+
+const CATALOG: &[(&str, &str, &str, bool)] = &[
+    ("awg", "443", "1280", true),
+    ("wireguard", "51820", "1420", false),
+    ("openvpn", "1194", "", false),
+    ("cloak", "443", "", false),
+    ("shadowsocks", "443", "", false),
+    ("ikev2", "500", "", false),
+    ("xray", "443", "", false),
+    ("socks5", "1080", "", false),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Server,
+    Protocols,
+    Access,
+    Link,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -23,39 +52,105 @@ pub enum Focus {
     Host,
     User,
     Pass,
-    Stack,
     Link,
+    Guest,
+    Dns,
+    Except,
+    Site,
+    App,
+    Port,
+    Mtu,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kill {
+    Off,
+    Soft,
+    Strict,
+}
+
+pub struct Proto {
+    pub id: &'static str,
+    pub on: bool,
+    pub port: String,
+    pub mtu: String,
+}
+
+struct Guest {
+    name: String,
+    full: bool,
+    body: String,
 }
 
 pub struct Stand {
+    pub section: Section,
     pub host: String,
     pub user: String,
     pub pass: String,
     pub stack_auto: bool,
     pub stack: String,
+    pub protocols: Vec<Proto>,
     pub focus: Focus,
     pub link: String,
+    guests: Vec<Guest>,
+    guest_draft: String,
+    qr_guest: Option<usize>,
+    kill: Kill,
+    pub dns: String,
+    pub except: String,
+    split_bypass: bool,
+    sites: Vec<String>,
+    apps: Vec<String>,
+    site_draft: String,
+    app_draft: String,
     pub bus: Arc<InstallBus>,
     /// Bumped when an install takes the password, so each window clears that field once.
     pub pass_epoch: u64,
+    /// Which draft was just committed. Each window clears that field store once.
+    pub clear_which: Focus,
+    pub clear_epoch: u64,
+    /// Sites, apps, or the split side changed. The shell pushes `set_scope` and clears this.
+    pub scope_dirty: bool,
 }
 
 impl Stand {
     pub fn load() -> Self {
         let mut stand = Self {
+            section: Section::Server,
             host: String::new(),
             user: "root".into(),
             pass: String::new(),
             stack_auto: true,
             stack: String::new(),
+            protocols: default_protocols(),
             focus: Focus::None,
             link: String::new(),
+            guests: Vec::new(),
+            guest_draft: String::new(),
+            qr_guest: None,
+            kill: Kill::Off,
+            dns: String::new(),
+            except: String::new(),
+            split_bypass: false,
+            sites: Vec::new(),
+            apps: Vec::new(),
+            site_draft: String::new(),
+            app_draft: String::new(),
             bus: Arc::new(InstallBus::new()),
             pass_epoch: 0,
+            clear_which: Focus::None,
+            clear_epoch: 0,
+            scope_dirty: false,
         };
         if let Some(dir) = dir() {
             if let Ok(text) = std::fs::read_to_string(dir.join("host.json")) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    stand.section = match v.get("section").and_then(|s| s.as_str()) {
+                        Some("protocols") => Section::Protocols,
+                        Some("access") => Section::Access,
+                        Some("link") => Section::Link,
+                        _ => Section::Server,
+                    };
                     if let Some(h) = v.get("host").and_then(|s| s.as_str()) {
                         stand.host = h.to_owned();
                     }
@@ -70,10 +165,67 @@ impl Stand {
                     if let Some(st) = v.get("stack").and_then(|s| s.as_str()) {
                         stand.stack = st.to_owned();
                     }
+                    if let Some(arr) = v.get("protocols").and_then(|p| p.as_array()) {
+                        for item in arr {
+                            let Some(id) = item.get("id").and_then(|s| s.as_str()) else {
+                                continue;
+                            };
+                            let Some(proto) = stand.protocols.iter_mut().find(|p| p.id == id) else {
+                                continue;
+                            };
+                            if let Some(on) = item.get("on").and_then(|b| b.as_bool()) {
+                                proto.on = on;
+                            }
+                            if let Some(port) = item.get("port").and_then(|s| s.as_str()) {
+                                proto.port = port.to_owned();
+                            }
+                            if let Some(mtu) = item.get("mtu").and_then(|s| s.as_str()) {
+                                proto.mtu = mtu.to_owned();
+                            }
+                        }
+                    }
+                    stand.kill = match v.get("kill").and_then(|s| s.as_str()) {
+                        Some("soft") => Kill::Soft,
+                        Some("strict") => Kill::Strict,
+                        _ => Kill::Off,
+                    };
+                    if let Some(dns) = v.get("dns").and_then(|s| s.as_str()) {
+                        stand.dns = dns.to_owned();
+                    }
+                    if let Some(except) = v.get("except").and_then(|s| s.as_str()) {
+                        stand.except = except.to_owned();
+                    }
+                    if let Some(bypass) = v.get("split_bypass").and_then(|s| s.as_bool()) {
+                        stand.split_bypass = bypass;
+                    }
+                    if let Some(sites) = string_list(&v, "sites") {
+                        stand.sites = sites;
+                    }
+                    if let Some(apps) = string_list(&v, "apps") {
+                        stand.apps = apps;
+                    }
                 }
             }
             if let Ok(link) = std::fs::read_to_string(dir.join("link.txt")) {
                 stand.link = link.trim().to_owned();
+            }
+            if let Ok(text) = std::fs::read_to_string(dir.join("guests.json")) {
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                    stand.guests = arr
+                        .into_iter()
+                        .filter_map(|item| {
+                            let name = item.get("name")?.as_str()?.trim().to_owned();
+                            if name.is_empty() {
+                                return None;
+                            }
+                            Some(Guest {
+                                name,
+                                full: item.get("full").and_then(|b| b.as_bool()).unwrap_or(false),
+                                body: item.get("body").and_then(|s| s.as_str()).unwrap_or("").to_owned(),
+                            })
+                        })
+                        .collect();
+                }
             }
         }
         stand
@@ -84,14 +236,49 @@ impl Stand {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
+        let protocols: Vec<_> = self
+            .protocols
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "on": p.on,
+                    "port": p.port,
+                    "mtu": p.mtu,
+                })
+            })
+            .collect();
         let text = serde_json::json!({
+            "section": section_key(self.section),
             "host": self.host,
             "user": self.user,
             "stack_auto": self.stack_auto,
             "stack": self.stack,
+            "protocols": protocols,
+            "kill": kill_key(self.kill),
+            "dns": self.dns,
+            "except": self.except,
+            "split_bypass": self.split_bypass,
+            "sites": self.sites,
+            "apps": self.apps,
         });
         if let Ok(body) = serde_json::to_string_pretty(&text) {
             let _ = std::fs::write(dir.join("host.json"), body);
+        }
+    }
+
+    fn save_guests(&self) {
+        let Some(dir) = dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let guests: Vec<_> = self
+            .guests
+            .iter()
+            .map(|g| serde_json::json!({"name": g.name, "full": g.full, "body": g.body}))
+            .collect();
+        if let Ok(body) = serde_json::to_string_pretty(&guests) {
+            let _ = std::fs::write(dir.join("guests.json"), body);
         }
     }
 
@@ -107,23 +294,81 @@ impl Stand {
         self.bus.text.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    pub fn install(&mut self) {
-        if self.bus.running.load(std::sync::atomic::Ordering::Relaxed) {
+    fn say(&self, line: &str) {
+        *self.bus.text.lock().unwrap_or_else(|p| p.into_inner()) = line.to_owned();
+    }
+
+    pub fn set_section(&mut self, section: Section) {
+        if self.section == section {
             return;
         }
-        let host_port = split_host(&self.host);
-        let Some((host, port)) = host_port else {
-            *self.bus.text.lock().unwrap_or_else(|p| p.into_inner()) = "нужен хост".into();
+        self.section = section;
+        self.focus = Focus::None;
+        self.save_profile();
+    }
+
+    pub fn take_scope(&mut self) -> bool {
+        let dirty = self.scope_dirty;
+        self.scope_dirty = false;
+        dirty
+    }
+
+    /// Include-list when the toggle is "только эти", bypass when it is "все кроме".
+    pub fn scope_args(&self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        if self.split_bypass {
+            (Vec::new(), Vec::new(), self.sites.clone(), self.apps.clone())
+        } else {
+            (self.sites.clone(), self.apps.clone(), Vec::new(), Vec::new())
+        }
+    }
+
+    pub fn server_env(&self) -> String {
+        let stack = if self.stack_auto || self.stack.trim().is_empty() {
+            "auto"
+        } else {
+            self.stack.trim()
+        };
+        let mut on: Vec<&Proto> = self.protocols.iter().filter(|p| p.on).collect();
+        if on.is_empty() {
+            if let Some(awg) = self.protocols.iter().find(|p| p.id == "awg") {
+                on.push(awg);
+            }
+        }
+        let mut lines = Vec::new();
+        lines.push(format!("STACK={stack}"));
+        let ids: Vec<&str> = on.iter().map(|p| p.id).collect();
+        lines.push(format!("PROTOCOLS={}", ids.join(",")));
+        for proto in &on {
+            let key = proto.id.to_ascii_uppercase().replace('-', "_");
+            if !proto.port.trim().is_empty() {
+                lines.push(format!("{key}_PORT={}", proto.port.trim()));
+            }
+            if !proto.mtu.trim().is_empty() {
+                lines.push(format!("{key}_MTU={}", proto.mtu.trim()));
+            }
+        }
+        if !self.dns.trim().is_empty() {
+            lines.push(format!("DNS={}", self.dns.trim()));
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    pub fn install(&mut self) {
+        if self.bus.running.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((host, port)) = split_host(&self.host) else {
+            self.say("нужен хост");
             return;
         };
         if self.user.trim().is_empty() {
-            *self.bus.text.lock().unwrap_or_else(|p| p.into_inner()) = "нужен логин".into();
+            self.say("нужен логин");
             return;
         }
         self.save_profile();
-        let stack = if self.stack_auto {
-            "auto".to_owned()
-        } else if self.stack.trim().is_empty() {
+        let env = self.server_env();
+        let stack = if self.stack_auto || self.stack.trim().is_empty() {
             "auto".to_owned()
         } else {
             self.stack.trim().to_owned()
@@ -139,13 +384,31 @@ impl Stand {
                 user: self.user.trim().to_owned(),
                 password: std::mem::take(&mut self.pass),
                 stack,
+                env,
             },
             Arc::clone(&self.bus),
         );
     }
 
+    pub fn remove_remote(&mut self) {
+        if self.bus.running.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((host, port)) = split_host(&self.host) else {
+            self.say("нужен хост");
+            return;
+        };
+        if self.user.trim().is_empty() {
+            self.say("нужен логин");
+            return;
+        }
+        self.save_profile();
+        provision::remove(host, port, self.user.trim().to_owned(), Arc::clone(&self.bus));
+    }
+
     pub fn export(&self) {
         if self.link.is_empty() {
+            self.say("нет ссылки");
             return;
         }
         let Some(path) = rfd::FileDialog::new().set_file_name("m1r4g3-link.txt").save_file() else {
@@ -156,11 +419,172 @@ impl Stand {
 
     pub fn copy_link(&self) {
         if self.link.is_empty() {
+            self.say("нет ссылки");
             return;
         }
-        if let Ok(mut clip) = arboard::Clipboard::new() {
-            let _ = clip.set_text(self.link.clone());
+        self.copy_text(&self.link);
+    }
+
+    pub fn toggle_stack(&mut self) {
+        self.stack_auto = !self.stack_auto;
+        if !self.stack_auto && !self.protocols.iter().any(|p| p.id == self.stack) {
+            self.stack = self
+                .protocols
+                .iter()
+                .find(|p| p.on)
+                .map(|p| p.id.to_owned())
+                .unwrap_or_else(|| "awg".into());
         }
+        self.focus = Focus::None;
+        self.save_profile();
+    }
+
+    pub fn select_proto(&mut self, index: usize) {
+        let Some(id) = self.protocols.get(index).map(|p| p.id) else {
+            return;
+        };
+        self.stack_auto = false;
+        self.stack = id.to_owned();
+        if let Some(proto) = self.protocols.get_mut(index) {
+            proto.on = true;
+        }
+        self.focus = Focus::None;
+        self.save_profile();
+    }
+
+    pub fn toggle_proto(&mut self, index: usize) {
+        let Some(proto) = self.protocols.get_mut(index) else {
+            return;
+        };
+        proto.on = !proto.on;
+        self.save_profile();
+    }
+
+    pub fn cycle_kill(&mut self) {
+        self.kill = match self.kill {
+            Kill::Off => Kill::Soft,
+            Kill::Soft => Kill::Strict,
+            Kill::Strict => Kill::Off,
+        };
+        self.save_profile();
+    }
+
+    pub fn toggle_split(&mut self) {
+        self.split_bypass = !self.split_bypass;
+        self.scope_dirty = true;
+        self.save_profile();
+    }
+
+    pub fn commit_site(&mut self) -> bool {
+        let text = self.site_draft.trim().to_owned();
+        if text.is_empty() {
+            return false;
+        }
+        if !self.sites.iter().any(|s| s == &text) {
+            self.sites.push(text);
+        }
+        self.site_draft.clear();
+        self.bump_clear(Focus::Site);
+        self.scope_dirty = true;
+        self.save_profile();
+        true
+    }
+
+    pub fn commit_app(&mut self) -> bool {
+        let text = self.app_draft.trim().to_owned();
+        if text.is_empty() {
+            return false;
+        }
+        if !self.apps.iter().any(|s| s == &text) {
+            self.apps.push(text);
+        }
+        self.app_draft.clear();
+        self.bump_clear(Focus::App);
+        self.scope_dirty = true;
+        self.save_profile();
+        true
+    }
+
+    pub fn drop_site(&mut self, index: usize) {
+        if index >= self.sites.len() {
+            return;
+        }
+        self.sites.remove(index);
+        self.scope_dirty = true;
+        self.save_profile();
+    }
+
+    pub fn drop_app(&mut self, index: usize) {
+        if index >= self.apps.len() {
+            return;
+        }
+        self.apps.remove(index);
+        self.scope_dirty = true;
+        self.save_profile();
+    }
+
+    /// Local share. Connect is the current link. Full is host, user, link, and
+    /// stack — never the password. Nothing is sent to the server.
+    pub fn invite(&mut self, full: bool) {
+        let name = self.guest_draft.trim().to_owned();
+        if name.is_empty() {
+            self.say("нужно имя");
+            return;
+        }
+        let body = if full {
+            if self.host.trim().is_empty() {
+                self.say("нечего отдать");
+                return;
+            }
+            let stack = if self.stack_auto || self.stack.trim().is_empty() {
+                "auto"
+            } else {
+                self.stack.trim()
+            };
+            serde_json::json!({
+                "host": self.host.trim(),
+                "user": self.user.trim(),
+                "link": self.link,
+                "stack": stack,
+            })
+            .to_string()
+        } else if self.link.trim().is_empty() {
+            self.say("нет ссылки");
+            return;
+        } else {
+            self.link.clone()
+        };
+        self.guests.push(Guest { name, full, body: body.clone() });
+        self.qr_guest = Some(self.guests.len() - 1);
+        self.guest_draft.clear();
+        self.bump_clear(Focus::Guest);
+        self.save_guests();
+        self.copy_text(&body);
+        self.say("записано");
+    }
+
+    pub fn select_guest(&mut self, index: usize) {
+        let Some(body) = self.guests.get(index).map(|g| g.body.clone()) else {
+            return;
+        };
+        self.qr_guest = Some(index);
+        if !body.is_empty() {
+            self.copy_text(&body);
+            self.say("скопировано");
+        }
+    }
+
+    pub fn revoke(&mut self, index: usize) {
+        if index >= self.guests.len() {
+            return;
+        }
+        self.guests.remove(index);
+        self.qr_guest = match self.qr_guest {
+            Some(i) if i == index => None,
+            Some(i) if i > index => Some(i - 1),
+            other => other,
+        };
+        self.save_guests();
     }
 
     pub fn set_link(&mut self, link: &str) {
@@ -181,16 +605,49 @@ impl Stand {
         let _ = std::fs::write(dir.join("link.txt"), &self.link);
     }
 
-    pub fn type_text(&mut self, text: &str) {
-        let limit = if self.focus == Focus::Link { 256 * 1024 } else { 240 };
-        let Some(buf) = self.buf_mut() else {
-            return;
-        };
-        if buf.len() + text.len() > limit {
-            return;
+    pub fn field_mut(&mut self, focus: Focus) -> Option<&mut String> {
+        match focus {
+            Focus::Host => Some(&mut self.host),
+            Focus::User => Some(&mut self.user),
+            Focus::Pass => Some(&mut self.pass),
+            Focus::Link => Some(&mut self.link),
+            Focus::Guest => Some(&mut self.guest_draft),
+            Focus::Dns => Some(&mut self.dns),
+            Focus::Except => Some(&mut self.except),
+            Focus::Site => Some(&mut self.site_draft),
+            Focus::App => Some(&mut self.app_draft),
+            Focus::Port => {
+                let i = self.active_index()?;
+                Some(&mut self.protocols[i].port)
+            }
+            Focus::Mtu => {
+                let i = self.active_index()?;
+                Some(&mut self.protocols[i].mtu)
+            }
+            Focus::None => None,
         }
-        buf.push_str(text);
-        if self.focus == Focus::Link {
+    }
+
+    pub fn type_text(&mut self, text: &str) {
+        let focus = self.focus;
+        let limit = match focus {
+            Focus::Link => 256 * 1024,
+            Focus::Port => 8,
+            Focus::Mtu => 5,
+            Focus::Guest => 64,
+            Focus::None => return,
+            _ => 240,
+        };
+        {
+            let Some(buf) = self.buf_mut() else {
+                return;
+            };
+            if buf.len() + text.len() > limit {
+                return;
+            }
+            buf.push_str(text);
+        }
+        if focus == Focus::Link {
             self.save_link();
         }
     }
@@ -202,15 +659,69 @@ impl Stand {
     }
 
     fn buf_mut(&mut self) -> Option<&mut String> {
-        match self.focus {
-            Focus::Host => Some(&mut self.host),
-            Focus::User => Some(&mut self.user),
-            Focus::Pass => Some(&mut self.pass),
-            Focus::Stack if !self.stack_auto => Some(&mut self.stack),
-            Focus::Link => Some(&mut self.link),
-            Focus::Stack | Focus::None => None,
+        self.field_mut(self.focus)
+    }
+
+    fn active_index(&self) -> Option<usize> {
+        if self.stack_auto {
+            return None;
+        }
+        self.protocols.iter().position(|p| p.id == self.stack)
+    }
+
+    fn bump_clear(&mut self, which: Focus) {
+        self.clear_which = which;
+        self.clear_epoch = self.clear_epoch.wrapping_add(1);
+        if self.clear_epoch == 0 {
+            self.clear_epoch = 1;
         }
     }
+
+    fn copy_text(&self, text: &str) {
+        if let Ok(mut clip) = arboard::Clipboard::new() {
+            let _ = clip.set_text(text.to_owned());
+        }
+    }
+}
+
+fn default_protocols() -> Vec<Proto> {
+    CATALOG
+        .iter()
+        .map(|(id, port, mtu, on)| Proto {
+            id,
+            on: *on,
+            port: (*port).to_owned(),
+            mtu: (*mtu).to_owned(),
+        })
+        .collect()
+}
+
+fn section_key(section: Section) -> &'static str {
+    match section {
+        Section::Server => "server",
+        Section::Protocols => "protocols",
+        Section::Access => "access",
+        Section::Link => "link",
+    }
+}
+
+fn kill_key(kill: Kill) -> &'static str {
+    match kill {
+        Kill::Off => "off",
+        Kill::Soft => "soft",
+        Kill::Strict => "strict",
+    }
+}
+
+fn string_list(v: &serde_json::Value, key: &str) -> Option<Vec<String>> {
+    let arr = v.get(key)?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|item| item.as_str())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
 }
 
 fn dir() -> Option<std::path::PathBuf> {
@@ -235,6 +746,309 @@ fn split_host(raw: &str) -> Option<(String, u16)> {
     Some((raw.to_owned(), 22))
 }
 
+#[derive(Clone, Copy)]
+pub struct FieldSpec {
+    pub id: &'static str,
+    pub rect: Rect,
+    pub focus: Focus,
+    pub placeholder: &'static str,
+    pub max: usize,
+    pub masked: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NavBtn {
+    id: &'static str,
+    label: &'static str,
+    section: Section,
+    rect: Rect,
+}
+
+enum ButtonText {
+    Install,
+    Remove,
+    Export,
+    Copy,
+    InviteConn,
+    InviteFull,
+}
+
+enum Choice {
+    Stack,
+    Kill,
+    Split,
+}
+
+enum Row {
+    Field { rect: Rect, label: &'static str, focus: Focus },
+    Button { rect: Rect, text: ButtonText },
+    Choice { rect: Rect, label: &'static str, which: Choice },
+    Proto { rect: Rect, index: usize, toggle: Rect },
+    Guest { rect: Rect, index: usize, revoke: Rect },
+    Entry { rect: Rect, index: usize, site: bool },
+    Line { x: f64, y: f64 },
+}
+
+enum HitKind {
+    Install,
+    Remove,
+    Export,
+    Copy,
+    Stack,
+    Kill,
+    Split,
+    Invite(bool),
+    Proto(usize),
+    ProtoOn(usize),
+    Guest(usize),
+    Revoke(usize),
+    DropSite(usize),
+    DropApp(usize),
+}
+
+struct Hit {
+    id: String,
+    rect: Rect,
+    kind: HitKind,
+}
+
+struct Layout {
+    fields: Vec<FieldSpec>,
+    rows: Vec<Row>,
+    hits: Vec<Hit>,
+    bottom: f64,
+}
+
+struct Lay {
+    x: f64,
+    y: f64,
+    w: f64,
+    fields: Vec<FieldSpec>,
+    rows: Vec<Row>,
+    hits: Vec<Hit>,
+}
+
+impl Lay {
+    fn row_rect(&mut self) -> Rect {
+        let rect = Rect::new(self.x, self.y, self.w, ROW_H);
+        self.y += ROW;
+        rect
+    }
+
+    fn hit(&mut self, id: String, rect: Rect, kind: HitKind) {
+        self.hits.push(Hit { id, rect, kind });
+    }
+
+    fn field(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        focus: Focus,
+        placeholder: &'static str,
+        max: usize,
+        masked: bool,
+    ) {
+        let rect = self.row_rect();
+        self.rows.push(Row::Field { rect, label, focus });
+        self.fields.push(FieldSpec {
+            id,
+            rect: Rect::new(rect.x + LABEL_W, rect.y, (rect.width - LABEL_W).max(0.0), rect.height),
+            focus,
+            placeholder,
+            max,
+            masked,
+        });
+    }
+
+    fn pair(
+        &mut self,
+        left: (&'static str, ButtonText, HitKind),
+        right: (&'static str, ButtonText, HitKind),
+    ) {
+        let y = self.y;
+        let half = ((self.w - 8.0) / 2.0).max(0.0);
+        let a = Rect::new(self.x, y, half, ROW_H);
+        let b = Rect::new(self.x + half + 8.0, y, half, ROW_H);
+        self.y += ROW;
+        self.rows.push(Row::Button { rect: a, text: left.1 });
+        self.rows.push(Row::Button { rect: b, text: right.1 });
+        self.hit(left.0.to_owned(), a, left.2);
+        self.hit(right.0.to_owned(), b, right.2);
+    }
+
+    fn choice(&mut self, id: &'static str, label: &'static str, which: Choice, kind: HitKind) {
+        let rect = self.row_rect();
+        self.rows.push(Row::Choice { rect, label, which });
+        self.hit(id.to_owned(), rect, kind);
+    }
+
+    fn proto(&mut self, index: usize) {
+        let rect = self.row_rect();
+        let toggle_w = TOGGLE_W.min(rect.width);
+        let toggle = Rect::new(rect.x + rect.width - toggle_w, rect.y, toggle_w, rect.height);
+        let body = Rect::new(rect.x, rect.y, (rect.width - toggle_w).max(0.0), rect.height);
+        self.rows.push(Row::Proto { rect, index, toggle });
+        self.hit(format!("st-p{index}"), body, HitKind::Proto(index));
+        self.hit(format!("st-p{index}-on"), toggle, HitKind::ProtoOn(index));
+    }
+
+    fn guest(&mut self, index: usize) {
+        let rect = self.row_rect();
+        let revoke_w = REVOKE_W.min(rect.width);
+        let revoke = Rect::new(rect.x + rect.width - revoke_w, rect.y, revoke_w, rect.height);
+        let body = Rect::new(rect.x, rect.y, (rect.width - revoke_w).max(0.0), rect.height);
+        self.rows.push(Row::Guest { rect, index, revoke });
+        self.hit(format!("st-g{index}"), body, HitKind::Guest(index));
+        self.hit(format!("st-g{index}-x"), revoke, HitKind::Revoke(index));
+    }
+
+    fn entry(&mut self, index: usize, site: bool) {
+        let rect = self.row_rect();
+        self.rows.push(Row::Entry { rect, index, site });
+        if site {
+            self.hit(format!("st-site-row-{index}"), rect, HitKind::DropSite(index));
+        } else {
+            self.hit(format!("st-app-row-{index}"), rect, HitKind::DropApp(index));
+        }
+    }
+}
+
+fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
+    let mut lay = Lay {
+        x: content.x + 16.0,
+        y: content.y + NAV_H,
+        w: (content.width - 32.0).max(0.0),
+        fields: Vec::new(),
+        rows: Vec::new(),
+        hits: Vec::new(),
+    };
+    match stand.section {
+        Section::Server => {
+            lay.field("st-host", "хост", Focus::Host, "хост", 240, false);
+            lay.field("st-user", "логин", Focus::User, "логин", 240, false);
+            lay.field("st-pass", "пароль", Focus::Pass, "пароль", 240, true);
+            lay.pair(
+                ("st-go", ButtonText::Install, HitKind::Install),
+                ("st-down", ButtonText::Remove, HitKind::Remove),
+            );
+        }
+        Section::Protocols => {
+            lay.choice("st-stack", "стек", Choice::Stack, HitKind::Stack);
+            for index in 0..stand.protocols.len() {
+                lay.proto(index);
+            }
+            if stand.active_index().is_some() {
+                lay.field("st-port", "порт", Focus::Port, "порт", 8, false);
+                lay.field("st-mtu", "mtu", Focus::Mtu, "mtu", 5, false);
+            }
+        }
+        Section::Access => {
+            lay.field("st-link", "ссылка", Focus::Link, "вставить", 256 * 1024, false);
+            lay.pair(
+                ("st-export", ButtonText::Export, HitKind::Export),
+                ("st-copy", ButtonText::Copy, HitKind::Copy),
+            );
+            lay.field("st-guest", "гость", Focus::Guest, "имя", 64, false);
+            lay.pair(
+                ("st-invite-conn", ButtonText::InviteConn, HitKind::Invite(false)),
+                ("st-invite-full", ButtonText::InviteFull, HitKind::Invite(true)),
+            );
+            for index in 0..stand.guests.len() {
+                lay.guest(index);
+            }
+        }
+        Section::Link => {
+            lay.choice("st-kill", "киллсвитч", Choice::Kill, HitKind::Kill);
+            lay.field("st-dns", "dns", Focus::Dns, "свой резолвер", 240, false);
+            if stand.kill != Kill::Off {
+                lay.field("st-except", "исключения", Focus::Except, "dns через запятую", 240, false);
+            }
+            lay.choice("st-split", "маршруты", Choice::Split, HitKind::Split);
+            lay.field("st-site", "сайт", Focus::Site, "домен", 240, false);
+            for index in 0..stand.sites.len() {
+                lay.entry(index, true);
+            }
+            lay.field("st-app", "приложение", Focus::App, "процесс", 240, false);
+            for index in 0..stand.apps.len() {
+                lay.entry(index, false);
+            }
+        }
+    }
+    if show_line {
+        lay.rows.push(Row::Line { x: lay.x, y: lay.y });
+        lay.y += 22.0;
+    }
+    Layout {
+        fields: lay.fields,
+        rows: lay.rows,
+        hits: lay.hits,
+        bottom: lay.y,
+    }
+}
+
+fn nav_buttons(content: Rect) -> [NavBtn; 4] {
+    const IDS: [&str; 4] = ["st-nav-server", "st-nav-proto", "st-nav-access", "st-nav-link"];
+    const LABELS: [&str; 4] = ["сервер", "протоколы", "доступ", "связь"];
+    const SECS: [Section; 4] = [Section::Server, Section::Protocols, Section::Access, Section::Link];
+    let y = content.y + 6.0;
+    let gap = 6.0;
+    let x0 = content.x + 8.0;
+    let inner = (content.width - 16.0 - gap * 3.0).max(0.0);
+    let w = inner / 4.0;
+    let mut out = [NavBtn {
+        id: IDS[0],
+        label: LABELS[0],
+        section: Section::Server,
+        rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+    }; 4];
+    for i in 0..4 {
+        out[i] = NavBtn {
+            id: IDS[i],
+            label: LABELS[i],
+            section: SECS[i],
+            rect: Rect::new(x0 + i as f64 * (w + gap), y, w.max(0.0), 30.0),
+        };
+    }
+    out
+}
+
+fn qr_payload(stand: &Stand) -> Option<&str> {
+    if stand.section != Section::Access {
+        return None;
+    }
+    if let Some(index) = stand.qr_guest {
+        if let Some(guest) = stand.guests.get(index) {
+            if !guest.body.is_empty() {
+                return Some(guest.body.as_str());
+            }
+        }
+    }
+    if stand.link.is_empty() {
+        None
+    } else {
+        Some(stand.link.as_str())
+    }
+}
+
+fn apply(stand: &mut Stand, kind: HitKind) {
+    match kind {
+        HitKind::Install => stand.install(),
+        HitKind::Remove => stand.remove_remote(),
+        HitKind::Export => stand.export(),
+        HitKind::Copy => stand.copy_link(),
+        HitKind::Stack => stand.toggle_stack(),
+        HitKind::Kill => stand.cycle_kill(),
+        HitKind::Split => stand.toggle_split(),
+        HitKind::Invite(full) => stand.invite(full),
+        HitKind::Proto(index) => stand.select_proto(index),
+        HitKind::ProtoOn(index) => stand.toggle_proto(index),
+        HitKind::Guest(index) => stand.select_guest(index),
+        HitKind::Revoke(index) => stand.revoke(index),
+        HitKind::DropSite(index) => stand.drop_site(index),
+        HitKind::DropApp(index) => stand.drop_app(index),
+    }
+}
+
 pub fn register<S: uzor_framework::Spec>(
     coord: &mut InputCoordinator,
     view: &VisualView<S>,
@@ -243,61 +1057,34 @@ pub fn register<S: uzor_framework::Spec>(
     g: &Geom,
     stand: &mut Stand,
 ) {
-    let rows = field_rects(g.content);
-    for (id, rect, _) in &rows {
-        let hit = match *id {
-            "st-go" | "st-export" | "st-copy" => Some((*id, *rect)),
-            "st-stack" if stand.stack_auto => Some((*id, *rect)),
-            "st-stack" => Some((*id, Rect::new(rect.x, rect.y, 72.0, rect.height))),
-            _ => None,
-        };
-        let Some((hit_id, hit_rect)) = hit else {
-            continue;
-        };
-        coord.register_atomic(hit_id, WidgetKind::Button, at(hit_rect), Sense::CLICK, layer);
-        if view.clicked(&WidgetId::from(hit_id)) {
-            match hit_id {
-                "st-go" => stand.install(),
-                "st-export" => stand.export(),
-                "st-copy" => stand.copy_link(),
-                "st-stack" => {
-                    stand.stack_auto = !stand.stack_auto;
-                    stand.focus = Focus::None;
-                    stand.save_profile();
-                }
-                _ => {}
-            }
+    for nav in nav_buttons(g.content) {
+        coord.register_atomic(nav.id, WidgetKind::Button, at(nav.rect), Sense::CLICK, layer);
+        if view.clicked(&WidgetId::from(nav.id)) {
+            stand.set_section(nav.section);
+        }
+    }
+    let lay = layout(stand, g.content, false);
+    for hit in lay.hits {
+        coord.register_atomic(hit.id.as_str(), WidgetKind::Button, at(hit.rect), Sense::CLICK, layer);
+        if view.clicked(&WidgetId::from(hit.id.as_str())) {
+            apply(stand, hit.kind);
         }
     }
 }
 
-/// Height of the content rect. Fields, then the QR when a link is present.
-pub fn content_height(has_link: bool) -> f64 {
-    let fields = 8.0 + 6.0 * ROW + 32.0 + 8.0;
-    if has_link { fields + 12.0 + 168.0 } else { fields }
+/// Height of the content rect for the open section: nav, rows, status, QR.
+pub fn content_height(stand: &Stand, note: bool) -> f64 {
+    let show = note || !stand.status().is_empty();
+    let lay = layout(stand, Rect::new(0.0, 0.0, 320.0, 1.0), show);
+    let mut h = lay.bottom + 8.0;
+    if qr_payload(stand).is_some() {
+        h += 12.0 + 168.0;
+    }
+    h
 }
 
-pub fn field_rects(content: Rect) -> Vec<(&'static str, Rect, Focus)> {
-    let mut y = content.y + 8.0;
-    let x = content.x + 16.0;
-    let w = (content.width - 32.0).max(0.0);
-    let mut row = |id, focus| {
-        let rect = Rect::new(x, y, w, 32.0);
-        y += ROW;
-        (id, rect, focus)
-    };
-    let mut out = vec![
-        row("st-host", Focus::Host),
-        row("st-user", Focus::User),
-        row("st-pass", Focus::Pass),
-        row("st-stack", Focus::Stack),
-        row("st-link", Focus::Link),
-        row("st-go", Focus::None),
-    ];
-    let half = (w - 8.0) / 2.0;
-    out.push(("st-export", Rect::new(x, y, half.max(0.0), 32.0), Focus::None));
-    out.push(("st-copy", Rect::new(x + half + 8.0, y, half.max(0.0), 32.0), Focus::None));
-    out
+pub fn fields(stand: &Stand, content: Rect) -> Vec<FieldSpec> {
+    layout(stand, content, false).fields
 }
 
 pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, _hot_sep: bool, note: Option<&str>) {
@@ -307,76 +1094,185 @@ pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, _hot_sep: boo
     ctx.fill_rect(0.0, g.tabbar.y + g.tabbar.height - 1.0, g.panel.width, 1.0);
     ctx.fill_rect(0.0, g.panel.y + g.panel.height - 1.0, g.panel.width, 1.0);
 
-    let rows = field_rects(g.content);
+    paint_nav(ctx, g.content, stand.section);
+
     let status = stand.status();
-    let line = if !status.is_empty() { status } else { note.unwrap_or("").to_owned() };
+    let note_line = note.unwrap_or("");
+    let show = !status.is_empty() || !note_line.is_empty();
+    let line = if !status.is_empty() { status } else { note_line.to_owned() };
+    let lay = layout(stand, g.content, show);
+
     ctx.set_font("13px sans-serif");
     ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_fill_color(DIM);
-    if !line.is_empty() {
-        ctx.fill_text(&line, g.content.x + 16.0, g.content.y + 4.0);
+    for row in &lay.rows {
+        paint_row(ctx, stand, row, &line);
     }
-    for (id, rect, _) in &rows {
-        let (label, value, secret) = match *id {
-            "st-host" => ("хост", stand.host.as_str(), false),
-            "st-user" => ("логин", stand.user.as_str(), false),
-            "st-pass" => ("пароль", stand.pass.as_str(), true),
-            "st-stack" => (
-                "стек",
-                if stand.stack_auto { "авто" } else { "свой" },
-                false,
-            ),
-            "st-link" => ("ссылка", "", false),
-            "st-go" => ("", if stand.bus.running.load(std::sync::atomic::Ordering::Relaxed) { "ставится…" } else { "установить" }, false),
-            "st-export" => ("", "экспорт", false),
-            "st-copy" => ("", "копировать", false),
-            _ => ("", "", false),
-        };
-        let focused = match *id {
-            "st-host" => stand.focus == Focus::Host,
-            "st-user" => stand.focus == Focus::User,
-            "st-pass" => stand.focus == Focus::Pass,
-            "st-stack" => stand.focus == Focus::Stack && !stand.stack_auto,
-            "st-link" => stand.focus == Focus::Link,
-            _ => false,
-        };
-        ctx.set_fill_color(if focused { "rgba(251,178,106,0.10)" } else { "rgba(255,255,255,0.05)" });
-        ctx.fill_rect(rect.x, rect.y, rect.width, rect.height);
-        ctx.set_fill_color(if *id == "st-go" || *id == "st-export" || *id == "st-copy" { AMBER } else { FG });
-        ctx.set_text_align(TextAlign::Left);
-        if label.is_empty() {
-            ctx.set_text_align(TextAlign::Center);
-            ctx.fill_text(value, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-        } else {
-            ctx.set_fill_color(DIM);
-            ctx.fill_text(label, rect.x + 8.0, rect.y + rect.height / 2.0);
-            if *id == "st-stack" && stand.stack_auto {
-                ctx.set_fill_color(FG);
-                ctx.fill_text(value, rect.x + 72.0, rect.y + rect.height / 2.0);
-            }
-            let _ = secret;
-        }
-    }
-    if !stand.link.is_empty() {
-        paint_qr(ctx, g, &stand.link);
+    if let Some(text) = qr_payload(stand) {
+        paint_qr(ctx, g, text);
     }
 }
 
-fn link_preview(link: &str) -> String {
-    if link.is_empty() {
-        return "вставить".into();
+fn paint_nav(ctx: &mut dyn RenderContext, content: Rect, section: Section) {
+    ctx.set_font("11px sans-serif");
+    ctx.set_text_align(TextAlign::Center);
+    ctx.set_text_baseline(TextBaseline::Middle);
+    ctx.set_line_dash(&[]);
+    ctx.set_stroke_width(1.25);
+    for nav in nav_buttons(content) {
+        let color = if nav.section == section { AMBER } else { IDLE };
+        ctx.set_stroke_color(color);
+        ctx.stroke_rect(
+            nav.rect.x + 0.5,
+            nav.rect.y + 0.5,
+            (nav.rect.width - 1.0).max(0.0),
+            (nav.rect.height - 1.0).max(0.0),
+        );
+        ctx.set_fill_color(color);
+        ctx.fill_text(nav.label, nav.rect.x + nav.rect.width / 2.0, nav.rect.y + nav.rect.height / 2.0);
     }
-    if link.starts_with('{') {
-        return format!("артефакт · {} б", link.len());
+}
+
+fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) {
+    ctx.set_font("13px sans-serif");
+    ctx.set_text_baseline(TextBaseline::Middle);
+    match row {
+        Row::Field { rect, label, focus } => {
+            plate(ctx, *rect, stand.focus == *focus);
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_fill_color(DIM);
+            ctx.fill_text(label, rect.x + 8.0, rect.y + rect.height / 2.0);
+        }
+        Row::Button { rect, text } => {
+            plate(ctx, *rect, false);
+            ctx.set_text_align(TextAlign::Center);
+            ctx.set_fill_color(AMBER);
+            let label = button_label(stand, text);
+            ctx.fill_text(label, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        }
+        Row::Choice { rect, label, which } => {
+            plate(ctx, *rect, false);
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_fill_color(DIM);
+            ctx.fill_text(label, rect.x + 8.0, rect.y + rect.height / 2.0);
+            ctx.set_fill_color(FG);
+            let value = choice_value(stand, which);
+            ctx.fill_text(&value, rect.x + LABEL_W, rect.y + rect.height / 2.0);
+        }
+        Row::Proto { rect, index, toggle } => {
+            let Some(proto) = stand.protocols.get(*index) else {
+                return;
+            };
+            let active = !stand.stack_auto && stand.stack == proto.id;
+            plate(ctx, *rect, active);
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_fill_color(if active { AMBER } else { FG });
+            ctx.fill_text(proto.id, rect.x + 8.0, rect.y + rect.height / 2.0);
+            ctx.set_text_align(TextAlign::Center);
+            ctx.set_fill_color(if proto.on { AMBER } else { DIM });
+            let word = if proto.on { "вкл" } else { "выкл" };
+            ctx.fill_text(word, toggle.x + toggle.width / 2.0, toggle.y + toggle.height / 2.0);
+        }
+        Row::Guest { rect, index, revoke } => {
+            let Some(guest) = stand.guests.get(*index) else {
+                return;
+            };
+            plate(ctx, *rect, stand.qr_guest == Some(*index));
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_fill_color(FG);
+            ctx.fill_text(&short(&guest.name, 16), rect.x + 8.0, rect.y + rect.height / 2.0);
+            ctx.set_fill_color(DIM);
+            let kind = if guest.full { "полный" } else { "подключение" };
+            ctx.fill_text(kind, rect.x + LABEL_W, rect.y + rect.height / 2.0);
+            ctx.set_text_align(TextAlign::Center);
+            ctx.set_fill_color(AMBER);
+            ctx.fill_text("отозвать", revoke.x + revoke.width / 2.0, revoke.y + revoke.height / 2.0);
+        }
+        Row::Entry { rect, index, site } => {
+            let text = if *site {
+                stand.sites.get(*index).map(String::as_str)
+            } else {
+                stand.apps.get(*index).map(String::as_str)
+            };
+            let Some(text) = text else {
+                return;
+            };
+            plate(ctx, *rect, false);
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_fill_color(FG);
+            ctx.fill_text(&short(text, 24), rect.x + 8.0, rect.y + rect.height / 2.0);
+            ctx.set_text_align(TextAlign::Right);
+            ctx.set_fill_color(DIM);
+            ctx.fill_text("убрать", rect.x + rect.width - 8.0, rect.y + rect.height / 2.0);
+        }
+        Row::Line { x, y } => {
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_fill_color(DIM);
+            ctx.fill_text(line, *x, *y + 10.0);
+        }
     }
-    let count = link.chars().count();
-    if count > 28 {
-        let head: String = link.chars().take(28).collect();
-        format!("{head}…")
-    } else {
-        link.to_owned()
+}
+
+fn plate(ctx: &mut dyn RenderContext, rect: Rect, hot: bool) {
+    ctx.set_fill_color(if hot { "rgba(251,178,106,0.10)" } else { "rgba(255,255,255,0.05)" });
+    ctx.fill_rect(rect.x, rect.y, rect.width, rect.height);
+}
+
+fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
+    let running = stand.bus.running.load(Ordering::Relaxed);
+    match text {
+        ButtonText::Install => {
+            if running {
+                "ставится…"
+            } else {
+                "установить"
+            }
+        }
+        ButtonText::Remove => {
+            if running {
+                "снимается…"
+            } else {
+                "снять"
+            }
+        }
+        ButtonText::Export => "экспорт",
+        ButtonText::Copy => "копировать",
+        ButtonText::InviteConn => "подключение",
+        ButtonText::InviteFull => "полный",
     }
+}
+
+fn choice_value(stand: &Stand, which: &Choice) -> String {
+    match which {
+        Choice::Stack => {
+            if stand.stack_auto {
+                "авто".into()
+            } else if stand.stack.is_empty() {
+                "awg".into()
+            } else {
+                stand.stack.clone()
+            }
+        }
+        Choice::Kill => match stand.kill {
+            Kill::Off => "выкл".into(),
+            Kill::Soft => "мягкий".into(),
+            Kill::Strict => "жёсткий".into(),
+        },
+        Choice::Split => {
+            if stand.split_bypass {
+                "все кроме".into()
+            } else {
+                "только эти".into()
+            }
+        }
+    }
+}
+
+fn short(text: &str, n: usize) -> String {
+    if text.chars().count() <= n {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(n).collect();
+    format!("{head}…")
 }
 
 fn paint_qr(ctx: &mut dyn RenderContext, g: &Geom, link: &str) {

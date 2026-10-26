@@ -124,6 +124,8 @@ struct Oasis {
     bind_reset_seen: HashMap<WindowId, u64>,
     /// Windows that already applied [`Stand::pass_epoch`].
     pass_reset_seen: HashMap<WindowId, u64>,
+    /// Windows that already applied [`Stand::clear_epoch`].
+    clear_seen: HashMap<WindowId, u64>,
 }
 
 impl Oasis {
@@ -225,6 +227,9 @@ impl App for Oasis {
                 self.register_bind(cx.widgets.coord, &cx.view, &layer, &at, &g, w);
             } else {
                 stand::register(cx.widgets.coord, &cx.view, &layer, &at, &g, &mut self.stand);
+                if self.stand.take_scope() {
+                    self.apply_scope();
+                }
             }
             if cx.view.clicked(&WidgetId::from("scrim")) {
                 ui.menu = false;
@@ -509,7 +514,10 @@ impl Oasis {
             return;
         }
         match self.engine.adopt_artefact(&link) {
-            Ok(()) => self.adopted = link,
+            Ok(()) => {
+                self.adopted = link;
+                self.apply_scope();
+            }
             Err(err) => {
                 self.adopted = link;
                 self.note = err;
@@ -523,7 +531,7 @@ impl Oasis {
             let (_, content_h) = menu::layout_rows(&menu::cabinet_rows(), 0, 0, 0);
             content_h + if self.note.is_empty() { 0.0 } else { 26.0 }
         } else {
-            stand::content_height(!self.stand.link.is_empty())
+            stand::content_height(&self.stand, !self.note.is_empty())
         };
         (CHROME_H + body + LIP).min(window_h * menu::MAX_FRAC)
     }
@@ -532,9 +540,24 @@ impl Oasis {
         match id {
             "bind" => self.submit_bind(),
             "st-link" => self.stand.save_link(),
-            "st-host" | "st-user" | "st-pass" | "st-stack" => self.stand.install(),
+            "st-host" | "st-user" | "st-pass" => self.stand.install(),
+            "st-site" => {
+                self.stand.commit_site();
+            }
+            "st-app" => {
+                self.stand.commit_app();
+            }
+            "st-dns" | "st-except" | "st-port" | "st-mtu" => self.stand.save_profile(),
             _ => {}
         }
+        if self.stand.take_scope() {
+            self.apply_scope();
+        }
+    }
+
+    fn apply_scope(&mut self) {
+        let (services, apps, bypass_services, bypass_apps) = self.stand.scope_args();
+        self.engine.set_scope(&services, &apps, &bypass_services, &bypass_apps);
     }
 
     fn set_mode(&mut self, product: Product) {
@@ -687,49 +710,55 @@ impl Oasis {
         g: &menu::Geom,
     ) {
         let win = cx.window;
-        let epoch = self.stand.pass_epoch;
-        let wipe_pass = epoch_due(&mut self.pass_reset_seen, win, epoch);
-        let stack_auto = self.stand.stack_auto;
-        let rows = stand::field_rects(g.content);
+        let pass_epoch = self.stand.pass_epoch;
+        let mut wipe_pass =
+            pass_epoch != 0 && self.pass_reset_seen.get(&win).copied() != Some(pass_epoch);
+        let clear_epoch = self.stand.clear_epoch;
+        let clear_which = self.stand.clear_which;
+        let mut wipe_clear =
+            clear_epoch != 0 && self.clear_seen.get(&win).copied() != Some(clear_epoch);
+        let specs = stand::fields(&self.stand, g.content);
         let mut focus = stand::Focus::None;
         let mut profile = false;
         let mut link_changed = false;
-        for (id, rect, _) in rows {
-            let kind = match id {
-                "st-host" => stand::Focus::Host,
-                "st-user" => stand::Focus::User,
-                "st-pass" => stand::Focus::Pass,
-                "st-stack" if !stack_auto => stand::Focus::Stack,
-                "st-link" => stand::Focus::Link,
-                _ => continue,
+        for spec in specs {
+            let mut reset = false;
+            if spec.masked && wipe_pass {
+                wipe_pass = false;
+                self.pass_reset_seen.insert(win, pass_epoch);
+                reset = true;
+            }
+            if wipe_clear && spec.focus == clear_which {
+                wipe_clear = false;
+                self.clear_seen.insert(win, clear_epoch);
+                reset = true;
+            }
+            let Some(value) = self.stand.field_mut(spec.focus) else {
+                continue;
             };
-            let (placeholder, max, masked) = match kind {
-                stand::Focus::Host => ("хост", 240usize, false),
-                stand::Focus::User => ("логин", 240, false),
-                stand::Focus::Pass => ("пароль", 240, true),
-                stand::Focus::Stack => ("стек", 64, false),
-                stand::Focus::Link => ("вставить", 256 * 1024, false),
-                stand::Focus::None => continue,
-            };
-            let local = Rect::new(rect.x + 72.0, rect.y, (rect.width - 72.0).max(0.0), rect.height);
-            let reset = masked && wipe_pass;
-            let value = match kind {
-                stand::Focus::Host => &mut self.stand.host,
-                stand::Focus::User => &mut self.stand.user,
-                stand::Focus::Pass => &mut self.stand.pass,
-                stand::Focus::Stack => &mut self.stand.stack,
-                stand::Focus::Link => &mut self.stand.link,
-                stand::Focus::None => continue,
-            };
-            let (focused, changed) = sync_field(cx, id, at(local), placeholder, max, masked, value, reset);
+            let (focused, changed) = sync_field(
+                cx,
+                spec.id,
+                at(spec.rect),
+                spec.placeholder,
+                spec.max,
+                spec.masked,
+                value,
+                reset,
+            );
             if focused {
-                focus = kind;
+                focus = spec.focus;
             }
             if changed {
-                match kind {
-                    stand::Focus::Host | stand::Focus::User | stand::Focus::Stack => profile = true,
+                match spec.focus {
+                    stand::Focus::Host
+                    | stand::Focus::User
+                    | stand::Focus::Port
+                    | stand::Focus::Mtu
+                    | stand::Focus::Dns
+                    | stand::Focus::Except => profile = true,
                     stand::Focus::Link => link_changed = true,
-                    stand::Focus::Pass | stand::Focus::None => {}
+                    _ => {}
                 }
             }
         }
@@ -994,6 +1023,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             bind_reset_epoch: 0,
             bind_reset_seen: HashMap::new(),
             pass_reset_seen: HashMap::new(),
+            clear_seen: HashMap::new(),
         },
         cfg,
         NativeOptions {

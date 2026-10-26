@@ -51,6 +51,8 @@ pub struct Job {
     pub user: String,
     pub password: String,
     pub stack: String,
+    /// Full `server.env` body. Empty keeps the single `STACK=` line.
+    pub env: String,
 }
 
 pub fn start(job: Job, bus: Arc<InstallBus>) {
@@ -73,6 +75,49 @@ pub fn start(job: Job, bus: Arc<InstallBus>) {
         }
         bus.running.store(false, Ordering::Relaxed);
     });
+}
+
+/// Key-only `docker compose down`. No password. Shares the install bus so the
+/// two jobs cannot run together.
+pub fn remove(host: String, port: u16, user: String, bus: Arc<InstallBus>) {
+    use std::sync::atomic::Ordering;
+    if bus.running.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    set_text(&bus, "снятие");
+    std::thread::spawn(move || {
+        let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt.block_on(take_down(&host, port, &user)),
+            Err(err) => Err(format!("runtime: {err}")),
+        };
+        match outcome {
+            Ok(()) => set_text(&bus, "контейнер снят"),
+            Err(err) => set_text(&bus, &err),
+        }
+        bus.running.store(false, Ordering::Relaxed);
+    });
+}
+
+async fn take_down(host: &str, port: u16, user: &str) -> Result<(), String> {
+    let dir = state_dir()?;
+    let key_path = dir.join("server.key");
+    if !key_path.is_file() {
+        return Err("нет ключа".into());
+    }
+    let pem = fs::read(&key_path).map_err(|e| format!("key: {e}"))?;
+    let pins = dir.join("host-keys.json");
+    let addr = format!("{host}:{port}");
+    let session = connect_key(&addr, user, &pem, &pins).await?;
+    let out = exec(&session, "docker compose -f /opt/m1r4g3/docker-compose.yml down").await?;
+    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+    if out.exit.unwrap_or(1) != 0 {
+        let err = out.stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
+        if err.is_empty() {
+            return Err(format!("снятие: exit {:?}", out.exit));
+        }
+        return Err(format!("снятие: {err}"));
+    }
+    Ok(())
 }
 
 fn set_text(bus: &InstallBus, line: &str) {
@@ -111,7 +156,11 @@ async fn install(job: Job, bus: &InstallBus) -> Result<String, String> {
     let remote = "/opt/m1r4g3";
     exec(&session, &format!("mkdir -p {remote}")).await?;
     upload(&session, COMPOSE.as_bytes(), &format!("{remote}/docker-compose.yml")).await?;
-    let env = format!("STACK={}\n", job.stack);
+    let env = if job.env.is_empty() {
+        format!("STACK={}\n", job.stack)
+    } else {
+        job.env
+    };
     upload(&session, env.as_bytes(), &format!("{remote}/server.env")).await?;
     upload(&session, INSTALL_SH.as_bytes(), &format!("{remote}/install.sh")).await?;
     if let Some(tar) = image_tar() {
