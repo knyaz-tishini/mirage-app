@@ -3084,6 +3084,7 @@ dependencies = [
  "ed25519-dalek",
  "embed-manifest",
  "hex",
+ "image",
  "nokhwa",
  "qrcode",
  "rand 0.8.6",

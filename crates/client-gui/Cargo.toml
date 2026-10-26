@@ -87,6 +87,7 @@ qrcode                  = { version = "0.14", default-features = false }
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 uzor-framework = { path = "../../../uzor/uzor-framework", features = ["native"] }
 uzor-anim-js = { path = "../../../uzor/uzor-anim-js", features = ["quickjs"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.14"
 arboard = "3"
 nokhwa = { version = "0.10.11", features = ["input-native"] }

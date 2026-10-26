@@ -284,7 +284,7 @@ impl App for Oasis {
         {
             let on = self.target < 0.5;
             self.target = if on { 1.0 } else { 0.0 };
-            self.style = (self.toggles % 6) as f64;
+            self.style = (self.toggles % 4) as f64;
             self.toggles = self.toggles.wrapping_add(1);
             if on {
                 self.raise_link();
@@ -321,7 +321,6 @@ impl App for Oasis {
         let pointer = cx.view.raw_pointer().map(|(x, y)| (x - rect.x, y - rect.y));
         let bind_hot = cx.view.is_focused(&WidgetId::from("bind"));
         cx.out.request_frame();
-
         let render: &mut dyn RenderContext = cx.render;
         render.save();
         render.translate(rect.x, rect.y);
@@ -565,7 +564,7 @@ impl Oasis {
             && self.note.is_empty()
         {
             self.target = 1.0;
-            self.style = (self.toggles % 6) as f64;
+            self.style = (self.toggles % 4) as f64;
             self.toggles = self.toggles.wrapping_add(1);
             self.raise_link();
         }
@@ -1065,7 +1064,8 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     let host = JsAnimHost::new()?;
     host.load(include_str!("veg.js"))?;
     host.load(include_str!("figures.js"))?;
-    host.load(include_str!("scene.js"))?;
+    host.load(include_str!("toon/toon-skin.js"))?;
+    host.load(include_str!("toon/scene.js"))?;
     host.load(include_str!("chrome.js"))?;
     if !host.has("desert") {
         return Err("oasis: desert anim was not registered".into());
@@ -1073,13 +1073,18 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     if !host.has("chrome") {
         return Err("oasis: chrome anim was not registered".into());
     }
-    // Logical points, 1:1 on this 1920×1080 desktop. iPhone 14 / 16e is
-    // 390×844 (9:19.5). iPad 9.7" is 768×1024 (3:4). An 11" iPad is
-    // 820×1180 and does not fit above the taskbar.
-    let phone = app_window("phone", 390, 844, 24, 96);
-    let ipad = app_window("ipad", 768, 1024, 438, 8);
+    let (rider, rw, rh) = decode_png(include_bytes!("toon/rider-toon.png"))?;
+    let (palm, pw, ph) = decode_png(include_bytes!("toon/palm-tall.png"))?;
+    host.bind_bitmap("m1r4g3Skin", &rider, rw, rh, 0, true)?;
+    host.bind_bitmap("m1r4g3PalmImage", &palm, pw, ph, 1, false)?;
+    // Logical points of the devices. Portraits on the primary work area.
+    // Landscapes on the monitor above it (work origin y = -1080).
+    let phone = app_window("phone", 390, 844, 16, 16);
+    let ipad = app_window("ipad", 768, 1024, 422, 8);
+    let phone_land = app_window("phone-land", 844, 390, 16, -1064);
+    let ipad_land = app_window("ipad-land", 1024, 768, 876, -1064);
     let cfg = RuntimeConfig {
-        windows: vec![phone, ipad],
+        windows: vec![phone, ipad, phone_land, ipad_land],
         tokens: Tokens::builtin(BuiltinSet::Dark),
         dark: true,
         ..RuntimeConfig::default()
@@ -1087,8 +1092,8 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     run_native(
         Oasis {
             host,
-            link: 0.0,
-            target: 0.0,
+            link: 1.0,
+            target: 1.0,
             style: 0.0,
             toggles: 0,
             scratch: Vec::new(),
@@ -1156,8 +1161,14 @@ fn app_window(key: &str, w: u32, h: u32, x: i32, y: i32) -> WindowSpec {
     window.decorations = false;
     window.corner_style = uzor::CornerStyle::Rounded;
     window.position = Some((x, y));
-    window.min_inner_size = Some(SizePx::new(320, 520));
+    window.min_inner_size = Some(SizePx::new(320, 320));
     window
+}
+
+fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), Box<dyn std::error::Error>> {
+    let img = image::load_from_memory(bytes)?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Ok((img.into_raw(), w, h))
 }
 
 fn local_clock() -> (f64, f64, f64) {
