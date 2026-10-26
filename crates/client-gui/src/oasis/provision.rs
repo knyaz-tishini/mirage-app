@@ -658,6 +658,11 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 20
 fi
 cd /opt/m1r4g3
+# The compose file names server.env twice: as env_file and as a read-only
+# bind mount. If the file does not exist, docker would create a DIRECTORY
+# at that path and compose would refuse to read it as an env file. So the
+# file is created before the first container starts.
+[ -f server.env ] || printf 'STACK=auto\n' > server.env
 if [ -f image.tar ]; then
   $SUDO docker load -i image.tar
 fi
