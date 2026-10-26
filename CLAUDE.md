@@ -211,9 +211,17 @@ rewrite:
   the wire's `ExitPreference` by `exit_preference_from_mode` and sent inside
   `EdgeHello` on every dial — the edge answers with the countries it can
   serve and the exit it actually fulfils (`EdgeWelcome`), never a node list.
-- A UDP-shaped entrance (`TransportCamouflage::is_udp()`) is recognised but
-  skipped with a logged warning — the edge-session dial only speaks
-  TCP-shaped faces today (`crate::assembly`).
+- EVERY entrance is dialable — the outer camouflage decides the wire
+  transport (`mirage_control_plane::edge_session::face_transport`), so a
+  datagram-shaped face is dialled over datagrams and a stream-shaped one
+  over a stream (`crate::dial::StaticKeyProtocol` calls the transport-aware
+  `run_client_v9_transport_aware`). Nothing is skipped for being
+  datagram-shaped (`crate::assembly`).
+- The faces offered in `EdgeHello` are the ones riding the SAME transport as
+  the probed face (`crate::session::offered_ports_for_transport` → the shared
+  rule `mirage_control_plane::edge_session::filter_offered_faces_by_transport`):
+  the wire format carries bare ports with no transport tag, so the two can
+  never disagree. A face with no port namespace (ICMP) is never offered.
 
 ### Session + local surface
 

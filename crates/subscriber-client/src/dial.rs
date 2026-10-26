@@ -24,6 +24,20 @@
 //! own body (`endpoint_protocol.rs:107-135`) with exactly one substitution:
 //! the key comes from `self`, decoded once from the artefact, never from
 //! `OsRng`.
+//!
+//! **The dial is transport-aware.** The subscriber may be handed an entrance
+//! wearing ANY outer camouflage — a stream one (raw TCP, TLS, WebSocket,
+//! xhttp, Reality, SSH, gRPC) or a datagram one (raw UDP, QUIC, HTTP/3,
+//! WebTransport, WireGuard, Hysteria2, a DNS tunnel, a raw ICMP echo socket).
+//! The camouflage decides the wire transport; it is not a decoration that can
+//! be bolted onto a TCP socket. This adapter therefore calls
+//! [`mirage_protocol::client_transport::run_client_v9_transport_aware`],
+//! the one dispatcher that routes by the camouflage: a stream camouflage goes
+//! to `run_client_tcp_v9` (the config is passed through UNCHANGED, so the
+//! bytes on the wire stay byte-for-byte the ones the TCP-only client has
+//! always produced) and a datagram camouflage goes to `run_client_udp_v9`.
+//! The persistent key model above is untouched by this: BOTH paths take the
+//! same `client_static_priv` this adapter holds.
 
 use std::net::SocketAddr;
 
@@ -33,7 +47,8 @@ use mirage_core::{
     error::MirageError,
 };
 use mirage_protocol::{
-    driver::{run_client_tcp_v9, ClientCredential},
+    client_transport::run_client_v9_transport_aware,
+    driver::ClientCredential,
     traits::{AcceptResult, TcpProtocol, Tunnel},
 };
 use tokio::net::TcpStream;
@@ -78,7 +93,7 @@ impl TcpProtocol for StaticKeyProtocol {
         sni: &str,
         _camouflage: CamouflageMode,
     ) -> Result<Box<dyn Tunnel>, MirageError> {
-        run_client_tcp_v9(
+        run_client_v9_transport_aware(
             &self.config,
             addr,
             server_pubkey,
@@ -110,7 +125,7 @@ impl TcpProtocol for StaticKeyProtocol {
         } else {
             &self.config
         };
-        run_client_tcp_v9(
+        run_client_v9_transport_aware(
             config_ref,
             addr,
             server_pubkey,
@@ -176,5 +191,77 @@ mod tests {
         let a = StaticKeyProtocol::new(sample_config(), b"MESH2".to_vec(), [0x01u8; 32]);
         let b = StaticKeyProtocol::new(sample_config(), b"MESH2".to_vec(), [0x02u8; 32]);
         assert_ne!(a.dial_static_key(), b.dial_static_key());
+    }
+
+    // ── the dial is transport-aware ─────────────────────────────────────
+
+    /// A datagram-shaped entrance must be dialled over DATAGRAMS — the
+    /// subscriber has to reach a box that publishes only those faces.
+    ///
+    /// The listener is a UDP socket on an ephemeral loopback port and nothing
+    /// listens on TCP for it, so a TCP dial could not even reach the
+    /// handshake. The datagram that arrives is the V9 `ClientHello`.
+    #[tokio::test]
+    async fn a_datagram_camouflage_dials_over_datagrams_not_tcp() {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind ephemeral udp port");
+        let addr = sock.local_addr().expect("local_addr of the bound udp socket");
+        let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let read = sock.recv(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(read);
+        });
+
+        // `transport: tcp` on purpose — the camouflage decides, not the config.
+        let config = MirageEndpointConfig {
+            transport: mirage_core::config::TransportKind::Tcp,
+            auth: mirage_core::config::AuthMode::Blake3,
+            camouflage: TransportCamouflage::RawUdp {
+                bind_addr: "127.0.0.1:0".parse().expect("valid addr"),
+            },
+            byte_cipher: None,
+            byte_cipher_mode: None,
+        };
+        let proto = StaticKeyProtocol::new(config, b"MESH2".to_vec(), [0x42u8; 32]);
+        let dial = tokio::spawn(async move {
+            let _ = proto.connect(addr, &[7u8; 32], "", CamouflageMode::Raw).await;
+        });
+
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("the client must put a datagram on the wire")
+            .expect("the oneshot sender must not be dropped");
+        dial.abort();
+        let _ = server.await;
+
+        assert!(read > 0, "the V9 client hello must arrive as a non-empty datagram");
+    }
+
+    /// The stream path is untouched by the dispatcher: a stream camouflage
+    /// still opens a TCP connection, and the bytes on the wire are the ones
+    /// the TCP-only client has always produced.
+    #[tokio::test]
+    async fn a_stream_camouflage_still_dials_over_tcp() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral tcp port");
+        let addr = listener.local_addr().expect("local_addr of the bound tcp listener");
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await.is_ok();
+            let _ = tx.send(accepted);
+        });
+
+        let proto = StaticKeyProtocol::new(sample_config(), b"MESH2".to_vec(), [0x42u8; 32]);
+        let dial = tokio::spawn(async move {
+            let _ = proto.connect(addr, &[7u8; 32], "", CamouflageMode::Raw).await;
+        });
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("the client must open a TCP connection")
+            .expect("the oneshot sender must not be dropped");
+        dial.abort();
+        let _ = server.await;
+
+        assert!(accepted, "the TCP listener must have accepted the client's connection");
     }
 }

@@ -17,9 +17,10 @@
 //!    (full-auto or a named country) — see `mirage2app/CLAUDE.md`
 //!    "subscriber-client config (edge session)".
 //! 2. Dial one persistent [`session::EdgeSession`] over the artefact's
-//!    TCP-shaped entrance faces (round-robin failover), exchange
-//!    `EdgeHello`/`EdgeWelcome`, and — once accepted — upgrade to a mux
-//!    session. [`session::EdgeSessionSupervisor`] holds this session up
+//!    entrance faces — stream-shaped and datagram-shaped alike, the outer
+//!    camouflage deciding the wire transport — with round-robin failover,
+//!    exchange `EdgeHello`/`EdgeWelcome`, and — once accepted — upgrade to a
+//!    mux session. [`session::EdgeSessionSupervisor`] holds this session up
 //!    across drops with exponential-backoff reconnect. This replaces the
 //!    crate's earlier one-single-hop-dial-per-flow path — see
 //!    [`assembly`]'s own module doc.

@@ -1,11 +1,12 @@
 //! Assembles a validated [`EntranceArtefact`] into a running local proxy.
 //!
 //! One [`EdgeSessionSupervisor`] holds the ONE persistent mux session to the
-//! customer's edge, dialed across every TCP-shaped entrance face
-//! (round-robin failover, reconnect with backoff — `crate::session`), fronting
-//! one [`crate::socks5`] listener for SOCKS5 CONNECT. UDP ASSOCIATE is
-//! refused cleanly (`crate::socks5`'s own doc) — the UDP relay over the mux
-//! session is a later slice.
+//! customer's edge, dialed across every entrance face the artefact carries
+//! — stream-shaped and datagram-shaped alike, the outer camouflage deciding
+//! the wire transport (round-robin failover, reconnect with backoff —
+//! `crate::session`), fronting one [`crate::socks5`] listener for SOCKS5
+//! CONNECT. UDP ASSOCIATE is refused cleanly (`crate::socks5`'s own doc) —
+//! the UDP relay over the mux session is a later slice.
 //!
 //! This replaces the crate's previous one-single-hop-dial-per-flow path
 //! (`ChainSet`/`RouterImpl`/`TunnelPool`, one `ChainConfig` per entrance) —
@@ -26,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::artefact::{ArtefactError, EntranceArtefact};
 use crate::scope::EgressScope;
@@ -43,12 +44,6 @@ pub enum SubscriberClientError {
     #[error(transparent)]
     EdgeDial(#[from] EdgeDialError),
 
-    #[error(
-        "subscriber client: every entrance in the artefact is UDP-shaped — the edge session \
-         dial only speaks TCP-shaped faces today"
-    )]
-    NoUsableEntrance,
-
     #[error("subscriber client: cannot write the status file {}: {source}", path.display())]
     StatusFile { path: PathBuf, source: io::Error },
 }
@@ -59,7 +54,7 @@ impl SubscriberClientError {
     /// written to is the thing that failed.
     pub fn status_reason(&self) -> Option<EdgeReason> {
         match self {
-            Self::Artefact(_) | Self::NoUsableEntrance => Some(EdgeReason::BadArtefact),
+            Self::Artefact(_) => Some(EdgeReason::BadArtefact),
             Self::EdgeDial(e) => Some(EdgeReason::from(e)),
             Self::StatusFile { .. } => None,
         }
@@ -110,8 +105,9 @@ pub struct SubscriberClient {
 
 impl SubscriberClient {
     /// Validate `artefact`, spawn the edge-session supervisor over its
-    /// TCP-shaped entrances, and stand up the local SOCKS5 listener (plus,
-    /// if configured, the TUN feed).
+    /// entrances (every one of them — the camouflage decides the transport),
+    /// and stand up the local SOCKS5 listener (plus, if configured, the TUN
+    /// feed).
     ///
     /// The stream-failure watchdog uses its default threshold — see
     /// [`Self::build_with_threshold`].
@@ -142,31 +138,15 @@ impl SubscriberClient {
         let client_static_priv = artefact.client_static_priv()?;
         let mesh_id = artefact.mesh_id.as_bytes().to_vec();
 
-        let tcp_entrances: Vec<_> = artefact
-            .entrances
-            .iter()
-            .filter(|e| {
-                if e.camouflage.is_udp() {
-                    warn!(
-                        addr = %e.addr,
-                        camouflage = e.camouflage.label(),
-                        "entrance is UDP-shaped — the edge session dial only speaks TCP-shaped \
-                         faces today (UDP relay is a later slice); skipping"
-                    );
-                    false
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-
-        if tcp_entrances.is_empty() {
-            return Err(SubscriberClientError::NoUsableEntrance);
-        }
+        // EVERY entrance is dialable — the outer camouflage decides the wire
+        // transport, so a datagram-shaped face is dialled over datagrams and
+        // a stream-shaped one over a stream. Dropping the datagram-shaped
+        // faces here would make the subscriber unable to reach a box that
+        // publishes only those.
+        let entrances = artefact.entrances.clone();
 
         let supervisor = EdgeSessionSupervisor::spawn_with_threshold(
-            tcp_entrances,
+            entrances,
             mesh_id,
             client_static_priv,
             exit,
@@ -278,17 +258,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_refuses_when_every_entrance_is_udp_shaped() {
+    async fn build_accepts_an_artefact_whose_only_entrance_is_udp_shaped() {
+        // A datagram-shaped face is dialled over datagrams — the subscriber
+        // must not be refused an artefact that carries nothing else.
         let mut artefact = sample_artefact(1);
         artefact.entrances[0].camouflage =
-            TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:853".parse().expect("valid addr") };
+            TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:18530".parse().expect("valid addr") };
         let bind = free_local_addr().await;
         let opts = SubscriberClientOptions { socks5_bind: bind, ..Default::default() };
-        match SubscriberClient::build(&artefact, opts).await {
-            Err(SubscriberClientError::NoUsableEntrance) => {}
-            Err(other) => panic!("expected NoUsableEntrance, got a different error: {other}"),
-            Ok(_) => panic!("expected a refusal, build succeeded"),
-        }
+        let client = SubscriberClient::build(&artefact, opts)
+            .await
+            .expect("a UDP-only artefact must build — the mask decides the transport");
+        client.shutdown();
     }
 
     // ── build spawns a reachable SOCKS5 listener over the edge supervisor ──

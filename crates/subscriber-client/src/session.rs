@@ -18,10 +18,19 @@
 //! exponential backoff whenever it closes. The edge assigns the session
 //! face. This client speaks hello version 3 first, version 2 when the edge
 //! refuses version 3, and version 1 when the edge refuses version 2. It
-//! only picks a TCP probe, and fails that probe over onto another TCP face
-//! when the probe itself cannot connect. The version-1 fallback is
-//! [`EdgeSession::connect_first_available`] from index 0. A version-3
-//! refusal does not skip version 2.
+//! picks a probe from every face the artefact carries — stream-shaped and
+//! datagram-shaped alike — and fails that probe over onto another face of
+//! the SAME transport when the probe itself cannot connect. The version-1
+//! fallback is [`EdgeSession::connect_first_available`] from index 0. A
+//! version-3 refusal does not skip version 2.
+//!
+//! **Any face, not only a TCP one.** The subscriber may be handed an
+//! entrance wearing any outer camouflage — a stream one or a datagram one —
+//! and the camouflage decides the wire transport. The probe is therefore
+//! picked from EVERY entrance, and the faces the hello offers are the ones
+//! riding the SAME transport as the probed face (the wire format carries
+//! bare ports with no transport tag, so the two can never disagree). See
+//! [`offered_ports_for_transport`] and `mirage_control_plane::edge_session`.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +42,8 @@ use mirage_control_plane::{
     CountryCode, EdgeHello, EdgeOutcome, EdgeRefusal, EdgeSessionError as WireError, EdgeWelcome,
     ExitPreference, StreamKind, StreamOpen, StreamTarget,
 };
-use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportKind};
+use mirage_control_plane::edge_session::{face_transport, filter_offered_faces_by_transport};
+use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
 use mirage_core::error::MirageError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
 use mirage_mux::MuxError;
@@ -106,10 +116,10 @@ pub enum EdgeDialError {
     #[error("edge session: EdgeHello encode: {0}")]
     MalformedHello(WireError),
 
-    #[error("edge session: edge assigned port {port} which is not a tcp entrance on the artefact")]
+    #[error("edge session: edge assigned port {port} which is not an entrance on the artefact")]
     AssignedFaceMissing { port: u16 },
 
-    #[error("edge session: {count} tcp entrances exceeds the {max} a version-2 hello can offer")]
+    #[error("edge session: {count} entrances of one transport exceeds the {max} a version-2 hello can offer")]
     TooManyFaces { count: usize, max: usize },
 }
 
@@ -372,8 +382,12 @@ async fn open_entrance_tunnel(
         reason: e.to_string(),
     })?;
     let server_pubkey = entrance.server_pubkey()?;
+    // The camouflage — not this crate — decides the wire transport: a stream
+    // camouflage rides TCP, a datagram one rides datagrams. The config's
+    // `transport` field is therefore DERIVED from the mask, never hardcoded,
+    // so the tunnel this opens is dialled the way the face is published.
     let ep_config = MirageEndpointConfig {
-        transport: TransportKind::Tcp,
+        transport: face_transport(&entrance.camouflage),
         auth: AuthMode::Blake3,
         camouflage: entrance.camouflage.clone(),
         byte_cipher: None,
@@ -409,17 +423,34 @@ fn entrance_tcp_port(entrance: &ArtefactEntrance) -> Result<u16, EdgeDialError> 
     })
 }
 
-/// TCP faces only, in artefact order, as `(index, port)`. UDP-shaped faces,
-/// including `raw_udp`, are not offered and not probed.
-fn offered_tcp_ports(entrances: &[ArtefactEntrance]) -> Result<Vec<(usize, u16)>, EdgeDialError> {
-    let mut offered = Vec::new();
-    for (idx, entrance) in entrances.iter().enumerate() {
-        if entrance.camouflage.is_udp() {
-            continue;
-        }
-        offered.push((idx, entrance_tcp_port(entrance)?));
-    }
-    Ok(offered)
+/// The faces of `entrances` that ride `transport`, in artefact order, as
+/// `(index, port)`.
+///
+/// The [`EdgeHello`] wire format carries bare port numbers and NO transport
+/// tag, so the edge cannot tell a TCP port from a UDP one. The client
+/// therefore offers ONLY the faces of the transport its session actually
+/// rides: a session over datagrams must not also offer its stream faces, or
+/// the edge may assign one of them back and the follow-up dial would be a
+/// stream dial on a datagram session.
+///
+/// The rule itself lives in `mirage-control-plane`
+/// ([`filter_offered_faces_by_transport`]) — the same one the edge and the
+/// wire-format code use — so the client and the edge can never disagree
+/// about which face rides what. A face whose mask has no port namespace
+/// (ICMP) is never offered, whatever the transport is.
+///
+/// The result is NOT capped at [`EdgeHello::MAX_OFFERED_PORTS`]: that cap is
+/// a wire-format limit the caller checks before encoding.
+fn offered_ports_for_transport(
+    entrances: &[ArtefactEntrance],
+    transport: TransportKind,
+) -> Result<Vec<(usize, u16)>, EdgeDialError> {
+    let faces: Vec<(usize, &TransportCamouflage, u16)> = entrances
+        .iter()
+        .enumerate()
+        .map(|(idx, e)| Ok((idx, &e.camouflage, entrance_tcp_port(e)?)))
+        .collect::<Result<Vec<_>, EdgeDialError>>()?;
+    Ok(filter_offered_faces_by_transport(&faces, transport))
 }
 
 fn probe_origin(len: usize) -> usize {
@@ -580,7 +611,8 @@ impl ExitCtrl {
     }
 }
 
-/// [`EdgeDialer`] over the artefact's own TCP-shaped entrances.
+/// [`EdgeDialer`] over the artefact's own entrances — every one of them,
+/// stream-shaped and datagram-shaped alike.
 struct EntranceDialer {
     entrances: Vec<ArtefactEntrance>,
     mesh_id: Vec<u8>,
@@ -589,29 +621,57 @@ struct EntranceDialer {
 }
 
 impl EntranceDialer {
-    /// Probe TCP faces at `version` (2 or 3). A version-2 unsupported-version
+    /// Probe faces at `version` (2 or 3). A version-2 unsupported-version
     /// refusal falls back to version 1. A version-3 refusal is returned so
     /// the caller can retry at version 2 — it does not skip to version 1.
+    ///
+    /// The probe face is picked from EVERY entrance — stream- and
+    /// datagram-shaped alike — and the faces the hello offers are the ones
+    /// riding the SAME transport as the probed face. The transport of the
+    /// session is therefore known BEFORE the offer is assembled, never
+    /// after.
     async fn dial_at(
         &self,
         version: u8,
-        offered: &[(usize, u16)],
-        ports: &[u16],
         exit: ExitPreference,
     ) -> Result<(usize, EdgeSession), EdgeDialError> {
-        let start = probe_origin(offered.len());
+        if self.entrances.is_empty() {
+            return Err(EdgeDialError::NoEntrances);
+        }
+        let start = probe_origin(self.entrances.len());
         let mut last_err = EdgeDialError::NoEntrances;
-        for offset in 0..offered.len() {
-            let slot = (start + offset) % offered.len();
-            let (idx, probe_port) = offered[slot];
-            let probe_addr = self.entrances[idx].addr.clone();
+        // A refusal kept for the report: a transport whose face count does
+        // not fit in one hello is skipped, not fatal — another transport may
+        // still carry the session.
+        let mut too_many: Option<EdgeDialError> = None;
+        for offset in 0..self.entrances.len() {
+            let idx = (start + offset) % self.entrances.len();
+            let entrance = &self.entrances[idx];
+            let probe_addr = entrance.addr.clone();
+            let session_transport = face_transport(&entrance.camouflage);
+            let offered = offered_ports_for_transport(&self.entrances, session_transport)?;
+            if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
+                too_many.get_or_insert(EdgeDialError::TooManyFaces {
+                    count: offered.len(),
+                    max: EdgeHello::MAX_OFFERED_PORTS,
+                });
+                debug!(
+                    transport = %session_transport.as_str(),
+                    count = offered.len(),
+                    max = EdgeHello::MAX_OFFERED_PORTS,
+                    "edge session: too many faces of this transport to offer — skipping it"
+                );
+                continue;
+            }
+            let ports: Vec<u16> = offered.iter().map(|(_, port)| *port).collect();
+            let probe_port = entrance_tcp_port(entrance)?;
             match dial_v2_face(
-                &self.entrances[idx],
+                entrance,
                 &self.mesh_id,
                 self.client_static_priv,
                 exit,
                 false,
-                ports,
+                &ports,
                 version,
             )
             .await
@@ -629,7 +689,7 @@ impl EntranceDialer {
                                 self.client_static_priv,
                                 exit,
                                 true,
-                                ports,
+                                &ports,
                                 version,
                             )
                             .await?;
@@ -663,11 +723,18 @@ impl EntranceDialer {
                         debug!(
                             entrance = %probe_addr,
                             error = %other,
-                            "edge session: probe failed, trying next tcp face"
+                            "edge session: probe failed, trying next face"
                         );
                         last_err = other;
                     }
                 },
+            }
+        }
+        // A face count that did not fit is the more specific refusal than
+        // "no entrances" — report it when nothing else was tried.
+        if let Some(err) = too_many {
+            if matches!(last_err, EdgeDialError::NoEntrances) {
+                return Err(err);
             }
         }
         Err(last_err)
@@ -677,22 +744,14 @@ impl EntranceDialer {
 #[async_trait::async_trait]
 impl EdgeDialer for EntranceDialer {
     async fn dial(&self, _start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError> {
-        let offered = offered_tcp_ports(&self.entrances)?;
-        if offered.is_empty() {
+        if self.entrances.is_empty() {
             return Err(EdgeDialError::NoEntrances);
         }
-        if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
-            return Err(EdgeDialError::TooManyFaces {
-                count: offered.len(),
-                max: EdgeHello::MAX_OFFERED_PORTS,
-            });
-        }
-        let ports: Vec<u16> = offered.iter().map(|(_, port)| *port).collect();
         let exit = self.exit.get();
-        match self.dial_at(EDGE_SESSION_WIRE_VERSION_V3, &offered, &ports, exit).await {
+        match self.dial_at(EDGE_SESSION_WIRE_VERSION_V3, exit).await {
             Err(EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. }))) => {
                 info!("edge session: edge refused version 3, falling back to version 2");
-                self.dial_at(EDGE_SESSION_WIRE_VERSION_V2, &offered, &ports, exit).await
+                self.dial_at(EDGE_SESSION_WIRE_VERSION_V2, exit).await
             }
             other => other,
         }
@@ -724,8 +783,8 @@ impl Drop for EdgeSessionSupervisor {
 }
 
 impl EdgeSessionSupervisor {
-    /// Spawn the background dial/reconnect loop over `entrances` (already
-    /// filtered to TCP-shaped faces by the caller — see `crate::assembly`).
+    /// Spawn the background dial/reconnect loop over `entrances` (every
+    /// entrance the artefact carries — the camouflage decides the transport).
     ///
     /// The stream-failure watchdog uses its default threshold — see
     /// [`Self::spawn_with_threshold`].
@@ -1154,15 +1213,17 @@ mod tests {
         assert_eq!(exit_preference_from_mode(&ArtefactMode::FullAuto).expect("ok"), ExitPreference::Auto);
     }
 
-    #[test]
-    fn offered_tcp_ports_skip_udp_faces() {
+    /// The faces the offer tests share: two stream faces, two datagram faces
+    /// and one ICMP face — in that order, so the offered list's order is
+    /// observable.
+    fn mixed_face_artefact() -> Vec<ArtefactEntrance> {
         use mirage_core::config::TransportCamouflage;
         let face = |addr: &str, camouflage: TransportCamouflage| ArtefactEntrance {
             addr: addr.to_owned(),
             server_pubkey_hex: "ab".repeat(32),
             camouflage,
         };
-        let entrances = vec![
+        vec![
             face(
                 "203.0.113.10:80",
                 TransportCamouflage::WebSocket { path: "/".to_owned(), host: "h".to_owned() },
@@ -1183,9 +1244,97 @@ mod tests {
                 "203.0.113.10:8080",
                 TransportCamouflage::Xhttp { path: "/".to_owned(), host: "h".to_owned() },
             ),
-        ];
-        let offered = offered_tcp_ports(&entrances).expect("ports");
-        assert_eq!(offered, vec![(0, 80), (2, 443), (4, 8080)]);
+            // ICMP: no port namespace of its own — it must never be offered.
+            face(
+                "203.0.113.10:7",
+                TransportCamouflage::Icmp {
+                    peer_addr: "203.0.113.10".parse().expect("addr"),
+                    identifier: 7,
+                    mtu: 1400,
+                },
+            ),
+        ]
+    }
+
+    /// A stream session offers the stream faces only; a datagram session
+    /// offers the datagram faces only. The two sets never mix — the wire
+    /// format carries bare ports with no transport tag.
+    #[test]
+    fn offered_ports_for_transport_keeps_only_the_faces_of_that_transport() {
+        let entrances = mixed_face_artefact();
+
+        let tcp = offered_ports_for_transport(&entrances, TransportKind::Tcp).expect("ports");
+        assert_eq!(tcp, vec![(0, 80), (2, 443), (4, 8080)]);
+
+        let udp = offered_ports_for_transport(&entrances, TransportKind::Udp).expect("ports");
+        assert_eq!(udp, vec![(1, 5060), (3, 853)]);
+    }
+
+    /// The offer keeps the artefact's own order — the edge reads the list as
+    /// "these are the faces I may be assigned", not as an unordered set.
+    #[test]
+    fn the_offered_faces_keep_the_artefact_order() {
+        let entrances = mixed_face_artefact();
+        for transport in [TransportKind::Tcp, TransportKind::Udp] {
+            let offered = offered_ports_for_transport(&entrances, transport).expect("ports");
+            let mut indices: Vec<usize> = offered.iter().map(|(idx, _)| *idx).collect();
+            let artefact_order: Vec<usize> = indices.clone();
+            indices.sort_unstable();
+            assert_eq!(
+                indices,
+                artefact_order,
+                "the offered faces must stay in the artefact's order (transport {})",
+                transport.as_str()
+            );
+        }
+    }
+
+    /// A datagram face is offered by a datagram session and NEVER by a
+    /// stream session — and the other way round. This is the whole point of
+    /// the transport-aware offer: the subscriber reaches a box that publishes
+    /// datagram faces, without ever offering a stream port on a datagram
+    /// session.
+    #[test]
+    fn a_datagram_face_is_offered_by_a_datagram_session_only() {
+        let entrances = mixed_face_artefact();
+        let udp = offered_ports_for_transport(&entrances, TransportKind::Udp).expect("ports");
+        assert!(
+            udp.contains(&(1, 5060)) && udp.contains(&(3, 853)),
+            "both datagram faces must be offered to a datagram session, got {udp:?}"
+        );
+
+        let tcp = offered_ports_for_transport(&entrances, TransportKind::Tcp).expect("ports");
+        assert!(
+            !tcp.contains(&(1, 5060)) && !tcp.contains(&(3, 853)),
+            "a datagram face must never be offered to a stream session, got {tcp:?}"
+        );
+    }
+
+    /// ICMP has no port namespace of its own — there is no port to put in
+    /// the hello — so it is never offered, whatever the session's transport
+    /// is.
+    #[test]
+    fn an_icmp_face_is_never_offered() {
+        let entrances = mixed_face_artefact();
+        let icmp_idx = 5;
+        for transport in [TransportKind::Tcp, TransportKind::Udp] {
+            let offered = offered_ports_for_transport(&entrances, transport).expect("ports");
+            assert!(
+                !offered.iter().any(|(idx, _)| *idx == icmp_idx),
+                "an ICMP face must never be offered (transport {}), got {offered:?}",
+                transport.as_str()
+            );
+        }
+    }
+
+    /// The transport a face rides is the one its own camouflage decides —
+    /// the same rule the dial applies.
+    #[test]
+    fn the_transport_of_a_face_comes_from_its_camouflage() {
+        let entrances = mixed_face_artefact();
+        assert_eq!(face_transport(&entrances[0].camouflage), TransportKind::Tcp);
+        assert_eq!(face_transport(&entrances[1].camouflage), TransportKind::Udp);
+        assert_eq!(face_transport(&entrances[5].camouflage), TransportKind::Udp);
     }
 
     #[test]

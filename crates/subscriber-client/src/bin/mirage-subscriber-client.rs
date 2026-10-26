@@ -246,9 +246,9 @@ fn report_fatal(status_file: Option<&Path>, requested: &ExitPreference, reason: 
     }
 }
 
-/// Connect to the edge over its TCP-shaped entrances, print every country it
-/// can serve, and exit — no SOCKS5 listener, no supervisor, no reconnect
-/// loop; a single dial attempt is enough for this one-shot query.
+/// Connect to the edge over its entrances, print every country it can serve,
+/// and exit — no SOCKS5 listener, no supervisor, no reconnect loop; a single
+/// dial attempt is enough for this one-shot query.
 async fn run_countries(artefact: &EntranceArtefact) -> ExitCode {
     let exit = match exit_preference_from_mode(&artefact.mode) {
         Ok(exit) => exit,
@@ -265,18 +265,18 @@ async fn run_countries(artefact: &EntranceArtefact) -> ExitCode {
         }
     };
     let mesh_id = artefact.mesh_id.as_bytes().to_vec();
-    let tcp_entrances: Vec<_> =
-        artefact.entrances.iter().filter(|e| !e.camouflage.is_udp()).cloned().collect();
-    if tcp_entrances.is_empty() {
-        error!("refusing: every entrance in the artefact is UDP-shaped, nothing to dial");
+    // EVERY entrance is dialable — the outer camouflage decides the wire
+    // transport, so a datagram-shaped face is dialled over datagrams. The
+    // query must reach a box that publishes only those.
+    let entrances = &artefact.entrances;
+    if entrances.is_empty() {
+        error!("refusing: the artefact carries no entrance, nothing to dial");
         return ExitCode::FAILURE;
     }
 
-    match EdgeSession::connect_first_available(&tcp_entrances, &mesh_id, client_static_priv, exit, 0)
-        .await
-    {
+    match EdgeSession::connect_first_available(entrances, &mesh_id, client_static_priv, exit, 0).await {
         Ok((idx, session)) => {
-            info!(entrance = %tcp_entrances[idx].addr, "mirage-subscriber-client: connected to edge");
+            info!(entrance = %entrances[idx].addr, "mirage-subscriber-client: connected to edge");
             for cc in session.countries() {
                 println!("{cc}");
             }
