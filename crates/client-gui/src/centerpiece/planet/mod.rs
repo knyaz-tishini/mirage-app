@@ -198,7 +198,10 @@ impl Skin for PlanetSkin {
     fn render(&mut self, ctx: &mut dyn RenderContext, frame: CenterpieceState) {
         let dt = frame.dt;
         let rect: SkinRect = frame.rect;
-        self.t += dt;
+        let idle = matches!(frame.phase, ConnPhase::Disconnected);
+        if !idle {
+            self.t += dt;
+        }
 
         // ── Targets by phase ───────────────────────────────────────────────────
         // Fold is the "on" picture. Connecting is only the dial; the globe
@@ -222,8 +225,8 @@ impl Skin for PlanetSkin {
         if self.since_drag == 0 {
             // Dragged this frame — drag() already moved yaw/pitch.
             self.since_drag = 1;
-        } else if self.sel.is_none() {
-            // Idle: coast on inertia + a gentle auto-rotate.
+        } else if self.sel.is_none() && !idle {
+            // Session is up or dialing: coast on inertia + a gentle auto-rotate.
             self.yaw += self.vyaw + 0.12 * dt;
             self.pitch = clamp(self.pitch + self.vpitch, -1.35, 1.35);
             self.vyaw *= 0.92;

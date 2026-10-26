@@ -93,6 +93,14 @@ struct Args {
     #[arg(long = "bypass-cidr")]
     bypass_cidr: Vec<String>,
 
+    /// How many consecutive failed stream opens tear the edge session down
+    /// and force a redial. This is the watchdog that notices the edge
+    /// refusing streams (it holds no chain for this exit) — without it the
+    /// connector sits at `connected` through a blackout until the session
+    /// TCP dies on its own.
+    #[arg(long, default_value_t = mirage_subscriber_client::DEFAULT_STREAM_FAILURE_THRESHOLD)]
+    stream_failure_threshold: u32,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -562,7 +570,13 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
             start_socks: false,
             ..Default::default()
         };
-        let client = match SubscriberClient::build(artefact, options).await {
+        let client = match SubscriberClient::build_with_threshold(
+            artefact,
+            options,
+            args.stream_failure_threshold,
+        )
+        .await
+        {
             Ok(client) => client,
             Err(e) => {
                 error!(error = %e, "refusing: failed to assemble subscriber client");
@@ -681,7 +695,13 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
         ..Default::default()
     };
 
-    let client = match SubscriberClient::build(artefact, options).await {
+    let client = match SubscriberClient::build_with_threshold(
+        artefact,
+        options,
+        args.stream_failure_threshold,
+    )
+    .await
+    {
         Ok(client) => client,
         Err(e) => {
             error!(error = %e, "refusing: failed to assemble subscriber client");

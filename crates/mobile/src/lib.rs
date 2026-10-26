@@ -28,4 +28,7 @@ mod android;
 #[cfg(target_os = "ios")]
 mod ios;
 
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+mod store;
+
 mod tun;

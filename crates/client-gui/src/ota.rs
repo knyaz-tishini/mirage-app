@@ -181,6 +181,9 @@ fn note(message: &str) {
 
 /// Background check. One thread for the life of the process.
 pub fn start() {
+    if cfg!(target_os = "ios") {
+        return;
+    }
     thread::Builder::new()
         .name("mirage-ota".into())
         .spawn(|| {
@@ -349,6 +352,9 @@ pub fn clear_rollback_copy() {
 
 /// Press of «Перезагрузить». Spawn this same path (now the new bytes) and leave.
 pub fn restart() {
+    if cfg!(target_os = "ios") {
+        return;
+    }
     if let Err(err) = spawn_and_exit() {
         note(&format!("ota restart failed: {err}"));
         set_status(UpdateStatus::Error(err));

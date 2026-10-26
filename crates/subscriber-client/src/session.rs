@@ -36,6 +36,7 @@ use mirage_control_plane::{
 use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportKind};
 use mirage_core::error::MirageError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
+use mirage_mux::MuxError;
 use mirage_protocol::traits::{TcpProtocol, Tunnel};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -44,6 +45,7 @@ use tracing::{debug, info, warn};
 use crate::artefact::{ArtefactEntrance, ArtefactError, ArtefactMode};
 use crate::dial::StaticKeyProtocol;
 use crate::status::{EdgeReason, EdgeStatusFile};
+use crate::watchdog::{StreamHealth, WatchedStream, DEFAULT_STREAM_FAILURE_THRESHOLD};
 
 /// Version 1 of this client's edge-session wire — see [`EdgeHello::version`].
 /// A version-2 dial is a separate path ([`EntranceDialer`]); this constant
@@ -146,10 +148,17 @@ pub fn exit_preference_from_mode(mode: &ArtefactMode) -> Result<ExitPreference, 
 
 /// One live session to the customer's own edge.
 pub struct EdgeSession {
-    session: SessionHandle,
+    /// The mux session handle, or `None` once this session has been torn
+    /// down. It is an `Arc` so an in-flight stream open can keep using the
+    /// handle while the watchdog takes it away to close the session — see
+    /// [`Self::abort`].
+    session: Mutex<Option<Arc<SessionHandle>>>,
     welcome: EdgeWelcome,
     /// Which entrance this session dialed — logs only.
     entrance_label: String,
+    /// Consecutive failed stream opens on THIS session — see
+    /// [`crate::watchdog`].
+    health: Arc<StreamHealth>,
 }
 
 impl EdgeSession {
@@ -241,20 +250,68 @@ impl EdgeSession {
 
     /// `true` once the underlying mux session has closed (peer GoAway, EOF,
     /// or a transport error) — the caller (`EdgeSessionSupervisor`) redials.
+    /// A session that was torn down by the watchdog counts as closed.
     pub fn is_closed(&self) -> bool {
-        self.session.is_closed()
+        match self.handle() {
+            Some(handle) => handle.is_closed(),
+            None => true,
+        }
+    }
+
+    /// The mux session handle, while this session is still live.
+    fn handle(&self) -> Option<Arc<SessionHandle>> {
+        self.session.lock().unwrap_or_else(|e| e.into_inner()).as_ref().cloned()
+    }
+
+    /// The watchdog's counter for THIS session — consecutive failed stream
+    /// opens, reset by the first successful stream.
+    pub fn health(&self) -> &Arc<StreamHealth> {
+        &self.health
+    }
+
+    /// Tear this session down for real.
+    ///
+    /// Dropping the mux session handle closes the mux session: the handle
+    /// carries the close signal the mux driver waits for, and dropping it
+    /// drops that signal, so the driver closes the session (GoAway to the
+    /// edge) and the transport with it — the TCP to the edge ends, and the
+    /// EDGE records demand again when it accepts the next session. That is
+    /// what heals the 2026-10-21 blackout: a session that stays up but
+    /// cannot open streams never re-records demand.
+    ///
+    /// An in-flight stream open keeps its own reference to the handle, so
+    /// the close lands as soon as that open returns — microseconds later in
+    /// practice, because the mux driver answers an open immediately.
+    pub fn abort(&self) {
+        let taken = self.session.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(taken);
     }
 
     /// Open one mux stream for a TCP flow, writing the [`StreamOpen`] header
     /// as its first bytes. `target` is the raw `host:port` string the flow
     /// asked for — a domain name travels through unresolved so DNS resolves
     /// at the exit (see `crate::socks5`).
-    pub async fn open_tcp_stream(&self, target: &str) -> Result<TokioMuxStream, EdgeStreamError> {
+    ///
+    /// The returned stream reports how the open ended to this session's
+    /// watchdog — see [`crate::watchdog`].
+    pub async fn open_tcp_stream(&self, target: &str) -> Result<WatchedStream, EdgeStreamError> {
         let target = StreamTarget::new(target).map_err(EdgeStreamError::BadTarget)?;
-        let stream = self.session.open_stream().await?;
-        let mut stream = TokioMuxStream(stream);
+        let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
+        let stream = match handle.open_stream().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                // The session itself could not give us a stream — that is a
+                // failed open like any other.
+                self.health.record_failure();
+                return Err(e.into());
+            }
+        };
+        let mut stream = WatchedStream::new(TokioMuxStream(stream), Arc::clone(&self.health));
         let open = StreamOpen { kind: StreamKind::Tcp, target };
-        stream.write_all(&open.encode()).await?;
+        if let Err(e) = stream.write_all(&open.encode()).await {
+            self.health.record_failure();
+            return Err(e.into());
+        }
         Ok(stream)
     }
 
@@ -271,16 +328,35 @@ impl EdgeSession {
             return Err(EdgeStreamError::DatagramsRefused);
         }
         let target = StreamTarget::new(target).map_err(EdgeStreamError::BadTarget)?;
-        let stream = self.session.open_stream().await?;
-        let mut stream = TokioMuxStream(stream);
+        let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
+        let stream = match handle.open_stream().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                self.health.record_failure();
+                return Err(e.into());
+            }
+        };
+        let mut stream = WatchedStream::new(TokioMuxStream(stream), Arc::clone(&self.health));
         let open = StreamOpen { kind: StreamKind::Udp, target };
-        stream.write_all(&open.encode()).await?;
+        if let Err(e) = stream.write_all(&open.encode()).await {
+            self.health.record_failure();
+            return Err(e.into());
+        }
+        if let Err(e) = stream.flush().await {
+            self.health.record_failure();
+            return Err(e.into());
+        }
         Ok(crate::udp_flow::EdgeUdpFlow::new(stream))
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(session: SessionHandle, welcome: EdgeWelcome) -> Self {
-        Self { session, welcome, entrance_label: "test".to_owned() }
+        Self {
+            session: Mutex::new(Some(Arc::new(session))),
+            welcome,
+            entrance_label: "test".to_owned(),
+            health: Arc::new(StreamHealth::new()),
+        }
     }
 }
 
@@ -312,7 +388,12 @@ async fn open_entrance_tunnel(
 fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label: String) -> EdgeSession {
     let compat = TunnelCompat::wrap(tunnel);
     let session = SessionHandle::client(compat);
-    EdgeSession { session, welcome, entrance_label }
+    EdgeSession {
+        session: Mutex::new(Some(Arc::new(session))),
+        welcome,
+        entrance_label,
+        health: Arc::new(StreamHealth::new()),
+    }
 }
 
 fn entrance_tcp_port(entrance: &ArtefactEntrance) -> Result<u16, EdgeDialError> {
@@ -645,11 +726,34 @@ impl Drop for EdgeSessionSupervisor {
 impl EdgeSessionSupervisor {
     /// Spawn the background dial/reconnect loop over `entrances` (already
     /// filtered to TCP-shaped faces by the caller — see `crate::assembly`).
+    ///
+    /// The stream-failure watchdog uses its default threshold — see
+    /// [`Self::spawn_with_threshold`].
     pub fn spawn(
         entrances: Vec<ArtefactEntrance>,
         mesh_id: Vec<u8>,
         client_static_priv: [u8; 32],
         exit: ExitPreference,
+    ) -> Arc<Self> {
+        Self::spawn_with_threshold(
+            entrances,
+            mesh_id,
+            client_static_priv,
+            exit,
+            DEFAULT_STREAM_FAILURE_THRESHOLD,
+        )
+    }
+
+    /// [`Self::spawn`] with an explicit stream-failure threshold: how many
+    /// consecutive failed stream opens tear the session down and force a
+    /// redial. A threshold below one is clamped to one — the watchdog never
+    /// tears a session down without at least one failed open on record.
+    pub fn spawn_with_threshold(
+        entrances: Vec<ArtefactEntrance>,
+        mesh_id: Vec<u8>,
+        client_static_priv: [u8; 32],
+        exit: ExitPreference,
+        stream_failure_threshold: u32,
     ) -> Arc<Self> {
         let exit_ctrl = Arc::new(ExitCtrl::new(exit));
         Self::spawn_with_dialer_exit(
@@ -661,6 +765,7 @@ impl EdgeSessionSupervisor {
             },
             exit,
             Some(exit_ctrl),
+            stream_failure_threshold.max(1),
         )
     }
 
@@ -668,18 +773,35 @@ impl EdgeSessionSupervisor {
     /// status file reports as asked-for.
     #[cfg(test)]
     pub(crate) fn spawn_with_dialer(dialer: impl EdgeDialer, requested: ExitPreference) -> Arc<Self> {
-        Self::spawn_with_dialer_exit(dialer, requested, None)
+        Self::spawn_with_dialer_exit(dialer, requested, None, DEFAULT_STREAM_FAILURE_THRESHOLD)
+    }
+
+    /// [`Self::spawn_with_dialer`] with an explicit stream-failure threshold.
+    #[cfg(test)]
+    pub(crate) fn spawn_with_dialer_and_threshold(
+        dialer: impl EdgeDialer,
+        requested: ExitPreference,
+        stream_failure_threshold: u32,
+    ) -> Arc<Self> {
+        Self::spawn_with_dialer_exit(
+            dialer,
+            requested,
+            None,
+            stream_failure_threshold.max(1),
+        )
     }
 
     fn spawn_with_dialer_exit(
         dialer: impl EdgeDialer,
         requested: ExitPreference,
         exit: Option<Arc<ExitCtrl>>,
+        stream_failure_threshold: u32,
     ) -> Arc<Self> {
         let (slot, _slot_rx) = tokio::sync::watch::channel(None);
         let (status, _status_rx) =
             tokio::sync::watch::channel(EdgeStatusFile::connecting(&requested));
-        let driver = tokio::spawn(drive(dialer, slot.clone(), status.clone()));
+        let driver =
+            tokio::spawn(drive(dialer, slot.clone(), status.clone(), stream_failure_threshold));
         Arc::new(Self { slot, status, driver, exit })
     }
 
@@ -734,10 +856,18 @@ impl EdgeSessionSupervisor {
 
 /// The supervisor's dial/reconnect loop: keep one session up, publish every
 /// transition to `status`, back off exponentially between failed rounds.
+///
+/// The loop also runs the client-side watchdog
+/// ([`crate::watchdog`]): while a session is up it watches that session's
+/// consecutive failed stream opens, and once they reach
+/// `stream_failure_threshold` it tears the session down and redials — the
+/// only thing that makes the edge record demand again (see
+/// `docs/mirage/audits/edge-idle-demand-drop-blackout-2026-10-21.md`).
 async fn drive(
     dialer: impl EdgeDialer,
     slot: tokio::sync::watch::Sender<Option<Arc<EdgeSession>>>,
     status: tokio::sync::watch::Sender<EdgeStatusFile>,
+    stream_failure_threshold: u32,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut ever_connected = false;
@@ -755,16 +885,50 @@ async fn drive(
                 slot.send_replace(Some(Arc::clone(&session)));
                 status.send_modify(|s| s.set_connected(session.accepted_exit(), session.countries()));
                 let exit_gen = dialer.exit_generation();
+                // The watchdog's counter: the loop wakes on every change
+                // instead of waiting for its next liveness tick, so the
+                // teardown starts the moment the threshold is reached.
+                let mut failures = session.health().subscribe();
+                let mut watchdog_tripped = false;
                 while !session.is_closed() {
-                    tokio::time::sleep(LIVENESS_POLL_INTERVAL).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(LIVENESS_POLL_INTERVAL) => {}
+                        changed = failures.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     if dialer.exit_generation() != exit_gen {
                         info!("edge session: exit changed, redialing");
                         break;
                     }
+                    let failed = session.health().consecutive_failures();
+                    if failed >= stream_failure_threshold {
+                        warn!(
+                            failures = failed,
+                            threshold = stream_failure_threshold,
+                            "edge session: consecutive stream-open failures — tearing the session down"
+                        );
+                        watchdog_tripped = true;
+                        break;
+                    }
                 }
-                warn!("edge session: session closed, reconnecting");
-                slot.send_replace(None);
-                status.send_modify(EdgeStatusFile::set_reconnecting);
+                if watchdog_tripped {
+                    // The truth FIRST: this session is going away, so the
+                    // published status must stop saying `connected` before
+                    // anything else happens.
+                    status.send_modify(EdgeStatusFile::set_reconnecting);
+                    slot.send_replace(None);
+                    // Close the session for real, so the EDGE sees the
+                    // session end and records demand again on its next
+                    // accept.
+                    session.abort();
+                } else {
+                    warn!("edge session: session closed, reconnecting");
+                    slot.send_replace(None);
+                    status.send_modify(EdgeStatusFile::set_reconnecting);
+                }
             }
             Err(e) => {
                 warn!(
@@ -800,9 +964,12 @@ impl EdgeSessionSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::EdgeState;
     use mirage_protocol::traits::TransportInfo;
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+    use tokio::sync::mpsc;
 
     /// A hand-rolled [`Tunnel`] over pre-scripted inbound chunks, capturing
     /// every outbound `send()` call — lets `send_hello_and_read_welcome` be
@@ -1081,5 +1248,228 @@ mod tests {
             .await
             .expect("client read");
         assert_eq!(&pong, b"pong");
+    }
+
+    // ── the stream-failure watchdog (BUG-3, 2026-10-21 blackout) ───────
+    //
+    // The edge does not refuse a stream with an error frame: it closes the
+    // mux stream (`mirage2node/crates/mirage-edge/src/entrance.rs:733`).
+    // The tests below play that edge exactly — a stream that is closed at
+    // once, with nothing delivered on it.
+
+    /// How the edge handles one stream: refuse it (close it at once, like
+    /// the edge does when it holds no chain for this exit) or answer it.
+    #[derive(Clone, Copy)]
+    enum EdgeBehaviour {
+        Refuse,
+        Answer,
+    }
+
+    /// The edge's side of a test session: every accepted stream is handled
+    /// per the behaviour the test scripted for it.
+    async fn scripted_edge(server: SessionHandle, mut script: mpsc::Receiver<EdgeBehaviour>) {
+        while let Ok(raw) = server.accept_stream().await {
+            let mut stream = TokioMuxStream(raw);
+            match script.recv().await {
+                Some(EdgeBehaviour::Refuse) => {
+                    // The refusal shape: the stream ends with nothing on it.
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+                }
+                Some(EdgeBehaviour::Answer) => {
+                    let mut header = [0u8; 256];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut header).await;
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, b"ok").await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Read one stream to its end, the way the proxy does — the EOF is what
+    /// tells the watchdog how the open ended.
+    async fn drain_to_end(stream: &mut WatchedStream) -> Vec<u8> {
+        let mut buf = vec![0u8; 256];
+        let mut out = Vec::new();
+        loop {
+            let n = tokio::io::AsyncReadExt::read(stream, &mut buf).await.expect("read to end");
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Hands out one session and then parks, counting every dial — so a test
+    /// can see that the watchdog forced a redial.
+    struct OneShotDialer {
+        session: StdMutex<Option<EdgeSession>>,
+        dials: Arc<AtomicUsize>,
+    }
+
+    impl OneShotDialer {
+        fn new(session: EdgeSession) -> (Self, Arc<AtomicUsize>) {
+            let dials = Arc::new(AtomicUsize::new(0));
+            (
+                Self { session: StdMutex::new(Some(session)), dials: Arc::clone(&dials) },
+                dials,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeDialer for OneShotDialer {
+        async fn dial(&self, _start_idx: usize) -> Result<(usize, EdgeSession), EdgeDialError> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            // The guard must not live across the await below.
+            let next = { self.session.lock().expect("dialer mutex not poisoned").take() };
+            match next {
+                Some(session) => Ok((0, session)),
+                // Park: the supervisor must not spin redialing during a test.
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// A live session whose edge refuses or answers streams per script, plus
+    /// the supervisor over it.
+    async fn watchdog_scenario(
+        threshold: u32,
+    ) -> (mpsc::Sender<EdgeBehaviour>, Arc<EdgeSessionSupervisor>, Arc<AtomicUsize>) {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = SessionHandle::client(mirage_mux::tokio_compat::TokioIoCompat(client_io));
+        let server = SessionHandle::server(mirage_mux::tokio_compat::TokioIoCompat(server_io));
+        let (script_tx, script_rx) = mpsc::channel(16);
+        tokio::spawn(scripted_edge(server, script_rx));
+
+        let session = EdgeSession::for_test(
+            client,
+            sample_welcome(EdgeOutcome::Accepted { exit: ExitPreference::Auto }),
+        );
+        let (dialer, dials) = OneShotDialer::new(session);
+        let supervisor = EdgeSessionSupervisor::spawn_with_dialer_and_threshold(
+            dialer,
+            ExitPreference::Auto,
+            threshold,
+        );
+        (script_tx, supervisor, dials)
+    }
+
+    /// One refused stream: opened, then closed by the edge with nothing on
+    /// it — the shape the 2026-10-21 blackout produced.
+    async fn refused_stream(
+        session: &EdgeSession,
+        script: &mpsc::Sender<EdgeBehaviour>,
+    ) -> WatchedStream {
+        script.send(EdgeBehaviour::Refuse).await.expect("script");
+        let mut stream = session.open_tcp_stream("203.0.113.7:443").await.expect("open");
+        assert!(drain_to_end(&mut stream).await.is_empty(), "a refused stream carries nothing");
+        stream
+    }
+
+    #[tokio::test]
+    async fn n_consecutive_failed_stream_opens_tear_the_session_down_and_force_a_redial() {
+        let (script, supervisor, dials) = watchdog_scenario(3).await;
+        let mut status = supervisor.status();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status.wait_for(|s| s.state == EdgeState::Connected),
+        )
+        .await
+        .expect("the supervisor must reach `connected`")
+        .expect("status channel stays open");
+        let session = supervisor.current().expect("a live session");
+
+        for _ in 0..3 {
+            refused_stream(&session, &script).await;
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status.wait_for(|s| s.state == EdgeState::Reconnecting),
+        )
+        .await
+        .expect("the watchdog must publish `reconnecting`")
+        .expect("status channel stays open");
+
+        assert!(session.is_closed(), "the teardown must close the session for real");
+        // The redial follows the backoff, so it lands a moment later.
+        let redialed = tokio::time::timeout(Duration::from_secs(5), async {
+            while dials.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            redialed.is_ok(),
+            "the watchdog must force a redial — the edge records demand again on the next accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_stream_resets_the_failure_counter() {
+        let (script, supervisor, _dials) = watchdog_scenario(3).await;
+        let mut status = supervisor.status();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status.wait_for(|s| s.state == EdgeState::Connected),
+        )
+        .await
+        .expect("the supervisor must reach `connected`")
+        .expect("status channel stays open");
+        let session = supervisor.current().expect("a live session");
+
+        refused_stream(&session, &script).await;
+        refused_stream(&session, &script).await;
+        assert_eq!(session.health().consecutive_failures(), 2);
+
+        // One answered stream: the edge delivered a payload, so the run of
+        // failures ends here.
+        script.send(EdgeBehaviour::Answer).await.expect("script");
+        let mut stream = session.open_tcp_stream("203.0.113.8:443").await.expect("open");
+        assert_eq!(drain_to_end(&mut stream).await, b"ok");
+        assert_eq!(session.health().consecutive_failures(), 0, "a success must reset the counter");
+
+        // Two more failures — still under the threshold, so the session
+        // must survive them.
+        refused_stream(&session, &script).await;
+        refused_stream(&session, &script).await;
+        assert_eq!(session.health().consecutive_failures(), 2);
+        assert!(!session.is_closed(), "a reset counter must keep the session up");
+        assert_eq!(status.borrow().state, EdgeState::Connected);
+    }
+
+    #[tokio::test]
+    async fn the_published_status_is_not_connected_while_the_watchdog_tears_down() {
+        let (script, supervisor, _dials) = watchdog_scenario(3).await;
+        let mut status = supervisor.status();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status.wait_for(|s| s.state == EdgeState::Connected),
+        )
+        .await
+        .expect("the supervisor must reach `connected`")
+        .expect("status channel stays open");
+        let session = supervisor.current().expect("a live session");
+
+        for _ in 0..3 {
+            refused_stream(&session, &script).await;
+        }
+
+        // The status must LEAVE `connected` — it must not keep claiming a
+        // live session while the watchdog tears it down.
+        let degraded = tokio::time::timeout(
+            Duration::from_secs(5),
+            status.wait_for(|s| s.state != EdgeState::Connected),
+        )
+        .await
+        .expect("the status must leave `connected`")
+        .expect("status channel stays open");
+        assert_eq!(degraded.state, EdgeState::Reconnecting);
+        assert_ne!(degraded.state, EdgeState::Connected);
+        assert!(
+            supervisor.current().is_none(),
+            "the torn-down session must not stay in the slot"
+        );
     }
 }

@@ -34,7 +34,7 @@ use mirage_core::config::ClientConfig;
 use mirage_client_core::tun::config::TunConfig;
 use crate::tun::ios::{IosFirewall, IosRouting, IosTun, IosTunHandle};
 
-use crate::common::{build_tun_stack, get_status, init_runtime, start_vpn_with_stack, stop_vpn};
+use crate::common::{build_tun_stack, get_status, start_vpn_with_stack, stop_vpn};
 
 // ── Return codes ────────────────────────────────────────────────────────────
 

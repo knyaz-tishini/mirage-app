@@ -11,8 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+#[cfg(not(target_os = "ios"))]
 use nokhwa::pixel_format::RgbFormat;
+#[cfg(not(target_os = "ios"))]
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+#[cfg(not(target_os = "ios"))]
 use nokhwa::Camera;
 use uzor::render::{RenderContext, TextAlign, TextBaseline};
 
@@ -60,12 +63,21 @@ impl CameraScan {
             outcome: Mutex::new(ScanOutcome::Scanning),
             preview: Mutex::new(Preview::default()),
         });
+        #[cfg(not(target_os = "ios"))]
         let stop_t = stop.clone();
+        #[cfg(not(target_os = "ios"))]
         let shared_t = shared.clone();
+        #[cfg(target_os = "ios")]
+        {
+            *shared.outcome.lock().unwrap() = ScanOutcome::Failed("камера недоступна".into());
+            return Self { stop, shared, join: None, started: Instant::now() };
+        }
+        #[cfg(not(target_os = "ios"))]
         let join = std::thread::Builder::new()
             .name("mirage-cam-scan".into())
             .spawn(move || capture_loop(&stop_t, &shared_t))
             .ok();
+        #[cfg(not(target_os = "ios"))]
         Self { stop, shared, join, started: Instant::now() }
     }
 
@@ -95,6 +107,7 @@ impl Drop for CameraScan {
 }
 
 /// The background capture + decode loop. Writes results into `shared`.
+#[cfg(not(target_os = "ios"))]
 fn capture_loop(stop: &AtomicBool, shared: &Shared) {
     let index = CameraIndex::Index(0);
     let fmt = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);

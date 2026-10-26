@@ -50,6 +50,7 @@
 
 pub mod artefact;
 pub mod assembly;
+pub mod claim;
 pub mod claim_image;
 pub mod control;
 pub mod dial;
@@ -63,8 +64,10 @@ pub mod tun_feed;
 pub mod tun_mode;
 pub mod udp_associate;
 pub mod udp_flow;
+pub mod watchdog;
 
 pub use artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefact};
+pub use claim::redeem_artefact_json;
 pub use assembly::{SubscriberClient, SubscriberClientError, SubscriberClientOptions};
 pub use scope::EgressScope;
 pub use tun_mode::TunMode;
@@ -76,3 +79,4 @@ pub use status::{
 };
 pub use udp_associate::{serve_udp_association, UdpAssociateError};
 pub use udp_flow::EdgeUdpFlow;
+pub use watchdog::{StreamHealth, WatchedStream, DEFAULT_STREAM_FAILURE_THRESHOLD};

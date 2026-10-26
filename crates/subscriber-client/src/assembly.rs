@@ -112,9 +112,29 @@ impl SubscriberClient {
     /// Validate `artefact`, spawn the edge-session supervisor over its
     /// TCP-shaped entrances, and stand up the local SOCKS5 listener (plus,
     /// if configured, the TUN feed).
+    ///
+    /// The stream-failure watchdog uses its default threshold — see
+    /// [`Self::build_with_threshold`].
     pub async fn build(
         artefact: &EntranceArtefact,
         options: SubscriberClientOptions,
+    ) -> Result<Self, SubscriberClientError> {
+        Self::build_with_threshold(
+            artefact,
+            options,
+            crate::watchdog::DEFAULT_STREAM_FAILURE_THRESHOLD,
+        )
+        .await
+    }
+
+    /// [`Self::build`] with an explicit stream-failure threshold: how many
+    /// consecutive failed stream opens tear the edge session down and force a
+    /// redial — the client-side watchdog ([`crate::watchdog`]). A threshold
+    /// below one is clamped to one.
+    pub async fn build_with_threshold(
+        artefact: &EntranceArtefact,
+        options: SubscriberClientOptions,
+        stream_failure_threshold: u32,
     ) -> Result<Self, SubscriberClientError> {
         artefact.validate()?;
 
@@ -145,8 +165,13 @@ impl SubscriberClient {
             return Err(SubscriberClientError::NoUsableEntrance);
         }
 
-        let supervisor =
-            EdgeSessionSupervisor::spawn(tcp_entrances, mesh_id, client_static_priv, exit);
+        let supervisor = EdgeSessionSupervisor::spawn_with_threshold(
+            tcp_entrances,
+            mesh_id,
+            client_static_priv,
+            exit,
+            stream_failure_threshold,
+        );
 
         // Started before anything else is bound so an unwritable path refuses
         // the build (dropping `supervisor` aborts its dial loop) instead of

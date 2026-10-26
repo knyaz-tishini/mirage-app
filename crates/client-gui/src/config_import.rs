@@ -38,23 +38,37 @@ pub fn parse(raw: &str) -> Result<Imported, String> {
 
 /// Pick a file via the native dialog and parse it. Blocking (modal dialog).
 pub fn from_file() -> Result<Imported, String> {
-    let path = rfd::FileDialog::new()
-        .add_filter("Mirage config", &["json", "txt", "mirage"])
-        .set_title("Import Mirage config")
-        .pick_file()
-        .ok_or_else(|| "отменено".to_string())?;
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("чтение файла: {e}"))?;
-    parse(&raw)
+    #[cfg(target_os = "ios")]
+    {
+        Err("файл недоступен".into())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let path = rfd::FileDialog::new()
+            .add_filter("m1r4g3 config", &["json", "txt", "mirage"])
+            .set_title("Import m1r4g3 config")
+            .pick_file()
+            .ok_or_else(|| "отменено".to_string())?;
+        let raw = std::fs::read_to_string(&path).map_err(|e| format!("чтение файла: {e}"))?;
+        parse(&raw)
+    }
 }
 
 /// One name per line, or several separated by commas. `*` and `all` are ignored.
 pub fn list_from_file() -> Result<Vec<String>, String> {
-    let path = rfd::FileDialog::new()
-        .add_filter("List", &["txt", "csv", "list"])
-        .set_title("Sites or apps")
-        .pick_file()
-        .ok_or_else(|| "отменено".to_string())?;
-    names_from_path(&path)
+    #[cfg(target_os = "ios")]
+    {
+        Err("файл недоступен".into())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let path = rfd::FileDialog::new()
+            .add_filter("List", &["txt", "csv", "list"])
+            .set_title("Sites or apps")
+            .pick_file()
+            .ok_or_else(|| "отменено".to_string())?;
+        names_from_path(&path)
+    }
 }
 
 /// Names typed or pasted. Comma, semicolon, and newline separate them.
@@ -69,8 +83,15 @@ pub fn names_from_path(path: &std::path::Path) -> Result<Vec<String>, String> {
 
 /// Clipboard text for the list field. `None` when the clipboard is empty.
 pub fn clipboard_text() -> Option<String> {
-    let mut cb = arboard::Clipboard::new().ok()?;
-    cb.get_text().ok()
+    #[cfg(target_os = "ios")]
+    {
+        return None;
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let mut cb = arboard::Clipboard::new().ok()?;
+        cb.get_text().ok()
+    }
 }
 
 fn parse_name_list(raw: &str) -> Vec<String> {
@@ -83,19 +104,33 @@ fn parse_name_list(raw: &str) -> Vec<String> {
 
 /// Read the clipboard text and parse it.
 pub fn from_clipboard_text() -> Result<Imported, String> {
-    let mut cb = arboard::Clipboard::new().map_err(|e| format!("буфер недоступен: {e}"))?;
-    let raw = cb.get_text().map_err(|e| format!("в буфере нет текста: {e}"))?;
-    parse(&raw)
+    #[cfg(target_os = "ios")]
+    {
+        Err("буфер недоступен".into())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let mut cb = arboard::Clipboard::new().map_err(|e| format!("буфер недоступен: {e}"))?;
+        let raw = cb.get_text().map_err(|e| format!("в буфере нет текста: {e}"))?;
+        parse(&raw)
+    }
 }
 
 /// Read a QR-code image from the clipboard, decode it, and parse the payload.
 pub fn from_clipboard_qr() -> Result<Imported, String> {
-    let mut cb = arboard::Clipboard::new().map_err(|e| format!("буфер недоступен: {e}"))?;
-    let img = cb
-        .get_image()
-        .map_err(|e| format!("в буфере нет картинки: {e}"))?;
-    let raw = decode_qr_rgba(&img.bytes, img.width, img.height)?;
-    parse(&raw)
+    #[cfg(target_os = "ios")]
+    {
+        Err("буфер недоступен".into())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let mut cb = arboard::Clipboard::new().map_err(|e| format!("буфер недоступен: {e}"))?;
+        let img = cb
+            .get_image()
+            .map_err(|e| format!("в буфере нет картинки: {e}"))?;
+        let raw = decode_qr_rgba(&img.bytes, img.width, img.height)?;
+        parse(&raw)
+    }
 }
 
 /// Decode the first QR code found in an RGBA8 buffer to its text payload.

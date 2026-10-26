@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tracing::debug;
 
 use crate::scope::EgressScope;
-use crate::session::{EdgeSessionSupervisor, EdgeStreamError};
+use crate::session::{EdgeSession, EdgeSessionSupervisor, EdgeStreamError};
 use crate::socks5;
 use crate::udp_flow::EdgeUdpFlow;
 
@@ -71,6 +71,30 @@ const RELAY_RECV_BUF_LEN: usize = 65535;
 /// backpressure by dropping, exactly like ordinary UDP loss, never by
 /// blocking the relay's single receive loop.
 const FLOW_OUTBOUND_QUEUE_LEN: usize = 64;
+
+/// How often to repeat one unanswered payload on the same stream.
+/// The first send is immediate. The edge drops any datagram bytes that
+/// share the `StreamOpen` read, and it does not read the stream again
+/// until the datagram dial returns. A copy written after that read is
+/// what the pump relays. The payload stays UDP.
+const RESEND_EVERY: Duration = Duration::from_millis(1000);
+
+/// Copies with no reply before the flow dials one replacement stream.
+/// A dial that never returns keeps the first stream silent, and every
+/// copy already queued on it is discarded with the header when that
+/// read finally happens.
+const SILENCE_REOPEN_AFTER: u32 = 4;
+
+/// Stop repeating after this many copies of the same unanswered payload.
+const MAX_RESENDS: u32 = 16;
+
+/// After a failed stream is replaced, wait this long before the first
+/// payload so it is not sitting in the new `StreamOpen` buffer.
+const REOPEN_GAP: Duration = Duration::from_millis(200);
+
+/// A dead mux stream (send or recv error) may be dialled again this many
+/// times. Silence is not a dead stream: the copies above stay on it.
+const MAX_STREAM_REOPENS: u8 = 1;
 
 /// Every way serving one UDP association fails at the control-stream level.
 #[derive(Debug, Error)]
@@ -264,8 +288,19 @@ impl UdpAssociation {
         let association = Arc::clone(self);
         let target = request.target;
         let idle_timeout = self.idle_timeout;
+        let session_for_flow = Arc::clone(&session);
         tokio::spawn(async move {
-            run_flow(flow, rx, relay_socket, client_addr, request.header_echo, idle_timeout).await;
+            run_flow(
+                flow,
+                rx,
+                relay_socket,
+                client_addr,
+                request.header_echo,
+                idle_timeout,
+                session_for_flow,
+                target.clone(),
+            )
+            .await;
             association.flows.lock().await.remove(&target);
         });
 
@@ -285,42 +320,251 @@ async fn run_flow(
     client_addr: watch::Receiver<Option<SocketAddr>>,
     header_echo: Vec<u8>,
     idle_timeout: Duration,
+    session: Arc<EdgeSession>,
+    target: String,
 ) {
+    // `opening` is the latest datagram with no reply yet. `copies` counts
+    // repeats already sent. A reply clears both.
+    let mut opening: Option<Vec<u8>> = None;
+    let mut retry_at: Option<tokio::time::Instant> = None;
+    let mut copies: u32 = 0;
+    let mut silence_reopened = false;
+    let mut reopens_left = MAX_STREAM_REOPENS;
+    // A second dial races the first. One held chain can sit in the datagram
+    // handshake for its whole timeout while the next chain answers at once.
+    // The edge picks the chain when the stream is accepted, so the spare has
+    // to be open while the first dial is still in flight.
+    let (spare_tx, mut spare_rx) = mpsc::channel::<(EdgeUdpFlow, Vec<u8>)>(1);
+    let mut spare_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
+        let retry_wait = async {
+            match retry_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
+            biased;
             maybe_payload = outbound_rx.recv() => {
                 match maybe_payload {
                     Some(payload) => {
-                        if let Err(e) = flow.send(&payload).await {
-                            debug!(error = %e, "socks5 udp: flow send to edge failed — ending flow");
-                            return;
+                        let first = opening.is_none();
+                        opening = Some(payload.clone());
+                        if first {
+                            copies = 0;
+                            silence_reopened = false;
+                            retry_at = Some(tokio::time::Instant::now() + RESEND_EVERY);
+                        }
+                        if (first || copies > 0) && !send_payload(&mut flow, &payload).await {
+                            if !reopen_stream(
+                                &mut flow,
+                                &session,
+                                &target,
+                                &mut reopens_left,
+                                &mut retry_at,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                        if first && spare_task.is_none() {
+                            spare_task = Some(spawn_spare(
+                                Arc::clone(&session),
+                                target.clone(),
+                                payload,
+                                spare_tx.clone(),
+                            ));
                         }
                     }
                     None => return, // Sender dropped — association is shutting down.
                 }
             }
+            _ = retry_wait => {
+                retry_at = None;
+                let Some(payload) = opening.clone() else {
+                    continue;
+                };
+                if !silence_reopened && copies >= SILENCE_REOPEN_AFTER && reopens_left > 0 {
+                    debug!(copies, "socks5 udp: no reply, opening another stream");
+                    silence_reopened = true;
+                    copies = 0;
+                    if !reopen_stream(
+                        &mut flow,
+                        &session,
+                        &target,
+                        &mut reopens_left,
+                        &mut retry_at,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if !send_payload(&mut flow, &payload).await {
+                    if !reopen_stream(
+                        &mut flow,
+                        &session,
+                        &target,
+                        &mut reopens_left,
+                        &mut retry_at,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                copies += 1;
+                debug!(copies, "socks5 udp: resend unanswered datagram");
+                if copies < MAX_RESENDS {
+                    retry_at = Some(tokio::time::Instant::now() + RESEND_EVERY);
+                }
+            }
             recv_result = flow.recv() => {
                 match recv_result {
                     Ok(payload) => {
-                        let addr = *client_addr.borrow();
-                        if let Some(addr) = addr {
-                            let mut reply = Vec::with_capacity(3 + header_echo.len() + payload.len());
-                            reply.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV RSV FRAG=0
-                            reply.extend_from_slice(&header_echo);
-                            reply.extend_from_slice(&payload);
-                            let _ = relay_socket.send_to(&reply, addr).await;
+                        if let Some(task) = spare_task.take() {
+                            task.abort();
                         }
+                        opening = None;
+                        retry_at = None;
+                        copies = 0;
+                        silence_reopened = false;
+                        reopens_left = MAX_STREAM_REOPENS;
+                        deliver_reply(&payload, &header_echo, &client_addr, &relay_socket).await;
                     }
                     Err(e) => {
-                        debug!(error = %e, "socks5 udp: flow recv from edge failed — ending flow");
-                        return;
+                        debug!(error = %e, "socks5 udp: flow recv from edge failed");
+                        if opening.is_none() {
+                            return;
+                        }
+                        if !reopen_stream(
+                            &mut flow,
+                            &session,
+                            &target,
+                            &mut reopens_left,
+                            &mut retry_at,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                     }
                 }
+            }
+            won = spare_rx.recv() => {
+                let Some((winner, payload)) = won else {
+                    continue;
+                };
+                spare_task.take();
+                flow = winner;
+                opening = None;
+                retry_at = None;
+                copies = 0;
+                silence_reopened = false;
+                reopens_left = MAX_STREAM_REOPENS;
+                debug!("socks5 udp: spare stream answered");
+                deliver_reply(&payload, &header_echo, &client_addr, &relay_socket).await;
             }
             _ = tokio::time::sleep(idle_timeout) => {
                 debug!("socks5 udp: flow idle timeout — ending flow");
                 return;
             }
+        }
+    }
+}
+
+fn spawn_spare(
+    session: Arc<EdgeSession>,
+    target: String,
+    payload: Vec<u8>,
+    win_tx: mpsc::Sender<(EdgeUdpFlow, Vec<u8>)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut spare = match session.open_udp_flow(&target).await {
+            Ok(flow) => flow,
+            Err(e) => {
+                debug!(error = %e, "socks5 udp: spare stream failed");
+                return;
+            }
+        };
+        tokio::time::sleep(REOPEN_GAP).await;
+        debug!("socks5 udp: spare stream armed");
+        for copies in 1..=8 {
+            if !send_payload(&mut spare, &payload).await {
+                debug!("socks5 udp: spare send failed");
+                return;
+            }
+            debug!(copies, "socks5 udp: spare datagram");
+            tokio::select! {
+                result = spare.recv() => {
+                    match result {
+                        Ok(reply) => {
+                            let _ = win_tx.send((spare, reply)).await;
+                        }
+                        Err(e) => debug!(error = %e, "socks5 udp: spare recv failed"),
+                    }
+                    return;
+                }
+                _ = tokio::time::sleep(RESEND_EVERY) => {}
+            }
+        }
+    })
+}
+
+async fn deliver_reply(
+    payload: &[u8],
+    header_echo: &[u8],
+    client_addr: &watch::Receiver<Option<SocketAddr>>,
+    relay_socket: &UdpSocket,
+) {
+    let addr = *client_addr.borrow();
+    let Some(addr) = addr else {
+        return;
+    };
+    let mut reply = Vec::with_capacity(3 + header_echo.len() + payload.len());
+    reply.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV RSV FRAG=0
+    reply.extend_from_slice(header_echo);
+    reply.extend_from_slice(payload);
+    let _ = relay_socket.send_to(&reply, addr).await;
+}
+
+async fn send_payload(flow: &mut EdgeUdpFlow, payload: &[u8]) -> bool {
+    match flow.send(payload).await {
+        Ok(()) => true,
+        Err(e) => {
+            debug!(error = %e, "socks5 udp: flow send to edge failed");
+            false
+        }
+    }
+}
+
+/// The mux stream failed. Dial another and restart the header gap. Returns
+/// false when the flow should end. Does not send: the gap timer does.
+async fn reopen_stream(
+    flow: &mut EdgeUdpFlow,
+    session: &EdgeSession,
+    target: &str,
+    reopens_left: &mut u8,
+    retry_at: &mut Option<tokio::time::Instant>,
+) -> bool {
+    if *reopens_left == 0 {
+        debug!("socks5 udp: edge stream failed, no reopen left");
+        return false;
+    }
+    *reopens_left -= 1;
+    debug!("socks5 udp: edge stream failed, opening another");
+    match session.open_udp_flow(target).await {
+        Ok(new_flow) => {
+            *flow = new_flow;
+            *retry_at = Some(tokio::time::Instant::now() + REOPEN_GAP);
+            true
+        }
+        Err(e) => {
+            debug!(error = %e, "socks5 udp: replacement stream failed — ending flow");
+            false
         }
     }
 }

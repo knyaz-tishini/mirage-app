@@ -9,15 +9,21 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 mirage-core        = { workspace = true }
 mirage-protocol    = { workspace = true }
-mirage-client-core = { path = "../mirage-client-core" }
+mirage-client-core = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 serde_json         = { workspace = true }
+async-trait        = "0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni              = "0.21"
 android_logger   = "0.14"
 libc             = "0.2"
 
-[target.'cfg(target_os = "ios")'.dependencies]
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 libc = "0.2"
+mirage-tun-ios = { path = "../../../mirage2tun/crates/mirage-tun-ios", default-features = false }
+mirage-tun-core = { path = "../../../mirage2tun/crates/mirage-tun-core" }
+mirage-subscriber-client = { path = "../subscriber-client" }
+tokio-util = { workspace = true }
+tracing-subscriber = { workspace = true }

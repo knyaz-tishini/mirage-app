@@ -253,7 +253,7 @@ impl MirageClientApp {
             skin_kind,
             current_phase: ConnPhase::Disconnected,
             pending_connect_at: None,
-            menu_open: true,
+            menu_open: false,
             menu_tab: MenuTab::Setup,
             menu_frac: menu::DEFAULT_FRAC,
             menu_scroll: 0.0,
@@ -339,6 +339,11 @@ impl MirageClientApp {
     fn focus_bind(&mut self) {
         self.dismiss_list_editor();
         self.bind_focused = true;
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn wants_keyboard(&self) -> bool {
+        self.menu_open && (self.bind_focused || self.list_editor.is_some())
     }
 
     fn remember(&mut self, text: &str) {
@@ -915,8 +920,8 @@ impl App<NoPanel> for MirageClientApp {
         self.prev_pointer_down = self.pointer_down;
 
         if win.layout.was_clicked(&id_restart()) {
-            if matches!(mirage_client_gui::ota::status(), mirage_client_gui::ota::UpdateStatus::RestartPending { .. }) {
-                mirage_client_gui::ota::restart();
+            if matches!(crate::ota::status(), crate::ota::UpdateStatus::RestartPending { .. }) {
+                crate::ota::restart();
             }
         }
 
@@ -1097,11 +1102,11 @@ impl App<NoPanel> for MirageClientApp {
                 });
             }
             if matches!(
-                mirage_client_gui::ota::status(),
-                mirage_client_gui::ota::UpdateStatus::Downloading { .. }
-                    | mirage_client_gui::ota::UpdateStatus::Verifying
-                    | mirage_client_gui::ota::UpdateStatus::Installing
-                    | mirage_client_gui::ota::UpdateStatus::RestartPending { .. }
+                crate::ota::status(),
+                crate::ota::UpdateStatus::Downloading { .. }
+                    | crate::ota::UpdateStatus::Verifying
+                    | crate::ota::UpdateStatus::Installing
+                    | crate::ota::UpdateStatus::RestartPending { .. }
             ) {
                 register_hit(layout, id_restart(), restart_rect(w));
             }
@@ -1124,22 +1129,25 @@ impl App<NoPanel> for MirageClientApp {
             render.fill_text("M", SLOT_W / 2.0, CHROME_H / 2.0 - 1.0);
         }
 
-        // ── fps HUD (dev-tools; top-right, under chrome; hidden when menu open)
+        // ── fps HUD (dev-tools; top-right, under chrome; hidden when menu open).
+        // A screenshot run sets MIRAGE_SHOT_SIZE and must not paint the HUD.
         #[cfg(feature = "dev-tools")]
-        if let (Some(text), false) = (&hud, self.menu_open) {
-            crate::dev::draw_hud(&mut *win.render, w, CHROME_H, text);
+        if std::env::var_os("MIRAGE_SHOT_SIZE").is_none() {
+            if let (Some(text), false) = (&hud, self.menu_open) {
+                crate::dev::draw_hud(&mut *win.render, w, CHROME_H, text);
+            }
         }
 
         // Painted last so an installed update stays on top of the open menu.
         // The accent reading is the restart control. A download only reports
         // progress; it does not ask for a click.
-        let update = mirage_client_gui::ota::status();
+        let update = crate::ota::status();
         let banner: Option<(String, bool)> = match &update {
-            mirage_client_gui::ota::UpdateStatus::Downloading { percent } => Some((format!("загрузка {percent}%"), false)),
-            mirage_client_gui::ota::UpdateStatus::Verifying | mirage_client_gui::ota::UpdateStatus::Installing => {
+            crate::ota::UpdateStatus::Downloading { percent } => Some((format!("загрузка {percent}%"), false)),
+            crate::ota::UpdateStatus::Verifying | crate::ota::UpdateStatus::Installing => {
                 Some(("установка".to_owned(), false))
             }
-            mirage_client_gui::ota::UpdateStatus::RestartPending { .. } => Some(("Перезагрузить".to_owned(), true)),
+            crate::ota::UpdateStatus::RestartPending { .. } => Some(("Перезагрузить".to_owned(), true)),
             _ => None,
         };
         if let Some((label, ready)) = banner {

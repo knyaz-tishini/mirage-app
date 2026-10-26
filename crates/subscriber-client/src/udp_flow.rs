@@ -6,10 +6,10 @@
 //! the client-side twin of `EdgeSession::open_tcp_stream`'s TCP flow).
 
 use mirage_control_plane::{decode_udp_datagram_frame, encode_udp_datagram_frame, EdgeSessionError as WireError};
-use mirage_mux::tokio_compat::TokioMuxStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::session::EdgeStreamError;
+use crate::watchdog::WatchedStream;
 
 /// Largest single `read()` chunk pulled off the underlying mux stream while
 /// accumulating a partial datagram frame.
@@ -18,8 +18,12 @@ const READ_CHUNK_LEN: usize = 4096;
 /// One `StreamKind::Udp` mux stream to the edge — one flow, one fixed
 /// destination for its whole life. Constructed only by
 /// [`crate::session::EdgeSession::open_udp_flow`].
+///
+/// The underlying stream is a [`WatchedStream`], so a UDP flow the edge
+/// refused (no chain held for this exit) is counted by the session's
+/// watchdog just like a refused TCP flow.
 pub struct EdgeUdpFlow {
-    stream: TokioMuxStream,
+    stream: WatchedStream,
     /// Bytes read off the wire but not yet decoded into a whole datagram
     /// frame — a `recv()` call may need several underlying reads to see one
     /// complete frame.
@@ -27,14 +31,17 @@ pub struct EdgeUdpFlow {
 }
 
 impl EdgeUdpFlow {
-    pub(crate) fn new(stream: TokioMuxStream) -> Self {
+    pub(crate) fn new(stream: WatchedStream) -> Self {
         Self { stream, read_buf: Vec::new() }
     }
 
     /// Encode `payload` as one `[2B len][payload]` frame and write it whole.
+    /// Flush so the frame leaves this stream's send queue before the caller
+    /// waits for a reply. `write_all` alone only queues it.
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), EdgeStreamError> {
         let frame = encode_udp_datagram_frame(payload).map_err(EdgeStreamError::Codec)?;
         self.stream.write_all(&frame).await?;
+        self.stream.flush().await?;
         Ok(())
     }
 
