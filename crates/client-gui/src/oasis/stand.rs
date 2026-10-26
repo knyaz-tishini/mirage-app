@@ -29,28 +29,32 @@ const LABEL_W: f64 = 108.0;
 const TOGGLE_W: f64 = 64.0;
 const REVOKE_W: f64 = 72.0;
 
-/// The server-side protocols the standalone image can actually publish, as
+/// The server-side protocols the standalone image publishes, as
 /// `(id, port, mtu, on_by_default)`.
+///
+/// The id names what the traffic should LOOK like, not a protocol to
+/// implement: Mirage has one wire over TCP and one over UDP, and the mask on
+/// the wire is derived from the port (443 is TLS, 80 is a WebSocket, and so
+/// on — the same rule the fleet's own persona follows). A UDP id publishes a
+/// datagram face, relayed to the node the same way the fleet does it.
 ///
 /// Two rules the server enforces on this list, and the menu has to honour
 /// them or the install fails on the box:
 ///
-/// * **The UDP-only protocols are not here.** `awg`, `wireguard`, `openvpn`
-///   and `ikev2` are datagram transports, and the perimeter in this build has
-///   no datagram binder — the server refuses them by name rather than
-///   pretending. They come back when that binder lands.
 /// * **No two entries share a port.** The server binds one face per port and
 ///   refuses a duplicate, so the defaults are distinct: a user who switches
 ///   two protocols on gets two faces, not a collision.
-///
-/// The port is what the traffic LOOKS like, not the id: the mask on the wire
-/// is derived from the port (443 is TLS, 80 is a WebSocket, and so on), and
-/// the client dials the mask the artefact carries.
+/// * **At least one TCP face.** The subscriber client dials TCP entrances
+///   only — a box with nothing but datagram faces has nothing to dial.
 const CATALOG: &[(&str, &str, &str, bool)] = &[
     ("cloak", "443", "", true),
     ("xray", "8443", "", false),
     ("shadowsocks", "2083", "", false),
     ("socks5", "1080", "", false),
+    ("awg", "853", "1280", false),
+    ("wireguard", "3478", "1420", false),
+    ("openvpn", "5060", "", false),
+    ("ikev2", "5349", "", false),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
