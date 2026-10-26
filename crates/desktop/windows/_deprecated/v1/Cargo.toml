@@ -8,7 +8,7 @@ name = "mirage2app"
 path = "src/main.rs"
 
 [dependencies]
-mirage-core            = { path = "../../../../../mirage2web/crates/mirage-core" }
+mirage-core            = { path = "../../../../../mirage-oss/crates/mirage-core" }
 uzor                   = { path = "../../../../../uzor/uzor" }
 uzor-desktop           = { path = "../../../../../uzor/uzor-desktop" }
 uzor-backend-tiny-skia = { path = "../../../../../uzor/uzor-backend-tiny-skia" }

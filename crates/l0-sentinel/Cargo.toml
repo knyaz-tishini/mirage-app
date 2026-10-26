@@ -21,7 +21,7 @@ path = "src/bin/mirage-sentinel-test.rs"
 
 [dependencies]
 mirage-client-core = { path = "../client-core" }
-mirage-core        = { path = "../../../mirage2web/crates/mirage-core" }
+mirage-core        = { path = "../../../mirage-oss/crates/mirage-core" }
 # The commercial artefact branch (T1.1) validates an `EntranceArtefact` with
 # the SAME parser this crate spawns as a child — shared, never copied. See
 # `src/entrance_artefact.rs`.
