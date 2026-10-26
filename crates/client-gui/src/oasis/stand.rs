@@ -29,14 +29,27 @@ const LABEL_W: f64 = 108.0;
 const TOGGLE_W: f64 = 64.0;
 const REVOKE_W: f64 = 72.0;
 
+/// The server-side protocols the standalone image can actually publish, as
+/// `(id, port, mtu, on_by_default)`.
+///
+/// Two rules the server enforces on this list, and the menu has to honour
+/// them or the install fails on the box:
+///
+/// * **The UDP-only protocols are not here.** `awg`, `wireguard`, `openvpn`
+///   and `ikev2` are datagram transports, and the perimeter in this build has
+///   no datagram binder — the server refuses them by name rather than
+///   pretending. They come back when that binder lands.
+/// * **No two entries share a port.** The server binds one face per port and
+///   refuses a duplicate, so the defaults are distinct: a user who switches
+///   two protocols on gets two faces, not a collision.
+///
+/// The port is what the traffic LOOKS like, not the id: the mask on the wire
+/// is derived from the port (443 is TLS, 80 is a WebSocket, and so on), and
+/// the client dials the mask the artefact carries.
 const CATALOG: &[(&str, &str, &str, bool)] = &[
-    ("awg", "443", "1280", true),
-    ("wireguard", "51820", "1420", false),
-    ("openvpn", "1194", "", false),
-    ("cloak", "443", "", false),
-    ("shadowsocks", "443", "", false),
-    ("ikev2", "500", "", false),
-    ("xray", "443", "", false),
+    ("cloak", "443", "", true),
+    ("xray", "8443", "", false),
+    ("shadowsocks", "2083", "", false),
     ("socks5", "1080", "", false),
 ];
 
@@ -350,8 +363,11 @@ impl Stand {
         };
         let mut on: Vec<&Proto> = self.protocols.iter().filter(|p| p.on).collect();
         if on.is_empty() {
-            if let Some(awg) = self.protocols.iter().find(|p| p.id == "awg") {
-                on.push(awg);
+            // Nothing switched on: fall back to the catalogue's first entry
+            // rather than to a protocol by name — the menu owns that choice,
+            // and a name that leaves the catalogue would break the install.
+            if let Some(first) = self.protocols.first() {
+                on.push(first);
             }
         }
         let mut lines = Vec::new();
@@ -447,13 +463,14 @@ impl Stand {
 
     pub fn toggle_stack(&mut self) {
         self.stack_auto = !self.stack_auto;
+        let fallback = self.protocols.first().map(|p| p.id.to_owned()).unwrap_or_default();
         if !self.stack_auto && !self.protocols.iter().any(|p| p.id == self.stack) {
             self.stack = self
                 .protocols
                 .iter()
                 .find(|p| p.on)
                 .map(|p| p.id.to_owned())
-                .unwrap_or_else(|| "awg".into());
+                .unwrap_or(fallback);
         }
         self.focus = Focus::None;
         self.save_profile();
@@ -1406,7 +1423,11 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
             if stand.stack_auto {
                 "авто".into()
             } else if stand.stack.is_empty() {
-                "awg".into()
+                stand
+                    .protocols
+                    .first()
+                    .map(|p| p.id.to_owned())
+                    .unwrap_or_default()
             } else {
                 stand.stack.clone()
             }
