@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		A00000000000000000000013 /* MirageApp.swift in iOS */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001E; };
+		A00000000000000000000061 /* main.swift in iOS */ = {isa = PBXBuildFile; fileRef = A00000000000000000000060; };
 		A00000000000000000000046 /* DeviceStore.swift in iOS */ = {isa = PBXBuildFile; fileRef = A00000000000000000000045; };
 		A00000000000000000000047 /* DeviceStore.swift in Mac */ = {isa = PBXBuildFile; fileRef = A00000000000000000000045; };
 		A00000000000000000000048 /* DeviceStore.swift in iOS tunnel */ = {isa = PBXBuildFile; fileRef = A00000000000000000000045; };
@@ -71,6 +72,7 @@
 		A0000000000000000000002C /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
 		A00000000000000000000050 /* MirageClientView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MirageClientView.swift; sourceTree = "<group>"; };
 		A00000000000000000000052 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		A00000000000000000000060 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		A00000000000000000000022 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		A00000000000000000000003 /* AppInfo.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AppInfo.plist; sourceTree = "<group>"; };
 		A00000000000000000000015 /* TunnelInfo.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = TunnelInfo.plist; sourceTree = "<group>"; };
@@ -121,6 +123,7 @@
 		A0000000000000000000002A /* ios */ = {
 			isa = PBXGroup;
 			children = (
+				A00000000000000000000060 /* main.swift */,
 				A00000000000000000000003 /* AppInfo.plist */,
 				A00000000000000000000015 /* TunnelInfo.plist */,
 				A0000000000000000000002E /* App.entitlements */,
@@ -276,6 +279,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A00000000000000000000061 /* main.swift in iOS */,
 				A00000000000000000000013 /* MirageApp.swift in iOS */,
 				A00000000000000000000051 /* MirageClientView.swift in iOS */,
 				A00000000000000000000046 /* DeviceStore.swift in iOS */,

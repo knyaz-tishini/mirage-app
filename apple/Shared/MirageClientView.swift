@@ -27,7 +27,7 @@ func mirage_gui_set_bound(_ bound: Int32, _ name: UnsafePointer<CChar>?)
 
 @_silgen_name("mirage_gui_set_hooks")
 func mirage_gui_set_hooks(
-    _ start: (@convention(c) () -> Void)?,
+    _ start: (@convention(c) (UnsafePointer<CChar>?) -> Void)?,
     _ stop: (@convention(c) () -> Void)?,
     _ status: (@convention(c) () -> Int32)?,
     _ bind: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
@@ -42,7 +42,7 @@ func mirage_claim_redeem(_ code: UnsafePointer<CChar>?) -> UnsafeMutablePointer<
 @_silgen_name("mirage_store_free")
 func mirage_store_free(_ ptr: UnsafeMutablePointer<CChar>?)
 
-private enum TunnelBridge {
+enum TunnelBridge {
     static var phase: Int32 = 0
 
     static func install() {
@@ -57,7 +57,8 @@ private enum TunnelBridge {
         phase
     }
 
-    static let startTunnel: @convention(c) () -> Void = {
+    static let startTunnel: @convention(c) (UnsafePointer<CChar>?) -> Void = { raw in
+        let passed = raw.map { String(cString: $0) }.filter { !$0.isEmpty }
         phase = 1
         NETunnelProviderManager.loadAllFromPreferences { managers, error in
             if error != nil {
@@ -82,7 +83,13 @@ private enum TunnelBridge {
                         return
                     }
                     do {
-                        try manager.connection.startVPNTunnel()
+                        if let passed {
+                            try manager.connection.startVPNTunnel(options: [
+                                "m1r4g3-artefact": passed as NSString
+                            ])
+                        } else {
+                            try manager.connection.startVPNTunnel()
+                        }
                     } catch {
                         phase = 0
                     }

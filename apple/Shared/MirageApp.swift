@@ -1,13 +1,4 @@
 #if os(iOS)
-import SwiftUI
-
-@main
-struct MirageApp: App {
-    var body: some Scene {
-        WindowGroup {
-            MirageClientView()
-                .ignoresSafeArea()
-        }
-    }
-}
+import UIKit
+// The process entry is ios/main.swift. It runs the oasis window.
 #endif

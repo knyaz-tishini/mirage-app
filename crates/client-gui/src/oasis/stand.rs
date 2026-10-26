@@ -562,10 +562,18 @@ impl Stand {
             self.say("нет ссылки");
             return;
         }
-        let Some(path) = rfd::FileDialog::new().set_file_name("m1r4g3-link.txt").save_file() else {
+        #[cfg(target_os = "ios")]
+        {
+            self.say("файл недоступен");
             return;
-        };
-        let _ = std::fs::write(path, &self.link);
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            let Some(path) = rfd::FileDialog::new().set_file_name("m1r4g3-link.txt").save_file() else {
+                return;
+            };
+            let _ = std::fs::write(path, &self.link);
+        }
     }
 
     pub fn copy_link(&self) {
@@ -792,39 +800,55 @@ impl Stand {
     }
 
     pub fn import_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Конфиг или ссылка")
-            .add_filter("конфиг", &["json", "txt", "mirage", "conf", "vpn"])
-            .pick_file()
-        else {
+        #[cfg(target_os = "ios")]
+        {
+            self.say("файл недоступен");
             return;
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(raw) => self.accept_raw(&raw),
-            Err(_) => self.say("файл не читается"),
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Конфиг или ссылка")
+                .add_filter("конфиг", &["json", "txt", "mirage", "conf", "vpn"])
+                .pick_file()
+            else {
+                return;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => self.accept_raw(&raw),
+                Err(_) => self.say("файл не читается"),
+            }
         }
     }
 
     pub fn import_clipboard(&mut self) {
-        let mut clip = match arboard::Clipboard::new() {
-            Ok(clip) => clip,
-            Err(_) => {
-                self.say("буфер недоступен");
-                return;
-            }
-        };
-        if let Ok(text) = clip.get_text() {
-            if !text.trim().is_empty() {
-                self.accept_raw(&text);
-                return;
-            }
+        #[cfg(target_os = "ios")]
+        {
+            self.say("буфер недоступен");
+            return;
         }
-        match clip.get_image() {
-            Ok(img) => match decode_qr_rgba(&img.bytes, img.width, img.height) {
-                Ok(raw) => self.accept_raw(&raw),
-                Err(err) => self.say(&err),
-            },
-            Err(_) => self.say("в буфере пусто"),
+        #[cfg(not(target_os = "ios"))]
+        {
+            let mut clip = match arboard::Clipboard::new() {
+                Ok(clip) => clip,
+                Err(_) => {
+                    self.say("буфер недоступен");
+                    return;
+                }
+            };
+            if let Ok(text) = clip.get_text() {
+                if !text.trim().is_empty() {
+                    self.accept_raw(&text);
+                    return;
+                }
+            }
+            match clip.get_image() {
+                Ok(img) => match decode_qr_rgba(&img.bytes, img.width, img.height) {
+                    Ok(raw) => self.accept_raw(&raw),
+                    Err(err) => self.say(&err),
+                },
+                Err(_) => self.say("в буфере пусто"),
+            }
         }
     }
 
@@ -937,8 +961,13 @@ impl Stand {
     }
 
     fn copy_text(&self, text: &str) {
+        #[cfg(not(target_os = "ios"))]
         if let Ok(mut clip) = arboard::Clipboard::new() {
             let _ = clip.set_text(text.to_owned());
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let _ = text;
         }
     }
 }

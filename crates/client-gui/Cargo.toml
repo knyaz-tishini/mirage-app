@@ -93,8 +93,9 @@ arboard = "3"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-uzor-render-tiny-skia = { path = "../../../uzor/uzor-render-tiny-skia" }
-tiny-skia = "0.11"
+uzor-framework = { path = "../../../uzor/uzor-framework", features = ["native"] }
+uzor-anim-js = { path = "../../../uzor/uzor-anim-js", features = ["quickjs"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [patch.crates-io]
 winit = { path = "third-party/winit" }

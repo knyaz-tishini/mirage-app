@@ -8,7 +8,6 @@
 use uzor::core::types::Rect;
 use uzor::render::{RenderContext, TextAlign, TextBaseline};
 
-use crate::centerpiece::SkinKind;
 
 pub const MENU_TOP: f64 = 32.0;
 pub const TABBAR_H: f64 = 32.0;
@@ -62,7 +61,6 @@ pub enum MenuRow {
     /// Cabinet countries, 3 per row, at most 3 rows visible. Scrolls inside
     /// itself when there are more rows.
     Countries,
-    Skin(SkinKind),
     Action(MenuAction),
     /// First Setup row. A claim code or `/c/` link. Enter or BIND redeems it.
     Bind,
@@ -92,14 +90,12 @@ fn metrics(row: &MenuRow, country_count: usize, services: usize, apps: usize) ->
         MenuRow::Apps => (list_block_height(apps), true),
         MenuRow::ExitMode => (46.0, true),
         MenuRow::Countries => (country_block_height(country_count), true),
-        MenuRow::Skin(_) => (38.0, true),
         MenuRow::Bind => (48.0, true),
     }
 }
 
-/// Cabinet sheet: the claim field only. Exit, transport, sites, apps, skins
-/// and import are not rows. The desktop shell applies exit and transport itself.
-#[cfg(not(target_os = "ios"))]
+/// Cabinet sheet: the claim field only. Exit, transport, sites, apps
+/// and import are not rows. The shell applies exit and transport itself.
 pub fn cabinet_rows() -> Vec<MenuRow> {
     vec![MenuRow::Bind]
 }
@@ -123,8 +119,6 @@ pub fn tab_rows(tab: MenuTab, exit_auto: bool, country_count: usize) -> Vec<Menu
         }
         MenuTab::Setup => vec![
             MenuRow::Bind,
-            MenuRow::Skin(SkinKind::Bloom),
-            MenuRow::Skin(SkinKind::Planet),
             MenuRow::Action(MenuAction::ImportFile),
             MenuRow::Action(MenuAction::ImportText),
             MenuRow::Action(MenuAction::ImportQrClip),
@@ -406,7 +400,6 @@ pub fn draw_menu(
     content_h: f64,
     scroll: f64,
     country_scroll: f64,
-    skin: SkinKind,
     countries: &[String],
     selected: Option<&str>,
     exit_auto: bool,
@@ -467,7 +460,7 @@ pub fn draw_menu(
             continue; // culled
         }
         draw_row(
-            ctx, w, lr, ry, country_scroll, skin, countries, selected, exit_auto, mode,
+            ctx, w, lr, ry, country_scroll, countries, selected, exit_auto, mode,
             socks_on, http_on, tun_on, services, apps, bypass_services, bypass_apps,
             sites_focused, apps_focused, list_draft, bind_focused, bind_draft, bound, unlink_armed, cabinet,
             bound_name,
@@ -695,7 +688,6 @@ fn draw_row(
     lr: &LaidRow,
     ry: f64,
     country_scroll: f64,
-    skin: SkinKind,
     countries: &[String],
     selected: Option<&str>,
     exit_auto: bool,
@@ -808,28 +800,6 @@ fn draw_row(
             if let Some(thumb) = grid.thumb {
                 ctx.set_fill_color("rgba(255,255,255,0.28)");
                 ctx.fill_rect(thumb.x, thumb.y, thumb.width, thumb.height);
-            }
-        }
-        MenuRow::Skin(s) => {
-            let active = s == skin;
-            if active {
-                ctx.set_fill_color("rgba(251,178,106,0.10)");
-                ctx.fill_rect(2.0, ry, w - 2.0, lr.h);
-            }
-            ctx.set_fill_color(if active { AMBER } else { FG });
-            ctx.set_font("14px sans-serif");
-            ctx.set_text_align(TextAlign::Left);
-            ctx.set_text_baseline(TextBaseline::Middle);
-            let name = match s {
-                SkinKind::Bloom => "Bloom",
-                SkinKind::Planet => "Planet",
-            };
-            fill_clipped(ctx, name, 20.0, ry + lr.h / 2.0, 12.0, ry, (w - 48.0).max(0.0), lr.h);
-            if active {
-                ctx.set_fill_color(AMBER);
-                ctx.begin_path();
-                ctx.arc(w - 22.0, ry + lr.h / 2.0, 3.5, 0.0, std::f64::consts::TAU);
-                ctx.fill();
             }
         }
         MenuRow::Action(a) => {

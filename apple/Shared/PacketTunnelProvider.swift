@@ -23,8 +23,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         options: [String: NSObject]?,
         completionHandler: @escaping (Error?) -> Void
     ) {
-        let _ = options
-        guard let json = DeviceStore.load() else {
+        let json: Data
+        if let passed = options?["m1r4g3-artefact"] as? String,
+            let data = passed.data(using: .utf8),
+            !data.isEmpty
+        {
+            json = data
+        } else if let stored = DeviceStore.load() {
+            json = stored
+        } else {
             completionHandler(tunnelError("устройство не привязано"))
             return
         }

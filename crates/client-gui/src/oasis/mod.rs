@@ -25,7 +25,6 @@ use uzor_framework::{
 };
 
 use crate::backend::{EngineLink, LocalHttp};
-use crate::centerpiece::SkinKind;
 use crate::shell::menu::{self, MenuTab};
 
 mod provision;
@@ -116,6 +115,8 @@ struct Oasis {
     note: String,
     fell_back: bool,
     stand: Stand,
+    /// Scene button has started the configured connection. The boot picture is not this.
+    linked: bool,
     /// Last standalone link handed to the subscriber. Stops a re-spawn every frame.
     adopted: String,
     pending_submit: Option<String>,
@@ -282,15 +283,17 @@ impl App for Oasis {
             && !min_click
             && !close_click
         {
-            let on = self.target < 0.5;
-            self.target = if on { 1.0 } else { 0.0 };
-            self.style = (self.toggles % 4) as f64;
-            self.toggles = self.toggles.wrapping_add(1);
-            if on {
-                self.raise_link();
-            } else {
-                self.engine.disconnect();
-                self.fell_back = false;
+            if self.linked {
+                self.linked = false;
+                self.target = 0.0;
+                self.style = (self.toggles % 4) as f64;
+                self.toggles = self.toggles.wrapping_add(1);
+                self.stop_link();
+            } else if self.connection_ready() && self.raise_link() {
+                self.linked = true;
+                self.target = 1.0;
+                self.style = (self.toggles % 4) as f64;
+                self.toggles = self.toggles.wrapping_add(1);
             }
         }
         if menu_click {
@@ -352,7 +355,6 @@ impl App for Oasis {
                     content_h,
                     menu_now.scroll,
                     0.0,
-                    SkinKind::Planet,
                     &[],
                     None,
                     true,
@@ -518,7 +520,74 @@ impl Oasis {
         }
     }
 
-    fn raise_link(&mut self) {
+    /// Cabinet is a redeemed device. Standalone is a JSON entrance artefact.
+    /// Anything else is not a connection, and the scene button does not start one.
+    fn connection_ready(&self) -> bool {
+        match self.product {
+            Product::Cabinet => self.cabinet_ready(),
+            Product::Standalone => self.standalone_artefact().is_some(),
+        }
+    }
+
+    fn cabinet_ready(&self) -> bool {
+        if self.engine.is_bound() {
+            return true;
+        }
+        #[cfg(target_os = "ios")]
+        {
+            return crate::ios_host::cabinet_bound();
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            return false;
+        }
+    }
+
+    fn standalone_artefact(&self) -> Option<String> {
+        let link = self.stand.link.trim();
+        if json_object(link) {
+            return Some(link.to_owned());
+        }
+        let path = std::env::current_exe()
+            .ok()?
+            .parent()?
+            .join("standalone")
+            .join("artefact.json");
+        let text = std::fs::read_to_string(path).ok()?;
+        let text = text.trim();
+        if json_object(text) {
+            Some(text.to_owned())
+        } else {
+            None
+        }
+    }
+
+    fn raise_link(&mut self) -> bool {
+        if !self.connection_ready() {
+            return false;
+        }
+        if self.product == Product::Standalone {
+            let Some(json) = self.standalone_artefact() else {
+                return false;
+            };
+            if self.adopted != json {
+                match self.engine.adopt_artefact(&json) {
+                    Ok(()) => self.adopted = json,
+                    Err(err) => {
+                        #[cfg(not(target_os = "ios"))]
+                        {
+                            self.note = err;
+                            return false;
+                        }
+                        #[cfg(target_os = "ios")]
+                        {
+                            let _ = err;
+                            self.adopted = json;
+                        }
+                    }
+                }
+            }
+        }
         self.engine.set_exit("auto");
         if self.engine.status().tun_block.is_some() {
             self.engine.set_listeners(true, false);
@@ -527,6 +596,24 @@ impl Oasis {
             self.engine.set_tun(true);
         }
         self.engine.connect();
+        #[cfg(target_os = "ios")]
+        {
+            let arg = match self.product {
+                Product::Standalone => self.standalone_artefact(),
+                Product::Cabinet => None,
+            };
+            if !crate::ios_host::tunnel_start(arg.as_deref()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn stop_link(&mut self) {
+        self.engine.disconnect();
+        self.fell_back = false;
+        #[cfg(target_os = "ios")]
+        crate::ios_host::tunnel_stop();
     }
 
     fn poll_scan(&mut self) {
@@ -562,11 +649,12 @@ impl Oasis {
             && !link.is_empty()
             && link == self.adopted
             && self.note.is_empty()
+            && self.raise_link()
         {
+            self.linked = true;
             self.target = 1.0;
             self.style = (self.toggles % 4) as f64;
             self.toggles = self.toggles.wrapping_add(1);
-            self.raise_link();
         }
         true
     }
@@ -588,8 +676,17 @@ impl Oasis {
                 self.apply_scope();
             }
             Err(err) => {
-                self.adopted = link;
-                self.note = err;
+                #[cfg(target_os = "ios")]
+                {
+                    let _ = err;
+                    self.adopted = link;
+                    self.apply_scope();
+                }
+                #[cfg(not(target_os = "ios"))]
+                {
+                    self.adopted = link;
+                    self.note = err;
+                }
             }
         }
     }
@@ -1104,6 +1201,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             note: String::new(),
             fell_back: false,
             stand: Stand::load(),
+            linked: false,
             adopted: String::new(),
             pending_submit: None,
             bind_reset_epoch: 0,
@@ -1129,6 +1227,12 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     Ok(())
+}
+
+fn json_object(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .is_some_and(|value| value.is_object())
 }
 
 /// Cabinet unless this launch passed `--standalone` or a previous launch wrote

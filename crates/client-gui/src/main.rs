@@ -34,7 +34,6 @@ fn main() {
         }
     }));
     note("mirage-client-gui start");
-    #[cfg(not(target_os = "ios"))]
     if let Err(err) = mirage_client_gui::run() {
         note(&format!("mirage-client-gui: {err}"));
         std::process::exit(1);

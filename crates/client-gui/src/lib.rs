@@ -3,25 +3,12 @@
 
 pub mod ota;
 
-// The planet/bloom shell speaks the removed AppBuilder API. The Windows
-// customer bin is the oasis host. Those modules stay for the Apple bundle.
-#[cfg(target_os = "ios")]
-mod app;
+// One picture: the oasis scene. Desktop and iOS both enter through `run`.
 mod backend;
-mod centerpiece;
-#[cfg(target_os = "ios")]
-mod config_import;
-#[cfg(all(feature = "dev-tools", target_os = "ios"))]
-mod dev;
+mod camera;
 #[cfg(target_os = "ios")]
 mod ios_host;
-mod nodes;
-#[cfg(not(target_os = "ios"))]
-mod camera;
-#[cfg(not(target_os = "ios"))]
 mod oasis;
-#[cfg(target_os = "ios")]
-mod render_backend;
 mod shell;
 
 /// Dev-tools only. `MIRAGE_SHOT_SIZE=1206x2622` sets the window the screenshot
@@ -40,7 +27,6 @@ fn dev_shot_size() -> (u32, u32) {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     ota::wait_for_parent_exit();
     ota::clear_rollback_copy();
@@ -72,7 +58,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(target_os = "ios"))]
 #[no_mangle]
 pub extern "C" fn mirage_gui_run() -> i32 {
     match run() {
