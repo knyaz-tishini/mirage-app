@@ -106,10 +106,17 @@ pub struct Job {
     /// The first press of "install" asks; the second one installs with the
     /// faces the person chose.
     pub ask_faces: bool,
+    /// This box's own state directory.
+    ///
+    /// `None` means the default one, next to the executable. A chain gives
+    /// every box its own directory: the key the client installs on a box and
+    /// the host-key pin of that box belong to THAT box, and two boxes must
+    /// not overwrite each other's.
+    pub state: Option<PathBuf>,
 }
 
 /// What one install step ended with.
-enum Outcome {
+pub enum Outcome {
     /// The box answered what it could offer. The person now chooses.
     Faces {
         faces: Vec<ProposedFace>,
@@ -209,8 +216,8 @@ fn set_text(bus: &InstallBus, line: &str) {
     *bus.text.lock().unwrap_or_else(|p| p.into_inner()) = line.to_owned();
 }
 
-async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
-    let dir = state_dir()?;
+pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
+    let dir = job_state_dir(&job)?;
     let key_path = dir.join("server.key");
     let pub_path = dir.join("server.pub");
     ensure_key(&key_path, &pub_path)?;
@@ -356,6 +363,49 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         link: link.to_owned(),
         warn: warning,
     })
+}
+
+/// Write a new `server.env` to an installed box and bring it back up with it.
+///
+/// The box is already installed; what changes is the chain it belongs to. The
+/// compose file reads `server.env` when the container starts, so the env has
+/// to be written and the container brought up again — `up -d` is exactly the
+/// command the install runs, and it re-creates the container when the env
+/// changed.
+pub async fn reconfigure(
+    host: &str,
+    port: u16,
+    user: &str,
+    state: &Path,
+    env: &str,
+) -> Result<(), String> {
+    let key_path = state.join("server.key");
+    let pem = fs::read(&key_path).map_err(|e| format!("key: {e}"))?;
+    let pins = state.join("host-keys.json");
+    let addr = format!("{host}:{port}");
+    let session = connect_key(&addr, user, &pem, &pins).await?;
+    let remote = "/opt/m1r4g3";
+    upload(&session, env.as_bytes(), &format!("{remote}/server.env")).await?;
+    let out = exec(
+        &session,
+        "docker compose -f /opt/m1r4g3/docker-compose.yml up -d",
+    )
+    .await?;
+    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+    if out.exit.unwrap_or(1) != 0 {
+        let err = out
+            .stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        return Err(if err.is_empty() {
+            format!("docker compose up: exit {:?}", out.exit)
+        } else {
+            format!("docker compose up: {err}")
+        });
+    }
+    Ok(())
 }
 
 /// An error, with the warning attached when there is one.
@@ -578,6 +628,21 @@ fn state_dir() -> Result<PathBuf, String> {
     let dir = exe.parent().ok_or("exe dir")?.join("standalone");
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
     Ok(dir)
+}
+
+/// The state directory one job works in.
+///
+/// A job that names its own directory gets it — a chain gives every box its
+/// own, so the key the client installs on one box and the host-key pin of
+/// that box are never overwritten by the next box in the chain.
+fn job_state_dir(job: &Job) -> Result<PathBuf, String> {
+    match job.state.as_ref() {
+        Some(dir) => {
+            fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
+            Ok(dir.clone())
+        }
+        None => state_dir(),
+    }
 }
 
 fn image_tar() -> Option<PathBuf> {

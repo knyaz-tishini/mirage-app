@@ -13,6 +13,8 @@
 //!   POST /stand/install → step two: bring it up with the faces that were chosen
 //!   POST /stand/remove  → take the container down
 //!   GET  /stand/status  → what the running job is doing
+//!   POST /stand/chain   → build a chain of boxes: install them, then wire them
+//!                         together, and hand back the entry box's link
 //!
 //! The listener binds `127.0.0.1` only: this drives a box over SSH, it must
 //! not become a way into this machine. The password arrives in the POST body,
@@ -26,8 +28,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::oasis::chain_install;
 use crate::oasis::provision::ProposedFace;
-use crate::oasis::stand::{Proto, Stand};
+use crate::oasis::stand::{split_host, Proto, Stand};
 
 /// Port the control API listens on when nothing else is asked for.
 pub const DEFAULT_PORT: u16 = 17500;
@@ -165,6 +168,7 @@ enum Route {
     Install,
     Remove,
     Status,
+    Chain,
 }
 
 fn route(path: &str) -> Option<Route> {
@@ -175,6 +179,7 @@ fn route(path: &str) -> Option<Route> {
         "/stand/install" => Some(Route::Install),
         "/stand/remove" => Some(Route::Remove),
         "/stand/status" => Some(Route::Status),
+        "/stand/chain" => Some(Route::Chain),
         _ => None,
     }
 }
@@ -203,7 +208,10 @@ fn handle(api: &Api, stream: &mut TcpStream) {
         respond(stream, 404, &error_body("not found"));
         return;
     };
-    let wants_post = matches!(route, Route::Ask | Route::Install | Route::Remove);
+    let wants_post = matches!(
+        route,
+        Route::Ask | Route::Install | Route::Remove | Route::Chain
+    );
     if wants_post != (request.method == "POST") {
         respond(stream, 405, &error_body("method not allowed"));
         return;
@@ -230,6 +238,13 @@ fn handle(api: &Api, stream: &mut TcpStream) {
         Route::Remove => match credentials(&request.body, false) {
             Ok(creds) => {
                 let (code, body) = remove(api, &creds);
+                respond(stream, code, &body);
+            }
+            Err(err) => respond(stream, 400, &error_body(&err)),
+        },
+        Route::Chain => match chain_request(&request.body) {
+            Ok(chain) => {
+                let (code, body) = start_chain(api, chain);
                 respond(stream, code, &body);
             }
             Err(err) => respond(stream, 400, &error_body(&err)),
@@ -431,6 +446,131 @@ fn install(api: &Api, creds: &Credentials, ask_faces: bool) -> (u16, String) {
 }
 
 /// Take the container down and answer with what happened.
+/// One box of a chain, as the request names it.
+struct ChainBoxBody {
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+}
+
+/// A chain to build, as the request names it.
+struct ChainBody {
+    chain_id: String,
+    boxes: Vec<ChainBoxBody>,
+}
+
+/// Read the chain out of a request body.
+///
+/// The password of every box is read here and goes straight into the worker's
+/// memory: it is never written down and never comes back out.
+fn chain_request(body: &[u8]) -> Result<ChainBody, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "body is not text".to_owned())?;
+    let value: Value = serde_json::from_str(text).map_err(|err| format!("bad json: {err}"))?;
+    let chain_id = value
+        .get("chain_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("stand")
+        .to_owned();
+    let raw = value
+        .get("boxes")
+        .and_then(Value::as_array)
+        .ok_or("boxes is required")?;
+    if raw.is_empty() {
+        return Err("a chain needs at least one box".to_owned());
+    }
+    let mut boxes = Vec::with_capacity(raw.len());
+    for item in raw {
+        let host = item
+            .get("host")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        check_host(&host)?;
+        let (host, port) = split_host(&host).ok_or("host is required")?;
+        let user = item
+            .get("user")
+            .and_then(Value::as_str)
+            .unwrap_or("root")
+            .trim()
+            .to_owned();
+        let password = item
+            .get("password")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        boxes.push(ChainBoxBody {
+            host,
+            port,
+            user,
+            password,
+        });
+    }
+    Ok(ChainBody { chain_id, boxes })
+}
+
+/// Build the chain, and answer with what the build is doing.
+///
+/// The build is long — every box is installed over SSH — so it runs in a
+/// worker and the answer comes through `/stand/status`, exactly like a
+/// single box's install does.
+fn start_chain(api: &Api, body: ChainBody) -> (u16, String) {
+    let mut stand = api.lock_stand();
+    api.sync_bus(&mut stand);
+    if stand.bus.running.load(Ordering::Relaxed) {
+        return (409, error_body("busy"));
+    }
+    let base_env = stand.server_env();
+    let bus = Arc::clone(&stand.bus);
+    let chain_id = body.chain_id.clone();
+    bus.running.store(true, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let boxes: Vec<chain_install::ChainRequest> = body
+            .boxes
+            .iter()
+            .map(|box_| chain_install::ChainRequest {
+                host: box_.host.clone(),
+                port: box_.port,
+                user: box_.user.clone(),
+                password: box_.password.clone(),
+            })
+            .collect();
+        let outcome = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(chain_install::install_chain(
+                &chain_id,
+                &boxes,
+                &base_env,
+                &bus,
+            )),
+            Err(err) => Err(format!("runtime: {err}")),
+        };
+        match outcome {
+            Ok(outcome) => {
+                *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome.link.clone());
+                let boxes: Vec<String> = outcome
+                    .boxes
+                    .iter()
+                    .map(|box_| format!("{} {}", box_.host, box_.role.as_env()))
+                    .collect();
+                *bus.text.lock().unwrap_or_else(|p| p.into_inner()) =
+                    format!("chain {chain_id}: {}", boxes.join(", "));
+            }
+            Err(err) => *bus.text.lock().unwrap_or_else(|p| p.into_inner()) = err,
+        }
+        bus.running.store(false, Ordering::Relaxed);
+    });
+    (
+        200,
+        json!({"ok": true, "started": true, "chain_id": body.chain_id}).to_string(),
+    )
+}
+
 fn remove(api: &Api, creds: &Credentials) -> (u16, String) {
     let mut stand = api.lock_stand();
     api.sync_bus(&mut stand);

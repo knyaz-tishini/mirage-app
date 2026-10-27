@@ -547,6 +547,7 @@ impl Stand {
                 stack,
                 env,
                 ask_faces,
+                state: None,
             },
             Arc::clone(&self.bus),
         );
