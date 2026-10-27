@@ -111,9 +111,17 @@ pub struct Job {
 /// What one install step ended with.
 enum Outcome {
     /// The box answered what it could offer. The person now chooses.
-    Faces(Vec<ProposedFace>),
+    Faces {
+        faces: Vec<ProposedFace>,
+        /// What the operator should know that is not a failure.
+        warn: Option<String>,
+    },
     /// The box is up, and this is the customer's link.
-    Link(String),
+    Link {
+        link: String,
+        /// What the operator should know that is not a failure.
+        warn: Option<String>,
+    },
 }
 
 pub fn start(job: Job, bus: Arc<InstallBus>) {
@@ -128,18 +136,30 @@ pub fn start(job: Job, bus: Arc<InstallBus>) {
             Err(err) => Err(format!("runtime: {err}")),
         };
         match outcome {
-            Ok(Outcome::Faces(faces)) => {
+            Ok(Outcome::Faces { faces, warn }) => {
                 *bus.faces.lock().unwrap_or_else(|p| p.into_inner()) = Some(faces);
-                set_text(&bus, crate::text::tr("p.faces_review"));
+                set_text(&bus, &status_line(crate::text::tr("p.faces_review"), warn));
             }
-            Ok(Outcome::Link(link)) => {
+            Ok(Outcome::Link { link, warn }) => {
                 *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(link);
-                set_text(&bus, crate::text::tr("p.up"));
+                set_text(&bus, &status_line(crate::text::tr("p.up"), warn));
             }
             Err(err) => set_text(&bus, &err),
         }
         bus.running.store(false, Ordering::Relaxed);
     });
+}
+
+/// The status line, with a warning appended when there is one.
+///
+/// A warning is not a failure: the install stands, but the operator has to
+/// know about it — a box that kept its password door is a box the customer
+/// can still walk into with a password.
+fn status_line(base: &str, warn: Option<String>) -> String {
+    match warn {
+        Some(warn) => format!("{base} — {warn}"),
+        None => base.to_owned(),
+    }
 }
 
 /// Key-only `docker compose down`. No password. Shares the install bus so the
@@ -217,6 +237,15 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
     // Password is not used after the key is on the host.
     drop(job.password);
 
+    // The client's key is on the box and it works — the install only gets
+    // here after a successful key authentication. From now on the box
+    // answers to that key and to nothing else: a password would be a second
+    // way in that nobody needs.
+    //
+    // The step is best-effort. A box that will not take the change keeps its
+    // password door, and the operator is told so — but the install stands.
+    let mut warning = disable_password_auth(&session).await.err();
+
     set_text(bus, "docker");
     let remote = "/opt/m1r4g3";
     exec(&session, &format!("mkdir -p {remote}")).await?;
@@ -265,21 +294,24 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
                 format!("{}: {err}", crate::text::tr("p.no_proposal"))
             });
         }
-        return Ok(Outcome::Faces(parse_faces(&out.stdout).map_err(|err| {
-            // The box's own words about WHY it could not answer are more
-            // useful than the client's summary of an empty answer.
-            let last = out
-                .stderr
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("");
-            if last.is_empty() {
-                err
-            } else {
-                format!("{err}: {last}")
-            }
-        })?));
+        return Ok(Outcome::Faces {
+            faces: parse_faces(&out.stdout).map_err(|err| {
+                // The box's own words about WHY it could not answer are more
+                // useful than the client's summary of an empty answer.
+                let last = out
+                    .stderr
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("");
+                if last.is_empty() {
+                    err
+                } else {
+                    format!("{err}: {last}")
+                }
+            })?,
+            warn: warning,
+        });
     }
 
     // Step two: the box comes up with the faces the person chose.
@@ -289,7 +321,13 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         exec(&session, &format!("sh {remote}/install.sh")),
     )
     .await
-    .map_err(|_| crate::text::tr("p.install_timeout").to_owned())??;
+    .map_err(|_| crate::text::tr("p.install_timeout").to_owned())?
+    .map_err(|err| with_warning(err, &warning))?;
+    // The last word on the password door: the first attempt ran before the
+    // container came up, and a box that was busy then may be free now.
+    if let Err(reason) = disable_password_auth(&session).await {
+        warning = warning.or(Some(reason));
+    }
     let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
     let link = out
         .stdout
@@ -298,14 +336,175 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         .filter(|line| !line.is_empty())
         .ok_or_else(|| {
             let err = out.stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
-            if err.is_empty() {
+            let text = if err.is_empty() {
                 format!("{} (exit {:?})", crate::text::tr("p.no_link"), out.exit)
             } else {
                 format!("{}: {err}", crate::text::tr("p.no_link"))
-            }
+            };
+            with_warning(text, &warning)
         })?;
     fs::write(dir.join("link.txt"), link).map_err(|e| format!("save link: {e}"))?;
-    Ok(Outcome::Link(link.to_owned()))
+    Ok(Outcome::Link {
+        link: link.to_owned(),
+        warn: warning,
+    })
+}
+
+/// An error, with the warning attached when there is one.
+///
+/// The warning is not the reason the install failed, but the operator has to
+/// see both: the box failed to come up, and it still has its password door.
+fn with_warning(err: String, warn: &Option<String>) -> String {
+    match warn {
+        Some(warn) => format!("{err} ({warn})"),
+        None => err,
+    }
+}
+
+/// Close the password door on the box.
+///
+/// The client's own key is already on the box and already proven — the
+/// install only reaches this point after a successful key authentication.
+/// From here on the box answers to that key and to nothing else: a password
+/// would be a second way in that nobody needs.
+///
+/// The step is best-effort. A box that will not take the change (no write
+/// access, no `sshd` on the PATH, a `sudo` that wants a password) keeps its
+/// password door, and the reason comes back to the operator as a warning
+/// rather than as a failed install.
+async fn disable_password_auth(
+    session: &client::Handle<Handler>,
+) -> Result<(), String> {
+    let out = exec(session, &disable_password_script()).await?;
+    if out.exit.unwrap_or(1) != 0 {
+        let err = out
+            .stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        return Err(if err.is_empty() {
+            format!("{WARN_PASSWORD_DOOR}: exit {:?}", out.exit)
+        } else {
+            format!("{WARN_PASSWORD_DOOR}: {err}")
+        });
+    }
+    if out.stdout.contains("m1r4g3-sshd-key-only") {
+        return Ok(());
+    }
+    if let Some((_, reason)) = out.stdout.split_once("m1r4g3-sshd-skip") {
+        return Err(format!("{WARN_PASSWORD_DOOR}: {}", reason.trim()));
+    }
+    Err(format!("{WARN_PASSWORD_DOOR}: бокс не ответил"))
+}
+
+/// The directives that make the box a key-only door.
+///
+/// `PasswordAuthentication no` is the point of the whole step: the client's
+/// own key is on the box and works, so a password is a second way in that
+/// nobody needs. `PermitRootLogin prohibit-password` keeps the root account
+/// reachable BY KEY — the client talks to the box as root.
+const SSHD_KEY_ONLY_DIRECTIVES: &str = "PasswordAuthentication no\n\
+KbdInteractiveAuthentication no\n\
+PermitRootLogin prohibit-password\n\
+PubkeyAuthentication yes\n";
+
+/// Where the drop-in goes when the box reads drop-ins.
+const SSHD_DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/90-mirage-key-only.conf";
+
+/// The markers around the block when the box has no drop-in support.
+///
+/// The block goes to the TOP of `sshd_config`, because sshd takes the FIRST
+/// value it sees for a keyword: a block at the end would lose against an
+/// earlier `PasswordAuthentication yes`.
+const SSHD_BLOCK_BEGIN: &str = "# BEGIN m1r4g3 key-only";
+const SSHD_BLOCK_END: &str = "# END m1r4g3 key-only";
+
+/// What the operator is told when the box keeps its password door.
+const WARN_PASSWORD_DOOR: &str = "парольный вход на боксе не отключён";
+
+/// The shell that turns the box into a key-only door.
+///
+/// The step is built so that running it twice is the same as running it
+/// once: the drop-in is written from scratch, and the marked block is
+/// removed before it is written again.
+///
+/// Two ways to write the directives, and the choice between them matters:
+/// sshd takes the FIRST value it sees for a keyword, so a drop-in only wins
+/// when the `Include` that pulls it in comes before every directive of ours.
+/// When it does not, the block goes to the top of `sshd_config` instead —
+/// there it always wins. Silently losing the race would leave the password
+/// door open while the step reports success.
+///
+/// `sshd -t` has to pass BEFORE sshd is reloaded — a broken config never
+/// reaches the running daemon, and the box keeps the config it had. The
+/// reload is deliberately not a restart: a restart would drop the very
+/// session this script runs in.
+fn disable_password_script() -> String {
+    let dropin = format!(
+        "# Installed by the m1r4g3 client after its own key was verified.\n\
+         # The key is the only way in now.\n\
+         {SSHD_KEY_ONLY_DIRECTIVES}"
+    );
+    format!(
+        r#"#!/bin/sh
+set -eu
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+else
+  if ! sudo -n true 2>/dev/null; then
+    echo "m1r4g3-sshd-skip sudo needs a password"
+    exit 0
+  fi
+  SUDO="sudo -n"
+fi
+SSHD=$(command -v sshd || echo /usr/sbin/sshd)
+CONF=/etc/ssh/sshd_config
+DROPIN={dropin_path}
+TMP=$(mktemp /tmp/m1r4g3-key-only.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+cat > "$TMP" <<'M1R4G3_EOF'
+{dropin}M1R4G3_EOF
+include_at=$(grep -in -m1 '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "$CONF" | cut -d: -f1)
+ours_at=$(grep -in -m1 -E '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|PermitRootLogin)[[:space:]]' "$CONF" | cut -d: -f1)
+if [ -n "$include_at" ] && {{ [ -z "$ours_at" ] || [ "$include_at" -lt "$ours_at" ]; }}; then
+  mkdir -p "$(dirname "$DROPIN")"
+  $SUDO cp -p "$CONF" "$CONF.m1r4g3.bak"
+  $SUDO cp "$TMP" "$DROPIN"
+else
+  $SUDO cp -p "$CONF" "$CONF.m1r4g3.bak"
+  $SUDO sed -i '/^{begin}$/,/^{end}$/d' "$CONF"
+  MERGED=$(mktemp /tmp/m1r4g3-sshd-config.XXXXXX)
+  {{ printf '%s\n' '{begin}'; cat "$TMP"; printf '%s\n' '{end}'; cat "$CONF"; }} > "$MERGED"
+  $SUDO cp "$MERGED" "$CONF"
+  rm -f "$MERGED"
+fi
+if ! $SUDO "$SSHD" -t; then
+  echo "sshd -t refused the config" >&2
+  exit 1
+fi
+if $SUDO systemctl reload ssh 2>/dev/null; then
+  :
+elif $SUDO systemctl reload sshd 2>/dev/null; then
+  :
+elif $SUDO service ssh reload 2>/dev/null; then
+  :
+else
+  PID=$(cat /run/sshd.pid 2>/dev/null || true)
+  if [ -n "$PID" ] && $SUDO kill -HUP "$PID" 2>/dev/null; then
+    :
+  else
+    echo "could not reload sshd" >&2
+    exit 1
+  fi
+fi
+echo "m1r4g3-sshd-key-only"
+"#,
+        dropin_path = SSHD_DROPIN_PATH,
+        dropin = dropin,
+        begin = SSHD_BLOCK_BEGIN,
+        end = SSHD_BLOCK_END,
+    )
 }
 
 /// Read the proposal out of the box's answer.
@@ -727,5 +926,99 @@ why = "443/UDP — там обычно весит QUIC."
     fn a_stream_without_a_proposal_is_refused() {
         let err = parse_faces("Loaded image: m1r4g3-server:1\n").expect_err("nothing to read");
         assert!(err.contains("не прислал") || err.contains("did not send"), "{err}");
+    }
+
+    #[test]
+    fn the_key_only_door_has_exactly_the_four_directives() {
+        let script = disable_password_script();
+        for directive in [
+            "PasswordAuthentication no",
+            "KbdInteractiveAuthentication no",
+            "PermitRootLogin prohibit-password",
+            "PubkeyAuthentication yes",
+        ] {
+            assert!(script.contains(directive), "{directive} is missing");
+        }
+    }
+
+    #[test]
+    fn the_config_is_checked_before_sshd_is_reloaded() {
+        let script = disable_password_script();
+        let check = script.find("\"$SSHD\" -t").expect("the config is checked");
+        let reload = script.find("reload").expect("sshd is reloaded");
+        assert!(check < reload, "the check must come before the reload");
+        assert!(
+            !script.contains("restart"),
+            "a restart would drop the session the script runs in"
+        );
+    }
+
+    #[test]
+    fn the_reload_has_a_way_that_works_without_systemd() {
+        // A HUP on the running master makes it re-read its config and keeps
+        // the sessions that are already open — a restart would not.
+        let script = disable_password_script();
+        assert!(script.contains("kill -HUP"), "the HUP fallback is there");
+        assert!(script.contains("/run/sshd.pid"), "the master pid is found");
+    }
+
+    #[test]
+    fn the_step_never_asks_for_a_password() {
+        let script = disable_password_script();
+        assert!(script.contains("sudo -n"), "sudo must be non-interactive");
+        assert!(
+            !script.contains("sudo -S"),
+            "sudo must not read a password from the stream"
+        );
+    }
+
+    #[test]
+    fn the_marked_block_is_removed_before_it_is_written_again() {
+        let script = disable_password_script();
+        assert!(script.contains(SSHD_BLOCK_BEGIN));
+        assert!(script.contains(SSHD_BLOCK_END));
+        assert!(
+            script.contains(&format!("/^{}$/,/^{}$/d", SSHD_BLOCK_BEGIN, SSHD_BLOCK_END)),
+            "the old block must be deleted before the new one is written"
+        );
+    }
+
+    #[test]
+    fn the_block_goes_before_the_old_config_because_sshd_takes_the_first_value() {
+        let script = disable_password_script();
+        let begin = script
+            .find(&format!("printf '%s\\n' '{SSHD_BLOCK_BEGIN}'"))
+            .expect("the block is written");
+        let old = script.find("cat \"$CONF\"").expect("the old config is kept");
+        assert!(begin < old, "the block must be written before the old config");
+    }
+
+    #[test]
+    fn the_dropin_goes_where_sshd_reads_it() {
+        let script = disable_password_script();
+        assert!(script.contains(SSHD_DROPIN_PATH));
+        assert!(script.contains("sshd_config\\.d"), "the drop-in dir is probed");
+    }
+
+    #[test]
+    fn the_dropin_is_only_used_when_it_wins_the_first_value_race() {
+        // sshd takes the first value it sees for a keyword, so a drop-in
+        // that is included AFTER another `PasswordAuthentication` would lose
+        // and leave the password door open. The script has to compare the
+        // two positions and fall back to the top of the config.
+        let script = disable_password_script();
+        assert!(script.contains("include_at"), "the Include position is read");
+        assert!(script.contains("ours_at"), "our own position is read");
+        assert!(
+            script.contains("[ \"$include_at\" -lt \"$ours_at\" ]"),
+            "the Include must come before our directives"
+        );
+    }
+
+    #[test]
+    fn a_box_that_cannot_take_the_change_says_so() {
+        let script = disable_password_script();
+        assert!(script.contains("m1r4g3-sshd-key-only"));
+        assert!(script.contains("m1r4g3-sshd-skip"));
     }
 }
