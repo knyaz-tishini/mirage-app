@@ -1892,19 +1892,26 @@
     var horizon = lay.horizon;
     var light = 0.25 + 0.75 * sun.day;
     var gold = sun.set * (1 - sun.day * 0.7);
+    // 0 draws the whole picture, same order as before.
+    // 1 sky, 2 land, 3 stars, 4 grain and shade, 5 rider, 6 eye glow.
+    // The host bakes 1/2/4 and only replays 3/5/6 while something moves.
+    var layer = args[6] | 0;
+    var pass = function (n) { return layer === 0 || layer === n; };
 
     // 1. sky, then sun and moon, still behind the dunes and the rider
-    sky(ctx, w, h, horizon, sun);
-    stars(ctx, w, horizon, t, sun.night);
-    sunMoon(ctx, w, h, horizon, hour, sun);
+    if (pass(1)) sky(ctx, w, h, horizon, sun);
+    if (pass(3)) stars(ctx, w, horizon, t, sun.night);
+    if (pass(2)) {
+      sunMoon(ctx, w, h, horizon, hour, sun);
 
-    // 2. dunes, back to front (palette from 5.jpg)
-    var rows = duneRows(w, h, horizon);
-    var tint = function (c) { return mix(mix(c, [c[0] * 0.95, c[1] * 0.6, c[2] * 0.55], gold * 0.5), [c[0] * 0.3, c[1] * 0.28, c[2] * 0.4], (1 - light) * 0.4); };
-    duneRow(ctx, w, h, rows[0].base, rows[0].peaks, tint([232, 148, 78]), tint([186, 96, 48]), 1, 0, 100);
-    duneRow(ctx, w, h, rows[1].base, rows[1].peaks, tint([214, 118, 58]), tint([150, 72, 40]), 1, 0, 200);
-    bigDune(ctx, w, h, horizon, tint([236, 142, 68]), tint([158, 74, 38]), 300, lay.portrait);
-    printSpots(ctx, w, h);
+      // 2. dunes, back to front (palette from 5.jpg)
+      var rows = duneRows(w, h, horizon);
+      var tint = function (c) { return mix(mix(c, [c[0] * 0.95, c[1] * 0.6, c[2] * 0.55], gold * 0.5), [c[0] * 0.3, c[1] * 0.28, c[2] * 0.4], (1 - light) * 0.4); };
+      duneRow(ctx, w, h, rows[0].base, rows[0].peaks, tint([232, 148, 78]), tint([186, 96, 48]), 1, 0, 100);
+      duneRow(ctx, w, h, rows[1].base, rows[1].peaks, tint([214, 118, 58]), tint([150, 72, 40]), 1, 0, 200);
+      bigDune(ctx, w, h, horizon, tint([236, 142, 68]), tint([158, 74, 38]), 300, lay.portrait);
+      printSpots(ctx, w, h);
+    }
 
     // 3. oasis: once
     var e = smooth(0, 1, link);
@@ -1936,32 +1943,36 @@
       },
     };
     var fx = glitchFx(style, e, g, t, w, h, appear);
-    if (fx.alpha > 0.005 && (link > 0.001)) oasis(ctx, t, env, fx, sun);
+    if (pass(5)) {
+      if (fx.alpha > 0.005 && (link > 0.001)) oasis(ctx, t, env, fx, sun);
+      // 4. glitch overlays sit under the print grain
+      glitchOverlay(ctx, style, e, g, t, w, h, horizon, appear);
+    }
 
-    // 4. wind, glitch overlays, print grain
-    glitchOverlay(ctx, style, e, g, t, w, h, horizon, appear);
-    halo(ctx, w, h, sun.day * (1 - sun.night));
-    printTexture(ctx, w, h);
-    vignette(ctx, w, h, 1.2);
-
-    // 5. light level: winter / dusk / night dim everything; eyes and ember stay lit
     var dark = clamp((1 - sun.day) * 0.32 + sun.night * 0.42, 0, 0.72);
-    if (dark > 0.01) {
-      var duskCol = mix([60, 20, 40], [6, 10, 34], sun.night);
-      var horizonU = clamp(horizon / h, 0, 1);
-      var skyKeep = 1 - sun.night * 0.9;
-      var row;
-      for (row = 0; row < h; row++) {
-        var ground = smooth(horizonU - 0.16, horizonU + 0.2, row / h);
-        ctx.fillStyle = rgba(duskCol, dark * (skyKeep + (1 - skyKeep) * ground));
-        ctx.fillRect(0, row, w, 1);
+    if (pass(4)) {
+      halo(ctx, w, h, sun.day * (1 - sun.night));
+      printTexture(ctx, w, h);
+      vignette(ctx, w, h, 1.2);
+
+      // 5. light level: winter / dusk / night dim everything; eyes and ember stay lit
+      if (dark > 0.01) {
+        var duskCol = mix([60, 20, 40], [6, 10, 34], sun.night);
+        var horizonU = clamp(horizon / h, 0, 1);
+        var skyKeep = 1 - sun.night * 0.9;
+        var row;
+        for (row = 0; row < h; row++) {
+          var ground = smooth(horizonU - 0.16, horizonU + 0.2, row / h);
+          ctx.fillStyle = rgba(duskCol, dark * (skyKeep + (1 - skyKeep) * ground));
+          ctx.fillRect(0, row, w, 1);
+        }
+      }
+      if (gold > 0.05) {
+        ctx.fillStyle = rgba([255, 90, 30], gold * 0.12 * (1 - sun.night));
+        ctx.fillRect(0, 0, w, h);
       }
     }
-    if (gold > 0.05) {
-      ctx.fillStyle = rgba([255, 90, 30], gold * 0.12 * (1 - sun.night));
-      ctx.fillRect(0, 0, w, h);
-    }
-    if (link > 0.001) glowPass(ctx, t, env, fx, clamp(dark * 1.6, 0, 1), sun);
+    if (pass(6) && link > 0.001) glowPass(ctx, t, env, fx, clamp(dark * 1.6, 0, 1), sun);
     ctx.globalAlpha = BASE;
     return sun;
   }

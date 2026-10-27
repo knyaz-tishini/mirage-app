@@ -3312,7 +3312,9 @@ dependencies = [
  "uzor",
  "uzor-anim-js",
  "uzor-framework",
+ "uzor-render-urx",
  "uzor-text",
+ "uzor-urx-cpu",
  "winresource",
 ]
 

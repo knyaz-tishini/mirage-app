@@ -14,15 +14,16 @@ use std::collections::HashMap;
 use uzor::input::keyboard::KeyCode;
 use uzor::input::{Sense, WidgetKind};
 use uzor::layout::docking::DockPanel;
-use uzor::render::{AnimParams, AnimScript, CircleBatch, LineSegment, RenderContext};
+use uzor::render::{AnimParams, AnimScript, CircleBatch, ImagePainter, LineSegment, RenderContext, TickRate};
 use uzor::tokens::{BuiltinSet, Tokens};
 use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
 use uzor_framework::host::native::{NativeOptions, RenderPreference, TraySpec, run_native};
 use uzor_framework::{
     App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
-    KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig, SizePx,
-    Spec, TextIntent, UnhandledInput, WindowCmd, WindowControlsStyle, WindowId, WindowIntent, WindowSpec,
+    KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig,
+    SizePx, Spec, TextIntent, UnhandledInput, WindowCmd, WindowControlsStyle, WindowId, WindowIntent,
+    WindowSpec,
 };
 
 use crate::backend::{EngineLink, LocalHttp};
@@ -134,6 +135,8 @@ struct Oasis {
     /// Windows that already pushed [`Stand::link_epoch`] into the link field.
     link_force_seen: HashMap<WindowId, u64>,
     scan: Option<crate::camera::CameraScan>,
+    /// Still desert, rebuilt when the window size or the sun's minute changes.
+    plates: Option<DesertPlates>,
 }
 
 impl Oasis {
@@ -148,6 +151,127 @@ impl Oasis {
         } else if self.link > self.target {
             self.link = (self.link - step).max(self.target);
         }
+    }
+
+    /// Blit the baked desert. Stars, the rider and the eye glow are the
+    /// only layers redrawn, and only while they are actually visible.
+    fn paint_desert(
+        &mut self,
+        render: &mut dyn RenderContext,
+        now: f64,
+        w: f64,
+        h: f64,
+        hour: f64,
+        day: f64,
+        dst: f64,
+    ) -> usize {
+        let pw = w.max(1.0).round();
+        let ph = h.max(1.0).round();
+        let pwu = pw as u32;
+        let phu = ph as u32;
+        if pwu == 0 || phu == 0 || render.image_painter().is_none() {
+            return self.paint_layer(render, now, pw, ph, hour, day, dst, 0.0);
+        }
+        let hour_q = (hour * 60.0).round() / 60.0;
+        let key = PlateKey {
+            pw: pwu,
+            ph: phu,
+            minute: (hour * 60.0).round() as i32,
+            day: day.round() as i32,
+            dst: dst.round() as i32,
+        };
+        let night = sun_night(hour_q, day, dst);
+        let live = self.link > 0.001 || self.target > 0.001 || night >= 0.05;
+        if self.plates.as_ref().is_none_or(|plate| plate.key != key) {
+            self.plates = Some(DesertPlates::empty(key));
+        }
+        if !live {
+            if self.plates.as_ref().is_some_and(|plate| plate.still.is_none()) {
+                let params = desert_params(pw, ph, 0.0, hour_q, day, dst, 0.0, 0.0, 0.0);
+                let baked = bake_plate(&self.host, &mut self.scratch, &params, 0.0, pwu, phu);
+                if baked.is_none() {
+                    return self.paint_layer(render, now, pw, ph, hour, day, dst, 0.0);
+                }
+                if let Some(plate) = self.plates.as_mut() {
+                    plate.still = baked;
+                }
+            }
+            return self.blit_still(render, pw, ph);
+        }
+        if !self.ensure_split(pw, ph, hour_q, day, dst) {
+            return self.paint_layer(render, now, pw, ph, hour, day, dst, 0.0);
+        }
+        self.blit_named(render, pw, ph, PlatePart::Sky);
+        let mut ops = 0usize;
+        if night >= 0.05 {
+            ops += self.paint_layer(render, now, pw, ph, hour_q, day, dst, 3.0);
+        }
+        self.blit_named(render, pw, ph, PlatePart::Land);
+        if self.link > 0.001 || self.target > 0.001 {
+            ops += self.paint_layer(render, now, pw, ph, hour_q, day, dst, 5.0);
+        }
+        self.blit_named(render, pw, ph, PlatePart::Front);
+        if self.link > 0.001 {
+            ops += self.paint_layer(render, now, pw, ph, hour_q, day, dst, 6.0);
+        }
+        ops
+    }
+
+    fn ensure_split(&mut self, pw: f64, ph: f64, hour: f64, day: f64, dst: f64) -> bool {
+        let pwu = pw as u32;
+        let phu = ph as u32;
+        for (part, layer) in [(PlatePart::Sky, 1.0), (PlatePart::Land, 2.0), (PlatePart::Front, 4.0)] {
+            let missing = self.plates.as_ref().is_none_or(|plate| plate.part(part).is_none());
+            if !missing {
+                continue;
+            }
+            let params = desert_params(pw, ph, 0.0, hour, day, dst, 0.0, 0.0, layer);
+            let Some(baked) = bake_plate(&self.host, &mut self.scratch, &params, 0.0, pwu, phu) else {
+                return false;
+            };
+            if let Some(plate) = self.plates.as_mut() {
+                plate.set_part(part, baked);
+            }
+        }
+        true
+    }
+
+    fn blit_still(&self, render: &mut dyn RenderContext, pw: f64, ph: f64) -> usize {
+        let Some(px) = self.plates.as_ref().and_then(|plate| plate.still.as_deref()) else {
+            return 0;
+        };
+        blit_rgba(render, px, pw as u32, ph as u32, pw, ph);
+        0
+    }
+
+    fn blit_named(&self, render: &mut dyn RenderContext, pw: f64, ph: f64, part: PlatePart) {
+        let Some(px) = self.plates.as_ref().and_then(|plate| plate.part(part)) else {
+            return;
+        };
+        blit_rgba(render, px, pw as u32, ph as u32, pw, ph);
+    }
+
+    fn paint_layer(
+        &mut self,
+        render: &mut dyn RenderContext,
+        now: f64,
+        pw: f64,
+        ph: f64,
+        hour: f64,
+        day: f64,
+        dst: f64,
+        layer: f64,
+    ) -> usize {
+        let params = desert_params(pw, ph, self.link, hour, day, dst, self.style, self.target, layer);
+        let mut anim = self.host.anim("desert");
+        if let Err(err) = anim.paint(render, now, &params, &mut self.scratch) {
+            if !self.paint_err {
+                eprintln!("oasis paint: {err}");
+                self.paint_err = true;
+            }
+            return 0;
+        }
+        self.scratch.len()
     }
 }
 
@@ -315,34 +439,19 @@ impl App for Oasis {
 
         self.ease(now, dt);
         let (hour, day, dst) = local_clock();
-        let mouse = cx.view.pointer_over(&WidgetId::from(HIT_SCENE)).map(|(x, y)| {
-            (x - rect.x, y - rect.y)
-        });
-        let params = AnimParams {
-            w,
-            h,
-            seed: 1,
-            mouse,
-            args: [self.link, hour, day, dst, self.style, self.target, 0.0, 0.0],
-        };
         let menu_now = self.ui.get(&win).cloned().unwrap_or_default();
         let panel_h = self.sheet_panel_h(h);
         let pointer = cx.view.raw_pointer().map(|(x, y)| (x - rect.x, y - rect.y));
         let bind_hot = cx.view.is_focused(&WidgetId::from("bind"));
-        cx.out.request_frame();
+        // Tick is Capped(60). request_frame would force Wake::Immediate
+        // and a cached blit would spin the core.
         let render: &mut dyn RenderContext = cx.render;
         render.save();
         render.translate(rect.x, rect.y);
         render.set_fill_color("#0C0C10");
         render.fill_rect(0.0, 0.0, w, h);
         render.save();
-        let mut anim = self.host.anim("desert");
-        if let Err(err) = anim.paint(render, now, &params, &mut self.scratch) {
-            if !self.paint_err {
-                eprintln!("oasis paint: {err}");
-                self.paint_err = true;
-            }
-        }
+        self.paint_desert(render, now, w, h, hour, day, dst);
         render.restore();
         if menu_now.menu {
             let g = open_geom(w, h, panel_h);
@@ -1174,6 +1283,138 @@ fn paint_server(render: &mut dyn RenderContext, r: Rect, color: &str) {
     );
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PlateKey {
+    pw: u32,
+    ph: u32,
+    minute: i32,
+    day: i32,
+    dst: i32,
+}
+
+#[derive(Clone, Copy)]
+enum PlatePart {
+    Sky,
+    Land,
+    Front,
+}
+
+struct DesertPlates {
+    key: PlateKey,
+    still: Option<Vec<u8>>,
+    sky: Option<Vec<u8>>,
+    land: Option<Vec<u8>>,
+    front: Option<Vec<u8>>,
+}
+
+impl DesertPlates {
+    fn empty(key: PlateKey) -> Self {
+        Self {
+            key,
+            still: None,
+            sky: None,
+            land: None,
+            front: None,
+        }
+    }
+
+    fn part(&self, part: PlatePart) -> Option<&[u8]> {
+        match part {
+            PlatePart::Sky => self.sky.as_deref(),
+            PlatePart::Land => self.land.as_deref(),
+            PlatePart::Front => self.front.as_deref(),
+        }
+    }
+
+    fn set_part(&mut self, part: PlatePart, bytes: Vec<u8>) {
+        match part {
+            PlatePart::Sky => self.sky = Some(bytes),
+            PlatePart::Land => self.land = Some(bytes),
+            PlatePart::Front => self.front = Some(bytes),
+        }
+    }
+}
+
+fn desert_params(
+    w: f64,
+    h: f64,
+    link: f64,
+    hour: f64,
+    day: f64,
+    dst: f64,
+    style: f64,
+    target: f64,
+    layer: f64,
+) -> AnimParams {
+    AnimParams {
+        w,
+        h,
+        seed: 1,
+        mouse: None,
+        args: [link, hour, day, dst, style, target, layer, 0.0],
+    }
+}
+
+/// Same night term as `solar()` in the scene script. Stars start at 0.05.
+fn sun_night(hour: f64, day: f64, dst: f64) -> f64 {
+    const LAT: f64 = 55.0 * std::f64::consts::PI / 180.0;
+    let decl = 23.44_f64.to_radians() * ((std::f64::consts::TAU * (day - 81.0)) / 365.0).sin();
+    let noon = if dst != 0.0 { 13.0 } else { 12.0 };
+    let h_ang = ((hour - noon) / 12.0) * std::f64::consts::PI;
+    let sin_alt = (LAT.sin() * decl.sin() + LAT.cos() * decl.cos() * h_ang.cos()).clamp(-1.0, 1.0);
+    let alt_deg = sin_alt.asin().to_degrees();
+    (-alt_deg / 14.0).clamp(0.0, 1.0)
+}
+
+fn bake_plate(
+    host: &JsAnimHost,
+    scratch: &mut Vec<f64>,
+    params: &AnimParams,
+    now: f64,
+    pw: u32,
+    ph: u32,
+) -> Option<Vec<u8>> {
+    let mut ctx = uzor_render_urx::UrxRenderContext::new(1.0);
+    ctx.begin_frame(pw, ph);
+    let mut anim = host.anim("desert");
+    if anim.paint(&mut ctx, now, params, scratch).is_err() {
+        return None;
+    }
+    let scene = ctx.take_scene();
+    let mut pixmap = uzor_urx_cpu::Pixmap::new(pw, ph);
+    if uzor_urx_cpu::CpuBackend::new().render(&scene, &mut pixmap).is_err() {
+        return None;
+    }
+    Some(straighten(pixmap.pixels()))
+}
+
+/// Cpu pixmap stores premul RGB. The image draw premultiplies again.
+fn straighten(src: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; src.len()];
+    for (dst, px) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let a = px[3];
+        if a == 0 || a == 255 {
+            dst.copy_from_slice(px);
+            continue;
+        }
+        let lift = |c: u8| {
+            let v = (u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a);
+            v.min(255) as u8
+        };
+        dst[0] = lift(px[0]);
+        dst[1] = lift(px[1]);
+        dst[2] = lift(px[2]);
+        dst[3] = a;
+    }
+    out
+}
+
+fn blit_rgba(render: &mut dyn RenderContext, px: &[u8], pw: u32, ph: u32, dw: f64, dh: f64) {
+    if let Some(painter) = render.image_painter() {
+        painter.draw_image_rgba(px, pw, ph, 0.0, 0.0, dw, dh);
+    }
+}
+
 fn menu_rect() -> Rect {
     Rect::new(4.0, (CHROME_H - MARK) / 2.0, MARK, MARK)
 }
@@ -1266,6 +1507,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         windows: vec![phone],
         tokens: Tokens::builtin(BuiltinSet::Dark),
         dark: true,
+        tick: TickRate::Capped(60),
         ..RuntimeConfig::default()
     };
     run_native(
@@ -1297,13 +1539,14 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             clear_seen: HashMap::new(),
             link_force_seen: HashMap::new(),
             scan: None,
+            plates: None,
         },
         cfg,
         NativeOptions {
-            // UrxWgpu draws fillRect as quads and drawImage as textured
-            // quads or triangles. The GPU assembles the scene.
+            // The still desert is a baked plate, so this stays smooth on UrxCpu.
+            // Family autodetect is a later switch; the pin skips it.
             render: RenderPreference {
-                backend: Some(uzor::RenderBackend::UrxWgpu),
+                backend: Some(uzor::RenderBackend::UrxCpu),
             },
             tray: Some(TraySpec {
                 tooltip: Some("m1r4g3".into()),
@@ -1350,6 +1593,7 @@ fn app_window(key: &str, w: u32, h: u32, x: i32, y: i32) -> WindowSpec {
         concat!("m1r4g3 ", env!("CARGO_PKG_VERSION")),
         SizePx::new(w, h),
     );
+    window.tick = Some(TickRate::Capped(60));
     window.decorations = false;
     window.corner_style = uzor::CornerStyle::Rounded;
     window.position = Some((x, y));

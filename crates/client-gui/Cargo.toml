@@ -51,6 +51,10 @@ winresource = "0.1"
 [dependencies]
 uzor          = { version = "1.5.14" }
 uzor-text     = { version = "1.5.14" }
+# Offscreen bake of the still desert. The window stays on UrxCpu;
+# these two crates rasterise a plate once, then the window blits it.
+uzor-render-urx = { version = "1.5.14" }
+uzor-urx-cpu    = { version = "1.5.14" }
 
 tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "io-util"] }
 tracing                 = "0.1"
