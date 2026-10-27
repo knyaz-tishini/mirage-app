@@ -15,6 +15,7 @@
 //!   * staging ids (anything containing `staging`),
 //!   * any IPv4 literal except `127.0.0.1`.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -85,6 +86,51 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The lines of a file that live inside a `#[cfg(test)]` module.
+///
+/// A test fixture is not customer content: `cfg(test)` is off in a normal
+/// build, so nothing under it ever reaches the customer binary — the same
+/// reason the whole `src/dev/` directory is skipped. A fixture that mirrors
+/// what a box really writes may well carry a sample address, and the gate is
+/// about what the shipped binary contains, not about what a test quotes.
+///
+/// Only a `#[cfg(test)]` on a MODULE is treated this way. The attribute on
+/// a single function is not, and everything after it stays in the scan.
+fn test_only_lines(text: &str) -> HashSet<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = HashSet::new();
+    let mut inside = false;
+    for (idx, line) in lines.iter().enumerate() {
+        if inside {
+            out.insert(idx);
+            // The module ends at the brace that closes it, at the left margin.
+            if line.trim_end() == "}" {
+                inside = false;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let starts_test = trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("#[cfg(all(test");
+        if !starts_test {
+            continue;
+        }
+        let is_module = lines
+            .get(idx + 1..)
+            .unwrap_or_default()
+            .iter()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .map(|l| {
+                let l = l.trim_start();
+                l.starts_with("mod ") || l.starts_with("pub mod ")
+            })
+            .unwrap_or(false);
+        if is_module {
+            inside = true;
+        }
+    }
+    out
+}
+
 /// True when `word` occurs in `line` bounded by non-word characters.
 fn contains_word(line: &str, word: &str) -> bool {
     line.match_indices(word).any(|(i, _)| {
@@ -147,7 +193,11 @@ fn customer_sources_have_no_operator_strings() {
     for path in customer_source_files() {
         // Binary assets (the baked land mask) carry no source text.
         let Ok(text) = fs::read_to_string(&path) else { continue };
+        let test_lines = test_only_lines(&text);
         for (idx, line) in text.lines().enumerate() {
+            if test_lines.contains(&idx) {
+                continue;
+            }
             for why in line_violations(line) {
                 let rel = path.strip_prefix(src_dir()).unwrap_or(&path);
                 report.push(format!("src/{}:{}: {why}", rel.display(), idx + 1));
@@ -161,12 +211,37 @@ fn customer_sources_have_no_operator_strings() {
     );
 }
 
+/// A `#[cfg(test)]` module is skipped; the rest of the file is not.
+///
+/// The fixture inside the module may quote an address, and the module itself
+/// is still scanned for the denylist outside the test block.
+#[test]
+fn only_the_test_module_is_skipped() {
+    let text = "\
+fn main() {}
+#[cfg(test)]
+mod tests {
+    const SAMPLE: &str = \"0.0.0.0\";
+    #[test]
+    fn sample() {
+        assert!(SAMPLE.contains(\"0.0.0.0\"));
+    }
+}
+fn after() {}
+";
+    let lines = test_only_lines(text);
+    assert!(lines.contains(&3), "the fixture line is test-only");
+    assert!(lines.contains(&8), "the test body is test-only");
+    assert!(!lines.contains(&0), "code before the module stays in the scan");
+    assert!(!lines.contains(&9), "code after the module stays in the scan");
+}
+
 #[test]
 fn scan_covers_customer_sources_and_skips_dev() {
     let root = src_dir();
     let dev_dir = root.join("dev");
     let files = customer_source_files();
-    for expected in ["main.rs", "app.rs", "nodes.rs", "backend.rs"] {
+    for expected in ["main.rs", "oasis/mod.rs", "nodes.rs", "backend.rs"] {
         assert!(
             files.contains(&root.join(expected)),
             "scan is missing src/{expected}"
