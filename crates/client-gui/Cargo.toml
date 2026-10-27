@@ -47,14 +47,14 @@ dev-tools = []
 embed-manifest = "1"
 winresource = "0.1"
 
-# ── uzor 1.5.16 from crates.io: framework window + QuickJS scene ──────────────
+# ── uzor 1.5.17 from crates.io: framework window + QuickJS scene ──────────────
 [dependencies]
-uzor          = { version = "1.5.16" }
-uzor-text     = { version = "1.5.16" }
+uzor          = { version = "1.5.17" }
+uzor-text     = { version = "1.5.17" }
 # Offscreen bake of the still desert. The window follows uzor autodetect;
 # these two crates rasterise a plate once, then the window blits it.
-uzor-render-urx = { version = "1.5.16" }
-uzor-urx-cpu    = { version = "1.5.16" }
+uzor-render-urx = { version = "1.5.17" }
+uzor-urx-cpu    = { version = "1.5.17" }
 
 tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "io-util"] }
 tracing                 = "0.1"
@@ -89,16 +89,16 @@ hex                     = "0.4"
 qrcode                  = { version = "0.14", default-features = false }
 
 [target.'cfg(not(target_os = "ios"))'.dependencies]
-uzor-framework = { version = "1.5.16", features = ["native"] }
-uzor-anim-js = { version = "1.5.16", features = ["quickjs"] }
+uzor-framework = { version = "1.5.17", features = ["native"] }
+uzor-anim-js = { version = "1.5.17", features = ["quickjs"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.14"
 arboard = "3"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-uzor-framework = { version = "1.5.16", features = ["native"] }
-uzor-anim-js = { version = "1.5.16", features = ["quickjs"] }
+uzor-framework = { version = "1.5.17", features = ["native"] }
+uzor-anim-js = { version = "1.5.17", features = ["quickjs"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [patch.crates-io]
