@@ -76,17 +76,20 @@ impl Api {
     /// The window pulls the bus every frame, so the proposal is in the stand
     /// before the second press of "install". The API has no frames, so it
     /// pulls the bus itself before every step.
+    ///
+    /// The kept copy is what the status reports: the bus hands the proposal
+    /// over exactly once, and the answer to "what did the box offer" must
+    /// not depend on who asked first.
     fn sync_bus(&self, stand: &mut Stand) -> Vec<ProposedFace> {
-        let offered = {
+        let from_bus = {
             let guard = stand.bus.faces.lock().unwrap_or_else(PoisonError::into_inner);
             (*guard).clone().unwrap_or_default()
         };
-        if !offered.is_empty() {
-            let mut kept = self.lock_offered();
-            *kept = offered.clone();
+        if !from_bus.is_empty() {
+            *self.lock_offered() = from_bus;
         }
         stand.pull_bus();
-        offered
+        self.lock_offered().clone()
     }
 }
 
