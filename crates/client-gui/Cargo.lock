@@ -6523,9 +6523,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uzor"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c20983be48103d9433817b5df4800f6ff55c37fd2d35ae35b828e6062f354714"
+checksum = "33f8d7d4c810aaf50f5e50624632f675c8deb1dd2df45e213e738ebea504f045"
 dependencies = [
  "ahash",
  "bitflags 2.13.0",
@@ -6545,9 +6545,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-anim-js"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87b3afb0674aa9ab126b3e10c08b962791f2be25bd3f606705417087b2e2fd09"
+checksum = "db353b19fa299cce97c740adc94b21320652567f3c8ec54073b3bf282fab55f2"
 dependencies = [
  "js-sys",
  "quickjs-jit",
@@ -6558,15 +6558,15 @@ dependencies = [
 
 [[package]]
 name = "uzor-fonts"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "087cb168ecae07fe78ae96ac36d6f8e618bdde37528610311496ef348d33784f"
+checksum = "c787096e64da5458a0e2fea251754f44af7bf5bf48d1f7531cc3945a4289bc4a"
 
 [[package]]
 name = "uzor-framework"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2b3dd572205ad195c58b2fdc800d530ec7e1abcef216867e587e295e048a040"
+checksum = "fd36f206ca5fe20b25ceadcb6ae9cc4b001682450ad11538c9bb49da7e371b47"
 dependencies = [
  "arboard",
  "arc-swap",
@@ -6589,9 +6589,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-framework-macros"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29eb592d941645975e635295691bbce77ba796c414176de736101d6641e67f59"
+checksum = "196d76e9eddc12c14ca63b328e8e6705dcf37367b0d5055bed79c12db7619a25"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6600,9 +6600,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-canvas2d"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6650f05e7ac1056274324decf914f9b75a5a0f1a8e712f4c229a803cf6233e5"
+checksum = "7296ad3ccb4f374871d8c18cfe8c32315f91ddc630e79ecbf997df6d05bbf0cb"
 dependencies = [
  "js-sys",
  "uzor",
@@ -6612,9 +6612,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-hub"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f00c2bb9734b2a445d8e9fd968a44573e454f00c54ca98671ffb32f09a15a8"
+checksum = "569fe4acd0d76f802338f70e45407805241737bd70630de9d09c89c930bf89e1"
 dependencies = [
  "color",
  "js-sys",
@@ -6650,9 +6650,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-tiny-skia"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a77806931fa4d01a642248d753451c2e6edf9c33571bb605b5065cbb550f289"
+checksum = "51b08e52cd4692fa78b7d5b0317be3038dd5f8134d3b44474f17ed28624cbff7"
 dependencies = [
  "fontdue",
  "tiny-skia",
@@ -6661,9 +6661,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-urx"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25cf075777f4d5bdac810227afd19846780150dde7a93180fb61ce09e7f64c92"
+checksum = "c69f034c51432bfc363fbbe2317197bbd95608ab4c283e8070f073c30eaf091a"
 dependencies = [
  "kurbo",
  "metrics",
@@ -6676,9 +6676,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-cpu"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95352f6db7710ba3758432dba8d6a749c248c9ff17418e925545cef2d5e97e33"
+checksum = "b31e404fab4f710fe8ee2ea9b46805a536b9da6f2797b259e736974dcda04e61"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -6687,9 +6687,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-gpu"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43bbe73ff550edfa10f3f0987b724336f954c5f2ac180d6764efa246957672fd"
+checksum = "fdbb6ddeac5347afba673a61521583cd9fed2e5def4930a27bfbc58fc7b7b4c9"
 dependencies = [
  "skrifa 0.42.1",
  "uzor",
@@ -6698,9 +6698,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-vello-hybrid"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3b6aab5f4eee84e6a2a9e896f5f8b66793868481fd64368dfff00466fdc744a"
+checksum = "258f800fb270e1b983a4956ef52e025c5e60e1ed4091823876e7520bd7cb89be"
 dependencies = [
  "glifo",
  "skrifa 0.42.1",
@@ -6712,9 +6712,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-render-wgpu-instanced"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecf715c47409d60e1204192fd2211a9add64f5f4365e34effca9a6f61d6a4230"
+checksum = "02eb55360ccdb0215e97c81fead343c27dcb2e5bf73f5701a6f838c3eb0cc679"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -6728,9 +6728,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-text"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2041a3c5f9a30ebe894459a05d71a37b94a7ae4a6856407533814cfdf4493c07"
+checksum = "087ffcace69d487a52ac3f9646121e181523a8a5ba13471cf2aae52edf019e54"
 dependencies = [
  "fastrand",
  "hypher",
@@ -6741,9 +6741,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-3d"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac4d408e48f7746d1af408a95a88f4658b8c2d29025b324d1d7dad42e82a0ad4"
+checksum = "fa26645e7517450405d2656997857da96a0bed2556c93cd09250fa37cbadacd1"
 dependencies = [
  "bytemuck",
  "glam",
@@ -6753,9 +6753,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-core"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7067932ef961488096da8f1463cca9e432d7cc3a1396e44563054b186f7b9136"
+checksum = "074483a57b5151c5ff6a7b12a23c21d928932b6861d84aa718b36ee41f371b61"
 dependencies = [
  "kurbo",
  "metrics",
@@ -6765,9 +6765,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-cpu"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0a75648d90c010e49a8fb1cb047142f4ba4da78d51a0485a739a7be3aec8415"
+checksum = "cfbcdbdbe6731db96e977012a06d9fe03f7c6a92a327c19d547c56e80011325c"
 dependencies = [
  "bumpalo",
  "bytemuck",
@@ -6783,9 +6783,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-engine"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37a1c118b530e040038be23cea9628bb5590cc1d8b68c7613bb2a90aaa48f831"
+checksum = "8790e281752097cebff54e4ef311467490ea97b86d01acff55415d53cd50f915"
 dependencies = [
  "metrics",
  "uzor-urx-core",
@@ -6798,9 +6798,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-glyph"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17bae400b65767bb1fddd16d15e78841ccbd924363a04988e3f339912e67ac69"
+checksum = "f15b7241654de6f5ef891da745ac7c20dec977c8db6e7d065b6132b2ec9a72ee"
 dependencies = [
  "metrics",
  "swash 0.2.10",
@@ -6810,9 +6810,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-hybrid"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17bdc5003ea795eb93d9aa9336b8008943bbee8ce15d60f8bdfe7ecfa7b9d963"
+checksum = "228a5de15496e1f7b39ff17e7a1abada711126e873d518f9200402079a75a184"
 dependencies = [
  "bytemuck",
  "etagere",
@@ -6825,27 +6825,27 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-image"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5e24892da6ffbeac07b3fd9931b7c3c08f53a6c4bb5ff0abc5aeecd78d1a6c0"
+checksum = "3ab98cf1ab5b1530560447ca2473d839a291ba80b2442f415f2f4f4f27b1db57"
 dependencies = [
  "uzor-urx-core",
 ]
 
 [[package]]
 name = "uzor-urx-physics"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36a7a5399dfb26b7e09193407db5d23fc12bff688a272cedfb051edb240f4bcc"
+checksum = "26c490154e1fc3e42e71fa20e432a2dce441b68deadd5941189f1e259c18afd9"
 dependencies = [
  "glam",
 ]
 
 [[package]]
 name = "uzor-urx-wgpu"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a39f76cafbd2c57afdf092186f50c8d3216f25f8f892b1a16965125292727e7b"
+checksum = "b78fec5153e06d8f0be673cb5d71927b323f17faea5f539b96dd693d2d028ef2"
 dependencies = [
  "bytemuck",
  "etagere",
@@ -6865,9 +6865,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-urx-wgpu-full"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c75f656a088a98c90ce857d167803a1f77b4de740d081f1e55bdf38c2a913629"
+checksum = "e442783d46cd00568adef311f211c0085d5a72fa066e35169db93056025611b6"
 dependencies = [
  "bytemuck",
  "kurbo",
@@ -6879,9 +6879,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-desktop"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91617329cef07541da553d6d2f9a2a0b83b6a04d748b9a1feffa67b91c6845d3"
+checksum = "d5dde305157efa7ac50fdd9060dd0fe217d312f80d02de74e3de20e1e35514df"
 dependencies = [
  "softbuffer",
  "uzor",
@@ -6890,9 +6890,9 @@ dependencies = [
 
 [[package]]
 name = "uzor-window-web"
-version = "1.5.13"
+version = "1.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7c581d5432ddb9fa93a6f503ff70bcc1ea4063f838c47364de15103b39e4015"
+checksum = "d68932884ef38a0dcd6bf1c566bfcdccbcaa029b64bfa04906b9c45c3a505645"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

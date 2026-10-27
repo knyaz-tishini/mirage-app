@@ -47,10 +47,10 @@ dev-tools = []
 embed-manifest = "1"
 winresource = "0.1"
 
-# ── uzor 1.5.13 from crates.io: framework window + QuickJS scene ──────────────
+# ── uzor 1.5.14 from crates.io: framework window + QuickJS scene ──────────────
 [dependencies]
-uzor          = { version = "1.5.13" }
-uzor-text     = { version = "1.5.13" }
+uzor          = { version = "1.5.14" }
+uzor-text     = { version = "1.5.14" }
 
 tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "io-util"] }
 tracing                 = "0.1"
@@ -85,16 +85,16 @@ hex                     = "0.4"
 qrcode                  = { version = "0.14", default-features = false }
 
 [target.'cfg(not(target_os = "ios"))'.dependencies]
-uzor-framework = { version = "1.5.13", features = ["native"] }
-uzor-anim-js = { version = "1.5.13", features = ["quickjs"] }
+uzor-framework = { version = "1.5.14", features = ["native"] }
+uzor-anim-js = { version = "1.5.14", features = ["quickjs"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.14"
 arboard = "3"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-uzor-framework = { version = "1.5.13", features = ["native"] }
-uzor-anim-js = { version = "1.5.13", features = ["quickjs"] }
+uzor-framework = { version = "1.5.14", features = ["native"] }
+uzor-anim-js = { version = "1.5.14", features = ["quickjs"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [patch.crates-io]
