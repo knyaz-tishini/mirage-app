@@ -18,7 +18,7 @@ use uzor::render::{AnimParams, AnimScript, CircleBatch, ImagePainter, LineSegmen
 use uzor::tokens::{BuiltinSet, Tokens};
 use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
-use uzor_framework::host::native::{NativeOptions, RenderPreference, TraySpec, run_native};
+use uzor_framework::host::native::{NativeOptions, TraySpec, run_native};
 use uzor_framework::{
     App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
     KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig,
@@ -1543,11 +1543,8 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         },
         cfg,
         NativeOptions {
-            // The still desert is a baked plate, so this stays smooth on UrxCpu.
-            // Family autodetect is a later switch; the pin skips it.
-            render: RenderPreference {
-                backend: Some(uzor::RenderBackend::UrxCpu),
-            },
+            // backend stays unset: the host walks UZOR_RENDER_FAMILY, then
+            // RenderFamily::default (URX), then the adapter probe.
             tray: Some(TraySpec {
                 tooltip: Some("m1r4g3".into()),
                 icon: Some(palm_icon(PALM_W, PALM)),
