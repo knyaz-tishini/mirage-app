@@ -229,7 +229,15 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
             }
             set_text(bus, crate::text::tr("p.key_on"));
             let password = job.password.clone();
-            password_install_key(&addr, &job.user, &password, &pub_line, &pins).await?;
+            password_install_key_when_ready(
+                &addr,
+                &job.user,
+                &password,
+                &pub_line,
+                &pins,
+                bus,
+            )
+            .await?;
             drop(password);
             connect_key(&addr, &job.user, &pem, &pins).await?
         }
@@ -410,7 +418,13 @@ PermitRootLogin prohibit-password\n\
 PubkeyAuthentication yes\n";
 
 /// Where the drop-in goes when the box reads drop-ins.
-const SSHD_DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/90-mirage-key-only.conf";
+///
+/// The name starts with `00-` on purpose: the include directory is read in
+/// name order and sshd keeps the FIRST value it sees for a keyword, so a
+/// drop-in named `90-…` loses to the file cloud-init writes there
+/// (`50-cloud-init.conf`, which says `PasswordAuthentication yes` on
+/// Ubuntu). A drop-in that sorts first wins.
+const SSHD_DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/00-mirage-key-only.conf";
 
 /// The markers around the block when the box has no drop-in support.
 ///
@@ -426,15 +440,17 @@ const WARN_PASSWORD_DOOR: &str = "парольный вход на боксе н
 /// The shell that turns the box into a key-only door.
 ///
 /// The step is built so that running it twice is the same as running it
-/// once: the drop-in is written from scratch, and the marked block is
-/// removed before it is written again.
+/// once: the drop-in is written from scratch, the older drop-ins with our
+/// name are removed, and the marked block is removed before it is written
+/// again.
 ///
-/// Two ways to write the directives, and the choice between them matters:
-/// sshd takes the FIRST value it sees for a keyword, so a drop-in only wins
-/// when the `Include` that pulls it in comes before every directive of ours.
-/// When it does not, the block goes to the top of `sshd_config` instead —
-/// there it always wins. Silently losing the race would leave the password
-/// door open while the step reports success.
+/// The file we write is NOT what counts — sshd keeps the FIRST value it
+/// sees for a keyword, and the include directory is read in name order, so
+/// another file there can win. What counts is the EFFECTIVE config, which
+/// `sshd -T` prints. So the script checks that, and if the drop-in did not
+/// win it puts the block at the top of `sshd_config`, where it is read
+/// before every include. If it still does not win, the step FAILS: a
+/// password door that stays open must never be reported as closed.
 ///
 /// `sshd -t` has to pass BEFORE sshd is reloaded — a broken config never
 /// reaches the running daemon, and the box keeps the config it had. The
@@ -465,14 +481,13 @@ TMP=$(mktemp /tmp/m1r4g3-key-only.XXXXXX)
 trap 'rm -f "$TMP"' EXIT
 cat > "$TMP" <<'M1R4G3_EOF'
 {dropin}M1R4G3_EOF
-include_at=$(grep -in -m1 '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "$CONF" | cut -d: -f1)
-ours_at=$(grep -in -m1 -E '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|PermitRootLogin)[[:space:]]' "$CONF" | cut -d: -f1)
-if [ -n "$include_at" ] && {{ [ -z "$ours_at" ] || [ "$include_at" -lt "$ours_at" ]; }}; then
-  mkdir -p "$(dirname "$DROPIN")"
-  $SUDO cp -p "$CONF" "$CONF.m1r4g3.bak"
-  $SUDO cp "$TMP" "$DROPIN"
-else
-  $SUDO cp -p "$CONF" "$CONF.m1r4g3.bak"
+mkdir -p "$(dirname "$DROPIN")"
+$SUDO cp -p "$CONF" "$CONF.m1r4g3.bak"
+for old in "$(dirname "$DROPIN")"/*-mirage-key-only.conf; do
+  if [ -e "$old" ]; then $SUDO rm -f "$old"; fi
+done
+$SUDO cp "$TMP" "$DROPIN"
+if ! $SUDO "$SSHD" -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
   $SUDO sed -i '/^{begin}$/,/^{end}$/d' "$CONF"
   MERGED=$(mktemp /tmp/m1r4g3-sshd-config.XXXXXX)
   {{ printf '%s\n' '{begin}'; cat "$TMP"; printf '%s\n' '{end}'; cat "$CONF"; }} > "$MERGED"
@@ -497,6 +512,10 @@ else
     echo "could not reload sshd" >&2
     exit 1
   fi
+fi
+if ! $SUDO "$SSHD" -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
+  echo "password authentication is still enabled" >&2
+  exit 1
 fi
 echo "m1r4g3-sshd-key-only"
 "#,
@@ -686,6 +705,64 @@ async fn password_install_key(
         });
     }
     Ok(())
+}
+
+/// How long the password path is retried before it is called a failure.
+///
+/// A freshly (re)installed box answers SSH before its root password works:
+/// the OS comes up, sshd starts, and only then does the image's own
+/// first-boot step apply the password. Measured on a freshly installed box:
+/// the password landed about a minute after SSH opened, and the box rebooted
+/// once more behind that. A single attempt at that moment is refused, and
+/// the install would die on a box that is merely not ready yet.
+///
+/// The key install is idempotent, so a retry costs nothing.
+const PASSWORD_ATTEMPTS: usize = 8;
+const PASSWORD_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Install the key with the password, waiting for the box to be ready.
+async fn password_install_key_when_ready(
+    addr: &str,
+    user: &str,
+    password: &str,
+    pub_line: &str,
+    pins: &Path,
+    bus: &InstallBus,
+) -> Result<(), String> {
+    retry_until_ready(PASSWORD_ATTEMPTS, PASSWORD_RETRY_WAIT, bus, || {
+        password_install_key(addr, user, password, pub_line, pins)
+    })
+    .await
+}
+
+/// Run `step` until it succeeds, up to `attempts` times.
+///
+/// Between the attempts the status line says the box is not ready yet, so
+/// the person watching sees the wait instead of a silent stall.
+async fn retry_until_ready<F, Fut>(
+    attempts: usize,
+    wait: std::time::Duration,
+    bus: &InstallBus,
+    mut step: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last = String::new();
+    for attempt in 1..=attempts.max(1) {
+        match step().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last = err;
+                if attempt < attempts.max(1) {
+                    set_text(bus, crate::text::tr("p.pass_retry"));
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+    Err(last)
 }
 
 async fn connect(addr: &str, pins: &Path) -> Result<client::Handle<Handler>, String> {
@@ -995,23 +1072,65 @@ why = "443/UDP — там обычно весит QUIC."
 
     #[test]
     fn the_dropin_goes_where_sshd_reads_it() {
+        // The path is declared once, and the script writes exactly that —
+        // the test reads the declaration, not the text of the shell.
+        assert!(
+            SSHD_DROPIN_PATH.starts_with("/etc/ssh/sshd_config.d/"),
+            "the drop-in has to live in the directory sshd reads"
+        );
         let script = disable_password_script();
-        assert!(script.contains(SSHD_DROPIN_PATH));
-        assert!(script.contains("sshd_config\\.d"), "the drop-in dir is probed");
+        assert!(
+            script.contains(&format!("DROPIN={SSHD_DROPIN_PATH}")),
+            "the script has to write the drop-in it declares"
+        );
     }
 
     #[test]
     fn the_dropin_is_only_used_when_it_wins_the_first_value_race() {
-        // sshd takes the first value it sees for a keyword, so a drop-in
-        // that is included AFTER another `PasswordAuthentication` would lose
-        // and leave the password door open. The script has to compare the
-        // two positions and fall back to the top of the config.
-        let script = disable_password_script();
-        assert!(script.contains("include_at"), "the Include position is read");
-        assert!(script.contains("ours_at"), "our own position is read");
+        // sshd keeps the FIRST value it sees for a keyword, and the include
+        // directory is read in name order. A drop-in that sorts after
+        // cloud-init's own file loses to it — so ours has to sort first.
         assert!(
-            script.contains("[ \"$include_at\" -lt \"$ours_at\" ]"),
-            "the Include must come before our directives"
+            SSHD_DROPIN_PATH.contains("/00-"),
+            "the drop-in has to sort before the other files in the directory"
+        );
+    }
+
+    #[test]
+    fn the_effective_config_is_what_counts() {
+        // Writing a file is not closing the door: another file in the
+        // include directory can win the race. The script has to look at what
+        // sshd actually ends up with, and fail if the door is still open.
+        let script = disable_password_script();
+        assert!(
+            script.contains("\"$SSHD\" -T"),
+            "the effective config has to be read"
+        );
+        assert!(
+            script.contains("^passwordauthentication no"),
+            "the effective value has to be the one we wrote"
+        );
+        assert!(
+            script.contains("password authentication is still enabled"),
+            "an open door has to fail the step, not pass it"
+        );
+    }
+
+    #[test]
+    fn there_is_a_way_that_wins_when_the_dropin_does_not() {
+        // The fallback: the block goes to the TOP of sshd_config, where it
+        // is read before every include.
+        let script = disable_password_script();
+        assert!(
+            script.contains(&format!(
+                "/^{}$/,/^{}$/d",
+                SSHD_BLOCK_BEGIN, SSHD_BLOCK_END
+            )),
+            "the old block has to be cut out before the new one goes in"
+        );
+        assert!(
+            script.contains("cat \"$CONF\""),
+            "the old config has to be kept behind the block"
         );
     }
 
@@ -1020,5 +1139,48 @@ why = "443/UDP — там обычно весит QUIC."
         let script = disable_password_script();
         assert!(script.contains("m1r4g3-sshd-key-only"));
         assert!(script.contains("m1r4g3-sshd-skip"));
+    }
+
+    #[tokio::test]
+    async fn the_password_path_retries_a_box_that_is_not_ready_yet() {
+        let bus = Arc::new(InstallBus::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let result = retry_until_ready(4, std::time::Duration::from_millis(1), &bus, || {
+            let seen = Arc::clone(&seen);
+            async move {
+                let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err("ssh: password rejected".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "the third attempt should have won");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            *bus.text.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::text::tr("p.pass_retry"),
+            "the wait has to be visible while it lasts"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_password_path_gives_up_and_keeps_the_last_reason() {
+        let bus = Arc::new(InstallBus::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let result = retry_until_ready(3, std::time::Duration::from_millis(1), &bus, || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("ssh: password rejected".to_owned())
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "ssh: password rejected");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

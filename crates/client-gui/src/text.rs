@@ -173,6 +173,10 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "p.no_face" => ("бокс не прислал ни одного лица", "the box did not send a face"),
         "p.key_write" => ("не удалось записать ключ", "could not write the key"),
         "p.ssh_pass" => ("ssh: пароль не принят", "ssh: password rejected"),
+        "p.pass_retry" => (
+            "бокс ещё не готов — пробуем пароль снова",
+            "the box is not ready yet — trying the password again",
+        ),
         "p.ssh_key" => ("ssh: ключ не принят", "ssh: key rejected"),
         "p.ssh_timeout" => ("таймаут", "timed out"),
         "p.ssh_host" => ("ключ хоста сменился", "host key changed"),
