@@ -17,6 +17,7 @@ use uzor_framework::handle::VisualView;
 
 use super::provision::{self, InstallBus, Job};
 use crate::shell::menu::Geom;
+use crate::text::tr;
 
 const AMBER: &str = "#FBB26A";
 const FG: &str = "#F4F4F5";
@@ -401,7 +402,7 @@ impl Stand {
             });
         }
         if applied.is_empty() {
-            self.say("бокс не предложил ни одного лица");
+            self.say(tr("say.no_face"));
             return;
         }
         // The proposed rows go first — they are what the box can do now —
@@ -507,11 +508,11 @@ impl Stand {
             return;
         }
         let Some((host, port)) = split_host(&self.host) else {
-            self.say("нужен хост");
+            self.say(tr("say.need_host"));
             return;
         };
         if self.user.trim().is_empty() {
-            self.say("нужен логин");
+            self.say(tr("say.need_login"));
             return;
         }
         self.save_profile();
@@ -546,11 +547,11 @@ impl Stand {
             return;
         }
         let Some((host, port)) = split_host(&self.host) else {
-            self.say("нужен хост");
+            self.say(tr("say.need_host"));
             return;
         };
         if self.user.trim().is_empty() {
-            self.say("нужен логин");
+            self.say(tr("say.need_login"));
             return;
         }
         self.save_profile();
@@ -559,12 +560,12 @@ impl Stand {
 
     pub fn export(&self) {
         if self.link.is_empty() {
-            self.say("нет ссылки");
+            self.say(tr("say.no_link"));
             return;
         }
         #[cfg(target_os = "ios")]
         {
-            self.say("файл недоступен");
+            self.say(tr("say.file_gone"));
             return;
         }
         #[cfg(not(target_os = "ios"))]
@@ -578,7 +579,7 @@ impl Stand {
 
     pub fn copy_link(&self) {
         if self.link.is_empty() {
-            self.say("нет ссылки");
+            self.say(tr("say.no_link"));
             return;
         }
         self.copy_text(&self.link);
@@ -688,12 +689,12 @@ impl Stand {
     pub fn invite(&mut self, full: bool) {
         let name = self.guest_draft.trim().to_owned();
         if name.is_empty() {
-            self.say("нужно имя");
+            self.say(tr("say.need_name"));
             return;
         }
         let body = if full {
             if self.host.trim().is_empty() {
-                self.say("нечего отдать");
+                self.say(tr("say.nothing"));
                 return;
             }
             let stack = if self.stack_auto || self.stack.trim().is_empty() {
@@ -709,7 +710,7 @@ impl Stand {
             })
             .to_string()
         } else if self.link.trim().is_empty() {
-            self.say("нет ссылки");
+            self.say(tr("say.no_link"));
             return;
         } else {
             self.link.clone()
@@ -720,7 +721,7 @@ impl Stand {
         self.bump_clear(Focus::Guest);
         self.save_guests();
         self.copy_text(&body);
-        self.say("записано");
+        self.say(tr("say.saved"));
     }
 
     pub fn select_guest(&mut self, index: usize) {
@@ -730,7 +731,7 @@ impl Stand {
         self.qr_guest = Some(index);
         if !body.is_empty() {
             self.copy_text(&body);
-            self.say("скопировано");
+            self.say(tr("say.copied"));
         }
     }
 
@@ -784,11 +785,11 @@ impl Stand {
     pub fn accept_raw(&mut self, raw: &str) {
         let raw = raw.trim();
         if raw.is_empty() {
-            self.say("пусто");
+            self.say(tr("say.empty"));
             return;
         }
         if raw.len() > 256 * 1024 {
-            self.say("слишком длинно");
+            self.say(tr("say.long"));
             return;
         }
         if self.section != Section::Access {
@@ -796,27 +797,27 @@ impl Stand {
             self.save_profile();
         }
         self.set_link(raw);
-        self.say(if raw.starts_with('{') { "конфиг принят" } else { "ссылка принята" });
+        self.say(if raw.starts_with('{') { tr("say.cfg") } else { tr("say.link_ok") });
     }
 
     pub fn import_file(&mut self) {
         #[cfg(target_os = "ios")]
         {
-            self.say("файл недоступен");
+            self.say(tr("say.file_gone"));
             return;
         }
         #[cfg(not(target_os = "ios"))]
         {
             let Some(path) = rfd::FileDialog::new()
-                .set_title("Конфиг или ссылка")
-                .add_filter("конфиг", &["json", "txt", "mirage", "conf", "vpn"])
+                .set_title(tr("dlg.title"))
+                .add_filter(tr("dlg.filter"), &["json", "txt", "mirage", "conf", "vpn"])
                 .pick_file()
             else {
                 return;
             };
             match std::fs::read_to_string(&path) {
                 Ok(raw) => self.accept_raw(&raw),
-                Err(_) => self.say("файл не читается"),
+                Err(_) => self.say(tr("say.unreadable")),
             }
         }
     }
@@ -824,7 +825,7 @@ impl Stand {
     pub fn import_clipboard(&mut self) {
         #[cfg(target_os = "ios")]
         {
-            self.say("буфер недоступен");
+            self.say(tr("say.clip_down"));
             return;
         }
         #[cfg(not(target_os = "ios"))]
@@ -832,7 +833,7 @@ impl Stand {
             let mut clip = match arboard::Clipboard::new() {
                 Ok(clip) => clip,
                 Err(_) => {
-                    self.say("буфер недоступен");
+                    self.say(tr("say.clip_down"));
                     return;
                 }
             };
@@ -847,7 +848,7 @@ impl Stand {
                     Ok(raw) => self.accept_raw(&raw),
                     Err(err) => self.say(&err),
                 },
-                Err(_) => self.say("в буфере пусто"),
+                Err(_) => self.say(tr("say.clip_empty")),
             }
         }
     }
@@ -1096,7 +1097,7 @@ fn dir() -> Option<std::path::PathBuf> {
 
 fn decode_qr_rgba(rgba: &[u8], w: usize, h: usize) -> Result<String, String> {
     if w == 0 || h == 0 || rgba.len() < w * h * 4 {
-        return Err("битый буфер картинки".into());
+        return Err(tr("say.bad_image").into());
     }
     let mut prep = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| {
         let i = (y * w + x) * 4;
@@ -1104,8 +1105,8 @@ fn decode_qr_rgba(rgba: &[u8], w: usize, h: usize) -> Result<String, String> {
         ((r * 299 + g * 587 + b * 114) / 1000) as u8
     });
     let grids = prep.detect_grids();
-    let grid = grids.first().ok_or("QR-код не найден на картинке")?;
-    let (_meta, content) = grid.decode().map_err(|e| format!("QR не читается: {e}"))?;
+    let grid = grids.first().ok_or(tr("say.qr_none"))?;
+    let (_meta, content) = grid.decode().map_err(|e| format!("{}: {e}", tr("say.qr_bad")))?;
     Ok(content)
 }
 
@@ -1160,6 +1161,7 @@ enum Choice {
     Stack,
     Kill,
     Split,
+    Lang,
 }
 
 enum Row {
@@ -1184,6 +1186,7 @@ enum HitKind {
     Stack,
     Kill,
     Split,
+    Lang,
     Invite(bool),
     Proto(usize),
     ProtoOn(usize),
@@ -1339,21 +1342,22 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
     };
     match stand.section {
         Section::Server => {
-            lay.field("st-host", "хост", Focus::Host, "хост", 240, false);
-            lay.field("st-user", "логин", Focus::User, "логин", 240, false);
-            lay.field("st-pass", "пароль", Focus::Pass, "пароль", 240, true);
+            lay.field("st-host", tr("f.host"), Focus::Host, tr("f.host"), 240, false);
+            lay.field("st-user", tr("f.user"), Focus::User, tr("f.user"), 240, false);
+            lay.field("st-pass", tr("f.pass"), Focus::Pass, tr("f.pass"), 240, true);
             lay.pair(
                 ("st-go", ButtonText::Install, HitKind::Install),
                 ("st-down", ButtonText::Remove, HitKind::Remove),
             );
+            lay.choice("st-lang", tr("f.lang"), Choice::Lang, HitKind::Lang);
         }
         Section::Protocols => {
-            lay.choice("st-stack", "стек", Choice::Stack, HitKind::Stack);
+            lay.choice("st-stack", tr("f.stack"), Choice::Stack, HitKind::Stack);
             for index in 0..stand.protocols.len() {
                 lay.proto(index);
             }
             if stand.active_index().is_some() {
-                lay.field("st-port", "порт", Focus::Port, "порт", 8, false);
+                lay.field("st-port", tr("f.port"), Focus::Port, tr("f.port"), 8, false);
                 lay.field("st-mtu", "mtu", Focus::Mtu, "mtu", 5, false);
                 // The box's own reason for the face the person is on. It is
                 // the sentence that says what this port looks like from
@@ -1365,7 +1369,7 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
             }
         }
         Section::Access => {
-            lay.field("st-link", "ссылка", Focus::Link, "вставить", 256 * 1024, false);
+            lay.field("st-link", tr("f.link"), Focus::Link, tr("f.paste"), 256 * 1024, false);
             lay.pair(
                 ("st-export", ButtonText::Export, HitKind::Export),
                 ("st-copy", ButtonText::Copy, HitKind::Copy),
@@ -1375,7 +1379,7 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
                 ("st-file", ButtonText::File, HitKind::File),
                 ("st-clip", ButtonText::Clip, HitKind::Clip),
             );
-            lay.field("st-guest", "гость", Focus::Guest, "имя", 64, false);
+            lay.field("st-guest", tr("f.guest"), Focus::Guest, tr("f.name"), 64, false);
             lay.pair(
                 ("st-invite-conn", ButtonText::InviteConn, HitKind::Invite(false)),
                 ("st-invite-full", ButtonText::InviteFull, HitKind::Invite(true)),
@@ -1385,17 +1389,17 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
             }
         }
         Section::Link => {
-            lay.choice("st-kill", "киллсвитч", Choice::Kill, HitKind::Kill);
-            lay.field("st-dns", "dns", Focus::Dns, "свой резолвер", 240, false);
+            lay.choice("st-kill", tr("f.kill"), Choice::Kill, HitKind::Kill);
+            lay.field("st-dns", tr("f.dns"), Focus::Dns, tr("f.resolver"), 240, false);
             if stand.kill != Kill::Off {
-                lay.field("st-except", "исключения", Focus::Except, "dns через запятую", 240, false);
+                lay.field("st-except", tr("f.except"), Focus::Except, tr("f.dns_list"), 240, false);
             }
-            lay.choice("st-split", "маршруты", Choice::Split, HitKind::Split);
-            lay.field("st-site", "сайт", Focus::Site, "домен", 240, false);
+            lay.choice("st-split", tr("f.routes"), Choice::Split, HitKind::Split);
+            lay.field("st-site", tr("f.site"), Focus::Site, tr("f.domain"), 240, false);
             for index in 0..stand.sites.len() {
                 lay.entry(index, true);
             }
-            lay.field("st-app", "приложение", Focus::App, "процесс", 240, false);
+            lay.field("st-app", tr("f.app"), Focus::App, tr("f.process"), 240, false);
             for index in 0..stand.apps.len() {
                 lay.entry(index, false);
             }
@@ -1415,7 +1419,7 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
 
 fn nav_buttons(content: Rect) -> [NavBtn; 4] {
     const IDS: [&str; 4] = ["st-nav-server", "st-nav-proto", "st-nav-access", "st-nav-link"];
-    const LABELS: [&str; 4] = ["сервер", "протоколы", "доступ", "связь"];
+    let labels = [tr("nav.server"), tr("nav.proto"), tr("nav.access"), tr("nav.link")];
     const SECS: [Section; 4] = [Section::Server, Section::Protocols, Section::Access, Section::Link];
     let y = content.y + 6.0;
     let gap = 6.0;
@@ -1424,14 +1428,14 @@ fn nav_buttons(content: Rect) -> [NavBtn; 4] {
     let w = inner / 4.0;
     let mut out = [NavBtn {
         id: IDS[0],
-        label: LABELS[0],
+        label: labels[0],
         section: Section::Server,
         rect: Rect::new(0.0, 0.0, 0.0, 0.0),
     }; 4];
     for i in 0..4 {
         out[i] = NavBtn {
             id: IDS[i],
-            label: LABELS[i],
+            label: labels[i],
             section: SECS[i],
             rect: Rect::new(x0 + i as f64 * (w + gap), y, w.max(0.0), 30.0),
         };
@@ -1469,6 +1473,7 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Stack => stand.toggle_stack(),
         HitKind::Kill => stand.cycle_kill(),
         HitKind::Split => stand.toggle_split(),
+        HitKind::Lang => crate::text::cycle(),
         HitKind::Invite(full) => stand.invite(full),
         HitKind::Proto(index) => stand.select_proto(index),
         HitKind::ProtoOn(index) => stand.toggle_proto(index),
@@ -1605,7 +1610,7 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             }
             ctx.set_text_align(TextAlign::Center);
             ctx.set_fill_color(if proto.on { AMBER } else { DIM });
-            let word = if proto.on { "вкл" } else { "выкл" };
+            let word = if proto.on { tr("b.on") } else { tr("b.off") };
             ctx.fill_text(word, toggle.x + toggle.width / 2.0, toggle.y + toggle.height / 2.0);
         }
         Row::Note { rect, text } => {
@@ -1626,11 +1631,11 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             ctx.set_fill_color(FG);
             ctx.fill_text(&short(&guest.name, 16), rect.x + 8.0, rect.y + rect.height / 2.0);
             ctx.set_fill_color(DIM);
-            let kind = if guest.full { "полный" } else { "подключение" };
+            let kind = if guest.full { tr("b.invite_full") } else { tr("b.invite_conn") };
             ctx.fill_text(kind, rect.x + LABEL_W, rect.y + rect.height / 2.0);
             ctx.set_text_align(TextAlign::Center);
             ctx.set_fill_color(AMBER);
-            ctx.fill_text("отозвать", revoke.x + revoke.width / 2.0, revoke.y + revoke.height / 2.0);
+            ctx.fill_text(tr("b.revoke"), revoke.x + revoke.width / 2.0, revoke.y + revoke.height / 2.0);
         }
         Row::Entry { rect, index, site } => {
             let text = if *site {
@@ -1647,7 +1652,7 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             ctx.fill_text(&short(text, 24), rect.x + 8.0, rect.y + rect.height / 2.0);
             ctx.set_text_align(TextAlign::Right);
             ctx.set_fill_color(DIM);
-            ctx.fill_text("убрать", rect.x + rect.width - 8.0, rect.y + rect.height / 2.0);
+            ctx.fill_text(tr("b.drop"), rect.x + rect.width - 8.0, rect.y + rect.height / 2.0);
         }
         Row::Line { x, y } => {
             ctx.set_text_align(TextAlign::Left);
@@ -1667,25 +1672,25 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
     match text {
         ButtonText::Install => {
             if running {
-                "ставится…"
+                tr("b.installing")
             } else {
-                "установить"
+                tr("b.install")
             }
         }
         ButtonText::Remove => {
             if running {
-                "снимается…"
+                tr("b.removing")
             } else {
-                "снять"
+                tr("b.remove")
             }
         }
-        ButtonText::Export => "экспорт",
-        ButtonText::Copy => "копировать",
-        ButtonText::Scan => "сканер",
-        ButtonText::File => "файл",
-        ButtonText::Clip => "буфер",
-        ButtonText::InviteConn => "подключение",
-        ButtonText::InviteFull => "полный",
+        ButtonText::Export => tr("b.export"),
+        ButtonText::Copy => tr("b.copy"),
+        ButtonText::Scan => tr("b.scan"),
+        ButtonText::File => tr("b.file"),
+        ButtonText::Clip => tr("b.clip"),
+        ButtonText::InviteConn => tr("b.invite_conn"),
+        ButtonText::InviteFull => tr("b.invite_full"),
     }
 }
 
@@ -1693,7 +1698,7 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
     match which {
         Choice::Stack => {
             if stand.stack_auto {
-                "авто".into()
+                tr("c.auto").into()
             } else if stand.stack.is_empty() {
                 stand
                     .protocols
@@ -1705,17 +1710,18 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
             }
         }
         Choice::Kill => match stand.kill {
-            Kill::Off => "выкл".into(),
-            Kill::Soft => "мягкий".into(),
-            Kill::Strict => "жёсткий".into(),
+            Kill::Off => tr("b.off").into(),
+            Kill::Soft => tr("c.soft").into(),
+            Kill::Strict => tr("c.strict").into(),
         },
         Choice::Split => {
             if stand.split_bypass {
-                "все кроме".into()
+                tr("c.bypass").into()
             } else {
-                "только эти".into()
+                tr("c.only").into()
             }
         }
+        Choice::Lang => crate::text::current_name().into(),
     }
 }
 

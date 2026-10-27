@@ -1,10 +1,11 @@
 //! m1r4g3 desktop shell. The oasis scene fills the window. Chrome is a
 //! transparent overlay: the palm logo on the left, drawn from assets/palm.svg,
 //! and minimize / close on the right drawn like a system caption. The empty
-//! band drags the window while the sheet is closed. An open sheet fills
-//! from the top, including the chrome band, and does not dim the scene.
-//! Cabinet and standalone sit on that fill, level with the palm and the
-//! caption buttons, and only while the sheet is open. Text rows are
+//! band drags the window. An open sheet fills from the top, including the
+//! chrome band, and does not dim the scene. Mesh and the own server are two
+//! marks beside the palm, only while the sheet is open. The gap between
+//! those marks and the caption buttons stays the sheet colour and still
+//! drags. Text rows are
 //! framework text fields. A click on the
 //! scene eases the link over 0.55s.
 
@@ -13,7 +14,7 @@ use std::collections::HashMap;
 use uzor::input::keyboard::KeyCode;
 use uzor::input::{Sense, WidgetKind};
 use uzor::layout::docking::DockPanel;
-use uzor::render::{AnimParams, AnimScript, RenderContext, TextAlign, TextBaseline};
+use uzor::render::{AnimParams, AnimScript, CircleBatch, LineSegment, RenderContext};
 use uzor::tokens::{BuiltinSet, Tokens};
 use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
@@ -220,12 +221,14 @@ impl App for Oasis {
         let (mode_cab, mode_std) = mode_pair(w);
 
         if ui.menu {
-            // Hover only: blocks window-drag on the sheet, and does not take
-            // the click. Text fields and buttons register after this.
+            // Hover on the body only. The chrome gap has no widget, so the
+            // caption drag band still moves the window. Text fields and
+            // buttons register after this.
+            let body = Rect::new(0.0, CHROME_H, w, (g.panel.height - CHROME_H).max(0.0));
             cx.widgets.coord.register_atomic(
                 "sheet",
                 WidgetKind::Custom,
-                at(g.panel),
+                at(body),
                 Sense::HOVER,
                 &layer,
             );
@@ -823,7 +826,7 @@ impl Oasis {
             return;
         }
         let button_x = menu::bind_button_x(w);
-        let go = Rect::new(button_x, by, 60.0, field_h);
+        let go = Rect::new(button_x, by, 92.0, field_h);
         coord.register_atomic("bind-go", WidgetKind::Button, at(go), Sense::CLICK, layer);
         if view.clicked(&WidgetId::from("bind-go")) {
             self.submit_bind();
@@ -1021,50 +1024,154 @@ fn sync_field(
 }
 
 /// Open sheet from the top of the window. The chrome band is part of the
-/// sheet fill. Mode buttons are painted on that fill.
+/// sheet fill. Mode marks are painted on that fill.
 fn open_geom(w: f64, h: f64, panel_h: f64) -> menu::Geom {
     menu::geom_at(w, h, panel_h, 1, 0.0, CHROME_H, LIP)
 }
 
+/// Palm, then the two mode marks, then empty drag space, then the caption.
+/// The marks are the palm's size. The old 14 px glyphs were what jagged.
 fn mode_pair(width: f64) -> (Rect, Rect) {
-    let left = 4.0 + MARK + 8.0;
-    let right = width - 6.0 - GLYPH * 2.0 - 6.0 - 8.0;
-    let gap = 6.0;
-    let h = 26.0;
-    let y = (CHROME_H - h) / 2.0;
-    let w = ((right - left - gap) / 2.0).max(0.0);
-    (Rect::new(left, y, w, h), Rect::new(left + w + gap, y, w, h))
+    let y = (CHROME_H - MARK) / 2.0;
+    let pair = 6.0;
+    let min_x = glyph_rect(width, 1).x;
+    let mut x = 4.0 + MARK + 10.0;
+    let end = x + MARK + pair + MARK;
+    if end + 8.0 > min_x {
+        x = (min_x - 8.0 - MARK - pair - MARK).max(4.0 + MARK + 4.0);
+    }
+    (Rect::new(x, y, MARK, MARK), Rect::new(x + MARK + pair, y, MARK, MARK))
 }
 
 fn paint_modes(render: &mut dyn RenderContext, cab: Rect, solo: Rect, product: Product) {
-    paint_mode(render, cab, "кабинет", product == Product::Cabinet, true);
-    paint_mode(render, solo, "стенделон", product == Product::Standalone, false);
+    paint_mode(render, cab, product == Product::Cabinet, true);
+    paint_mode(render, solo, product == Product::Standalone, false);
 }
 
-fn paint_mode(render: &mut dyn RenderContext, r: Rect, label: &str, on: bool, cabinet: bool) {
+/// One mark, no label and no box. Active is amber, idle is gray.
+///
+/// Outlines are the capsule and rounded-rect shaders. Width is 2 device
+/// px, centred on a whole pixel: uzor 1.5.14 covers that stroke in a
+/// 1px band, so the core is solid and the edge is one pixel.
+fn paint_mode(render: &mut dyn RenderContext, r: Rect, on: bool, mesh: bool) {
     let color = if on { "#FBB26A" } else { "#878B91" };
-    render.set_stroke_color(color);
-    render.set_stroke_width(1.25);
-    render.set_line_dash(&[]);
-    render.stroke_rect(r.x + 0.5, r.y + 0.5, (r.width - 1.0).max(0.0), (r.height - 1.0).max(0.0));
-    let ix = r.x + 10.0;
-    let iy = r.y + (r.height - 14.0) / 2.0;
-    if cabinet {
-        render.stroke_rect(ix + 1.0, iy + 4.0, 12.0, 10.0);
-        render.begin_path();
-        render.move_to(ix, iy + 5.0);
-        render.line_to(ix + 7.0, iy);
-        render.line_to(ix + 14.0, iy + 5.0);
-        render.stroke();
+    let pad = 2.0;
+    let box_r = Rect::new(
+        r.x + pad,
+        r.y + pad,
+        (r.width - pad * 2.0).max(8.0),
+        (r.height - pad * 2.0).max(8.0),
+    );
+    if mesh {
+        paint_mesh(render, box_r, color);
     } else {
-        render.stroke_rect(ix + 1.0, iy + 1.0, 12.0, 5.0);
-        render.stroke_rect(ix + 1.0, iy + 8.0, 12.0, 5.0);
+        paint_server(render, box_r, color);
     }
-    render.set_fill_color(color);
-    render.set_font("13px sans-serif");
-    render.set_text_align(TextAlign::Center);
-    render.set_text_baseline(TextBaseline::Middle);
-    render.fill_text(label, r.x + r.width / 2.0 + 6.0, r.y + r.height / 2.0);
+}
+
+/// 24-unit icon box, origin on a whole pixel.
+fn icon_frame(r: Rect) -> (f64, f64, f64) {
+    let side = r.width.min(r.height);
+    let scale = side / 24.0;
+    let ox = (r.x + (r.width - 24.0 * scale) / 2.0).floor();
+    let oy = (r.y + (r.height - 24.0 * scale) / 2.0).floor();
+    (ox, oy, scale)
+}
+
+/// Even device width. The centre sits on a whole pixel, so a 2px
+/// stroke covers two device pixels instead of straddling three.
+fn icon_pen(dpr: f64) -> f64 {
+    2.0 / dpr.max(0.5)
+}
+
+fn snap_px(v: f64, dpr: f64) -> f64 {
+    (v * dpr).round() / dpr
+}
+
+fn snap_len(v: f64, dpr: f64) -> f64 {
+    (v * dpr).round().max(1.0) / dpr
+}
+
+fn wash(hex: &str, alpha: f64) -> String {
+    let h = hex.trim_start_matches('#');
+    let n = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(255);
+    format!("rgba({},{},{},{alpha})", n(0), n(2), n(4))
+}
+
+/// Four nodes on a diamond, a cross through the middle, one wash.
+/// Same 2px capsules and the same half-fill as the server blades.
+fn paint_mesh(render: &mut dyn RenderContext, r: Rect, color: &str) {
+    let (ox, oy, s) = icon_frame(r);
+    let dpr = render.dpr();
+    let at = |u: f64, v: f64| (snap_px(ox + u * s, dpr), snap_px(oy + v * s, dpr));
+    let top = at(12.0, 4.0);
+    let left = at(4.0, 12.0);
+    let right = at(20.0, 12.0);
+    let bot = at(12.0, 20.0);
+    let mid = at(12.0, 12.0);
+    render.begin_path();
+    render.move_to(top.0, top.1);
+    render.line_to(right.0, right.1);
+    render.line_to(bot.0, bot.1);
+    render.line_to(left.0, left.1);
+    render.close_path();
+    render.set_fill_color(&wash(color, 0.30));
+    render.fill();
+    let seg = |p: (f64, f64), q: (f64, f64)| LineSegment { x1: p.0, y1: p.1, x2: q.0, y2: q.1 };
+    render.set_line_cap("round");
+    render.draw_line_batch(
+        &[
+            seg(top, right),
+            seg(right, bot),
+            seg(bot, left),
+            seg(left, top),
+            seg(left, right),
+            seg(top, bot),
+        ],
+        color,
+        icon_pen(dpr),
+    );
+    let rad = snap_len(1.7 * s, dpr);
+    let node = |p: (f64, f64)| CircleBatch { cx: p.0, cy: p.1, r: rad };
+    render.draw_circle_batch(
+        &[node(top), node(left), node(right), node(bot), node(mid)],
+        color,
+    );
+}
+
+/// Both chassis carry the same half-fill and the same thin outline.
+fn paint_server(render: &mut dyn RenderContext, r: Rect, color: &str) {
+    let (ox, oy, s) = icon_frame(r);
+    let dpr = render.dpr();
+    let pen = icon_pen(dpr);
+    let rad = snap_len(1.4 * s, dpr);
+    let wash = wash(color, 0.30);
+    let blade = |x: f64, y: f64| {
+        (
+            snap_px(ox + x * s, dpr),
+            snap_px(oy + y * s, dpr),
+            snap_len(17.0 * s, dpr),
+            snap_len(6.5 * s, dpr),
+        )
+    };
+    render.set_stroke_color(color);
+    render.set_line_dash(&[]);
+    render.set_stroke_width(pen);
+    for (x, y) in [(3.5, 3.5), (3.5, 14.0)] {
+        let (x, y, w, h) = blade(x, y);
+        render.set_fill_color(&wash);
+        render.fill_rounded_rect(x, y, w, h, rad);
+        render.stroke_rounded_rect(x, y, w, h, rad);
+    }
+    let led = snap_len(1.15 * s, dpr);
+    let (x0, _, _, _) = blade(3.5, 3.5);
+    render.draw_circle_batch(
+        &[
+            CircleBatch { cx: snap_px(x0 + 3.0 * s, dpr), cy: snap_px(oy + 6.75 * s, dpr), r: led },
+            CircleBatch { cx: snap_px(x0 + 3.0 * s, dpr), cy: snap_px(oy + 17.25 * s, dpr), r: led },
+        ],
+        color,
+    );
 }
 
 fn menu_rect() -> Rect {

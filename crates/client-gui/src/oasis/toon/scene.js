@@ -300,15 +300,84 @@
     return out;
   }
 
+  // Crest samples, about one every 2px, so the ridge is a curve and not a saw.
+  function ridgePts(w, peaks, base) {
+    var n = Math.max(24, Math.ceil(w / 2));
+    var pts = [];
+    for (var i = 0; i <= n; i++) {
+      var x = (w * i) / n;
+      pts.push([x, ridgeY(peaks, x, base)]);
+    }
+    return pts;
+  }
+
+  // One quadratic, sampled. n is the segment count.
+  function quadPts(x0, y0, cx, cy, x1, y1, n) {
+    var pts = [];
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      var u = 1 - t;
+      pts.push([
+        u * u * x0 + 2 * u * t * cx + t * t * x1,
+        u * u * y0 + 2 * u * t * cy + t * t * y1,
+      ]);
+    }
+    return pts;
+  }
+
+  // smoothLine as points. The anim recorder drops lineCap/lineJoin, so a
+  // curve stroke is a hard mesh. These points are stroked as separate
+  // move+line pairs, which the line shader covers.
+  function smoothPts(P) {
+    var pts = [[P[0][0], P[0][1]]];
+    var cx = P[0][0];
+    var cy = P[0][1];
+    var i, k, seg, mx, my, last, dx, dy, n, t;
+    for (i = 1; i < P.length - 1; i++) {
+      mx = (P[i][0] + P[i + 1][0]) / 2;
+      my = (P[i][1] + P[i + 1][1]) / 2;
+      seg = quadPts(cx, cy, P[i][0], P[i][1], mx, my, 10);
+      for (k = 1; k < seg.length; k++) pts.push(seg[k]);
+      cx = mx;
+      cy = my;
+    }
+    last = P[P.length - 1];
+    dx = last[0] - cx;
+    dy = last[1] - cy;
+    n = Math.max(2, Math.ceil(Math.sqrt(dx * dx + dy * dy) / 3));
+    for (i = 1; i <= n; i++) {
+      t = i / n;
+      pts.push([cx + dx * t, cy + dy * t]);
+    }
+    return pts;
+  }
+
+  function inkChain(ctx, pts, width) {
+    var pad = width * 0.35;
+    ctx.beginPath();
+    for (var i = 1; i < pts.length; i++) {
+      var x0 = pts[i - 1][0];
+      var y0 = pts[i - 1][1];
+      var x1 = pts[i][0];
+      var y1 = pts[i][1];
+      var dx = x1 - x0;
+      var dy = y1 - y0;
+      var len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 0.2) continue;
+      var s = Math.min(pad, len * 0.25) / len;
+      ctx.moveTo(x0 - dx * s, y0 - dy * s);
+      ctx.lineTo(x1 + dx * s, y1 + dy * s);
+    }
+    ctx.stroke();
+  }
+
   function duneRow(ctx, w, h, base, peaks, lit, shade, inkA, stip, seed) {
-    var steps = 90;
-    var i, x;
+    var pts = ridgePts(w, peaks, base);
+    var i;
     ctx.beginPath();
     ctx.moveTo(0, h);
-    for (i = 0; i <= steps; i++) {
-      x = (w * i) / steps;
-      ctx.lineTo(x, ridgeY(peaks, x, base));
-    }
+    ctx.lineTo(pts[0][0], pts[0][1]);
+    for (i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
     ctx.lineTo(w, h);
     ctx.closePath();
     ctx.fillStyle = rgba(lit);
@@ -332,23 +401,20 @@
     ctx.strokeStyle = "#140e0a";
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
-    ctx.lineWidth = Math.max(4.5, h * 0.008);
-    ctx.beginPath();
-    for (i = 0; i <= steps; i++) {
-      x = (w * i) / steps;
-      var yy = ridgeY(peaks, x, base);
-      if (i === 0) ctx.moveTo(x, yy);
-      else ctx.lineTo(x, yy);
-    }
-    ctx.stroke();
-    ctx.lineWidth = Math.max(2.4, h * 0.0035);
-    ctx.beginPath();
+    var crestW = Math.max(4.5, h * 0.008);
+    ctx.lineWidth = crestW;
+    inkChain(ctx, pts, crestW);
+    var slipW = Math.max(2.4, h * 0.0035);
+    ctx.lineWidth = slipW;
     for (k = 0; k < peaks.length; k++) {
       p = peaks[k];
-      ctx.moveTo(p.x, base - p.a);
-      ctx.quadraticCurveTo(p.x + p.wr * 0.16, base - p.a * 0.35, p.x + p.wr * 0.04, base + p.a * 0.08);
+      inkChain(ctx, quadPts(
+        p.x, base - p.a,
+        p.x + p.wr * 0.16, base - p.a * 0.35,
+        p.x + p.wr * 0.04, base + p.a * 0.08,
+        12
+      ), slipW);
     }
-    ctx.stroke();
     ctx.globalAlpha = BASE;
   }
 
@@ -1648,13 +1714,14 @@
     ctx.strokeStyle = "#140e0a";
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
-    ctx.lineWidth = Math.max(5, h * 0.009);
-    ctx.beginPath();
-    smoothLine(ctx, crest.slice(1), true);
-    smoothLine(ctx, ridge2, true);
-    ctx.moveTo(P(0.86, 0.06)[0], P(0.86, 0.06)[1]);
-    ctx.quadraticCurveTo(P(0.9, 0.1)[0], P(0.9, 0.1)[1], P(0.88, 0.15)[0], P(0.88, 0.15)[1]);
-    ctx.stroke();
+    var ink = Math.max(5, h * 0.009);
+    ctx.lineWidth = ink;
+    inkChain(ctx, smoothPts(crest.slice(1)), ink);
+    inkChain(ctx, smoothPts(ridge2), ink);
+    var a = P(0.86, 0.06);
+    var b = P(0.9, 0.1);
+    var c = P(0.88, 0.15);
+    inkChain(ctx, quadPts(a[0], a[1], b[0], b[1], c[0], c[1], 10), ink);
   }
 
   // Sepia spots and fibres live on the sky and the sand. The camel is drawn
@@ -1834,7 +1901,6 @@
     // 2. dunes, back to front (palette from 5.jpg)
     var rows = duneRows(w, h, horizon);
     var tint = function (c) { return mix(mix(c, [c[0] * 0.95, c[1] * 0.6, c[2] * 0.55], gold * 0.5), [c[0] * 0.3, c[1] * 0.28, c[2] * 0.4], (1 - light) * 0.4); };
-    mirageBand(ctx, w, h, horizon - h * 0.15, horizon + h * 0.04, w * 0.02, w * 0.74, t, smooth(0.15, 0.6, sun.day) * (1 - smooth(0, 0.5, link)) * 0.8, 3);
     duneRow(ctx, w, h, rows[0].base, rows[0].peaks, tint([232, 148, 78]), tint([186, 96, 48]), 1, 0, 100);
     duneRow(ctx, w, h, rows[1].base, rows[1].peaks, tint([214, 118, 58]), tint([150, 72, 40]), 1, 0, 200);
     bigDune(ctx, w, h, horizon, tint([236, 142, 68]), tint([158, 74, 38]), 300, lay.portrait);

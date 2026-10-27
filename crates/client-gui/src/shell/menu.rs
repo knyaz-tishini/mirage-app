@@ -826,7 +826,7 @@ fn draw_row(
 
 /// Right edge of the BIND button. A click to the right of this submits.
 pub fn bind_button_x(w: f64) -> f64 {
-    (w - 76.0).max(120.0)
+    (w - 108.0).max(120.0)
 }
 
 /// Left edge of ОТВЯЗАТЬ. A click on the name does nothing.
@@ -852,7 +852,7 @@ fn draw_bind_row(
     bound_name: Option<&str>,
 ) {
     if bound {
-        let button = if unlink_armed { "ПОДТВЕРДИТЬ" } else { "ОТВЯЗАТЬ" };
+        let button = if unlink_armed { crate::text::tr("bind.confirm") } else { crate::text::tr("bind.unlink") };
         let unlink_x = unlink_button_x(w);
         let bh = 32.0;
         let by = ry + (h - bh) / 2.0;
@@ -881,7 +881,7 @@ fn draw_bind_row(
             ctx.set_text_align(TextAlign::Center);
             fill_clipped(
                 ctx,
-                "КАБИНЕТ",
+                crate::text::tr("mode.mesh"),
                 cabinet_x + cabinet_w / 2.0,
                 by + bh / 2.0,
                 cabinet_x,
@@ -919,7 +919,7 @@ fn draw_bind_row(
     ctx.set_text_baseline(TextBaseline::Middle);
     ctx.set_fill_color(FG);
     ctx.set_text_align(TextAlign::Left);
-    fill_clipped(ctx, "CABINET", 16.0, ry + h / 2.0, 8.0, ry, 96.0, h);
+    fill_clipped(ctx, crate::text::tr("mode.mesh"), 16.0, ry + h / 2.0, 8.0, ry, 96.0, h);
     ctx.set_fill_color(if focused { "rgba(251,178,106,0.10)" } else { "rgba(255,255,255,0.05)" });
     ctx.fill_rect(field_x, field_y, field_w, field_h);
     if focused {
@@ -933,7 +933,7 @@ fn draw_bind_row(
         ctx.set_fill_color(DIMC);
         fill_clipped(
             ctx,
-            "claim or /c/ link",
+            crate::text::tr("bind.ph"),
             field_x + 8.0,
             field_y + field_h / 2.0,
             field_x + 4.0,
@@ -959,10 +959,11 @@ fn draw_bind_row(
         ctx.set_fill_color(AMBER);
         ctx.fill_rect(caret_x, field_y + 6.0, 1.0, (field_h - 12.0).max(0.0));
     }
+    let bind_w = 92.0;
     ctx.set_fill_color("rgba(251,178,106,0.16)");
-    ctx.fill_rect(button_x, field_y, 60.0, field_h);
+    ctx.fill_rect(button_x, field_y, bind_w, field_h);
     ctx.set_fill_color(AMBER);
     ctx.set_font("12px sans-serif");
     ctx.set_text_align(TextAlign::Center);
-    fill_clipped(ctx, "BIND", button_x + 30.0, field_y + field_h / 2.0, button_x, field_y, 60.0, field_h);
+    fill_clipped(ctx, crate::text::tr("bind.go"), button_x + bind_w / 2.0, field_y + field_h / 2.0, button_x, field_y, bind_w, field_h);
 }

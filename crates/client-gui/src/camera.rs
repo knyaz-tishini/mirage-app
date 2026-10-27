@@ -69,7 +69,7 @@ impl CameraScan {
         let shared_t = shared.clone();
         #[cfg(target_os = "ios")]
         {
-            *shared.outcome.lock().unwrap() = ScanOutcome::Failed("камера недоступна".into());
+            *shared.outcome.lock().unwrap() = ScanOutcome::Failed(crate::text::tr("cam.down").into());
             return Self { stop, shared, join: None, started: Instant::now() };
         }
         #[cfg(not(target_os = "ios"))]
@@ -114,12 +114,12 @@ fn capture_loop(stop: &AtomicBool, shared: &Shared) {
     let mut cam = match Camera::new(index, fmt) {
         Ok(c) => c,
         Err(e) => {
-            *shared.outcome.lock().unwrap() = ScanOutcome::Failed(format!("камера недоступна: {e}"));
+            *shared.outcome.lock().unwrap() = ScanOutcome::Failed(format!("{}: {e}", crate::text::tr("cam.down")));
             return;
         }
     };
     if let Err(e) = cam.open_stream() {
-        *shared.outcome.lock().unwrap() = ScanOutcome::Failed(format!("камера не стартует: {e}"));
+        *shared.outcome.lock().unwrap() = ScanOutcome::Failed(format!("{}: {e}", crate::text::tr("cam.start")));
         return;
     }
 
@@ -206,12 +206,17 @@ pub fn draw_overlay(ctx: &mut dyn RenderContext, w: f64, h: f64, chrome_h: f64, 
         ctx.set_font("13px monospace");
         ctx.set_text_align(TextAlign::Center);
         ctx.set_text_baseline(TextBaseline::Middle);
-        ctx.fill_text("открываю камеру…", w / 2.0, (top + bottom) / 2.0);
+        ctx.fill_text(crate::text::tr("cam.opening"), w / 2.0, (top + bottom) / 2.0);
     }
 
     // Caption with an animated ellipsis driven by elapsed time.
     let dots = ((scan.started.elapsed().as_millis() / 400) % 4) as usize;
-    let caption = format!("сканирую QR{}  ·  клик чтобы отменить", ".".repeat(dots));
+    let caption = format!(
+        "{}{}  ·  {}",
+        crate::text::tr("cam.scan"),
+        ".".repeat(dots),
+        crate::text::tr("cam.cancel")
+    );
     ctx.set_fill_color("#FBB26A");
     ctx.set_font("12px sans-serif");
     ctx.set_text_align(TextAlign::Center);

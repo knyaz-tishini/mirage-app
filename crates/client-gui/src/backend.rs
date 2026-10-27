@@ -292,9 +292,9 @@ impl LocalHttp {
     /// document the server put in `client.link`.
     pub fn adopt_artefact(&self, json: &str) -> Result<(), String> {
         let json = json.trim();
-        let value: serde_json::Value = serde_json::from_str(json).map_err(|_| "ссылка не артефакт")?;
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|_| crate::text::tr("bind.not_artefact"))?;
         if !value.is_object() {
-            return Err("ссылка не артефакт".into());
+            return Err(crate::text::tr("bind.not_artefact").into());
         }
         let dir = exe_dir().map_err(|e| e.to_string())?.join("standalone");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -307,7 +307,7 @@ impl LocalHttp {
             }
             slot.clone().unwrap_or_else(|| format!("http://127.0.0.1:{DEFAULT_CONTROL_PORT}"))
         };
-        replace_child(&self.child, &path, &url).map_err(|e| format!("клиент: {e}"))?;
+        replace_child(&self.child, &path, &url).map_err(|e| format!("{}: {e}", crate::text::tr("bind.client")))?;
         self.bound.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -626,11 +626,11 @@ fn redeem_and_respawn(
 ) -> String {
     let bin = match subscriber_bin() {
         Ok(bin) => bin,
-        Err(err) => return format!("привязка: нет клиента ({err})"),
+        Err(err) => return format!("{} ({err})", crate::text::tr("bind.no_client")),
     };
     let out = match bound_device_path() {
         Ok(path) => path,
-        Err(err) => return format!("привязка: {err}"),
+        Err(err) => return format!("{}: {err}", crate::text::tr("bind.fail")),
     };
     let mut cmd = Command::new(&bin);
     cmd.arg("claim")
@@ -648,7 +648,7 @@ fn redeem_and_respawn(
     }
     let output = match cmd.output() {
         Ok(output) => output,
-        Err(err) => return format!("привязка: не запустилась ({err})"),
+        Err(err) => return format!("{} ({err})", crate::text::tr("bind.not_started")),
     };
     if !output.status.success() || !out.is_file() {
         return bind_failure(&output, text);
@@ -667,7 +667,7 @@ fn redeem_and_respawn(
             bound.store(true, Ordering::Relaxed);
             bind_ok(&output.stdout)
         }
-        Err(err) => format!("привязано, процесс не перезапустился: {err}"),
+        Err(err) => format!("{}: {err}", crate::text::tr("bind.ok_stale")),
     }
 }
 
@@ -691,24 +691,24 @@ fn bind_ok(stdout: &[u8]) -> String {
         id.len() < 80 && id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
     });
     match id {
-        Some(id) => format!("привязано · {id}"),
-        None => "привязано".to_owned(),
+        Some(id) => format!("{} · {id}", crate::text::tr("bind.ok")),
+        None => crate::text::tr("bind.ok").to_owned(),
     }
 }
 
 fn bind_failure(output: &std::process::Output, claim: &str) -> String {
     match output.status.code().unwrap_or(-1) {
-        2 => return "привязка: код не найден".to_owned(),
-        3 => return "привязка: код уже использован".to_owned(),
-        4 => return "привязка: ещё не готово".to_owned(),
+        2 => return crate::text::tr("bind.missing").to_owned(),
+        3 => return crate::text::tr("bind.used").to_owned(),
+        4 => return crate::text::tr("bind.soon").to_owned(),
         code => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let last = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
             let cleaned = scrub_claim(last, claim);
             if cleaned.is_empty() {
-                format!("привязка: отказ {code}")
+                format!("{} {code}", crate::text::tr("bind.refused"))
             } else {
-                format!("привязка: {cleaned}")
+                format!("{}: {cleaned}", crate::text::tr("bind.fail"))
             }
         }
     }

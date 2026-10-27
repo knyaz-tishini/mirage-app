@@ -121,7 +121,7 @@ pub fn start(job: Job, bus: Arc<InstallBus>) {
     if bus.running.swap(true, Ordering::Relaxed) {
         return;
     }
-    set_text(&bus, "соединение");
+    set_text(&bus, crate::text::tr("p.connect"));
     std::thread::spawn(move || {
         let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt.block_on(install(job, &bus)),
@@ -130,11 +130,11 @@ pub fn start(job: Job, bus: Arc<InstallBus>) {
         match outcome {
             Ok(Outcome::Faces(faces)) => {
                 *bus.faces.lock().unwrap_or_else(|p| p.into_inner()) = Some(faces);
-                set_text(&bus, "бокс предложил лица — проверьте их и нажмите «установить» ещё раз");
+                set_text(&bus, crate::text::tr("p.faces_review"));
             }
             Ok(Outcome::Link(link)) => {
                 *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(link);
-                set_text(&bus, "сервер поднят");
+                set_text(&bus, crate::text::tr("p.up"));
             }
             Err(err) => set_text(&bus, &err),
         }
@@ -149,14 +149,14 @@ pub fn remove(host: String, port: u16, user: String, bus: Arc<InstallBus>) {
     if bus.running.swap(true, Ordering::Relaxed) {
         return;
     }
-    set_text(&bus, "снятие");
+    set_text(&bus, crate::text::tr("p.removing"));
     std::thread::spawn(move || {
         let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt.block_on(take_down(&host, port, &user)),
             Err(err) => Err(format!("runtime: {err}")),
         };
         match outcome {
-            Ok(()) => set_text(&bus, "контейнер снят"),
+            Ok(()) => set_text(&bus, crate::text::tr("p.removed")),
             Err(err) => set_text(&bus, &err),
         }
         bus.running.store(false, Ordering::Relaxed);
@@ -167,7 +167,7 @@ async fn take_down(host: &str, port: u16, user: &str) -> Result<(), String> {
     let dir = state_dir()?;
     let key_path = dir.join("server.key");
     if !key_path.is_file() {
-        return Err("нет ключа".into());
+        return Err(crate::text::tr("p.no_key").into());
     }
     let pem = fs::read(&key_path).map_err(|e| format!("key: {e}"))?;
     let pins = dir.join("host-keys.json");
@@ -178,9 +178,9 @@ async fn take_down(host: &str, port: u16, user: &str) -> Result<(), String> {
     if out.exit.unwrap_or(1) != 0 {
         let err = out.stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
         if err.is_empty() {
-            return Err(format!("снятие: exit {:?}", out.exit));
+            return Err(format!("{}: exit {:?}", crate::text::tr("p.remove_fail"), out.exit));
         }
-        return Err(format!("снятие: {err}"));
+        return Err(format!("{}: {err}", crate::text::tr("p.remove_fail")));
     }
     Ok(())
 }
@@ -207,7 +207,7 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
             if job.password.is_empty() {
                 return Err(key_err);
             }
-            set_text(bus, "ключ на сервере");
+            set_text(bus, crate::text::tr("p.key_on"));
             let password = job.password.clone();
             password_install_key(&addr, &job.user, &password, &pub_line, &pins).await?;
             drop(password);
@@ -232,7 +232,7 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
     // The image goes up once. The second press of "install" must not push a
     // hundred megabytes again to change one port.
     if let Some(tar) = image_tar() {
-        set_text(bus, "образ");
+        set_text(bus, crate::text::tr("p.image"));
         if !remote_has(&session, &format!("{remote}/image.tar")).await {
             let bytes = fs::read(&tar).map_err(|e| format!("image tar: {e}"))?;
             upload(&session, &bytes, &format!("{remote}/image.tar")).await?;
@@ -244,13 +244,13 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         // published yet — the person chooses, and the second press carries
         // the choice out.
         upload(&session, FACES_SH.as_bytes(), &format!("{remote}/faces.sh")).await?;
-        set_text(bus, "бокс смотрит свои порты");
+        set_text(bus, crate::text::tr("p.ports"));
         let out = tokio::time::timeout(
             INSTALL_TIMEOUT,
             exec(&session, &format!("sh {remote}/faces.sh")),
         )
         .await
-        .map_err(|_| "предложение лиц дольше 15 минут".to_owned())??;
+        .map_err(|_| crate::text::tr("p.faces_timeout").to_owned())??;
         let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
         if out.exit.unwrap_or(1) != 0 {
             let err = out
@@ -260,9 +260,9 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
                 .find(|line| !line.trim().is_empty())
                 .unwrap_or("");
             return Err(if err.is_empty() {
-                format!("бокс не ответил предложением (exit {:?})", out.exit)
+                format!("{} (exit {:?})", crate::text::tr("p.no_proposal"), out.exit)
             } else {
-                format!("бокс не ответил предложением: {err}")
+                format!("{}: {err}", crate::text::tr("p.no_proposal"))
             });
         }
         return Ok(Outcome::Faces(parse_faces(&out.stdout).map_err(|err| {
@@ -283,13 +283,13 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
     }
 
     // Step two: the box comes up with the faces the person chose.
-    set_text(bus, "контейнер");
+    set_text(bus, crate::text::tr("p.container"));
     let out = tokio::time::timeout(
         INSTALL_TIMEOUT,
         exec(&session, &format!("sh {remote}/install.sh")),
     )
     .await
-    .map_err(|_| "установка дольше 15 минут".to_owned())??;
+    .map_err(|_| crate::text::tr("p.install_timeout").to_owned())??;
     let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
     let link = out
         .stdout
@@ -299,9 +299,9 @@ async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         .ok_or_else(|| {
             let err = out.stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
             if err.is_empty() {
-                format!("контейнер не отдал ссылку (exit {:?})", out.exit)
+                format!("{} (exit {:?})", crate::text::tr("p.no_link"), out.exit)
             } else {
-                format!("контейнер не отдал ссылку: {err}")
+                format!("{}: {err}", crate::text::tr("p.no_link"))
             }
         })?;
     fs::write(dir.join("link.txt"), link).map_err(|e| format!("save link: {e}"))?;
@@ -332,7 +332,7 @@ fn parse_faces(stdout: &str) -> Result<Vec<ProposedFace>, String> {
         }
     }
     if body.trim().is_empty() {
-        return Err("бокс не прислал предложение лиц".into());
+        return Err(crate::text::tr("p.no_faces_doc").into());
     }
     parse_proposal(&body)
 }
@@ -340,9 +340,9 @@ fn parse_faces(stdout: &str) -> Result<Vec<ProposedFace>, String> {
 /// Read the proposal file the box writes.
 fn parse_proposal(text: &str) -> Result<Vec<ProposedFace>, String> {
     let proposal: FaceProposal =
-        toml::from_str(text).map_err(|e| format!("предложение лиц не прочитано: {e}"))?;
+        toml::from_str(text).map_err(|e| format!("{}: {e}", crate::text::tr("p.faces_bad")))?;
     if proposal.faces.is_empty() {
-        return Err("бокс не прислал ни одного лица".into());
+        return Err(crate::text::tr("p.no_face").into());
     }
     Ok(proposal.faces)
 }
@@ -452,7 +452,7 @@ async fn connect_key(
         .await
         .map_err(|e| format!("ssh: {e}"))?;
     if !ok {
-        return Err("ssh: ключ не принят".into());
+        return Err(crate::text::tr("p.ssh_key").into());
     }
     Ok(session)
 }
@@ -470,7 +470,7 @@ async fn password_install_key(
         .await
         .map_err(|e| format!("ssh: {e}"))?;
     if !ok {
-        return Err("ssh: пароль не принят".into());
+        return Err(crate::text::tr("p.ssh_pass").into());
     }
     let cmd = format!(
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && (grep -qF {q} ~/.ssh/authorized_keys 2>/dev/null || echo {q} >> ~/.ssh/authorized_keys) && chmod 600 ~/.ssh/authorized_keys",
@@ -481,9 +481,9 @@ async fn password_install_key(
     if out.exit.unwrap_or(1) != 0 {
         let err = out.stderr.trim();
         return Err(if err.is_empty() {
-            "не удалось записать ключ".into()
+            crate::text::tr("p.key_write").into()
         } else {
-            format!("не удалось записать ключ: {err}")
+            format!("{}: {err}", crate::text::tr("p.key_write"))
         });
     }
     Ok(())
@@ -501,10 +501,10 @@ async fn connect(addr: &str, pins: &Path) -> Result<client::Handle<Handler>, Str
         ..Default::default()
     });
     match tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, addr, handler)).await {
-        Err(_) => Err(format!("ssh {addr}: таймаут")),
+        Err(_) => Err(format!("ssh {addr}: {}", crate::text::tr("p.ssh_timeout"))),
         Ok(Err(err)) => {
             if mismatch.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
-                Err(format!("ssh {addr}: ключ хоста сменился"))
+                Err(format!("ssh {addr}: {}", crate::text::tr("p.ssh_host")))
             } else {
                 Err(format!("ssh {addr}: {err}"))
             }
@@ -559,7 +559,7 @@ async fn upload(session: &client::Handle<Handler>, bytes: &[u8], remote: &str) -
     let meta = sftp.metadata(&tmp).await.map_err(|e| format!("sftp stat: {e}"))?;
     if meta.size.unwrap_or(0) != bytes.len() as u64 {
         let _ = sftp.remove_file(&tmp).await;
-        return Err(format!("sftp: размер {remote} не сошёлся"));
+        return Err(format!("sftp {remote}: {}", crate::text::tr("p.sftp_size")));
     }
     // Permissions only. A default FileAttributes sets size to 0 and truncates.
     let attrs = russh_sftp::protocol::FileAttributes {
@@ -726,6 +726,6 @@ why = "443/UDP — там обычно весит QUIC."
     #[test]
     fn a_stream_without_a_proposal_is_refused() {
         let err = parse_faces("Loaded image: m1r4g3-server:1\n").expect_err("nothing to read");
-        assert!(err.contains("не прислал"), "{err}");
+        assert!(err.contains("не прислал") || err.contains("did not send"), "{err}");
     }
 }

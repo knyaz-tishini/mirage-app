@@ -6,6 +6,7 @@ pub mod ota;
 // One picture: the oasis scene. Desktop and iOS both enter through `run`.
 mod backend;
 mod camera;
+mod text;
 #[cfg(target_os = "ios")]
 mod ios_host;
 mod oasis;
