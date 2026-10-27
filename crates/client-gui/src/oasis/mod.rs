@@ -29,8 +29,8 @@ use crate::backend::{EngineLink, LocalHttp};
 use crate::shell::menu::{self, MenuTab};
 
 mod palm_mark;
-mod provision;
-mod stand;
+pub(crate) mod provision;
+pub(crate) mod stand;
 
 use stand::Stand;
 

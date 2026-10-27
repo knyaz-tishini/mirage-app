@@ -9,24 +9,12 @@ mod camera;
 mod text;
 #[cfg(target_os = "ios")]
 mod ios_host;
-mod oasis;
+pub(crate) mod oasis;
 mod shell;
 
-/// Dev-tools only. `MIRAGE_SHOT_SIZE=1206x2622` sets the window the screenshot
-/// API captures. The customer build does not compile this and stays 380×540.
+/// Dev-tools only. The customer build compiles none of this.
 #[cfg(feature = "dev-tools")]
-fn dev_shot_size() -> (u32, u32) {
-    let Ok(raw) = std::env::var("MIRAGE_SHOT_SIZE") else {
-        return (380, 540);
-    };
-    let Some((w, h)) = raw.split_once('x') else {
-        return (380, 540);
-    };
-    match (w.parse::<u32>(), h.parse::<u32>()) {
-        (Ok(w), Ok(h)) if w >= 280 && h >= 400 => (w, h),
-        _ => (380, 540),
-    }
-}
+pub mod dev;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     ota::wait_for_parent_exit();
@@ -55,6 +43,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ota::start();
+
+    // The headless mode opens no window at all: the control API is the whole
+    // surface, so an install on a box can be driven from a script or an agent.
+    #[cfg(feature = "dev-tools")]
+    {
+        if let Some(requested) = dev::stand_api::headless_port(std::env::args().skip(1)) {
+            let port = dev::stand_api::serve(requested)?;
+            tracing::info!("[stand-api] http://127.0.0.1:{port}");
+            // The process stays alive: the API thread serves, this one waits.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+    }
+
     oasis::launch()?;
     Ok(())
 }

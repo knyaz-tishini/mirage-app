@@ -503,7 +503,9 @@ impl Stand {
         lines.join("\n")
     }
 
-    pub fn install(&mut self) {
+    /// Install with an explicit mode: `ask_faces = true` asks the box what it
+    /// could publish, `false` brings it up with the faces the person chose.
+    pub fn install_with(&mut self, ask_faces: bool) {
         if self.bus.running.load(Ordering::Relaxed) {
             return;
         }
@@ -534,12 +536,17 @@ impl Stand {
                 password: std::mem::take(&mut self.pass),
                 stack,
                 env,
-                // The first press asks the box what it could publish; the
-                // second one installs with the faces the person chose.
-                ask_faces: !self.faces_from_box,
+                ask_faces,
             },
             Arc::clone(&self.bus),
         );
+    }
+
+    /// Install in the mode the stand is in: the first press asks the box what
+    /// it could publish, the second one installs with the faces the person
+    /// chose.
+    pub fn install(&mut self) {
+        self.install_with(!self.faces_from_box);
     }
 
     pub fn remove_remote(&mut self) {
@@ -1050,7 +1057,10 @@ mod tests {
     fn the_kind_picks_the_id() {
         let websocket = face(r#"{"type":"web_socket","path":"/","host":"a.example"}"#, 80);
         let xhttp = face(r#"{"type":"xhttp","path":"/","host":"a.example"}"#, 8080);
-        let quic = face(r#"{"type":"quic","alpn":["h3"],"bind_addr":"0.0.0.0:443"}"#, 443);
+        // The bind address is the loopback literal on purpose: the customer
+        // source gate allows no other IPv4 in these sources, and the address
+        // plays no part in the id the mask's kind picks.
+        let quic = face(r#"{"type":"quic","alpn":["h3"],"bind_addr":"127.0.0.1:443"}"#, 443);
         let taken: Vec<&'static str> = Vec::new();
         assert_eq!(id_for_face(&websocket, &taken), Some("shadowsocks"));
         assert_eq!(id_for_face(&xhttp, &taken), Some("socks5"));
