@@ -7,6 +7,7 @@ pub mod ota;
 mod backend;
 mod camera;
 mod text;
+mod theme;
 #[cfg(target_os = "ios")]
 mod ios_host;
 pub(crate) mod oasis;

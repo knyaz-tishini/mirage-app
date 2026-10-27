@@ -20,9 +20,19 @@ use crate::shell::menu::Geom;
 use crate::text::tr;
 
 const AMBER: &str = "#FBB26A";
-const FG: &str = "#F4F4F5";
-const DIM: &str = "#6B6F7A";
-const IDLE: &str = "#878B91";
+
+fn fg() -> &'static str {
+    if crate::theme::light() { "#16161a" } else { "#F4F4F5" }
+}
+
+fn dim() -> &'static str {
+    if crate::theme::light() { "#5c5c64" } else { "#9a9aa2" }
+}
+
+/// Light sheet has no amber. Dark keeps it for the on-state and the solid pills.
+fn accent() -> &'static str {
+    if crate::theme::light() { fg() } else { AMBER }
+}
 const ROW: f64 = 40.0;
 const ROW_H: f64 = 32.0;
 const NAV_H: f64 = 44.0;
@@ -1120,7 +1130,7 @@ fn decode_qr_rgba(rgba: &[u8], w: usize, h: usize) -> Result<String, String> {
     Ok(content)
 }
 
-fn split_host(raw: &str) -> Option<(String, u16)> {
+pub(crate) fn split_host(raw: &str) -> Option<(String, u16)> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -1172,6 +1182,7 @@ enum Choice {
     Kill,
     Split,
     Lang,
+    Style,
 }
 
 enum Row {
@@ -1197,6 +1208,7 @@ enum HitKind {
     Kill,
     Split,
     Lang,
+    Style,
     Invite(bool),
     Proto(usize),
     ProtoOn(usize),
@@ -1360,6 +1372,7 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
                 ("st-down", ButtonText::Remove, HitKind::Remove),
             );
             lay.choice("st-lang", tr("f.lang"), Choice::Lang, HitKind::Lang);
+            lay.choice("st-style", tr("f.style"), Choice::Style, HitKind::Style);
         }
         Section::Protocols => {
             lay.choice("st-stack", tr("f.stack"), Choice::Stack, HitKind::Stack);
@@ -1484,6 +1497,7 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Kill => stand.cycle_kill(),
         HitKind::Split => stand.toggle_split(),
         HitKind::Lang => crate::text::cycle(),
+        HitKind::Style => crate::theme::cycle(),
         HitKind::Invite(full) => stand.invite(full),
         HitKind::Proto(index) => stand.select_proto(index),
         HitKind::ProtoOn(index) => stand.toggle_proto(index),
@@ -1533,11 +1547,7 @@ pub fn fields(stand: &Stand, content: Rect) -> Vec<FieldSpec> {
 }
 
 pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, _hot_sep: bool, note: Option<&str>) {
-    ctx.set_fill_color("rgba(14,14,17,0.98)");
-    ctx.fill_rect(g.panel.x, g.panel.y, g.panel.width, g.panel.height);
-    ctx.set_fill_color("rgba(255,255,255,0.08)");
-    ctx.fill_rect(0.0, g.tabbar.y + g.tabbar.height - 1.0, g.panel.width, 1.0);
-    ctx.fill_rect(0.0, g.panel.y + g.panel.height - 1.0, g.panel.width, 1.0);
+    crate::theme::paint_sheet(ctx, g.panel.x, g.panel.y, g.panel.width, g.panel.height);
 
     paint_nav(ctx, g.content, stand.section);
 
@@ -1547,7 +1557,7 @@ pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, _hot_sep: boo
     let line = if !status.is_empty() { status } else { note_line.to_owned() };
     let lay = layout(stand, g.content, show);
 
-    ctx.set_font("13px sans-serif");
+    ctx.set_font("13px PT Root UI");
     ctx.set_text_baseline(TextBaseline::Middle);
     for row in &lay.rows {
         paint_row(ctx, stand, row, &line);
@@ -1558,50 +1568,51 @@ pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, _hot_sep: boo
 }
 
 fn paint_nav(ctx: &mut dyn RenderContext, content: Rect, section: Section) {
-    ctx.set_font("11px sans-serif");
+    ctx.set_font("13px PT Root UI");
     ctx.set_text_align(TextAlign::Center);
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.set_line_dash(&[]);
-    ctx.set_stroke_width(1.25);
+    ctx.set_text_baseline(TextBaseline::Alphabetic);
     for nav in nav_buttons(content) {
-        let color = if nav.section == section { AMBER } else { IDLE };
-        ctx.set_stroke_color(color);
-        ctx.stroke_rect(
-            nav.rect.x + 0.5,
-            nav.rect.y + 0.5,
-            (nav.rect.width - 1.0).max(0.0),
-            (nav.rect.height - 1.0).max(0.0),
-        );
-        ctx.set_fill_color(color);
-        ctx.fill_text(nav.label, nav.rect.x + nav.rect.width / 2.0, nav.rect.y + nav.rect.height / 2.0);
+        ctx.set_fill_color(if nav.section == section { fg() } else { dim() });
+        let y = crate::theme::label_baseline(nav.rect.y, nav.rect.height, 13.0);
+        ctx.fill_text(nav.label, nav.rect.x + nav.rect.width / 2.0, y);
     }
 }
 
 fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) {
-    ctx.set_font("13px sans-serif");
-    ctx.set_text_baseline(TextBaseline::Middle);
+    ctx.set_font("14px PT Root UI");
+    ctx.set_text_baseline(TextBaseline::Alphabetic);
     match row {
         Row::Field { rect, label, focus } => {
             plate(ctx, *rect, stand.focus == *focus);
             ctx.set_text_align(TextAlign::Left);
-            ctx.set_fill_color(DIM);
-            ctx.fill_text(label, rect.x + 8.0, rect.y + rect.height / 2.0);
+            ctx.set_fill_color(dim());
+            ctx.fill_text(label, rect.x + 8.0, crate::theme::label_baseline(rect.y, rect.height, 14.0));
         }
         Row::Button { rect, text } => {
-            plate(ctx, *rect, false);
+            let primary = matches!(text, ButtonText::Install);
+            if primary {
+                ctx.set_fill_color(if crate::theme::light() { "#1c1c1f" } else { AMBER });
+                ctx.fill_rounded_rect(rect.x, rect.y, rect.width, rect.height, 12.0);
+                ctx.set_fill_color(if crate::theme::light() { "#ffffff" } else { "#1a1208" });
+            } else {
+                plate(ctx, *rect, false);
+                ctx.set_fill_color(fg());
+            }
             ctx.set_text_align(TextAlign::Center);
-            ctx.set_fill_color(AMBER);
             let label = button_label(stand, text);
-            ctx.fill_text(label, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            ctx.fill_text(label, rect.x + rect.width / 2.0, crate::theme::label_baseline(rect.y, rect.height, 14.0));
         }
         Row::Choice { rect, label, which } => {
             plate(ctx, *rect, false);
             ctx.set_text_align(TextAlign::Left);
-            ctx.set_fill_color(DIM);
-            ctx.fill_text(label, rect.x + 8.0, rect.y + rect.height / 2.0);
-            ctx.set_fill_color(FG);
+            ctx.set_fill_color(dim());
+            let y = crate::theme::label_baseline(rect.y, rect.height, 14.0);
+            ctx.fill_text(label, rect.x + 8.0, y);
+            ctx.set_fill_color(fg());
+            ctx.set_text_align(TextAlign::Center);
             let value = choice_value(stand, which);
-            ctx.fill_text(&value, rect.x + LABEL_W, rect.y + rect.height / 2.0);
+            let space = (rect.width - LABEL_W).max(0.0);
+            ctx.fill_text(&value, rect.x + LABEL_W + space / 2.0, y);
         }
         Row::Proto { rect, index, toggle } => {
             let Some(proto) = stand.protocols.get(*index) else {
@@ -1610,26 +1621,27 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             let active = !stand.stack_auto && stand.stack == proto.id;
             plate(ctx, *rect, active);
             ctx.set_text_align(TextAlign::Left);
-            ctx.set_fill_color(if active { AMBER } else { FG });
-            ctx.fill_text(proto.id, rect.x + 8.0, rect.y + rect.height / 2.0);
+            let y = crate::theme::label_baseline(rect.y, rect.height, 14.0);
+            ctx.set_fill_color(if active { accent() } else { fg() });
+            ctx.fill_text(proto.id, rect.x + 8.0, y);
             // The port this face is on — the thing the person is choosing.
             if !proto.port.trim().is_empty() {
-                ctx.set_fill_color(DIM);
+                ctx.set_fill_color(dim());
                 let port = format!(":{}", proto.port.trim());
-                ctx.fill_text(&port, rect.x + LABEL_W, rect.y + rect.height / 2.0);
+                ctx.fill_text(&port, rect.x + LABEL_W, y);
             }
             ctx.set_text_align(TextAlign::Center);
-            ctx.set_fill_color(if proto.on { AMBER } else { DIM });
+            ctx.set_fill_color(if proto.on { accent() } else { dim() });
             let word = if proto.on { tr("b.on") } else { tr("b.off") };
-            ctx.fill_text(word, toggle.x + toggle.width / 2.0, toggle.y + toggle.height / 2.0);
+            ctx.fill_text(word, toggle.x + toggle.width / 2.0, crate::theme::label_baseline(toggle.y, toggle.height, 14.0));
         }
         Row::Note { rect, text } => {
             ctx.set_text_align(TextAlign::Left);
-            ctx.set_fill_color(DIM);
+            ctx.set_fill_color(dim());
             ctx.fill_text(
                 &short(text, 96),
                 rect.x + 8.0,
-                rect.y + rect.height / 2.0,
+                crate::theme::label_baseline(rect.y, rect.height, 14.0),
             );
         }
         Row::Guest { rect, index, revoke } => {
@@ -1638,14 +1650,15 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             };
             plate(ctx, *rect, stand.qr_guest == Some(*index));
             ctx.set_text_align(TextAlign::Left);
-            ctx.set_fill_color(FG);
-            ctx.fill_text(&short(&guest.name, 16), rect.x + 8.0, rect.y + rect.height / 2.0);
-            ctx.set_fill_color(DIM);
+            ctx.set_fill_color(fg());
+            let y = crate::theme::label_baseline(rect.y, rect.height, 14.0);
+            ctx.fill_text(&short(&guest.name, 16), rect.x + 8.0, y);
+            ctx.set_fill_color(dim());
             let kind = if guest.full { tr("b.invite_full") } else { tr("b.invite_conn") };
-            ctx.fill_text(kind, rect.x + LABEL_W, rect.y + rect.height / 2.0);
+            ctx.fill_text(kind, rect.x + LABEL_W, y);
             ctx.set_text_align(TextAlign::Center);
-            ctx.set_fill_color(AMBER);
-            ctx.fill_text(tr("b.revoke"), revoke.x + revoke.width / 2.0, revoke.y + revoke.height / 2.0);
+            ctx.set_fill_color(accent());
+            ctx.fill_text(tr("b.revoke"), revoke.x + revoke.width / 2.0, crate::theme::label_baseline(revoke.y, revoke.height, 14.0));
         }
         Row::Entry { rect, index, site } => {
             let text = if *site {
@@ -1658,23 +1671,38 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             };
             plate(ctx, *rect, false);
             ctx.set_text_align(TextAlign::Left);
-            ctx.set_fill_color(FG);
-            ctx.fill_text(&short(text, 24), rect.x + 8.0, rect.y + rect.height / 2.0);
+            ctx.set_fill_color(fg());
+            let y = crate::theme::label_baseline(rect.y, rect.height, 14.0);
+            ctx.fill_text(&short(text, 24), rect.x + 8.0, y);
             ctx.set_text_align(TextAlign::Right);
-            ctx.set_fill_color(DIM);
-            ctx.fill_text(tr("b.drop"), rect.x + rect.width - 8.0, rect.y + rect.height / 2.0);
+            ctx.set_fill_color(dim());
+            ctx.fill_text(tr("b.drop"), rect.x + rect.width - 8.0, y);
         }
         Row::Line { x, y } => {
             ctx.set_text_align(TextAlign::Left);
-            ctx.set_fill_color(DIM);
+            ctx.set_fill_color(dim());
             ctx.fill_text(line, *x, *y + 10.0);
         }
     }
 }
 
 fn plate(ctx: &mut dyn RenderContext, rect: Rect, hot: bool) {
-    ctx.set_fill_color(if hot { "rgba(251,178,106,0.10)" } else { "rgba(255,255,255,0.05)" });
-    ctx.fill_rect(rect.x, rect.y, rect.width, rect.height);
+    let (fill, line) = if crate::theme::light() {
+        (
+            if hot { "rgba(255,255,255,0.82)" } else { "rgba(255,255,255,0.5)" },
+            "rgba(255,255,255,0.72)",
+        )
+    } else if hot {
+        ("rgba(255,255,255,0.22)", "rgba(255,255,255,0.50)")
+    } else {
+        ("rgba(24,24,28,0.82)", "rgba(255,255,255,0.38)")
+    };
+    ctx.set_fill_color(fill);
+    ctx.fill_rounded_rect(rect.x, rect.y, rect.width, rect.height, 10.0);
+    ctx.set_stroke_color(line);
+    ctx.set_stroke_width(1.0);
+    ctx.set_line_dash(&[]);
+    ctx.stroke_rounded_rect(rect.x, rect.y, rect.width, rect.height, 10.0);
 }
 
 fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
@@ -1732,6 +1760,13 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
             }
         }
         Choice::Lang => crate::text::current_name().into(),
+        Choice::Style => {
+            if crate::theme::light() {
+                tr("theme.light").into()
+            } else {
+                tr("theme.dark").into()
+            }
+        }
     }
 }
 

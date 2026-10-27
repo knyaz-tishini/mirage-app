@@ -3,8 +3,8 @@
 //! and minimize / close on the right drawn like a system caption. The empty
 //! band drags the window. An open sheet fills from the top, including the
 //! chrome band, and does not dim the scene. Mesh and the own server are two
-//! marks beside the palm, only while the sheet is open. The gap between
-//! those marks and the caption buttons stays the sheet colour and still
+//! words in the chrome, only while the sheet is open. The gap between
+//! those words and the caption buttons stays the sheet colour and still
 //! drags. Text rows are
 //! framework text fields. A click on the
 //! scene eases the link over 0.55s.
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use uzor::input::keyboard::KeyCode;
 use uzor::input::{Sense, WidgetKind};
 use uzor::layout::docking::DockPanel;
-use uzor::render::{AnimParams, AnimScript, CircleBatch, ImagePainter, LineSegment, RenderContext, TickRate};
+use uzor::render::{AnimParams, AnimScript, ImagePainter, RenderContext, TextAlign, TextBaseline, TickRate};
 use uzor::tokens::{BuiltinSet, Tokens};
 use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
@@ -41,7 +41,8 @@ const SCALE: f64 = 1.75 * 0.75;
 const CHROME_H: f64 = 32.0 * SCALE;
 const MARK: f64 = 28.0 * SCALE;
 const GLYPH: f64 = 22.0 * SCALE;
-const LIP: f64 = 1.0;
+const LIP: f64 = 8.0;
+const SEG_H: f64 = 30.0;
 // Straight RGBA of assets/palm.svg at 64. The caption slot is ICON_SMALL:
 // a 256 bitmap there is what Windows crushes. The exe icon carries
 // 16/32/48/64/128/256 from the same vectors for the taskbar and Alt-Tab.
@@ -442,7 +443,6 @@ impl App for Oasis {
         let menu_now = self.ui.get(&win).cloned().unwrap_or_default();
         let panel_h = self.sheet_panel_h(h);
         let pointer = cx.view.raw_pointer().map(|(x, y)| (x - rect.x, y - rect.y));
-        let bind_hot = cx.view.is_focused(&WidgetId::from("bind"));
         // Tick is Capped(60). request_frame would force Wake::Immediate
         // and a cached blit would spin the core.
         let render: &mut dyn RenderContext = cx.render;
@@ -497,20 +497,6 @@ impl App for Oasis {
                     false,
                     pointer,
                 );
-                if !self.engine.is_bound() {
-                    if let Some(field) = bind_field_local(&g, w) {
-                        render.set_fill_color(if bind_hot {
-                            "rgba(251,178,106,0.10)"
-                        } else {
-                            "rgba(255,255,255,0.05)"
-                        });
-                        render.fill_rect(field.x, field.y, field.width, field.height);
-                        if bind_hot {
-                            render.set_fill_color("#FBB26A");
-                            render.fill_rect(field.x, field.y + field.height - 2.0, field.width, 2.0);
-                        }
-                    }
-                }
             } else {
                 let note = if self.note.is_empty() { None } else { Some(self.note.as_str()) };
                 stand::paint(render, &g, &self.stand, false, note);
@@ -1079,6 +1065,45 @@ fn bind_field_local(g: &menu::Geom, w: f64) -> Option<Rect> {
     Some(Rect::new(field_x, field_y, field_w, field_h))
 }
 
+/// Left edge of the shown string so a short word sits in the middle of the
+/// field. The widget draws left-aligned at `text_rect.x`. A value wider than
+/// the field stays on the left pad so its start remains visible.
+fn centered_field_text(
+    cx: &mut PanelCx<'_, Vocab>,
+    wid: &WidgetId,
+    rect: Rect,
+    placeholder: &str,
+    masked: bool,
+    value: &str,
+) -> Rect {
+    let live = {
+        let fields = cx.widgets.coord.text_fields();
+        if fields.has_field(wid) {
+            fields.text(wid).to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    let shown = if live.is_empty() {
+        placeholder.to_string()
+    } else if masked {
+        "\u{2022}".repeat(live.chars().count())
+    } else {
+        live
+    };
+    cx.render.set_font("400 14px PT Root UI");
+    let tw = cx.render.measure_text(&shown);
+    let pad = 8.0;
+    let inner = (rect.width - pad * 2.0).max(0.0);
+    if tw > 0.0 && tw <= inner {
+        let x = rect.x + (rect.width - tw) / 2.0;
+        let width = (rect.x + rect.width - x).max(tw + 2.0);
+        Rect::new(x, rect.y, width, rect.height)
+    } else {
+        Rect::new(rect.x + pad, rect.y, inner, rect.height)
+    }
+}
+
 /// Push the model into the store while the field is idle. While it is focused,
 /// the store is the text and the model follows it. `reset` clears both.
 fn sync_field(
@@ -1106,16 +1131,21 @@ fn sync_field(
             cx.widgets.coord.text_fields_mut().set_text(&wid, value);
         }
     }
-    let text_r = Rect::new(rect.x + 8.0, rect.y, (rect.width - 16.0).max(0.0), rect.height);
+    let text_r = centered_field_text(cx, &wid, rect, placeholder, masked, value);
     let config = if masked {
         TextFieldConfig::password().with_max_len(max)
     } else {
         TextFieldConfig::text().with_max_len(max)
     };
+    let (fg, ph) = if crate::theme::light() {
+        ("#141416", "#7a7a82")
+    } else {
+        ("#F4F4F5", "#9a9aa4")
+    };
     let resp = uzor_framework::widgets::kit::field(id, rect)
         .placeholder(placeholder)
-        .font(14.0, "sans-serif")
-        .colors("#F4F4F5", "#6B6F7A")
+        .font(14.0, "PT Root UI")
+        .colors(fg, ph)
         .clip(true)
         .text_rect(text_r)
         .masked(masked)
@@ -1133,154 +1163,45 @@ fn sync_field(
 }
 
 /// Open sheet from the top of the window. The chrome band is part of the
-/// sheet fill. Mode marks are painted on that fill.
+/// sheet fill. Mode words are painted on that fill.
 fn open_geom(w: f64, h: f64, panel_h: f64) -> menu::Geom {
     menu::geom_at(w, h, panel_h, 1, 0.0, CHROME_H, LIP)
 }
 
-/// Palm, then the two mode marks, then empty drag space, then the caption.
-/// The marks are the palm's size. The old 14 px glyphs were what jagged.
+/// Palm, then the two mode words, then empty drag space, then the caption.
+/// The words sit in one segment. The gap after it still drags.
 fn mode_pair(width: f64) -> (Rect, Rect) {
-    let y = (CHROME_H - MARK) / 2.0;
-    let pair = 6.0;
+    let y = (CHROME_H - SEG_H) / 2.0;
+    let x = 4.0 + MARK + 8.0;
     let min_x = glyph_rect(width, 1).x;
-    let mut x = 4.0 + MARK + 10.0;
-    let end = x + MARK + pair + MARK;
-    if end + 8.0 > min_x {
-        x = (min_x - 8.0 - MARK - pair - MARK).max(4.0 + MARK + 4.0);
-    }
-    (Rect::new(x, y, MARK, MARK), Rect::new(x + MARK + pair, y, MARK, MARK))
+    let avail = (min_x - 10.0 - x).max(0.0);
+    let half = avail / 2.0;
+    (Rect::new(x, y, half, SEG_H), Rect::new(x + half, y, avail - half, SEG_H))
 }
 
 fn paint_modes(render: &mut dyn RenderContext, cab: Rect, solo: Rect, product: Product) {
-    paint_mode(render, cab, product == Product::Cabinet, true);
-    paint_mode(render, solo, product == Product::Standalone, false);
-}
-
-/// One mark, no label and no box. Active is amber, idle is gray.
-///
-/// Outlines are the capsule and rounded-rect shaders. Width is 2 device
-/// px, centred on a whole pixel: uzor 1.5.14 covers that stroke in a
-/// 1px band, so the core is solid and the edge is one pixel.
-fn paint_mode(render: &mut dyn RenderContext, r: Rect, on: bool, mesh: bool) {
-    let color = if on { "#FBB26A" } else { "#878B91" };
-    let pad = 2.0;
-    let box_r = Rect::new(
-        r.x + pad,
-        r.y + pad,
-        (r.width - pad * 2.0).max(8.0),
-        (r.height - pad * 2.0).max(8.0),
-    );
-    if mesh {
-        paint_mesh(render, box_r, color);
-    } else {
-        paint_server(render, box_r, color);
-    }
-}
-
-/// 24-unit icon box, origin on a whole pixel.
-fn icon_frame(r: Rect) -> (f64, f64, f64) {
-    let side = r.width.min(r.height);
-    let scale = side / 24.0;
-    let ox = (r.x + (r.width - 24.0 * scale) / 2.0).floor();
-    let oy = (r.y + (r.height - 24.0 * scale) / 2.0).floor();
-    (ox, oy, scale)
-}
-
-/// Even device width. The centre sits on a whole pixel, so a 2px
-/// stroke covers two device pixels instead of straddling three.
-fn icon_pen(dpr: f64) -> f64 {
-    2.0 / dpr.max(0.5)
-}
-
-fn snap_px(v: f64, dpr: f64) -> f64 {
-    (v * dpr).round() / dpr
-}
-
-fn snap_len(v: f64, dpr: f64) -> f64 {
-    (v * dpr).round().max(1.0) / dpr
-}
-
-fn wash(hex: &str, alpha: f64) -> String {
-    let h = hex.trim_start_matches('#');
-    let n = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(255);
-    format!("rgba({},{},{},{alpha})", n(0), n(2), n(4))
-}
-
-/// Four nodes on a diamond, a cross through the middle, one wash.
-/// Same 2px capsules and the same half-fill as the server blades.
-fn paint_mesh(render: &mut dyn RenderContext, r: Rect, color: &str) {
-    let (ox, oy, s) = icon_frame(r);
-    let dpr = render.dpr();
-    let at = |u: f64, v: f64| (snap_px(ox + u * s, dpr), snap_px(oy + v * s, dpr));
-    let top = at(12.0, 4.0);
-    let left = at(4.0, 12.0);
-    let right = at(20.0, 12.0);
-    let bot = at(12.0, 20.0);
-    let mid = at(12.0, 12.0);
-    render.begin_path();
-    render.move_to(top.0, top.1);
-    render.line_to(right.0, right.1);
-    render.line_to(bot.0, bot.1);
-    render.line_to(left.0, left.1);
-    render.close_path();
-    render.set_fill_color(&wash(color, 0.30));
-    render.fill();
-    let seg = |p: (f64, f64), q: (f64, f64)| LineSegment { x1: p.0, y1: p.1, x2: q.0, y2: q.1 };
-    render.set_line_cap("round");
-    render.draw_line_batch(
-        &[
-            seg(top, right),
-            seg(right, bot),
-            seg(bot, left),
-            seg(left, top),
-            seg(left, right),
-            seg(top, bot),
-        ],
-        color,
-        icon_pen(dpr),
-    );
-    let rad = snap_len(1.7 * s, dpr);
-    let node = |p: (f64, f64)| CircleBatch { cx: p.0, cy: p.1, r: rad };
-    render.draw_circle_batch(
-        &[node(top), node(left), node(right), node(bot), node(mid)],
-        color,
-    );
-}
-
-/// Both chassis carry the same half-fill and the same thin outline.
-fn paint_server(render: &mut dyn RenderContext, r: Rect, color: &str) {
-    let (ox, oy, s) = icon_frame(r);
-    let dpr = render.dpr();
-    let pen = icon_pen(dpr);
-    let rad = snap_len(1.4 * s, dpr);
-    let wash = wash(color, 0.30);
-    let blade = |x: f64, y: f64| {
-        (
-            snap_px(ox + x * s, dpr),
-            snap_px(oy + y * s, dpr),
-            snap_len(17.0 * s, dpr),
-            snap_len(6.5 * s, dpr),
-        )
+    let light = crate::theme::light();
+    let x = cab.x;
+    let y = cab.y;
+    let w = solo.x + solo.width - cab.x;
+    let h = cab.height;
+    render.set_fill_color(if light { "rgba(255,255,255,0.34)" } else { "rgba(255,255,255,0.18)" });
+    render.fill_rounded_rect(x, y, w, h, 10.0);
+    let on = if product == Product::Cabinet { cab } else { solo };
+    let cell = Rect::new(on.x + 2.0, on.y + 2.0, (on.width - 4.0).max(0.0), (on.height - 4.0).max(0.0));
+    render.set_fill_color(if light { "rgba(255,255,255,0.86)" } else { "rgba(255,255,255,0.32)" });
+    render.fill_rounded_rect(cell.x, cell.y, cell.width, cell.height, 8.0);
+    render.set_font("13px PT Root UI");
+    render.set_text_align(TextAlign::Center);
+    render.set_text_baseline(TextBaseline::Alphabetic);
+    let idle = if light { "#5c5c64" } else { "#b4b4bc" };
+    let hot = if light { "#141416" } else { "#f4f4f5" };
+    let word = |render: &mut dyn RenderContext, r: Rect, label: &str, active: bool| {
+        render.set_fill_color(if active { hot } else { idle });
+        render.fill_text(label, r.x + r.width / 2.0, crate::theme::label_baseline(r.y, r.height, 13.0));
     };
-    render.set_stroke_color(color);
-    render.set_line_dash(&[]);
-    render.set_stroke_width(pen);
-    for (x, y) in [(3.5, 3.5), (3.5, 14.0)] {
-        let (x, y, w, h) = blade(x, y);
-        render.set_fill_color(&wash);
-        render.fill_rounded_rect(x, y, w, h, rad);
-        render.stroke_rounded_rect(x, y, w, h, rad);
-    }
-    let led = snap_len(1.15 * s, dpr);
-    let (x0, _, _, _) = blade(3.5, 3.5);
-    render.draw_circle_batch(
-        &[
-            CircleBatch { cx: snap_px(x0 + 3.0 * s, dpr), cy: snap_px(oy + 6.75 * s, dpr), r: led },
-            CircleBatch { cx: snap_px(x0 + 3.0 * s, dpr), cy: snap_px(oy + 17.25 * s, dpr), r: led },
-        ],
-        color,
-    );
+    word(render, cab, crate::text::tr("mode.mesh"), product == Product::Cabinet);
+    word(render, solo, crate::text::tr("mode.own"), product == Product::Standalone);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1441,7 +1362,7 @@ fn paint_controls(render: &mut dyn RenderContext, width: f64, pointer: Option<(f
     let over_min = pointer.is_some_and(|(x, y)| min_r.contains(x, y));
     let over_close = pointer.is_some_and(|(x, y)| close_r.contains(x, y));
     if over_min {
-        render.set_fill_color("rgba(255,255,255,0.10)");
+        render.set_fill_color(if crate::theme::light() { "rgba(0,0,0,0.06)" } else { "rgba(255,255,255,0.10)" });
         render.fill_rect(min_r.x, min_r.y, min_r.width, min_r.height);
     }
     paint_minus(render, min_r);
@@ -1457,6 +1378,11 @@ fn paint_minus(render: &mut dyn RenderContext, r: Rect) {
     let cy = r.y + r.height / 2.0;
     let hw = 5.0 * SCALE;
     let hh = 0.5 * SCALE;
+    if crate::theme::light() {
+        render.set_fill_color("#1c1c1f");
+        render.fill_rect(cx - hw, cy - hh, hw * 2.0, hh * 2.0);
+        return;
+    }
     render.set_fill_color("rgba(0,0,0,0.65)");
     render.fill_rect(cx - hw - 0.6, cy - hh - 0.6, hw * 2.0 + 1.2, hh * 2.0 + 1.2);
     render.set_fill_color("#F3F3F3");
@@ -1467,10 +1393,16 @@ fn paint_close_x(render: &mut dyn RenderContext, r: Rect, hovered: bool) {
     let cx = r.x + r.width / 2.0;
     let cy = r.y + r.height / 2.0;
     let s = 5.0 * SCALE;
-    if !hovered {
+    if !hovered && !crate::theme::light() {
         stroke_x(render, cx, cy, s, "rgba(0,0,0,0.75)", 2.6 * SCALE);
     }
-    let color = if hovered { "#FFFFFF" } else { "#F3F3F3" };
+    let color = if hovered {
+        "#FFFFFF"
+    } else if crate::theme::light() {
+        "#1c1c1f"
+    } else {
+        "#F3F3F3"
+    };
     stroke_x(render, cx, cy, s, color, 1.5 * SCALE);
 }
 

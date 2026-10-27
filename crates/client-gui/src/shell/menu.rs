@@ -18,12 +18,10 @@ pub const MIN_FRAC: f64 = 0.22;
 pub const MAX_FRAC: f64 = 0.96;
 
 // ── Palette ──────────────────────────────────────────────────────────────────────
-const BG: &str = "rgba(14,14,17,0.98)";
 const AMBER: &str = "#FBB26A";
 const FG: &str = "#F4F4F5";
 const MUTED: &str = "#878B91";
 const DIMC: &str = "#6B6F7A";
-const LINE: &str = "rgba(255,255,255,0.08)";
 
 // ── Tabs ───────────────────────────────────────────────────────────────────────
 
@@ -90,7 +88,7 @@ fn metrics(row: &MenuRow, country_count: usize, services: usize, apps: usize) ->
         MenuRow::Apps => (list_block_height(apps), true),
         MenuRow::ExitMode => (46.0, true),
         MenuRow::Countries => (country_block_height(country_count), true),
-        MenuRow::Bind => (48.0, true),
+        MenuRow::Bind => (40.0, true),
     }
 }
 
@@ -133,14 +131,15 @@ pub fn layout_rows(
     services: usize,
     apps: usize,
 ) -> (Vec<LaidRow>, f64) {
-    let mut y = 6.0;
+    let pad = if rows.len() == 1 && matches!(rows.first(), Some(MenuRow::Bind)) { 4.0 } else { 6.0 };
+    let mut y = pad;
     let mut out = Vec::with_capacity(rows.len());
     for &row in rows {
         let (h, clickable) = metrics(&row, country_count, services, apps);
         out.push(LaidRow { row, y, h, clickable });
         y += h;
     }
-    (out, y + 6.0)
+    (out, y + pad)
 }
 
 // ── Country grid ─────────────────────────────────────────────────────────────
@@ -428,8 +427,7 @@ pub fn draw_menu(
     pointer: Option<(f64, f64)>,
 ) {
     // Panel. The scene under the sheet stays as it is. No logo-color stripe.
-    ctx.set_fill_color(BG);
-    ctx.fill_rect(g.panel.x, g.panel.y, g.panel.width, g.panel.height);
+    crate::theme::paint_sheet(ctx, g.panel.x, g.panel.y, g.panel.width, g.panel.height);
 
     // ── Tab bar ──────────────────────────────────────────────────────────────
     for (i, tb) in tabs.iter().enumerate() {
@@ -442,14 +440,11 @@ pub fn draw_menu(
             ctx.fill_rect(r.x, r.y + r.height - 2.0, r.width, 2.0);
         }
         ctx.set_fill_color(if active { AMBER } else { MUTED });
-        ctx.set_font("12px sans-serif");
+        ctx.set_font("12px PT Root UI");
         ctx.set_text_align(TextAlign::Center);
         ctx.set_text_baseline(TextBaseline::Middle);
         fill_clipped(ctx, tb.label(), r.x + r.width / 2.0, r.y + r.height / 2.0, r.x, r.y, r.width, r.height);
     }
-    ctx.set_fill_color(LINE);
-    ctx.fill_rect(0.0, g.tabbar.y + g.tabbar.height - 1.0, w, 1.0);
-
     // ── Content (clipped + scrolled) ───────────────────────────────────────────
     ctx.save();
     ctx.clip_rect(g.content.x, g.content.y, g.content.width, g.content.height);
@@ -479,10 +474,6 @@ pub fn draw_menu(
         ctx.fill_rect(w - 4.0, ty, 3.0, thumb_h);
     }
 
-    // Same hairline as the rule under the chrome. Not a drag handle.
-    ctx.set_fill_color(LINE);
-    ctx.fill_rect(0.0, g.panel.y + g.panel.height - 1.0, w, 1.0);
-
     if let Some(n) = note {
         draw_ticker(ctx, w, g, n, marquee, log, log_open);
     }
@@ -510,7 +501,7 @@ fn draw_ticker(
         8.0 - (marquee * 36.0) % span
     };
     ctx.set_fill_color(AMBER);
-    ctx.set_font("13px sans-serif");
+    ctx.set_font("13px PT Root UI");
     ctx.set_text_align(TextAlign::Left);
     ctx.set_text_baseline(TextBaseline::Middle);
     fill_clipped(ctx, text, x, strip_y + strip_h / 2.0, 8.0, strip_y, view, strip_h);
@@ -525,7 +516,7 @@ fn draw_ticker(
     ctx.fill_rect(8.0, top, (w - 16.0).max(0.0), ph);
     ctx.set_fill_color(AMBER);
     ctx.fill_rect(8.0, top, (w - 16.0).max(0.0), 1.0);
-    ctx.set_font("12px sans-serif");
+    ctx.set_font("12px PT Root UI");
     ctx.set_fill_color(FG);
     ctx.set_text_align(TextAlign::Left);
     ctx.set_text_baseline(TextBaseline::Middle);
@@ -558,14 +549,14 @@ fn draw_list_block(
         ctx.fill_rect(w - 9.0, ry + 1.0, 1.0, (h - 2.0).max(0.0));
     }
     let count = names.len() + if roles { bypass.len() } else { 0 };
-    ctx.set_font("14px sans-serif");
+    ctx.set_font("14px PT Root UI");
     ctx.set_text_baseline(TextBaseline::Middle);
     ctx.set_fill_color(FG);
     ctx.set_text_align(TextAlign::Left);
     fill_clipped(ctx, label, 20.0, ry + LIST_HEADER / 2.0, 12.0, ry, 64.0, LIST_HEADER);
     if roles {
         ctx.set_fill_color(AMBER);
-        ctx.set_font("11px sans-serif");
+        ctx.set_font("11px PT Root UI");
         fill_clipped(
             ctx,
             "TUNNEL / BYPASS",
@@ -594,7 +585,7 @@ fn draw_list_block(
         ctx.set_fill_color(AMBER);
         ctx.fill_rect(field_x, field_y + field_h - 2.0, field_w, 2.0);
     }
-    ctx.set_font("14px sans-serif");
+    ctx.set_font("14px PT Root UI");
     ctx.set_text_align(TextAlign::Left);
     ctx.set_text_baseline(TextBaseline::Middle);
     let shown = if focused { draft } else { "" };
@@ -602,18 +593,18 @@ fn draw_list_block(
         ctx.set_fill_color(DIMC);
         fill_clipped(ctx, "type or drop", field_x + 8.0, field_y + field_h / 2.0, field_x + 4.0, field_y, (field_w - 8.0).max(0.0), field_h);
     } else {
-        ctx.set_fill_color(FG);
+        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
         fill_clipped(ctx, shown, field_x + 8.0, field_y + field_h / 2.0, field_x + 4.0, field_y, (field_w - 12.0).max(0.0), field_h);
     }
     if focused {
         let caret_x = (field_x + 8.0 + shown.chars().count() as f64 * 7.2).min(field_x + field_w - 6.0);
-        ctx.set_fill_color(AMBER);
+        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { AMBER });
         ctx.fill_rect(caret_x, field_y + 6.0, 1.0, (field_h - 12.0).max(0.0));
     }
     ctx.set_fill_color("rgba(251,178,106,0.16)");
     ctx.fill_rect(file_x, field_y, 48.0, field_h);
     ctx.set_fill_color(AMBER);
-    ctx.set_font("12px sans-serif");
+    ctx.set_font("12px PT Root UI");
     ctx.set_text_align(TextAlign::Center);
     fill_clipped(ctx, "FILE", file_x + 24.0, field_y + field_h / 2.0, file_x, field_y, 48.0, field_h);
 
@@ -624,14 +615,14 @@ fn draw_list_block(
         ctx.set_fill_color("rgba(255,255,255,0.06)");
         ctx.fill_rect(cell.x, cell.y, cell.width, cell.height);
         let name_w = if roles { (cell.width - 90.0).max(0.0) } else { (cell.width - 22.0).max(0.0) };
-        ctx.set_fill_color(FG);
-        ctx.set_font("12px sans-serif");
+        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
+        ctx.set_font("12px PT Root UI");
         ctx.set_text_align(TextAlign::Left);
         ctx.set_text_baseline(TextBaseline::Middle);
         fill_clipped(ctx, name, cell.x + 8.0, cell.y + cell.height / 2.0, cell.x + 4.0, cell.y, name_w, cell.height);
         if roles {
             ctx.set_fill_color(if bypassed { MUTED } else { AMBER });
-            ctx.set_font("11px sans-serif");
+            ctx.set_font("11px PT Root UI");
             ctx.set_text_align(TextAlign::Right);
             let role = if bypassed { "BYPASS" } else { "TUNNEL" };
             fill_clipped(
@@ -646,7 +637,7 @@ fn draw_list_block(
             );
         }
         ctx.set_fill_color(DIMC);
-        ctx.set_font("12px sans-serif");
+        ctx.set_font("12px PT Root UI");
         ctx.set_text_align(TextAlign::Right);
         fill_clipped(ctx, "x", cell.x + cell.width - 6.0, cell.y + cell.height / 2.0, cell.x + cell.width - 16.0, cell.y, 14.0, cell.height);
     };
@@ -727,7 +718,7 @@ fn draw_row(
                 ctx.arc(10.0, ry + lr.h / 2.0, 3.0, 0.0, std::f64::consts::TAU);
                 ctx.fill();
             }
-            ctx.set_font("14px sans-serif");
+            ctx.set_font("14px PT Root UI");
             ctx.set_text_baseline(TextBaseline::Middle);
             ctx.set_fill_color(if picked { AMBER } else { FG });
             ctx.set_text_align(TextAlign::Left);
@@ -743,13 +734,13 @@ fn draw_row(
             draw_list_block(ctx, w, ry, lr.h, label, names, bypass, roles, focused, list_draft, file_hover, pointer);
         }
         MenuRow::ExitMode => {
-            ctx.set_font("14px sans-serif");
+            ctx.set_font("14px PT Root UI");
             ctx.set_text_baseline(TextBaseline::Middle);
             // Pill stays inside the row. The label holder ends where the pill starts.
             let pill_h = 26.0;
             let (px, pill_w) = exit_pill_box(w);
             let py = ry + (lr.h - pill_h) / 2.0;
-            ctx.set_fill_color(FG);
+            ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
             ctx.set_text_align(TextAlign::Left);
             fill_clipped(ctx, "EXIT", 20.0, ry + lr.h / 2.0, 12.0, ry, (px - 16.0).max(0.0), lr.h);
             ctx.set_fill_color("rgba(255,255,255,0.05)");
@@ -760,7 +751,7 @@ fn draw_row(
             ctx.fill_rect(active_x, py, half, pill_h);
             ctx.set_fill_color(AMBER);
             ctx.fill_rect(active_x, py + pill_h - 2.0, half, 2.0);
-            ctx.set_font("12px sans-serif");
+            ctx.set_font("12px PT Root UI");
             ctx.set_text_align(TextAlign::Center);
             ctx.set_fill_color(if exit_auto { AMBER } else { MUTED });
             fill_clipped(ctx, "Auto", px + half / 2.0, py + pill_h / 2.0, px, py, half, pill_h);
@@ -782,7 +773,7 @@ fn draw_row(
                 ctx.set_fill_color(if sel { "rgba(251,178,106,0.18)" } else { "rgba(255,255,255,0.05)" });
                 ctx.fill_rect(cell.x, cell.y, cell.width, cell.height);
                 ctx.set_fill_color(if sel { AMBER } else { FG });
-                ctx.set_font("12px sans-serif");
+                ctx.set_font("12px PT Root UI");
                 ctx.set_text_align(TextAlign::Center);
                 ctx.set_text_baseline(TextBaseline::Middle);
                 fill_clipped(
@@ -809,13 +800,13 @@ fn draw_row(
                 MenuAction::ImportQrClip => "Import  ·  paste QR",
             };
             ctx.set_fill_color(AMBER);
-            ctx.set_font("14px sans-serif");
+            ctx.set_font("14px PT Root UI");
             ctx.set_text_align(TextAlign::Left);
             ctx.set_text_baseline(TextBaseline::Middle);
             fill_clipped(ctx, label, 20.0, ry + lr.h / 2.0, 12.0, ry, (w - 44.0).max(0.0), lr.h);
             ctx.set_fill_color(DIMC);
             ctx.set_text_align(TextAlign::Right);
-            ctx.set_font("15px sans-serif");
+            ctx.set_font("15px PT Root UI");
             fill_clipped(ctx, "›", w - 18.0, ry + lr.h / 2.0, w - 36.0, ry, 24.0, lr.h);
         }
         MenuRow::Bind => {
@@ -858,15 +849,15 @@ fn draw_bind_row(
         let by = ry + (h - bh) / 2.0;
         let unlink_w = (w - 16.0 - unlink_x).max(0.0);
         let name_right = if cabinet { cabinet_button_x(w) } else { unlink_x };
-        ctx.set_font("14px sans-serif");
-        ctx.set_text_baseline(TextBaseline::Middle);
+        ctx.set_font("14px PT Root UI");
+        ctx.set_text_baseline(TextBaseline::Alphabetic);
         ctx.set_text_align(TextAlign::Left);
-        ctx.set_fill_color(FG);
+        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
         fill_clipped(
             ctx,
             bound_name.unwrap_or(""),
             16.0,
-            ry + h / 2.0,
+            crate::theme::label_baseline(ry, h, 14.0),
             12.0,
             ry,
             (name_right - 20.0).max(0.0),
@@ -877,32 +868,35 @@ fn draw_bind_row(
             let cabinet_w = (unlink_x - 6.0 - cabinet_x).max(0.0);
             ctx.set_fill_color("rgba(255,255,255,0.08)");
             ctx.fill_rect(cabinet_x, by, cabinet_w, bh);
-            ctx.set_fill_color(FG);
+            ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
             ctx.set_text_align(TextAlign::Center);
             fill_clipped(
                 ctx,
                 crate::text::tr("mode.mesh"),
                 cabinet_x + cabinet_w / 2.0,
-                by + bh / 2.0,
+                crate::theme::label_baseline(by, bh, 14.0),
                 cabinet_x,
                 by,
                 cabinet_w,
                 bh,
             );
         }
-        ctx.set_fill_color(if unlink_armed {
-            "rgba(251,178,106,0.28)"
+        if crate::theme::light() {
+            ctx.set_fill_color("#1c1c1f");
+            ctx.fill_rounded_rect(unlink_x, by, unlink_w, bh, 12.0);
+            ctx.set_fill_color("#ffffff");
         } else {
-            "rgba(251,178,106,0.16)"
-        });
-        ctx.fill_rect(unlink_x, by, unlink_w, bh);
-        ctx.set_fill_color(AMBER);
+            ctx.set_fill_color(AMBER);
+            ctx.fill_rounded_rect(unlink_x, by, unlink_w, bh, 12.0);
+            ctx.set_fill_color("#1a1208");
+        }
+        ctx.set_font("12px PT Root UI");
         ctx.set_text_align(TextAlign::Center);
         fill_clipped(
             ctx,
             button,
             unlink_x + unlink_w / 2.0,
-            by + bh / 2.0,
+            crate::theme::label_baseline(by, bh, 12.0),
             unlink_x,
             by,
             unlink_w,
@@ -915,39 +909,44 @@ fn draw_bind_row(
     let field_w = (button_x - 8.0 - field_x).max(0.0);
     let field_h = 32.0;
     let field_y = ry + (h - field_h) / 2.0;
-    ctx.set_font("14px sans-serif");
-    ctx.set_text_baseline(TextBaseline::Middle);
-    ctx.set_fill_color(FG);
+    ctx.set_font("14px PT Root UI");
+    ctx.set_text_baseline(TextBaseline::Alphabetic);
+    ctx.set_fill_color(if crate::theme::light() { "#5c5c64" } else { DIMC });
     ctx.set_text_align(TextAlign::Left);
-    fill_clipped(ctx, crate::text::tr("mode.mesh"), 16.0, ry + h / 2.0, 8.0, ry, 96.0, h);
-    ctx.set_fill_color(if focused { "rgba(251,178,106,0.10)" } else { "rgba(255,255,255,0.05)" });
-    ctx.fill_rect(field_x, field_y, field_w, field_h);
-    if focused {
-        ctx.set_fill_color(AMBER);
-        ctx.fill_rect(field_x, field_y + field_h - 2.0, field_w, 2.0);
-    }
-    ctx.set_font("14px sans-serif");
+    fill_clipped(ctx, crate::text::tr("mode.mesh"), 16.0, crate::theme::label_baseline(ry, h, 14.0), 8.0, ry, 96.0, h);
+    let (field_fill, field_line) = if crate::theme::light() {
+        ("rgba(255,255,255,0.55)", "rgba(255,255,255,0.75)")
+    } else {
+        ("rgba(24,24,28,0.82)", "rgba(255,255,255,0.38)")
+    };
+    ctx.set_fill_color(field_fill);
+    ctx.fill_rounded_rect(field_x, field_y, field_w, field_h, 10.0);
+    ctx.set_stroke_color(field_line);
+    ctx.set_stroke_width(1.0);
+    ctx.set_line_dash(&[]);
+    ctx.stroke_rounded_rect(field_x, field_y, field_w, field_h, 10.0);
+    ctx.set_font("14px PT Root UI");
     ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Middle);
+    ctx.set_text_baseline(TextBaseline::Alphabetic);
     if draft.is_empty() {
         ctx.set_fill_color(DIMC);
         fill_clipped(
             ctx,
             crate::text::tr("bind.ph"),
             field_x + 8.0,
-            field_y + field_h / 2.0,
+            crate::theme::label_baseline(field_y, field_h, 14.0),
             field_x + 4.0,
             field_y,
             (field_w - 8.0).max(0.0),
             field_h,
         );
     } else {
-        ctx.set_fill_color(FG);
+        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
         fill_clipped(
             ctx,
             draft,
             field_x + 8.0,
-            field_y + field_h / 2.0,
+            crate::theme::label_baseline(field_y, field_h, 14.0),
             field_x + 4.0,
             field_y,
             (field_w - 12.0).max(0.0),
@@ -956,14 +955,20 @@ fn draw_bind_row(
     }
     if focused {
         let caret_x = (field_x + 8.0 + draft.chars().count() as f64 * 7.2).min(field_x + field_w - 6.0);
-        ctx.set_fill_color(AMBER);
+        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { AMBER });
         ctx.fill_rect(caret_x, field_y + 6.0, 1.0, (field_h - 12.0).max(0.0));
     }
     let bind_w = 92.0;
-    ctx.set_fill_color("rgba(251,178,106,0.16)");
-    ctx.fill_rect(button_x, field_y, bind_w, field_h);
-    ctx.set_fill_color(AMBER);
-    ctx.set_font("12px sans-serif");
+    if crate::theme::light() {
+        ctx.set_fill_color("#1c1c1f");
+        ctx.fill_rounded_rect(button_x, field_y, bind_w, field_h, 12.0);
+        ctx.set_fill_color("#ffffff");
+    } else {
+        ctx.set_fill_color(AMBER);
+        ctx.fill_rounded_rect(button_x, field_y, bind_w, field_h, 12.0);
+        ctx.set_fill_color("#1a1208");
+    }
+    ctx.set_font("12px PT Root UI");
     ctx.set_text_align(TextAlign::Center);
-    fill_clipped(ctx, crate::text::tr("bind.go"), button_x + bind_w / 2.0, field_y + field_h / 2.0, button_x, field_y, bind_w, field_h);
+    fill_clipped(ctx, crate::text::tr("bind.go"), button_x + bind_w / 2.0, crate::theme::label_baseline(field_y, field_h, 12.0), button_x, field_y, bind_w, field_h);
 }

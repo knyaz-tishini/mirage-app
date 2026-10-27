@@ -82,6 +82,9 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "f.app" => ("приложение", "app"),
         "f.process" => ("процесс", "process"),
         "f.lang" => ("язык", "language"),
+        "f.style" => ("стиль", "style"),
+        "theme.light" => ("светлая", "light"),
+        "theme.dark" => ("тёмная", "dark"),
 
         "b.install" => ("установить", "install"),
         "b.installing" => ("ставится…", "installing…"),
