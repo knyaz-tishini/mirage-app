@@ -48,7 +48,7 @@ const SEG_H: f64 = 30.0;
 // Straight RGBA of assets/palm.svg at 64. The caption slot is ICON_SMALL:
 // a 256 bitmap there is what Windows crushes. The exe icon carries
 // 16/32/48/64/128/256 from the same vectors for the taskbar and Alt-Tab.
-// The menu mark itself is the SVG, not this bitmap.
+// The menu mark is the baked raster in palm_mark, not this bitmap.
 const PALM_W: u32 = 64;
 const PALM: &[u8] = include_bytes!("palm64.rgba");
 

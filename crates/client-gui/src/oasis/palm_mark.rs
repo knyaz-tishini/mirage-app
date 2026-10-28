@@ -1,6 +1,6 @@
-//! Menu mark. Vectors from `assets/palm.svg`, parsed once. The same file is
-//! rasterized only where a platform asks for pixels: the exe icon, the tray,
-//! the window icon, and the Apple icon set.
+//! Menu mark. Vectors from `assets/palm.svg`, parsed once and baked to a
+//! raster. Drawn live, the 1px trace lets the sheet show through. The same
+//! file is what the exe, tray, window, and Apple icons rasterize.
 
 use std::sync::OnceLock;
 
@@ -26,7 +26,52 @@ struct Mark {
     shapes: Vec<Shape>,
 }
 
+/// Source bake and the bitmap the menu actually blits. The trace is 1px
+/// stairs in a 1024 viewBox. At menu size a stair is a fraction of a pixel,
+/// and each seam composites against the sheet. Bake on transparent and
+/// box-filter so a seam is averaged into the neighbouring fill.
+const BAKE_PX: u32 = 512;
+const MARK_PX: u32 = 128;
+
+struct Baked {
+    bytes: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
 pub fn paint(ctx: &mut dyn RenderContext, x: f64, y: f64, w: f64, h: f64) {
+    if let Some(img) = baked() {
+        if let Some(painter) = ctx.image_painter() {
+            painter.draw_image_rgba(&img.bytes, img.w, img.h, x, y, w, h);
+            return;
+        }
+    }
+    paint_vectors(ctx, x, y, w, h);
+}
+
+fn baked() -> Option<&'static Baked> {
+    static SLOT: OnceLock<Option<Baked>> = OnceLock::new();
+    SLOT.get_or_init(bake).as_ref()
+}
+
+fn bake() -> Option<Baked> {
+    let mut ctx = uzor_render_urx::UrxRenderContext::new(1.0);
+    ctx.begin_frame(BAKE_PX, BAKE_PX);
+    paint_vectors(&mut ctx, 0.0, 0.0, BAKE_PX as f64, BAKE_PX as f64);
+    let scene = ctx.take_scene();
+    let mut pixmap = uzor_urx_cpu::Pixmap::new(BAKE_PX, BAKE_PX);
+    if uzor_urx_cpu::CpuBackend::new().render(&scene, &mut pixmap).is_err() {
+        return None;
+    }
+    let straight = straighten(pixmap.pixels());
+    Some(Baked {
+        bytes: box_down(&straight, BAKE_PX, BAKE_PX, MARK_PX, MARK_PX),
+        w: MARK_PX,
+        h: MARK_PX,
+    })
+}
+
+fn paint_vectors(ctx: &mut dyn RenderContext, x: f64, y: f64, w: f64, h: f64) {
     let mark = mark();
     let s = w.min(h) / 1024.0;
     let ox = x + (w - 1024.0 * s) * 0.5;
@@ -49,6 +94,58 @@ pub fn paint(ctx: &mut dyn RenderContext, x: f64, y: f64, w: f64, h: f64) {
             ctx.stroke();
         }
     }
+}
+
+/// Cpu pixmap stores premul RGB. The image draw premultiplies again.
+fn straighten(src: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; src.len()];
+    for (dst, px) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let a = px[3];
+        if a == 0 || a == 255 {
+            dst.copy_from_slice(px);
+            continue;
+        }
+        let lift = |c: u8| {
+            let v = (u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a);
+            v.min(255) as u8
+        };
+        dst[0] = lift(px[0]);
+        dst[1] = lift(px[1]);
+        dst[2] = lift(px[2]);
+        dst[3] = a;
+    }
+    out
+}
+
+fn box_down(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let sx = (sw / dw) as usize;
+    let sy = (sh / dh) as usize;
+    let sw = sw as usize;
+    let dw = dw as usize;
+    let dh = dh as usize;
+    let n = (sx * sy) as u32;
+    let mut out = vec![0u8; dw * dh * 4];
+    for y in 0..dh {
+        for x in 0..dw {
+            let mut acc = [0u32; 4];
+            for yy in 0..sy {
+                let row = (y * sy + yy) * sw;
+                for xx in 0..sx {
+                    let i = (row + x * sx + xx) * 4;
+                    acc[0] += u32::from(src[i]);
+                    acc[1] += u32::from(src[i + 1]);
+                    acc[2] += u32::from(src[i + 2]);
+                    acc[3] += u32::from(src[i + 3]);
+                }
+            }
+            let o = (y * dw + x) * 4;
+            out[o] = ((acc[0] + n / 2) / n) as u8;
+            out[o + 1] = ((acc[1] + n / 2) / n) as u8;
+            out[o + 2] = ((acc[2] + n / 2) / n) as u8;
+            out[o + 3] = ((acc[3] + n / 2) / n) as u8;
+        }
+    }
+    out
 }
 
 fn trace(ctx: &mut dyn RenderContext, shape: &Shape, ox: f64, oy: f64, s: f64, tx: f64, ty: f64) {
