@@ -15,7 +15,7 @@ use uzor::render::{RenderContext, TextAlign, TextBaseline};
 use uzor::{Rect, WidgetId};
 use uzor_framework::handle::VisualView;
 
-use super::provision::{self, InstallBus, Job};
+use mirage_client_chain::provision::{self, InstallBus, Job};
 use crate::shell::menu::Geom;
 use crate::text::tr;
 

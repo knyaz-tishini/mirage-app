@@ -3281,6 +3281,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirage-client-chain"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.6",
+ "russh",
+ "russh-keys",
+ "russh-sftp",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ssh-key",
+ "tokio",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "mirage-client-gui"
 version = "0.1.8"
 dependencies = [
@@ -3291,6 +3310,7 @@ dependencies = [
  "embed-manifest",
  "hex",
  "image",
+ "mirage-client-chain",
  "nokhwa",
  "qrcode",
  "rand 0.8.6",

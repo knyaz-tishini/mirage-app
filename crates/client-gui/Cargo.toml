@@ -60,6 +60,11 @@ tokio                   = { version = "1", features = ["rt", "rt-multi-thread", 
 tracing                 = "0.1"
 tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
 
+# The chain of boxes, its installer and the installer's copy — one crate,
+# shared with the headless client. The GUI is a consumer of it, never a
+# second copy of it.
+mirage-client-chain     = { path = "../mirage-client-chain" }
+
 # Config import: parse/validate, file picker, clipboard (text + image).
 serde_json              = "1"
 # QR decode (pure Rust, no platform deps — safe for the isolated workspace).

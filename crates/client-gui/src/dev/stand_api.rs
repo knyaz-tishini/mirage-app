@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::oasis::chain_install;
-use crate::oasis::provision::ProposedFace;
+use mirage_client_chain::chain_install;
+use mirage_client_chain::provision::ProposedFace;
 use crate::oasis::stand::{split_host, Proto, Stand};
 
 /// Port the control API listens on when nothing else is asked for.

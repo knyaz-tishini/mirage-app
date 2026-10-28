@@ -18,10 +18,14 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use mirage_control_plane::ExitPreference;
+use mirage_client_chain::chain_install::{self, ChainRequest};
+use mirage_client_chain::provision::InstallBus;
 use mirage_subscriber_client::{
     control, exit_preference_from_mode, http_connect, publish_fatal, tun_mode, EdgeReason,
     EdgeSession, EdgeState, EgressScope, EntranceArtefact, SubscriberClient, SubscriberClientError,
@@ -131,6 +135,36 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Build a chain of boxes: install every box, wire them into one relay
+    /// path, and write the chain down.
+    ///
+    /// No session is opened and no traffic is carried — the chain is written
+    /// for the client that dials it. The FIRST box is the edge the customer
+    /// talks to; the boxes after it are the hops the traffic walks.
+    Chain {
+        /// The chain's id. Written into every box of the chain.
+        #[arg(long, default_value = "stand")]
+        chain_id: String,
+        /// The boxes of the chain, edge first: `user@host:port`. One flag per
+        /// box, in the order the traffic walks them.
+        #[arg(long = "box", value_name = "USER@HOST:PORT")]
+        boxes: Vec<String>,
+        /// The password of the boxes' SSH door. Used once per box to plant
+        /// the key, then dropped — it is not written anywhere.
+        #[arg(long)]
+        password: Option<String>,
+        /// A file with the password, for when the password must not sit in
+        /// the shell's history.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+        /// The base `server.env` every box needs for itself — the stack, the
+        /// protocols, the ports, the masks. The chain is appended to it.
+        #[arg(long)]
+        base_env: Option<PathBuf>,
+        /// Where the chain is written: `chain.json` and `link.txt`.
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+    },
 }
 
 /// Standard L0 panic catcher (matches every other binary in this
@@ -191,6 +225,28 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
+    // A chain is built before anything is dialled: it needs no artefact and
+    // opens no session, so it is answered before the artefact is demanded.
+    if let Some(Command::Chain {
+        chain_id,
+        boxes,
+        password,
+        password_file,
+        base_env,
+        out,
+    }) = &args.command
+    {
+        return run_chain(
+            chain_id,
+            boxes,
+            password.as_deref(),
+            password_file.as_deref(),
+            base_env.as_deref(),
+            out,
+        )
+        .await;
+    }
+
     if let Some(Command::Claim { panel, claim, qr, poll, out }) = &args.command {
         if qr.is_some() && claim.is_some() {
             error!("refusing: pass a code, a link, or one qr image");
@@ -232,6 +288,7 @@ async fn main() -> ExitCode {
     match &args.command {
         Some(Command::Countries) => run_countries(&artefact).await,
         Some(Command::Claim { .. }) => ExitCode::FAILURE,
+        Some(Command::Chain { .. }) => ExitCode::FAILURE,
         None => run_proxy(&artefact, &args).await,
     }
 }
@@ -996,4 +1053,158 @@ async fn run_claim(panel: &str, claim: Option<&str>, poll: Option<&str>, out: &P
         error!(status = state, "credential was already delivered");
         return ExitCode::FAILURE;
     }
+}
+
+/// Build a chain of boxes and write it down.
+///
+/// The boxes are installed first, each on its own, and only then is the chain
+/// written into them: a hop cannot be told about a neighbour that nobody has
+/// installed yet. The chain's key material is minted here, and the mesh id is
+/// the EDGE's own — taken from the edge's link — so the chain's legs match
+/// the link the customer dials.
+async fn run_chain(
+    chain_id: &str,
+    boxes: &[String],
+    password: Option<&str>,
+    password_file: Option<&Path>,
+    base_env_file: Option<&Path>,
+    out: &Path,
+) -> ExitCode {
+    if boxes.is_empty() {
+        error!("refusing: a chain needs at least one box (--box)");
+        return ExitCode::FAILURE;
+    }
+    let password = match (password, password_file) {
+        (Some(_), Some(_)) => {
+            error!("refusing: pass --password or --password-file, not both");
+            return ExitCode::FAILURE;
+        }
+        (Some(password), None) => password.to_owned(),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(text) => text.trim_end_matches(['\r', '\n']).to_owned(),
+            Err(err) => {
+                error!(path = %path.display(), error = %err, "cannot read the password file");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => String::new(),
+    };
+    let mut requests: Vec<ChainRequest> = Vec::with_capacity(boxes.len());
+    for spec in boxes {
+        match parse_box(spec) {
+            Ok(mut request) => {
+                request.password = password.clone();
+                requests.push(request);
+            }
+            Err(err) => {
+                error!(box = %spec, error = %err, "refusing: bad box");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let base_env = match base_env_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                error!(path = %path.display(), error = %err, "cannot read the base env");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => String::new(),
+    };
+
+    let bus = Arc::new(InstallBus::new());
+    let stop = watch_progress(Arc::clone(&bus));
+    let outcome = chain_install::install_chain(chain_id, &requests, &base_env, bus.as_ref()).await;
+    stop.store(true, Ordering::Relaxed);
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            error!(error = %err, "the chain did not come up");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("chain {} is up", outcome.chain.chain_id);
+    for (index, box_) in outcome.boxes.iter().enumerate() {
+        println!(
+            "  {}. {} {} door {} ({} doors)",
+            index + 1,
+            box_.role.as_env(),
+            box_.host,
+            box_.face.addr,
+            box_.faces
+        );
+    }
+    if let Err(err) = chain_install::save_chain(out, &outcome) {
+        error!(dir = %out.display(), error = %err, "cannot write the chain");
+        return ExitCode::FAILURE;
+    }
+    if let Err(err) = std::fs::write(out.join("link.txt"), outcome.link.as_bytes()) {
+        error!(dir = %out.display(), error = %err, "cannot write the link");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "wrote {} and {}",
+        out.join("chain.json").display(),
+        out.join("link.txt").display()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Print the installer's status line as it changes.
+///
+/// The installer writes its progress into the bus, and a headless run has no
+/// window to show it in — so the line is printed as it changes. The operator
+/// sees that the box is checking its ports instead of a silent minute.
+fn watch_progress(bus: Arc<InstallBus>) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        let mut last = String::new();
+        while !flag.load(Ordering::Relaxed) {
+            let line = bus.text.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if !line.is_empty() && line != last {
+                println!("... {line}");
+                last = line;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+    stop
+}
+
+/// One box of the chain, as it was named on the command line.
+///
+/// `user@host:port`, or `host:port` for the root login on the standard SSH
+/// port. An IPv6 address goes in brackets, the way a URL does.
+fn parse_box(spec: &str) -> Result<ChainRequest, String> {
+    let (user, rest) = match spec.split_once('@') {
+        Some((user, rest)) => (user.to_owned(), rest.to_owned()),
+        None => ("root".to_owned(), spec.to_owned()),
+    };
+    if user.trim().is_empty() {
+        return Err("no login".to_owned());
+    }
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => {
+            let port: u16 = port
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad port {port}"))?;
+            let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+            (host.to_owned(), port)
+        }
+        None => (rest.trim().to_owned(), 22),
+    };
+    if host.trim().is_empty() {
+        return Err("no host".to_owned());
+    }
+    Ok(ChainRequest {
+        host: host.trim().to_owned(),
+        port,
+        user: user.trim().to_owned(),
+        password: String::new(),
+    })
 }

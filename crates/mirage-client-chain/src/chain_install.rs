@@ -41,8 +41,8 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use super::chain::{Chain, ChainBox, ChainFace, ChainKeys, ChainRole};
-use super::provision::{self, InstallBus, Job, Outcome};
+use crate::chain::{Chain, ChainBox, ChainFace, ChainKeys, ChainRole};
+use crate::provision::{self, InstallBus, Job, Outcome};
 
 /// The camouflage types that speak UDP rather than TCP.
 ///
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn an_address_becomes_a_name_and_not_a_path() {
-        assert_eq!(sanitize("144.172.115.106"), "144.172.115.106");
+        assert_eq!(sanitize("192.0.2.10"), "192.0.2.10");
         assert_eq!(sanitize("10.0.0.1:443"), "10.0.0.1_443");
         assert_eq!(sanitize("../etc"), ".._etc");
         assert_eq!(sanitize(""), "box");

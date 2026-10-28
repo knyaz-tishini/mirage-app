@@ -12,6 +12,9 @@ mirage-protocol      = { workspace = true }
 mirage-client-core   = { workspace = true }
 mirage-control-plane = { workspace = true }
 mirage-mux           = { workspace = true }
+# The chain of boxes and its installer — the same crate the desktop client
+# builds its chains with, so a chain built here is the chain it reads.
+mirage-client-chain   = { path = "../mirage-client-chain" }
 tokio                = { workspace = true }
 tracing              = { workspace = true }
 tracing-subscriber   = { workspace = true }

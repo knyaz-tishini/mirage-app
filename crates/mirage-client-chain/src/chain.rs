@@ -394,14 +394,14 @@ mod tests {
             chain_id: "stand-2hop".to_owned(),
             boxes: vec![
                 ChainBox {
-                    host: "144.172.115.106".to_owned(),
+                    host: "192.0.2.10".to_owned(),
                     user: "root".to_owned(),
-                    face: face("144.172.115.106:443"),
+                    face: face("192.0.2.10:443"),
                 },
                 ChainBox {
-                    host: "144.172.105.29".to_owned(),
+                    host: "192.0.2.20".to_owned(),
                     user: "root".to_owned(),
-                    face: face("144.172.105.29:443"),
+                    face: face("192.0.2.20:443"),
                 },
             ],
             keys: keys(),
@@ -522,7 +522,7 @@ mod tests {
 
         // The edge is not a hop of its own chain: only the second box is.
         for env in [&edge, &hop] {
-            assert!(env.contains("MIRAGE_CHAIN_HOP_0_ADDR=144.172.105.29:443"));
+            assert!(env.contains("MIRAGE_CHAIN_HOP_0_ADDR=192.0.2.20:443"));
             assert!(env.contains(&format!("MIRAGE_CHAIN_HOP_0_PUBKEY={}", "22".repeat(32))));
             assert!(env.contains("MIRAGE_CHAIN_HOP_0_MASK="));
             assert!(!env.contains("MIRAGE_CHAIN_HOP_1_"), "the edge is not a hop");

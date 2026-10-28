@@ -136,7 +136,7 @@ pub fn start(job: Job, bus: Arc<InstallBus>) {
     if bus.running.swap(true, Ordering::Relaxed) {
         return;
     }
-    set_text(&bus, crate::text::tr("p.connect"));
+    set_text(&bus, crate::i18n::tr("p.connect"));
     std::thread::spawn(move || {
         let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt.block_on(install(job, &bus)),
@@ -145,11 +145,11 @@ pub fn start(job: Job, bus: Arc<InstallBus>) {
         match outcome {
             Ok(Outcome::Faces { faces, warn }) => {
                 *bus.faces.lock().unwrap_or_else(|p| p.into_inner()) = Some(faces);
-                set_text(&bus, &status_line(crate::text::tr("p.faces_review"), warn));
+                set_text(&bus, &status_line(crate::i18n::tr("p.faces_review"), warn));
             }
             Ok(Outcome::Link { link, warn }) => {
                 *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(link);
-                set_text(&bus, &status_line(crate::text::tr("p.up"), warn));
+                set_text(&bus, &status_line(crate::i18n::tr("p.up"), warn));
             }
             Err(err) => set_text(&bus, &err),
         }
@@ -176,14 +176,14 @@ pub fn remove(host: String, port: u16, user: String, bus: Arc<InstallBus>) {
     if bus.running.swap(true, Ordering::Relaxed) {
         return;
     }
-    set_text(&bus, crate::text::tr("p.removing"));
+    set_text(&bus, crate::i18n::tr("p.removing"));
     std::thread::spawn(move || {
         let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt.block_on(take_down(&host, port, &user)),
             Err(err) => Err(format!("runtime: {err}")),
         };
         match outcome {
-            Ok(()) => set_text(&bus, crate::text::tr("p.removed")),
+            Ok(()) => set_text(&bus, crate::i18n::tr("p.removed")),
             Err(err) => set_text(&bus, &err),
         }
         bus.running.store(false, Ordering::Relaxed);
@@ -194,7 +194,7 @@ async fn take_down(host: &str, port: u16, user: &str) -> Result<(), String> {
     let dir = state_dir()?;
     let key_path = dir.join("server.key");
     if !key_path.is_file() {
-        return Err(crate::text::tr("p.no_key").into());
+        return Err(crate::i18n::tr("p.no_key").into());
     }
     let pem = fs::read(&key_path).map_err(|e| format!("key: {e}"))?;
     let pins = dir.join("host-keys.json");
@@ -205,9 +205,9 @@ async fn take_down(host: &str, port: u16, user: &str) -> Result<(), String> {
     if out.exit.unwrap_or(1) != 0 {
         let err = out.stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
         if err.is_empty() {
-            return Err(format!("{}: exit {:?}", crate::text::tr("p.remove_fail"), out.exit));
+            return Err(format!("{}: exit {:?}", crate::i18n::tr("p.remove_fail"), out.exit));
         }
-        return Err(format!("{}: {err}", crate::text::tr("p.remove_fail")));
+        return Err(format!("{}: {err}", crate::i18n::tr("p.remove_fail")));
     }
     Ok(())
 }
@@ -234,7 +234,7 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
             if job.password.is_empty() {
                 return Err(key_err);
             }
-            set_text(bus, crate::text::tr("p.key_on"));
+            set_text(bus, crate::i18n::tr("p.key_on"));
             let password = job.password.clone();
             password_install_key_when_ready(
                 &addr,
@@ -276,7 +276,7 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
     // The image goes up once. The second press of "install" must not push a
     // hundred megabytes again to change one port.
     if let Some(tar) = image_tar() {
-        set_text(bus, crate::text::tr("p.image"));
+        set_text(bus, crate::i18n::tr("p.image"));
         if !remote_has(&session, &format!("{remote}/image.tar")).await {
             let bytes = fs::read(&tar).map_err(|e| format!("image tar: {e}"))?;
             upload(&session, &bytes, &format!("{remote}/image.tar")).await?;
@@ -288,13 +288,13 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         // published yet — the person chooses, and the second press carries
         // the choice out.
         upload(&session, faces_sh().as_bytes(), &format!("{remote}/faces.sh")).await?;
-        set_text(bus, crate::text::tr("p.ports"));
+        set_text(bus, crate::i18n::tr("p.ports"));
         let out = tokio::time::timeout(
             INSTALL_TIMEOUT,
             exec(&session, &format!("sh {remote}/faces.sh")),
         )
         .await
-        .map_err(|_| crate::text::tr("p.faces_timeout").to_owned())??;
+        .map_err(|_| crate::i18n::tr("p.faces_timeout").to_owned())??;
         let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
         if out.exit.unwrap_or(1) != 0 {
             let err = out
@@ -304,9 +304,9 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
                 .find(|line| !line.trim().is_empty())
                 .unwrap_or("");
             return Err(if err.is_empty() {
-                format!("{} (exit {:?})", crate::text::tr("p.no_proposal"), out.exit)
+                format!("{} (exit {:?})", crate::i18n::tr("p.no_proposal"), out.exit)
             } else {
-                format!("{}: {err}", crate::text::tr("p.no_proposal"))
+                format!("{}: {err}", crate::i18n::tr("p.no_proposal"))
             });
         }
         return Ok(Outcome::Faces {
@@ -330,13 +330,13 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
     }
 
     // Step two: the box comes up with the faces the person chose.
-    set_text(bus, crate::text::tr("p.container"));
+    set_text(bus, crate::i18n::tr("p.container"));
     let out = tokio::time::timeout(
         INSTALL_TIMEOUT,
         exec(&session, &format!("sh {remote}/install.sh")),
     )
     .await
-    .map_err(|_| crate::text::tr("p.install_timeout").to_owned())?
+    .map_err(|_| crate::i18n::tr("p.install_timeout").to_owned())?
     .map_err(|err| with_warning(err, &warning))?;
     // The last word on the password door: the first attempt ran before the
     // container came up, and a box that was busy then may be free now.
@@ -352,9 +352,9 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         .ok_or_else(|| {
             let err = out.stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
             let text = if err.is_empty() {
-                format!("{} (exit {:?})", crate::text::tr("p.no_link"), out.exit)
+                format!("{} (exit {:?})", crate::i18n::tr("p.no_link"), out.exit)
             } else {
-                format!("{}: {err}", crate::text::tr("p.no_link"))
+                format!("{}: {err}", crate::i18n::tr("p.no_link"))
             };
             with_warning(text, &warning)
         })?;
@@ -600,7 +600,7 @@ fn parse_faces(stdout: &str) -> Result<Vec<ProposedFace>, String> {
         }
     }
     if body.trim().is_empty() {
-        return Err(crate::text::tr("p.no_faces_doc").into());
+        return Err(crate::i18n::tr("p.no_faces_doc").into());
     }
     parse_proposal(&body)
 }
@@ -608,9 +608,9 @@ fn parse_faces(stdout: &str) -> Result<Vec<ProposedFace>, String> {
 /// Read the proposal file the box writes.
 fn parse_proposal(text: &str) -> Result<Vec<ProposedFace>, String> {
     let proposal: FaceProposal =
-        toml::from_str(text).map_err(|e| format!("{}: {e}", crate::text::tr("p.faces_bad")))?;
+        toml::from_str(text).map_err(|e| format!("{}: {e}", crate::i18n::tr("p.faces_bad")))?;
     if proposal.faces.is_empty() {
-        return Err(crate::text::tr("p.no_face").into());
+        return Err(crate::i18n::tr("p.no_face").into());
     }
     Ok(proposal.faces)
 }
@@ -735,7 +735,7 @@ async fn connect_key(
         .await
         .map_err(|e| format!("ssh: {e}"))?;
     if !ok {
-        return Err(crate::text::tr("p.ssh_key").into());
+        return Err(crate::i18n::tr("p.ssh_key").into());
     }
     Ok(session)
 }
@@ -753,7 +753,7 @@ async fn password_install_key(
         .await
         .map_err(|e| format!("ssh: {e}"))?;
     if !ok {
-        return Err(crate::text::tr("p.ssh_pass").into());
+        return Err(crate::i18n::tr("p.ssh_pass").into());
     }
     let cmd = format!(
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && (grep -qF {q} ~/.ssh/authorized_keys 2>/dev/null || echo {q} >> ~/.ssh/authorized_keys) && chmod 600 ~/.ssh/authorized_keys",
@@ -764,9 +764,9 @@ async fn password_install_key(
     if out.exit.unwrap_or(1) != 0 {
         let err = out.stderr.trim();
         return Err(if err.is_empty() {
-            crate::text::tr("p.key_write").into()
+            crate::i18n::tr("p.key_write").into()
         } else {
-            format!("{}: {err}", crate::text::tr("p.key_write"))
+            format!("{}: {err}", crate::i18n::tr("p.key_write"))
         });
     }
     Ok(())
@@ -821,7 +821,7 @@ where
             Err(err) => {
                 last = err;
                 if attempt < attempts.max(1) {
-                    set_text(bus, crate::text::tr("p.pass_retry"));
+                    set_text(bus, crate::i18n::tr("p.pass_retry"));
                     tokio::time::sleep(wait).await;
                 }
             }
@@ -842,10 +842,10 @@ async fn connect(addr: &str, pins: &Path) -> Result<client::Handle<Handler>, Str
         ..Default::default()
     });
     match tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, addr, handler)).await {
-        Err(_) => Err(format!("ssh {addr}: {}", crate::text::tr("p.ssh_timeout"))),
+        Err(_) => Err(format!("ssh {addr}: {}", crate::i18n::tr("p.ssh_timeout"))),
         Ok(Err(err)) => {
             if mismatch.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
-                Err(format!("ssh {addr}: {}", crate::text::tr("p.ssh_host")))
+                Err(format!("ssh {addr}: {}", crate::i18n::tr("p.ssh_host")))
             } else {
                 Err(format!("ssh {addr}: {err}"))
             }
@@ -900,7 +900,7 @@ async fn upload(session: &client::Handle<Handler>, bytes: &[u8], remote: &str) -
     let meta = sftp.metadata(&tmp).await.map_err(|e| format!("sftp stat: {e}"))?;
     if meta.size.unwrap_or(0) != bytes.len() as u64 {
         let _ = sftp.remove_file(&tmp).await;
-        return Err(format!("sftp {remote}: {}", crate::text::tr("p.sftp_size")));
+        return Err(format!("sftp {remote}: {}", crate::i18n::tr("p.sftp_size")));
     }
     // Permissions only. A default FileAttributes sets size to 0 and truncates.
     let attrs = russh_sftp::protocol::FileAttributes {
@@ -1260,7 +1260,7 @@ why = "443/UDP — там обычно весит QUIC."
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert_eq!(
             *bus.text.lock().unwrap_or_else(|p| p.into_inner()),
-            crate::text::tr("p.pass_retry"),
+            crate::i18n::tr("p.pass_retry"),
             "the wait has to be visible while it lasts"
         );
     }

@@ -30,9 +30,6 @@ use crate::backend::{EngineLink, LocalHttp};
 use crate::shell::menu::{self, MenuTab};
 
 mod palm_mark;
-pub(crate) mod chain;
-pub(crate) mod chain_install;
-pub(crate) mod provision;
 pub(crate) mod stand;
 
 use stand::Stand;

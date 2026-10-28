@@ -153,37 +153,9 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "cam.scan" => ("сканирую QR", "scanning QR"),
         "cam.cancel" => ("клик чтобы отменить", "click to cancel"),
 
-        "p.connect" => ("соединение", "connecting"),
-        "p.faces_review" => (
-            "бокс предложил лица — проверьте их и нажмите «установить» ещё раз",
-            "the box offered faces — check them and press install again",
-        ),
-        "p.up" => ("сервер поднят", "server is up"),
-        "p.removing" => ("снятие", "removing"),
-        "p.removed" => ("контейнер снят", "container removed"),
-        "p.no_key" => ("нет ключа", "no key"),
-        "p.remove_fail" => ("снятие", "remove"),
-        "p.key_on" => ("ключ на сервере", "key is on the server"),
-        "p.image" => ("образ", "image"),
-        "p.ports" => ("бокс смотрит свои порты", "the box is checking its ports"),
-        "p.faces_timeout" => ("предложение лиц дольше 15 минут", "face proposal took longer than 15 minutes"),
-        "p.no_proposal" => ("бокс не ответил предложением", "the box did not answer with a proposal"),
-        "p.install_timeout" => ("установка дольше 15 минут", "install took longer than 15 minutes"),
-        "p.container" => ("контейнер", "container"),
-        "p.no_link" => ("контейнер не отдал ссылку", "the container did not return a link"),
-        "p.no_faces_doc" => ("бокс не прислал предложение лиц", "the box did not send a face proposal"),
-        "p.faces_bad" => ("предложение лиц не прочитано", "face proposal could not be read"),
-        "p.no_face" => ("бокс не прислал ни одного лица", "the box did not send a face"),
-        "p.key_write" => ("не удалось записать ключ", "could not write the key"),
-        "p.ssh_pass" => ("ssh: пароль не принят", "ssh: password rejected"),
-        "p.pass_retry" => (
-            "бокс ещё не готов — пробуем пароль снова",
-            "the box is not ready yet — trying the password again",
-        ),
-        "p.ssh_key" => ("ssh: ключ не принят", "ssh: key rejected"),
-        "p.ssh_timeout" => ("таймаут", "timed out"),
-        "p.ssh_host" => ("ключ хоста сменился", "host key changed"),
-        "p.sftp_size" => ("размер не сошёлся", "size did not match"),
+        // The installer's own copy (`p.*`) lives with the installer, in
+        // `mirage_client_chain::i18n` — the GUI and the headless client read
+        // it from there, so the two can never say different things.
         _ => (id, id),
     }
 }
