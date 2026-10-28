@@ -1446,9 +1446,8 @@ fn nav_buttons(content: Rect) -> [NavBtn; 4] {
     let labels = [tr("nav.server"), tr("nav.proto"), tr("nav.access"), tr("nav.link")];
     const SECS: [Section; 4] = [Section::Server, Section::Protocols, Section::Access, Section::Link];
     let y = content.y + 6.0;
-    let gap = 6.0;
-    let x0 = content.x + 8.0;
-    let inner = (content.width - 16.0 - gap * 3.0).max(0.0);
+    let x0 = content.x + 16.0;
+    let inner = (content.width - 32.0).max(0.0);
     let w = inner / 4.0;
     let mut out = [NavBtn {
         id: IDS[0],
@@ -1461,7 +1460,7 @@ fn nav_buttons(content: Rect) -> [NavBtn; 4] {
             id: IDS[i],
             label: labels[i],
             section: SECS[i],
-            rect: Rect::new(x0 + i as f64 * (w + gap), y, w.max(0.0), 30.0),
+            rect: Rect::new(x0 + i as f64 * w, y, w.max(0.0), 30.0),
         };
     }
     out
@@ -1569,13 +1568,25 @@ pub fn paint(ctx: &mut dyn RenderContext, g: &Geom, stand: &Stand, _hot_sep: boo
 }
 
 fn paint_nav(ctx: &mut dyn RenderContext, content: Rect, section: Section) {
+    let nav = nav_buttons(content);
+    let track = Rect::new(
+        nav[0].rect.x,
+        nav[0].rect.y,
+        nav[3].rect.x + nav[3].rect.width - nav[0].rect.x,
+        nav[0].rect.height,
+    );
+    let active = nav.iter().find(|n| n.section == section).map(|n| n.rect).unwrap_or(nav[0].rect);
+    crate::theme::paint_segment(ctx, track, active);
     ctx.set_font("13px PT Root UI");
     ctx.set_text_align(TextAlign::Center);
     ctx.set_text_baseline(TextBaseline::Alphabetic);
-    for nav in nav_buttons(content) {
-        ctx.set_fill_color(if nav.section == section { fg() } else { dim() });
-        let y = crate::theme::label_baseline(nav.rect.y, nav.rect.height, 13.0);
-        ctx.fill_text(nav.label, nav.rect.x + nav.rect.width / 2.0, y);
+    let light = crate::theme::light();
+    let idle = if light { "#5c5c64" } else { "#b4b4bc" };
+    let hot = if light { "#141416" } else { "#f4f4f5" };
+    for btn in &nav {
+        ctx.set_fill_color(if btn.section == section { hot } else { idle });
+        let y = crate::theme::label_baseline(btn.rect.y, btn.rect.height, 13.0);
+        ctx.fill_text(btn.label, btn.rect.x + btn.rect.width / 2.0, y);
     }
 }
 

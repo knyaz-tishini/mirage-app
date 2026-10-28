@@ -5,6 +5,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use uzor::render::RenderContext;
+use uzor::Rect;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -40,6 +41,23 @@ pub fn cycle() {
     };
     CUR.store(next as u8, Ordering::Relaxed);
     let _ = write_stored(next);
+}
+
+/// Segmented switch, the same one the chrome uses for mesh / own server.
+/// `active` is the chosen cell in track coordinates. The fill sits inset
+/// so the track stays visible around it.
+pub fn paint_segment(ctx: &mut dyn RenderContext, track: Rect, active: Rect) {
+    let light = light();
+    ctx.set_fill_color(if light { "rgba(255,255,255,0.34)" } else { "rgba(255,255,255,0.18)" });
+    ctx.fill_rounded_rect(track.x, track.y, track.width, track.height, 10.0);
+    let cell = Rect::new(
+        active.x + 2.0,
+        active.y + 2.0,
+        (active.width - 4.0).max(0.0),
+        (active.height - 4.0).max(0.0),
+    );
+    ctx.set_fill_color(if light { "rgba(255,255,255,0.86)" } else { "rgba(255,255,255,0.32)" });
+    ctx.fill_rounded_rect(cell.x, cell.y, cell.width, cell.height, 8.0);
 }
 
 /// Alphabetic baseline that centres the em box in a row. Same line box as

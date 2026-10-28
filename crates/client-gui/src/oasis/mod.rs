@@ -1187,12 +1187,8 @@ fn paint_modes(render: &mut dyn RenderContext, cab: Rect, solo: Rect, product: P
     let y = cab.y;
     let w = solo.x + solo.width - cab.x;
     let h = cab.height;
-    render.set_fill_color(if light { "rgba(255,255,255,0.34)" } else { "rgba(255,255,255,0.18)" });
-    render.fill_rounded_rect(x, y, w, h, 10.0);
     let on = if product == Product::Cabinet { cab } else { solo };
-    let cell = Rect::new(on.x + 2.0, on.y + 2.0, (on.width - 4.0).max(0.0), (on.height - 4.0).max(0.0));
-    render.set_fill_color(if light { "rgba(255,255,255,0.86)" } else { "rgba(255,255,255,0.32)" });
-    render.fill_rounded_rect(cell.x, cell.y, cell.width, cell.height, 8.0);
+    crate::theme::paint_segment(render, Rect::new(x, y, w, h), on);
     render.set_font("13px PT Root UI");
     render.set_text_align(TextAlign::Center);
     render.set_text_baseline(TextBaseline::Alphabetic);
