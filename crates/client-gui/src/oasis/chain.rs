@@ -2,64 +2,80 @@
 //!
 //! # The shape of a chain
 //!
-//! A chain is a list of boxes, in the order the client's traffic walks it:
-//! the first box receives the client, the last one sends it out to the
-//! internet, and everything between relays onward. One box is a chain of
-//! one — the exit of its own one-hop chain.
+//! A chain is a list of boxes. The FIRST box is the EDGE — the box the
+//! customer talks to, the one that owns the chain and dials it. The boxes
+//! after it are the chain's HOPS: the edge dials the first hop, that hop
+//! dials the next one, and the last hop sends the traffic out to the
+//! internet.
 //!
-//! # Why every box gets the WHOLE chain
+//! The edge is NOT a hop of its own chain. It stands in front of the chain:
+//! the customer's link points at it, and the chain starts behind it.
 //!
-//! The client writes the same chain description to every box in it, and each
-//! box reads the same list — differing only in the box's own position:
+//! # What every box is told
+//!
+//! Every box of the chain is told the SAME chain — the same hop list, the
+//! same trust anchor, the same mesh id — and the boxes differ in two lines
+//! only: a hop knows its place among the hops, and the edge alone keeps the
+//! chain's signing secret.
 //!
 //! ```text
 //! MIRAGE_CHAIN_ID=stand-2hop
-//! MIRAGE_CHAIN_POSITION=1
-//! MIRAGE_CHAIN_LENGTH=2
-//! MIRAGE_CHAIN_HOP_0_ADDR=<the entry box's address>
-//! MIRAGE_CHAIN_HOP_0_PUBKEY=<the entry box's wire key>
+//! MIRAGE_CHAIN_LENGTH=1
+//! MIRAGE_CHAIN_POSITION=0
+//! MIRAGE_CHAIN_HOP_0_ADDR=<the hop's address>
+//! MIRAGE_CHAIN_HOP_0_PUBKEY=<the hop's wire key>
 //! MIRAGE_CHAIN_HOP_0_MASK={"type":"tls_real","sni":"…"}
-//! MIRAGE_CHAIN_HOP_1_ADDR=<the exit box's address>
-//! MIRAGE_CHAIN_HOP_1_PUBKEY=<the exit box's wire key>
-//! MIRAGE_CHAIN_HOP_1_MASK={"type":"tls_real","sni":"…"}
+//! MIRAGE_OPERATOR_PUBKEY_HEX=<the chain's operator public key>
+//! MIRAGE_MESH_ID=<the chain's shared mesh id>
+//! MIRAGE_CHAIN_OPERATOR_SECRET_HEX=<the chain's operator secret>
 //! ```
 //!
-//! This is not decoration. A box told only about "the hop after me" has
-//! never heard of the one in front of it: the exit box would have no way to
-//! recognise the entry box that knocks on its door, and no way to accept its
-//! leg. The exit box needs the entry box's key and address exactly as much
-//! as the entry box needs the exit box's.
+//! `MIRAGE_CHAIN_POSITION` is on the HOPS only, and the secret is on the
+//! EDGE only. `MIRAGE_CHAIN_LENGTH` counts the HOPS — the edge is not one of
+//! them — so a chain of two boxes has one hop and says so.
 //!
-//! The client dials the FIRST box of the chain — the entry. Everything past
-//! it is the chain's own business, and a client that joins the same chain
+//! # Why every box gets the WHOLE chain
+//!
+//! The hop list is the same on every box, and that is load-bearing. A box
+//! told only about "the hop after me" has never heard of the one in front
+//! of it: the exit would have no way to recognise the entry that knocks on
+//! its door, and no way to accept its leg. The exit needs the entry's key
+//! and address exactly as much as the entry needs the exit's.
+//!
+//! # The client's own door
+//!
+//! The client dials the EDGE — the first box of the chain — and the edge
+//! dials the chain's first HOP, which is the second box. Everything past
+//! that is the chain's own business, and a client that joins the same chain
 //! later walks the same road without knowing it.
 
 use serde::{Deserialize, Serialize};
 
-/// What a box does in the chain.
+/// What a HOP does in the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HopRole {
-    /// The box receives the client and relays onward.
+    /// The hop takes the chain from the edge and relays onward.
     Entry,
-    /// The box relays onward, and the chain continues past it.
+    /// The hop relays onward, and the chain continues past it.
     Middle,
-    /// The box is the end of the chain.
+    /// The hop is the end of the chain.
     Exit,
 }
 
 impl HopRole {
-    /// The role a box plays at `index` in a chain of `length` boxes.
+    /// The role a HOP plays at `position` among a chain of `length` hops.
     ///
-    /// The first box receives the client, the last one exits, and everything
-    /// between relays onward. A chain of one box is the exit: it receives
-    /// the client and exits by itself.
-    pub fn for_position(index: usize, length: usize) -> Self {
+    /// The first hop takes the chain from the edge and relays onward, the
+    /// last hop ends the chain, and everything between relays onward. A
+    /// chain of ONE hop is the exit: it takes the chain from the edge and
+    /// sends the traffic out by itself.
+    pub fn for_position(position: usize, length: usize) -> Self {
         if length <= 1 {
             HopRole::Exit
-        } else if index == 0 {
+        } else if position == 0 {
             HopRole::Entry
-        } else if index + 1 == length {
+        } else if position + 1 == length {
             HopRole::Exit
         } else {
             HopRole::Middle
@@ -72,6 +88,30 @@ impl HopRole {
             HopRole::Entry => "entry",
             HopRole::Middle => "middle",
             HopRole::Exit => "exit",
+        }
+    }
+}
+
+/// Where a box sits in the chain.
+///
+/// The chain has two kinds of box: the EDGE — the customer-facing one that
+/// owns the chain and dials it — and the HOPS, the boxes the edge dials in
+/// turn. Only a hop has a [`HopRole`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChainRole {
+    /// The edge: the customer-facing box that owns the chain.
+    Edge,
+    /// A hop of the chain, with the role it plays among the hops.
+    Hop(HopRole),
+}
+
+impl ChainRole {
+    /// The role as the env file spells it.
+    pub fn as_env(&self) -> &'static str {
+        match self {
+            ChainRole::Edge => "edge",
+            ChainRole::Hop(role) => role.as_env(),
         }
     }
 }
@@ -95,8 +135,36 @@ pub struct ChainBox {
     pub host: String,
     /// The login the client uses on the box.
     pub user: String,
-    /// The door the chain leg to this box uses.
+    /// The door the box published.
+    ///
+    /// For a HOP this is the door the chain leg to it uses. For the EDGE it
+    /// is the edge's own door — the one the customer's link points at, and
+    /// not a door of the chain.
     pub face: ChainFace,
+}
+
+/// The key material every box of one chain shares.
+///
+/// One chain, one trust anchor: the edge signs the chain leg's credential
+/// with the secret, and every hop verifies that signature against the
+/// public key. A hop that does not know the anchor refuses the leg, so the
+/// anchor is written into EVERY box of the chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainKeys {
+    /// The chain's operator PUBLIC key, hex — the trust anchor.
+    pub operator_pubkey_hex: String,
+    /// The chain's operator PRIVATE seed, hex — the edge signs with it.
+    ///
+    /// Only the edge is told this. A hop never signs the chain leg, so a
+    /// hop never gets the secret.
+    pub operator_secret_hex: String,
+    /// The chain's shared mesh id, hex.
+    ///
+    /// The chain leg's credential carries a mesh id and the receiving hop
+    /// compares it byte for byte with its own — so every box of one chain
+    /// carries the same value, and that value is the EDGE's: the customer's
+    /// own link carries the edge's mesh id.
+    pub mesh_id: String,
 }
 
 /// A whole chain, as the client keeps it.
@@ -104,20 +172,45 @@ pub struct ChainBox {
 pub struct Chain {
     /// The chain's id — the same in every box.
     pub chain_id: String,
-    /// The boxes, in the order the traffic walks them.
+    /// The boxes, in the order the traffic walks them: the edge first, then
+    /// the hops.
     pub boxes: Vec<ChainBox>,
+    /// The key material the whole chain shares.
+    pub keys: ChainKeys,
 }
 
 impl Chain {
-    /// The role of the box at `index`.
-    pub fn role_of(&self, index: usize) -> HopRole {
-        HopRole::for_position(index, self.boxes.len())
+    /// The chain's HOPS: the boxes after the edge.
+    ///
+    /// The edge is not a hop of its own chain — it owns the chain and dials
+    /// it — so the hop list starts at the second box.
+    pub fn hops(&self) -> &[ChainBox] {
+        self.boxes.get(1..).unwrap_or(&[])
     }
 
-    /// The door the CLIENT dials: the first box's own published door.
+    /// How many hops the chain has.
     ///
-    /// A client that joins the chain walks the same road as everybody else,
-    /// so it starts where the chain starts.
+    /// The edge is not one of them, so a chain of two boxes has one hop.
+    pub fn hop_count(&self) -> usize {
+        self.hops().len()
+    }
+
+    /// The role of the box at `index`.
+    ///
+    /// The first box is the edge; every box after it is a hop, and the hop's
+    /// role is its place among the hops.
+    pub fn role_of(&self, index: usize) -> ChainRole {
+        match index {
+            0 => ChainRole::Edge,
+            index => ChainRole::Hop(HopRole::for_position(index - 1, self.hop_count())),
+        }
+    }
+
+    /// The door the CLIENT dials: the EDGE's own published door.
+    ///
+    /// The edge stands in front of the chain: the customer's link points at
+    /// it, and it dials the chain's first HOP — the second box of the
+    /// chain, not this one.
     pub fn entry_face(&self) -> Option<&ChainFace> {
         self.boxes.first().map(|node| &node.face)
     }
@@ -132,15 +225,27 @@ impl Chain {
         if index >= self.boxes.len() {
             return Err(ChainError::NoSuchBox { index });
         }
+        if self.keys.operator_pubkey_hex.trim().is_empty() {
+            // Without the anchor the hops would refuse every chain leg, and
+            // the box would come up looking healthy while carrying nothing.
+            return Err(ChainError::NoOperatorKey);
+        }
+        let hops = self.hops();
         let mut env = String::new();
         if !base.trim().is_empty() {
             env.push_str(base.trim_end());
             env.push('\n');
         }
         env.push_str(&format!("MIRAGE_CHAIN_ID={}\n", self.chain_id));
-        env.push_str(&format!("MIRAGE_CHAIN_POSITION={index}\n"));
-        env.push_str(&format!("MIRAGE_CHAIN_LENGTH={}\n", self.boxes.len()));
-        for (hop, node) in self.boxes.iter().enumerate() {
+        env.push_str(&format!("MIRAGE_CHAIN_LENGTH={}\n", hops.len()));
+        // Only a hop has a place among the hops. The edge owns the chain and
+        // has no position in it.
+        if index > 0 {
+            env.push_str(&format!("MIRAGE_CHAIN_POSITION={}\n", index - 1));
+        }
+        // The hop list is the SAME on every box — the exit has to know the
+        // entry's key and address, and the entry has to know the exit's.
+        for (hop, node) in hops.iter().enumerate() {
             env.push_str(&format!("MIRAGE_CHAIN_HOP_{hop}_ADDR={}\n", node.face.addr));
             env.push_str(&format!(
                 "MIRAGE_CHAIN_HOP_{hop}_PUBKEY={}\n",
@@ -149,6 +254,20 @@ impl Chain {
             env.push_str(&format!(
                 "MIRAGE_CHAIN_HOP_{hop}_MASK={}\n",
                 one_line(&node.face.camouflage)?
+            ));
+        }
+        // The trust anchor and the mesh id: on EVERY box of the chain.
+        env.push_str(&format!(
+            "MIRAGE_OPERATOR_PUBKEY_HEX={}\n",
+            self.keys.operator_pubkey_hex
+        ));
+        env.push_str(&format!("MIRAGE_MESH_ID={}\n", self.keys.mesh_id));
+        // The secret signs the chain leg's credential, and only the edge
+        // signs it.
+        if index == 0 {
+            env.push_str(&format!(
+                "MIRAGE_CHAIN_OPERATOR_SECRET_HEX={}\n",
+                self.keys.operator_secret_hex
             ));
         }
         Ok(env)
@@ -164,6 +283,9 @@ pub enum ChainError {
         index: usize,
     },
 
+    /// The chain carries no trust anchor, so no hop would accept its leg.
+    NoOperatorKey,
+
     /// A mask carries a line break, and a line break in an env value would
     /// silently cut the value in two.
     MaskNotOneLine,
@@ -174,6 +296,9 @@ impl std::fmt::Display for ChainError {
         match self {
             ChainError::NoSuchBox { index } => {
                 write!(f, "chain: there is no box at position {index}")
+            }
+            ChainError::NoOperatorKey => {
+                write!(f, "chain: the chain carries no operator key")
             }
             ChainError::MaskNotOneLine => write!(f, "chain: the mask of a hop is not one line"),
         }
@@ -213,6 +338,14 @@ mod tests {
         }
     }
 
+    fn keys() -> ChainKeys {
+        ChainKeys {
+            operator_pubkey_hex: "ab".repeat(32),
+            operator_secret_hex: "cd".repeat(32),
+            mesh_id: "ef".repeat(32),
+        }
+    }
+
     fn chain() -> Chain {
         Chain {
             chain_id: "stand-2hop".to_owned(),
@@ -228,18 +361,24 @@ mod tests {
                     face: face("144.172.105.29:443"),
                 },
             ],
+            keys: keys(),
         }
     }
 
     #[test]
-    fn the_first_box_is_the_entry_and_the_last_is_the_exit() {
+    fn the_first_box_is_the_edge_and_the_last_hop_is_the_exit() {
         let chain = chain();
-        assert_eq!(chain.role_of(0), HopRole::Entry);
-        assert_eq!(chain.role_of(1), HopRole::Exit);
+        assert_eq!(chain.role_of(0), ChainRole::Edge);
+        assert_eq!(chain.role_of(1), ChainRole::Hop(HopRole::Exit));
     }
 
     #[test]
-    fn a_chain_of_one_box_is_the_exit() {
+    fn a_chain_of_one_hop_is_the_exit() {
+        assert_eq!(HopRole::for_position(0, 1), HopRole::Exit);
+    }
+
+    #[test]
+    fn a_chain_of_one_box_is_the_edge_and_has_no_hops() {
         let chain = Chain {
             chain_id: "solo".to_owned(),
             boxes: vec![ChainBox {
@@ -247,14 +386,16 @@ mod tests {
                 user: "root".to_owned(),
                 face: face("10.0.0.1:443"),
             }],
+            keys: keys(),
         };
-        assert_eq!(chain.role_of(0), HopRole::Exit);
+        assert_eq!(chain.role_of(0), ChainRole::Edge);
+        assert_eq!(chain.hop_count(), 0);
     }
 
     #[test]
-    fn a_middle_box_is_a_middle_box() {
+    fn a_middle_hop_is_a_middle_hop() {
         let chain = Chain {
-            chain_id: "three".to_owned(),
+            chain_id: "four".to_owned(),
             boxes: vec![
                 ChainBox {
                     host: "10.0.0.1".to_owned(),
@@ -271,33 +412,79 @@ mod tests {
                     user: "root".to_owned(),
                     face: face("10.0.0.3:443"),
                 },
+                ChainBox {
+                    host: "10.0.0.4".to_owned(),
+                    user: "root".to_owned(),
+                    face: face("10.0.0.4:443"),
+                },
             ],
+            keys: keys(),
         };
-        assert_eq!(chain.role_of(0), HopRole::Entry);
-        assert_eq!(chain.role_of(1), HopRole::Middle);
-        assert_eq!(chain.role_of(2), HopRole::Exit);
+        assert_eq!(chain.role_of(0), ChainRole::Edge);
+        assert_eq!(chain.role_of(1), ChainRole::Hop(HopRole::Entry));
+        assert_eq!(chain.role_of(2), ChainRole::Hop(HopRole::Middle));
+        assert_eq!(chain.role_of(3), ChainRole::Hop(HopRole::Exit));
     }
 
     #[test]
-    fn every_box_gets_the_whole_chain_and_its_own_position() {
+    fn the_edge_has_no_position_and_the_hops_have_theirs() {
         let chain = chain();
-        let first = chain.server_env(0, "STACK=auto\n").expect("env");
-        let second = chain.server_env(1, "STACK=auto\n").expect("env");
+        let edge = chain.server_env(0, "STACK=auto\n").expect("env");
+        let hop = chain.server_env(1, "STACK=auto\n").expect("env");
 
-        assert!(first.contains("MIRAGE_CHAIN_POSITION=0"));
-        assert!(second.contains("MIRAGE_CHAIN_POSITION=1"));
-        assert!(first.contains("MIRAGE_CHAIN_LENGTH=2"));
-        assert!(second.contains("MIRAGE_CHAIN_LENGTH=2"));
+        assert!(!edge.contains("MIRAGE_CHAIN_POSITION"), "the edge has no position");
+        assert!(hop.contains("MIRAGE_CHAIN_POSITION=0"), "the only hop is at 0");
+    }
 
-        // Both boxes are told about BOTH hops — that is the whole point.
-        for env in [&first, &second] {
-            assert!(env.contains("MIRAGE_CHAIN_HOP_0_ADDR=144.172.115.106:443"));
-            assert!(env.contains("MIRAGE_CHAIN_HOP_1_ADDR=144.172.105.29:443"));
+    #[test]
+    fn the_hop_count_is_the_number_of_hops() {
+        let chain = chain();
+        let edge = chain.server_env(0, "").expect("env");
+        let hop = chain.server_env(1, "").expect("env");
+        assert!(edge.contains("MIRAGE_CHAIN_LENGTH=1"));
+        assert!(hop.contains("MIRAGE_CHAIN_LENGTH=1"));
+    }
+
+    #[test]
+    fn every_box_is_told_the_same_hops() {
+        let chain = chain();
+        let edge = chain.server_env(0, "").expect("env");
+        let hop = chain.server_env(1, "").expect("env");
+
+        // The edge is not a hop of its own chain: only the second box is.
+        for env in [&edge, &hop] {
+            assert!(env.contains("MIRAGE_CHAIN_HOP_0_ADDR=144.172.105.29:443"));
             assert!(env.contains(&format!("MIRAGE_CHAIN_HOP_0_PUBKEY={}", "22".repeat(32))));
-            assert!(env.contains(&format!("MIRAGE_CHAIN_HOP_1_PUBKEY={}", "22".repeat(32))));
             assert!(env.contains("MIRAGE_CHAIN_HOP_0_MASK="));
-            assert!(env.contains("MIRAGE_CHAIN_HOP_1_MASK="));
+            assert!(!env.contains("MIRAGE_CHAIN_HOP_1_"), "the edge is not a hop");
         }
+    }
+
+    #[test]
+    fn the_shared_keys_are_on_every_box_and_the_secret_only_on_the_edge() {
+        let chain = chain();
+        let edge = chain.server_env(0, "").expect("env");
+        let hop = chain.server_env(1, "").expect("env");
+
+        for env in [&edge, &hop] {
+            assert!(env.contains(&format!("MIRAGE_OPERATOR_PUBKEY_HEX={}", "ab".repeat(32))));
+            assert!(env.contains(&format!("MIRAGE_MESH_ID={}", "ef".repeat(32))));
+        }
+        assert!(edge.contains(&format!(
+            "MIRAGE_CHAIN_OPERATOR_SECRET_HEX={}",
+            "cd".repeat(32)
+        )));
+        assert!(!hop.contains("MIRAGE_CHAIN_OPERATOR_SECRET_HEX"));
+    }
+
+    #[test]
+    fn a_chain_without_an_anchor_is_refused() {
+        let mut chain = chain();
+        chain.keys.operator_pubkey_hex = String::new();
+        assert_eq!(
+            chain.server_env(0, "").expect_err("no anchor"),
+            ChainError::NoOperatorKey
+        );
     }
 
     #[test]
@@ -321,7 +508,7 @@ mod tests {
     #[test]
     fn a_mask_over_two_lines_is_refused() {
         let mut chain = chain();
-        chain.boxes[0].face.camouflage = "{\n\"type\":\"tls_real\"\n}".to_owned();
+        chain.boxes[1].face.camouflage = "{\n\"type\":\"tls_real\"\n}".to_owned();
         assert_eq!(
             chain.server_env(0, "").expect_err("two lines"),
             ChainError::MaskNotOneLine

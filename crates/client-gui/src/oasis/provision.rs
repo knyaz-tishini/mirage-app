@@ -271,7 +271,7 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         job.env
     };
     upload(&session, env.as_bytes(), &format!("{remote}/server.env")).await?;
-    upload(&session, INSTALL_SH.as_bytes(), &format!("{remote}/install.sh")).await?;
+    upload(&session, install_sh().as_bytes(), &format!("{remote}/install.sh")).await?;
 
     // The image goes up once. The second press of "install" must not push a
     // hundred megabytes again to change one port.
@@ -287,7 +287,7 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         // Step one: the box is asked what it could publish. Nothing is
         // published yet — the person chooses, and the second press carries
         // the choice out.
-        upload(&session, FACES_SH.as_bytes(), &format!("{remote}/faces.sh")).await?;
+        upload(&session, faces_sh().as_bytes(), &format!("{remote}/faces.sh")).await?;
         set_text(bus, crate::text::tr("p.ports"));
         let out = tokio::time::timeout(
             INSTALL_TIMEOUT,
@@ -945,15 +945,14 @@ const COMPOSE: &str = concat!(
     "  m1r4g3-data:\n",
 );
 
-/// Step one: ask the box what it could publish.
+/// Make sure the box has docker before anything else.
 ///
-/// The proposal is printed between two markers, because the box says other
-/// things on the same stream. `docker load` writes to stdout as well, and a
-/// proposal that swallowed a docker banner would be a proposal nobody could
-/// trust.
-const FACES_SH: &str = r#"#!/bin/sh
-set -eu
-if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+/// This block belongs to BOTH steps, not to the proposal alone: a box that was
+/// just wiped has no docker, and the install would fail on a box that the
+/// proposal had never prepared. The first press of "install" asks and
+/// installs docker; the second press installs and must be able to do so on a
+/// box that was never asked anything.
+const DOCKER_BOOTSTRAP: &str = r#"if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 if ! command -v docker >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
@@ -963,14 +962,26 @@ if ! command -v docker >/dev/null 2>&1; then
   elif command -v dnf >/dev/null 2>&1; then
     $SUDO dnf install -y docker
   else
-    echo "no docker and no apt-get or dnf" >&2
+    echo "this box has neither docker nor a package manager to install it with" >&2
     exit 20
   fi
   if command -v systemctl >/dev/null 2>&1; then
     $SUDO systemctl enable --now docker || true
   fi
 fi
-cd /opt/m1r4g3
+"#;
+
+/// Step one: ask the box what it could publish.
+///
+/// The proposal is printed between two markers, because the box says other
+/// things on the same stream. `docker load` writes to stdout as well, and a
+/// proposal that swallowed a docker banner would be a proposal nobody could
+/// trust.
+fn faces_sh() -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+{DOCKER_BOOTSTRAP}cd /opt/m1r4g3
 # The compose file names its env file, and compose refuses to run without
 # it — even for a one-off run that reads nothing from it.
 [ -f server.env ] || printf 'STACK=auto\n' > server.env
@@ -984,21 +995,20 @@ else
   $SUDO docker-compose run --rm -T --entrypoint /bin/sh mirage -c 'm1r4g3-server propose --dir /data --format toml'
 fi
 echo "m1r4g3-faces-end"
-"#;
+"#
+    )
+}
 
 /// Step two: bring the box up with the faces the person chose, and read the
 /// one line the customer needs.
 ///
 /// The contract is unchanged: the same image, the same compose file, the same
 /// volume, and the same `m1r4g3-link <LINK>` line on stdout.
-const INSTALL_SH: &str = r#"#!/bin/sh
+fn install_sh() -> String {
+    format!(
+        r#"#!/bin/sh
 set -eu
-if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
-if ! command -v docker >/dev/null 2>&1; then
-  echo "no docker and no apt-get or dnf" >&2
-  exit 20
-fi
-cd /opt/m1r4g3
+{DOCKER_BOOTSTRAP}cd /opt/m1r4g3
 # The compose file names server.env twice: as env_file and as a read-only
 # bind mount. If the file does not exist, docker would create a DIRECTORY
 # at that path and compose would refuse to read it as an env file. So the
@@ -1023,11 +1033,34 @@ if [ -z "$LINK" ]; then
   exit 21
 fi
 printf 'm1r4g3-link %s\n' "$LINK"
-"#;
+"#
+    )
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_install_script_stands_on_its_own() {
+        // A box that was just wiped has no docker. The install has to bring
+        // it itself: the bootstrap cannot live only in the proposal, or a box
+        // that was never asked anything can never be installed on — which is
+        // exactly what happened to the second box of a chain.
+        let script = install_sh();
+        assert!(
+            script.contains("apt-get install -y docker.io"),
+            "the install must install docker on a box that has none"
+        );
+        assert!(
+            script.contains("dnf install -y docker"),
+            "the install must install docker on a box that has none"
+        );
+        assert!(
+            faces_sh().contains("apt-get install -y docker.io"),
+            "the proposal must install docker too — it asks the box to speak"
+        );
+    }
 
     /// The proposal exactly as the box writes it — the file
     /// `m1r4g3-server propose` puts in the box's data directory.

@@ -14,7 +14,7 @@
 //!   POST /stand/remove  → take the container down
 //!   GET  /stand/status  → what the running job is doing
 //!   POST /stand/chain   → build a chain of boxes: install them, then wire them
-//!                         together, and hand back the entry box's link
+//!                         together, and hand back the edge box's link
 //!
 //! The listener binds `127.0.0.1` only: this drives a box over SSH, it must
 //! not become a way into this machine. The password arrives in the POST body,
@@ -553,6 +553,8 @@ fn start_chain(api: &Api, body: ChainBody) -> (u16, String) {
         match outcome {
             Ok(outcome) => {
                 *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome.link.clone());
+                // The first box is the edge — the customer-facing one — and the
+                // exit is the chain's LAST HOP, not the last box of the chain.
                 let boxes: Vec<String> = outcome
                     .boxes
                     .iter()

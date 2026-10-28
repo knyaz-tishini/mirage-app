@@ -13,6 +13,14 @@
 //! from that, and then write the chain into every box and bring them back up
 //! with it.
 //!
+//! # The edge and the hops
+//!
+//! The FIRST box of the chain is the EDGE — the box the customer talks to.
+//! It owns the chain and dials it: the edge dials the first HOP, which is
+//! the second box. The edge is not a hop of its own chain, so the chain's
+//! hop list starts at the second box, and the edge alone is told where to
+//! dial it.
+//!
 //! # The keys
 //!
 //! Every box gets its own state directory: its own client key, its own
@@ -20,10 +28,20 @@
 //! directory would have the second box's install overwrite the first box's
 //! pin — and the first box's pin is the thing that catches a swapped-out
 //! machine.
+//!
+//! The chain itself has one keypair of its own, minted here and shared by
+//! every box of the chain: the edge signs the chain leg's credential with
+//! the secret, and every hop verifies that signature against the public
+//! key. The mesh id is the edge's own, read from the edge's link — the
+//! customer's link carries it, so the chain's legs have to match it.
 
 use std::path::{Path, PathBuf};
 
-use super::chain::{Chain, ChainBox, ChainFace, HopRole};
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use rand::RngCore;
+
+use super::chain::{Chain, ChainBox, ChainFace, ChainKeys, ChainRole};
 use super::provision::{self, InstallBus, Job, Outcome};
 
 /// The camouflage types that speak UDP rather than TCP.
@@ -39,6 +57,9 @@ const UDP_CAMOUFLAGE_TYPES: &[&str] = &[
     "hysteria2",
     "raw_udp",
 ];
+
+/// How long a mesh id is, in hex characters.
+const MESH_ID_HEX_LEN: usize = 64;
 
 /// One box to put into a chain.
 #[derive(Debug, Clone)]
@@ -58,11 +79,12 @@ pub struct ChainRequest {
 pub struct InstalledBox {
     /// The box's address.
     pub host: String,
-    /// What the box does in the chain.
-    pub role: HopRole,
+    /// What the box does in the chain: the edge owns it, a hop relays.
+    pub role: ChainRole,
     /// How many doors the box published.
     pub faces: usize,
-    /// The door the chain leg to this box uses.
+    /// The door the box published for the chain: the hop's door, where the
+    /// chain leg knocks, and the edge's own door, where the customer does.
     pub face: ChainFace,
 }
 
@@ -71,12 +93,12 @@ pub struct InstalledBox {
 pub struct ChainOutcome {
     /// The chain, as the client built it.
     pub chain: Chain,
-    /// The link the client dials — the entry box's own.
+    /// The link the client dials — the EDGE's own.
     ///
     /// A client that joins the chain walks the same road as everybody else,
-    /// so it starts where the chain starts.
+    /// so it starts where the chain starts: at the edge.
     pub link: String,
-    /// Every box, in chain order.
+    /// Every box, in chain order: the edge first, then the hops.
     pub boxes: Vec<InstalledBox>,
 }
 
@@ -89,6 +111,12 @@ pub struct ChainOutcome {
 /// else.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct BoxArtefact {
+    /// The box's own mesh id, hex.
+    ///
+    /// The chain shares it: the customer's link carries the edge's mesh id,
+    /// and every box of the chain has to carry the same one.
+    #[serde(default)]
+    mesh_id: String,
     /// Every door the box published.
     entrances: Vec<ArtefactEntrance>,
 }
@@ -151,28 +179,42 @@ pub async fn install_chain(
         states.push(state);
     }
 
-    // Step two: what each box published becomes the chain's hops.
-    let mut chain_boxes = Vec::with_capacity(boxes.len());
-    let mut installed = Vec::with_capacity(boxes.len());
-    for (index, (request, link)) in boxes.iter().zip(links.iter()).enumerate() {
+    // Step two: what each box published becomes the chain.
+    let mut artefacts = Vec::with_capacity(boxes.len());
+    for (request, link) in boxes.iter().zip(links.iter()) {
         let artefact: BoxArtefact = serde_json::from_str(link)
             .map_err(|e| format!("{}: the box's link is not readable: {e}", request.host))?;
-        let face = pick_face(&artefact).ok_or_else(|| {
-            format!(
-                "{}: the box published no TCP door for the chain leg to use",
-                request.host
-            )
+        artefacts.push(artefact);
+    }
+
+    // The chain's own key material: ONE operator keypair for the whole
+    // chain, and the edge's mesh id — the customer's link carries it, so the
+    // chain's legs have to match it.
+    let keys = chain_keys(&artefacts[0])?;
+
+    // The first box is the EDGE: it owns the chain and dials it, and it is
+    // not a hop of its own chain. Every box after it is a hop, and the
+    // chain's leg knocks on the hop's door.
+    let mut chain_boxes = Vec::with_capacity(boxes.len());
+    for (index, (request, artefact)) in boxes.iter().zip(artefacts.iter()).enumerate() {
+        let face = if index == 0 {
+            pick_edge_face(artefact)
+        } else {
+            pick_face(artefact)
+        };
+        let face = face.ok_or_else(|| {
+            if index == 0 {
+                format!("{}: the box published no door at all", request.host)
+            } else {
+                format!(
+                    "{}: the box published no TCP door for the chain leg to use",
+                    request.host
+                )
+            }
         })?;
-        let role = HopRole::for_position(index, boxes.len());
         chain_boxes.push(ChainBox {
             host: request.host.clone(),
             user: request.user.clone(),
-            face: face.clone(),
-        });
-        installed.push(InstalledBox {
-            host: request.host.clone(),
-            role,
-            faces: artefact.entrances.len(),
             face,
         });
     }
@@ -180,7 +222,21 @@ pub async fn install_chain(
     let chain = Chain {
         chain_id: chain_id.to_owned(),
         boxes: chain_boxes,
+        keys,
     };
+
+    let installed: Vec<InstalledBox> = chain
+        .boxes
+        .iter()
+        .zip(artefacts.iter())
+        .enumerate()
+        .map(|(index, (chain_box, artefact))| InstalledBox {
+            host: chain_box.host.clone(),
+            role: chain.role_of(index),
+            faces: artefact.entrances.len(),
+            face: chain_box.face.clone(),
+        })
+        .collect();
 
     // Step three: the chain goes into every box, and every box comes back up
     // with it. A box that kept the old configuration would be a box that
@@ -198,6 +254,31 @@ pub async fn install_chain(
     })
 }
 
+/// The chain's own key material.
+///
+/// The keypair is the chain's trust anchor: the edge signs the chain leg's
+/// credential with the secret, and every hop verifies that signature against
+/// the public key. One keypair for the whole chain — a hop that carried a
+/// different anchor would refuse the leg.
+///
+/// The mesh id is the EDGE's, read from the edge's own link: the customer's
+/// link carries the edge's mesh id, and the chain's legs have to match it
+/// byte for byte.
+fn chain_keys(edge: &BoxArtefact) -> Result<ChainKeys, String> {
+    let mesh_id = edge.mesh_id.trim().to_owned();
+    if mesh_id.len() != MESH_ID_HEX_LEN || !mesh_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("the edge's link carries no usable mesh id".to_owned());
+    }
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    let signing = SigningKey::from_bytes(&seed);
+    Ok(ChainKeys {
+        operator_pubkey_hex: hex::encode(signing.verifying_key().to_bytes()),
+        operator_secret_hex: hex::encode(signing.to_bytes()),
+        mesh_id,
+    })
+}
+
 /// The door the chain leg to this box uses.
 ///
 /// The first TCP door the box published. The leg rides TCP, so a datagram
@@ -209,16 +290,26 @@ fn pick_face(artefact: &BoxArtefact) -> Option<ChainFace> {
         .entrances
         .iter()
         .find(|entrance| !is_datagram(&entrance.camouflage))
-        .map(|entrance| ChainFace {
-            addr: entrance.addr.clone(),
-            pubkey_hex: entrance.server_pubkey_hex.clone(),
-            camouflage: entrance
-                .camouflage
-                .get("type")
-                .and_then(|t| t.as_str())
-                .map(|t| entrance.camouflage.to_string())
-                .unwrap_or_else(|| entrance.camouflage.to_string()),
-        })
+        .map(face_of)
+}
+
+/// The edge's own door.
+///
+/// The edge takes no chain leg: the customer dials it, and every door the
+/// edge published is a door the customer may dial — the link speaks every
+/// transport the edge offers. So the edge needs no TCP door of its own, and
+/// the first door it published is the one the chain keeps.
+fn pick_edge_face(artefact: &BoxArtefact) -> Option<ChainFace> {
+    artefact.entrances.first().map(face_of)
+}
+
+/// One published door, as the chain keeps it.
+fn face_of(entrance: &ArtefactEntrance) -> ChainFace {
+    ChainFace {
+        addr: entrance.addr.clone(),
+        pubkey_hex: entrance.server_pubkey_hex.clone(),
+        camouflage: entrance.camouflage.to_string(),
+    }
 }
 
 /// Whether this mask speaks datagrams rather than a stream.
@@ -281,6 +372,21 @@ pub fn save_chain(dir: &Path, outcome: &ChainOutcome) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn artefact(mesh_id: &str, entrances: Vec<ArtefactEntrance>) -> BoxArtefact {
+        BoxArtefact {
+            mesh_id: mesh_id.to_owned(),
+            entrances,
+        }
+    }
+
+    fn entrance(addr: &str, camouflage: serde_json::Value) -> ArtefactEntrance {
+        ArtefactEntrance {
+            addr: addr.to_owned(),
+            server_pubkey_hex: "11".repeat(32),
+            camouflage,
+        }
+    }
+
     #[test]
     fn a_datagram_door_is_not_a_chain_leg() {
         assert!(is_datagram(&serde_json::json!({"type": "quic"})));
@@ -291,20 +397,16 @@ mod tests {
 
     #[test]
     fn the_first_tcp_door_is_the_one_the_leg_uses() {
-        let artefact = BoxArtefact {
-            entrances: vec![
-                ArtefactEntrance {
-                    addr: "10.0.0.1:443".to_owned(),
-                    server_pubkey_hex: "11".repeat(32),
-                    camouflage: serde_json::json!({"type": "quic"}),
-                },
-                ArtefactEntrance {
-                    addr: "10.0.0.1:8443".to_owned(),
-                    server_pubkey_hex: "11".repeat(32),
-                    camouflage: serde_json::json!({"type": "tls_real", "sni": "a.example"}),
-                },
+        let artefact = artefact(
+            &"ab".repeat(32),
+            vec![
+                entrance("10.0.0.1:443", serde_json::json!({"type": "quic"})),
+                entrance(
+                    "10.0.0.1:8443",
+                    serde_json::json!({"type": "tls_real", "sni": "a.example"}),
+                ),
             ],
-        };
+        );
         let face = pick_face(&artefact).expect("a TCP door");
         assert_eq!(face.addr, "10.0.0.1:8443");
         assert_eq!(face.pubkey_hex, "11".repeat(32));
@@ -313,14 +415,73 @@ mod tests {
 
     #[test]
     fn a_box_with_only_datagram_doors_has_no_leg() {
-        let artefact = BoxArtefact {
-            entrances: vec![ArtefactEntrance {
-                addr: "10.0.0.1:443".to_owned(),
-                server_pubkey_hex: "11".repeat(32),
-                camouflage: serde_json::json!({"type": "quic"}),
-            }],
-        };
+        let artefact = artefact(
+            &"ab".repeat(32),
+            vec![entrance(
+                "10.0.0.1:443",
+                serde_json::json!({"type": "quic"}),
+            )],
+        );
         assert!(pick_face(&artefact).is_none());
+    }
+
+    #[test]
+    fn the_edge_keeps_its_first_door_whatever_it_carries() {
+        // The edge takes no chain leg: the customer dials it, and every door
+        // it published is a door the customer may dial.
+        let artefact = artefact(
+            &"ab".repeat(32),
+            vec![entrance(
+                "10.0.0.1:443",
+                serde_json::json!({"type": "quic"}),
+            )],
+        );
+        let face = pick_edge_face(&artefact).expect("a door");
+        assert_eq!(face.addr, "10.0.0.1:443");
+    }
+
+    #[test]
+    fn the_chain_gets_one_keypair_and_the_edges_mesh_id() {
+        let edge = artefact(
+            &"ab".repeat(32),
+            vec![entrance(
+                "10.0.0.1:443",
+                serde_json::json!({"type": "tls_real"}),
+            )],
+        );
+        let keys = chain_keys(&edge).expect("keys");
+        assert_eq!(keys.mesh_id, "ab".repeat(32));
+        assert_eq!(keys.operator_pubkey_hex.len(), 64);
+        assert_eq!(keys.operator_secret_hex.len(), 64);
+        assert!(keys.operator_pubkey_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(keys.operator_secret_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn two_chains_get_two_keypairs() {
+        let edge = artefact(
+            &"ab".repeat(32),
+            vec![entrance(
+                "10.0.0.1:443",
+                serde_json::json!({"type": "tls_real"}),
+            )],
+        );
+        let first = chain_keys(&edge).expect("keys");
+        let second = chain_keys(&edge).expect("keys");
+        assert_ne!(first.operator_secret_hex, second.operator_secret_hex);
+        assert_ne!(first.operator_pubkey_hex, second.operator_pubkey_hex);
+    }
+
+    #[test]
+    fn an_edge_without_a_mesh_id_is_refused() {
+        let edge = artefact(
+            "",
+            vec![entrance(
+                "10.0.0.1:443",
+                serde_json::json!({"type": "tls_real"}),
+            )],
+        );
+        assert!(chain_keys(&edge).is_err());
     }
 
     #[test]
