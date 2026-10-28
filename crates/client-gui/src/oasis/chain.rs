@@ -225,16 +225,23 @@ impl Chain {
         if index >= self.boxes.len() {
             return Err(ChainError::NoSuchBox { index });
         }
-        if self.keys.operator_pubkey_hex.trim().is_empty() {
-            // Without the anchor the hops would refuse every chain leg, and
-            // the box would come up looking healthy while carrying nothing.
-            return Err(ChainError::NoOperatorKey);
-        }
         let hops = self.hops();
         let mut env = String::new();
         if !base.trim().is_empty() {
             env.push_str(base.trim_end());
             env.push('\n');
+        }
+        // A chain of ONE box is a box that stands alone: there is no hop to
+        // walk, so the box is told NOTHING about a chain and exits from
+        // itself. Writing a chain of zero hops would only name a chain that
+        // cannot exist — and the box would refuse to start.
+        if hops.is_empty() {
+            return Ok(env);
+        }
+        if self.keys.operator_pubkey_hex.trim().is_empty() {
+            // Without the anchor the hops would refuse every chain leg, and
+            // the box would come up looking healthy while carrying nothing.
+            return Err(ChainError::NoOperatorKey);
         }
         env.push_str(&format!("MIRAGE_CHAIN_ID={}\n", self.chain_id));
         env.push_str(&format!("MIRAGE_CHAIN_LENGTH={}\n", hops.len()));
@@ -390,6 +397,32 @@ mod tests {
         };
         assert_eq!(chain.role_of(0), ChainRole::Edge);
         assert_eq!(chain.hop_count(), 0);
+    }
+
+    #[test]
+    fn a_chain_of_one_box_writes_no_chain_at_all() {
+        // A box that stands alone has no hop to walk: it is told NOTHING
+        // about a chain and exits from itself. A chain of zero hops would
+        // name a chain that cannot exist, and the box would refuse to start.
+        let chain = Chain {
+            chain_id: "solo".to_owned(),
+            boxes: vec![ChainBox {
+                host: "10.0.0.1".to_owned(),
+                user: "root".to_owned(),
+                face: face("10.0.0.1:443"),
+            }],
+            keys: keys(),
+        };
+        let env = chain.server_env(0, "STACK=auto\n").expect("env");
+        assert_eq!(env, "STACK=auto\n");
+        assert!(
+            !env.contains("MIRAGE_CHAIN"),
+            "a box that stands alone is told no chain: {env}"
+        );
+        assert!(
+            !env.contains("MIRAGE_MESH_ID"),
+            "a box that stands alone keeps its own mesh id: {env}"
+        );
     }
 
     #[test]
