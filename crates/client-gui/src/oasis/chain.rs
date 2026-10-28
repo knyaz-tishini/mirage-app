@@ -262,6 +262,15 @@ impl Chain {
                 "MIRAGE_CHAIN_HOP_{hop}_MASK={}\n",
                 one_line(&node.face.camouflage)?
             ));
+            // The hop's DATAGRAM door, on the port every hop of the chain
+            // answers datagrams on. It is the same number on every hop —
+            // they are different boxes, and the number only has to be free on
+            // the box that binds it.
+            env.push_str(&format!(
+                "MIRAGE_CHAIN_HOP_{hop}_UDP_ADDR={}:{}\n",
+                host_of(&node.face.addr),
+                CHAIN_UDP_PORT
+            ));
         }
         // The trust anchor and the mesh id: on EVERY box of the chain.
         env.push_str(&format!(
@@ -276,8 +285,35 @@ impl Chain {
                 "MIRAGE_CHAIN_OPERATOR_SECRET_HEX={}\n",
                 self.keys.operator_secret_hex
             ));
+        } else {
+            // This box is a HOP of the chain: it answers the chain's datagram
+            // leg on this port. Without it the chain carries TCP only, and a
+            // customer's datagram would have to be refused rather than
+            // delivered out of the wrong box.
+            env.push_str(&format!("MIRAGE_CHAIN_UDP_PORT={}\n", CHAIN_UDP_PORT));
         }
         Ok(env)
+    }
+}
+
+/// The port every hop of a chain answers its datagram leg on.
+///
+/// A high port, out of the way of the doors a box publishes for customers
+/// (80, 443, 8080, 8443) and of the UDP doors the node binds itself (QUIC
+/// and friends). TCP and UDP have separate port spaces, so this number may
+/// coincide with a TCP face's — but not with another UDP bind on the same
+/// box, and the box refuses to start rather than shadowing one.
+const CHAIN_UDP_PORT: u16 = 51820;
+
+/// The host part of a `host:port` address.
+///
+/// The chain's datagram door is named by its host and the chain's own UDP
+/// port — not by the port the box published for its streams.
+fn host_of(addr: &str) -> &str {
+    match addr.rsplit_once(':') {
+        // A bracketed IPv6 address keeps its brackets: "[::1]:443" → "[::1]".
+        Some((host, _)) if host.ends_with(']') || !host.contains(':') => host,
+        _ => addr,
     }
 }
 
