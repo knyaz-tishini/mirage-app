@@ -94,7 +94,6 @@ const ID_POOLS: &[(&str, &[&str])] = &[
     ("http3", &["quic"]),
     ("web_transport", &["quic"]),
     ("wire_guard", &["quic"]),
-    ("hysteria2", &["quic"]),
     ("raw_udp", &["quic", "awg", "wireguard", "openvpn", "ikev2"]),
 ];
 

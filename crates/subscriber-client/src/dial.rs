@@ -28,7 +28,7 @@
 //! **The dial is transport-aware.** The subscriber may be handed an entrance
 //! wearing ANY outer camouflage — a stream one (raw TCP, TLS, WebSocket,
 //! xhttp, Reality, SSH, gRPC) or a datagram one (raw UDP, QUIC, HTTP/3,
-//! WebTransport, WireGuard, Hysteria2, a DNS tunnel, a raw ICMP echo socket).
+//! WebTransport, WireGuard, a DNS tunnel, a raw ICMP echo socket).
 //! The camouflage decides the wire transport; it is not a decoration that can
 //! be bolted onto a TCP socket. This adapter therefore calls
 //! [`mirage_protocol::client_transport::run_client_v9_transport_aware`],

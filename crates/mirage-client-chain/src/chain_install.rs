@@ -54,7 +54,6 @@ const UDP_CAMOUFLAGE_TYPES: &[&str] = &[
     "http3",
     "web_transport",
     "wire_guard",
-    "hysteria2",
     "raw_udp",
 ];
 
