@@ -154,9 +154,16 @@ enum Command {
         /// the shell's history.
         #[arg(long)]
         password_file: Option<PathBuf>,
+        /// Read the password from the standard input, one line.
+        ///
+        /// The password sits neither in the command line nor on the disk: the
+        /// caller writes it into the pipe and the installer takes it from
+        /// there. This is the way a windowed caller hands a secret over.
+        #[arg(long)]
+        password_stdin: bool,
         /// The `mirage-vpn` binary that goes on the box.
         #[arg(long)]
-        binary: PathBuf,
+        binary: Option<PathBuf>,
         /// The MirageVG port the box opens.
         #[arg(long)]
         mwg_port: Option<u16>,
@@ -183,6 +190,14 @@ enum Command {
         /// same path with `.pub` beside it.
         #[arg(long)]
         ssh_key: Option<PathBuf>,
+        /// Print the client's own key for this box and stop.
+        ///
+        /// The line goes into the box's own list of keys — through the
+        /// hoster's panel, or by hand — and the client comes in by key from
+        /// then on, with no password at all. The private half stays on this
+        /// machine.
+        #[arg(long)]
+        print_key: bool,
         /// Where the artefact is written.
         #[arg(long, default_value = "artefact.json")]
         out: PathBuf,
@@ -283,6 +298,7 @@ async fn main() -> ExitCode {
         box_addr,
         password,
         password_file,
+        password_stdin,
         binary,
         mwg_port,
         mkvik_port,
@@ -292,6 +308,7 @@ async fn main() -> ExitCode {
         key_out,
         state,
         ssh_key,
+        print_key,
         out,
     }) = &args.command
     {
@@ -299,7 +316,8 @@ async fn main() -> ExitCode {
             box_addr,
             password.as_deref(),
             password_file.as_deref(),
-            binary,
+            *password_stdin,
+            binary.as_deref(),
             *mwg_port,
             *mkvik_port,
             mesh_id,
@@ -308,6 +326,7 @@ async fn main() -> ExitCode {
             key_out.as_deref(),
             state.as_deref(),
             ssh_key.as_deref(),
+            *print_key,
             out,
         )
         .await;
@@ -1142,6 +1161,59 @@ async fn run_claim(panel: &str, claim: Option<&str>, poll: Option<&str>, out: &P
     }
 }
 
+/// The line a windowed caller reads when the install fails.
+///
+/// The GUI cannot read this process's log, so the reason travels back on the
+/// standard output, marked. The headless run prints the same reason twice:
+/// once for the operator's eyes, once for the caller's.
+fn refuse(message: &str) -> ExitCode {
+    println!("mirage-oss-error: {message}");
+    error!(error = %message, "the self-assembly did not come up");
+    ExitCode::FAILURE
+}
+
+/// The box's password, from wherever the caller left it.
+///
+/// Three ways in, and only one at a time: the command line, a file, or the
+/// standard input. The pipe is the one a windowed caller uses — the secret
+/// travels inside it and dies with it, and never sits in the process list
+/// where every other process on the machine can read it.
+fn take_password(
+    password: Option<&str>,
+    password_file: Option<&Path>,
+    password_stdin: bool,
+) -> Result<String, String> {
+    let given = [
+        password.is_some(),
+        password_file.is_some(),
+        password_stdin,
+    ]
+    .iter()
+    .filter(|given| **given)
+    .count();
+    if given > 1 {
+        return Err(
+            "pass --password, --password-file or --password-stdin, not more than one".to_owned(),
+        );
+    }
+    if let Some(password) = password {
+        return Ok(password.to_owned());
+    }
+    if let Some(path) = password_file {
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            format!("cannot read the password file {}: {err}", path.display())
+        })?;
+        return Ok(text.trim_end_matches(['\r', '\n']).to_owned());
+    }
+    if password_stdin {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .map_err(|err| format!("cannot read the password from the standard input: {err}"))?;
+        return Ok(text.trim_end_matches(['\r', '\n']).to_owned());
+    }
+    Ok(String::new())
+}
+
 /// Install a self-assembled box and write the artefact it published.
 ///
 /// The client makes its own key, the box is installed with that key's public
@@ -1152,7 +1224,8 @@ async fn run_oss(
     box_addr: &str,
     password: Option<&str>,
     password_file: Option<&Path>,
-    binary: &Path,
+    password_stdin: bool,
+    binary: Option<&Path>,
     mwg_port: Option<u16>,
     mkvik_port: Option<u16>,
     mesh_id: &str,
@@ -1161,24 +1234,35 @@ async fn run_oss(
     key_out: Option<&Path>,
     state: Option<&Path>,
     ssh_key: Option<&Path>,
+    print_key: bool,
     out: &Path,
 ) -> ExitCode {
-    let password = match (password, password_file) {
-        (Some(_), Some(_)) => {
-            error!("refusing: pass --password or --password-file, not both");
-            return ExitCode::FAILURE;
+    // The key the client comes in by. The person can put its public half into
+    // the box by hand and be done with passwords.
+    if print_key {
+        let key = match mirage_client_chain::oss_install::oss_key(state) {
+            Ok(key) => key,
+            Err(err) => return refuse(&err),
+        };
+        if let Err(err) = mirage_client_chain::provision::ensure_key(&key.priv_path, &key.pub_path) {
+            return refuse(&err);
         }
-        (Some(password), None) => password.to_owned(),
-        (None, Some(path)) => match std::fs::read_to_string(path) {
-            Ok(text) => text.trim_end_matches(['\r', '\n']).to_owned(),
-            Err(err) => {
-                error!(path = %path.display(), error = %err, "cannot read the password file");
-                return ExitCode::FAILURE;
+        match std::fs::read_to_string(&key.pub_path) {
+            Ok(line) => {
+                println!("{}", line.trim());
+                return ExitCode::SUCCESS;
             }
-        },
-        (None, None) => String::new(),
+            Err(err) => return refuse(&format!("cannot read the public key: {err}")),
+        }
+    }
+    let password = match take_password(password, password_file, password_stdin) {
+        Ok(password) => password,
+        Err(err) => return refuse(&err),
     };
 
+    let Some(binary) = binary else {
+        return refuse("name the box's binary: --binary <path>");
+    };
     let mut carriers = Vec::new();
     if let Some(port) = mwg_port {
         carriers.push(OssCarrier::mwg(port));
@@ -1187,12 +1271,13 @@ async fn run_oss(
         carriers.push(OssCarrier::mkvik(port));
     }
     if carriers.is_empty() {
-        error!("refusing: name at least one port for the box (--mwg-port or --mkvik-port)");
-        return ExitCode::FAILURE;
+        return refuse("name at least one port for the box (--mwg-port or --mkvik-port)");
     }
     if !binary.is_file() {
-        error!(path = %binary.display(), "refusing: the mirage-vpn binary is not there");
-        return ExitCode::FAILURE;
+        return refuse(&format!(
+            "the mirage-vpn binary is not there: {}",
+            binary.display()
+        ));
     }
 
     let bus = Arc::new(InstallBus::new());
@@ -1217,17 +1302,13 @@ async fn run_oss(
 
     let outcome = match outcome {
         Ok(outcome) => outcome,
-        Err(err) => {
-            error!(error = %err, "the box did not come up");
-            return ExitCode::FAILURE;
-        }
+        Err(err) => return refuse(&err),
     };
     if let Some(warn) = &outcome.warn {
         warn!(warning = %warn, "the box is up, with a warning");
     }
     if let Err(err) = std::fs::write(out, &outcome.artefact_json) {
-        error!(path = %out.display(), error = %err, "cannot write the artefact");
-        return ExitCode::FAILURE;
+        return refuse(&format!("cannot write the artefact {}: {err}", out.display()));
     }
     println!("the box is up, the artefact is written: {}", out.display());
     for entrance in &outcome.artefact.entrances {

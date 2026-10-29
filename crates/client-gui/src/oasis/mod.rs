@@ -1027,7 +1027,11 @@ impl Oasis {
                     | stand::Focus::Port
                     | stand::Focus::Mtu
                     | stand::Focus::Dns
-                    | stand::Focus::Except => profile = true,
+                    | stand::Focus::Except
+                    | stand::Focus::Binary
+                    | stand::Focus::SshKey
+                    | stand::Focus::MwgPort
+                    | stand::Focus::KvikPort => profile = true,
                     stand::Focus::Link => link_changed = true,
                     _ => {}
                 }

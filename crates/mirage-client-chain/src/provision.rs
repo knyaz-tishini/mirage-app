@@ -651,8 +651,28 @@ fn image_tar() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-pub(crate) fn ensure_key(priv_path: &Path, pub_path: &Path) -> Result<(), String> {
-    if priv_path.is_file() && pub_path.is_file() {
+/// The client's own key for a box, made once and kept.
+///
+/// The pair is the client's door into the box: the private half never leaves
+/// this machine, the public half is what the box takes. The person can put
+/// that public half into the box by hand — through the hoster's panel, or
+/// with a single `authorized_keys` line — and the client comes in by key
+/// from then on, with no password at all.
+pub fn ensure_key(priv_path: &Path, pub_path: &Path) -> Result<(), String> {
+    // The private half is the truth. When it is already there, the public
+    // half is derived from it and written down — a key never changes under
+    // the person who planted it.
+    //
+    // This matters: the public half is what the box takes, and a key that
+    // quietly changed after it was planted would leave the box with a door
+    // that no longer opens.
+    if priv_path.is_file() {
+        if !pub_path.is_file() {
+            let text = fs::read_to_string(priv_path).map_err(|e| format!("read key: {e}"))?;
+            let key = PrivateKey::from_openssh(&text).map_err(|e| format!("key: {e}"))?;
+            let pub_line = key.public_key().to_openssh().map_err(|e| format!("key: {e}"))?;
+            fs::write(pub_path, pub_line.as_bytes()).map_err(|e| format!("write key: {e}"))?;
+        }
         return Ok(());
     }
     let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).map_err(|e| e.to_string())?;
@@ -1040,6 +1060,41 @@ printf 'm1r4g3-link %s\n' "$LINK"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The private half is the truth: a lost public half is written down from
+    /// it, and the key itself never changes.
+    ///
+    /// A key that changed after it was planted would leave the box with a
+    /// door that no longer opens — and the person would never know why. The
+    /// public half is what the box takes, so it is derived, never invented.
+    #[test]
+    fn a_key_never_changes_under_the_person_who_planted_it() {
+        let dir = std::env::temp_dir().join(format!("mirage-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("the dir");
+        let priv_path = dir.join("server");
+        let pub_path = dir.join("server.pub");
+
+        ensure_key(&priv_path, &pub_path).expect("the first key");
+        let first_private = fs::read_to_string(&priv_path).expect("the private half");
+        let first_public = fs::read_to_string(&pub_path).expect("the public half");
+
+        // The public half is lost — the way a wiped machine loses it.
+        fs::remove_file(&pub_path).expect("the public half goes");
+        ensure_key(&priv_path, &pub_path).expect("the public half comes back");
+
+        assert_eq!(
+            fs::read_to_string(&priv_path).expect("the private half"),
+            first_private,
+            "the key must not change under the person who planted it"
+        );
+        assert_eq!(
+            fs::read_to_string(&pub_path).expect("the public half"),
+            first_public,
+            "the public half must be the very same key"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_install_script_stands_on_its_own() {

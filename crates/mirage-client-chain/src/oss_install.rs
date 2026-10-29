@@ -176,7 +176,10 @@ pub async fn install(job: OssJob, bus: &InstallBus) -> Result<OssOutcome, String
             name.push(".pub");
             (path.clone(), PathBuf::from(name))
         }
-        None => (dir.join("server.key"), dir.join("server.pub")),
+        None => {
+            let key = crate::oss_install::oss_key(job.state.as_deref())?;
+            (key.priv_path, key.pub_path)
+        }
     };
     provision::ensure_key(&key_path, &pub_path)?;
     let pub_line = fs::read_to_string(&pub_path)
@@ -360,6 +363,43 @@ echo "{PUBLICATION_BEGIN}"
 echo "{PUBLICATION_END}"
 "#
     )
+}
+
+/// The files the client's own key for a box lives in.
+#[derive(Debug, Clone)]
+pub struct OssKey {
+    /// The private half. It never leaves this machine.
+    pub priv_path: PathBuf,
+    /// The public half. This is what the box takes.
+    pub pub_path: PathBuf,
+}
+
+/// The client's own key for a box, in the state directory.
+///
+/// The state directory is the one the job names, or the default beside the
+/// executable. The key is made once and kept: the same client comes back to
+/// the same box with the same key, and the box's allowlist does not have to
+/// follow a fresh one every time.
+///
+/// The person can put the public half into the box by hand — through the
+/// hoster's panel, or with a single `authorized_keys` line — and the client
+/// comes in by key from then on, with no password at all.
+pub fn oss_key(state: Option<&Path>) -> Result<OssKey, String> {
+    let dir = match state {
+        Some(dir) => {
+            fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
+            dir.to_path_buf()
+        }
+        None => default_state_dir()?,
+    };
+    Ok(OssKey {
+        // The public half is the same name with `.pub` beside it — the
+        // OpenSSH way, and the way the operator's own keys are named. A key
+        // brought in from outside is read the same way, so one rule holds
+        // for both.
+        priv_path: dir.join("server"),
+        pub_path: dir.join("server.pub"),
+    })
 }
 
 /// The state directory one job works in.

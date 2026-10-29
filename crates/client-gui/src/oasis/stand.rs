@@ -40,6 +40,13 @@ const LABEL_W: f64 = 108.0;
 const TOGGLE_W: f64 = 64.0;
 const REVOKE_W: f64 = 72.0;
 
+/// The ports the box's own carriers open by default.
+///
+/// The carriers are the box's two doors: MirageVG and MirageKVIC. These are
+/// the numbers the box's own server opens them on.
+const DEFAULT_MWG_PORT: &str = "41443";
+const DEFAULT_KVIK_PORT: &str = "41444";
+
 /// The server-side protocols the standalone image publishes, as
 /// `(id, port, mtu, on_by_default)`.
 ///
@@ -119,6 +126,32 @@ pub enum Focus {
     App,
     Port,
     Mtu,
+    /// The binary that goes on the box, in the own-binary mode.
+    Binary,
+    /// The ssh key the client uses for the box's door.
+    SshKey,
+    /// The port the MirageVG carrier sits on.
+    MwgPort,
+    /// The port the MirageKVIC carrier sits on.
+    KvikPort,
+}
+
+/// Where the box's stack comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Build {
+    /// The ready-made stack the box is given.
+    Ready,
+    /// The client's own binary, put up on the box by the client itself.
+    Own,
+}
+
+/// Which key the client comes into the box with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// The client's own key, made once and kept beside the app.
+    Own,
+    /// A key the person brought in — their own, or one the hoster gave.
+    File,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,6 +195,20 @@ pub struct Stand {
     pub protocols: Vec<Proto>,
     pub focus: Focus,
     pub link: String,
+    /// Where the box's stack comes from: the ready-made one, or the client's
+    /// own binary put up by the client itself.
+    pub build: Build,
+    /// The binary that goes on the box — the own-binary mode only.
+    pub binary: String,
+    /// The ssh key the client uses for the box's door. Empty means "make one
+    /// and plant it with the password".
+    pub ssh_key: String,
+    /// Which key the client comes into the box with.
+    pub key_source: KeySource,
+    /// The port the MirageVG carrier sits on.
+    pub mwg_port: String,
+    /// The port the MirageKVIC carrier sits on.
+    pub kvik_port: String,
     guests: Vec<Guest>,
     guest_draft: String,
     qr_guest: Option<usize>,
@@ -204,6 +251,12 @@ impl Stand {
             protocols: default_protocols(),
             focus: Focus::None,
             link: String::new(),
+            build: Build::Ready,
+            binary: String::new(),
+            ssh_key: String::new(),
+            key_source: KeySource::Own,
+            mwg_port: DEFAULT_MWG_PORT.to_owned(),
+            kvik_port: DEFAULT_KVIK_PORT.to_owned(),
             guests: Vec::new(),
             guest_draft: String::new(),
             qr_guest: None,
@@ -247,6 +300,30 @@ impl Stand {
                     }
                     if let Some(st) = v.get("stack").and_then(|s| s.as_str()) {
                         stand.stack = st.to_owned();
+                    }
+                    stand.build = match v.get("build").and_then(|s| s.as_str()) {
+                        Some("own") => Build::Own,
+                        _ => Build::Ready,
+                    };
+                    if let Some(bin) = v.get("binary").and_then(|s| s.as_str()) {
+                        stand.binary = bin.to_owned();
+                    }
+                    if let Some(key) = v.get("ssh_key").and_then(|s| s.as_str()) {
+                        stand.ssh_key = key.to_owned();
+                    }
+                    stand.key_source = match v.get("key_source").and_then(|s| s.as_str()) {
+                        Some("file") => KeySource::File,
+                        _ => KeySource::Own,
+                    };
+                    if let Some(port) = v.get("mwg_port").and_then(|s| s.as_str()) {
+                        if !port.trim().is_empty() {
+                            stand.mwg_port = port.to_owned();
+                        }
+                    }
+                    if let Some(port) = v.get("kvik_port").and_then(|s| s.as_str()) {
+                        if !port.trim().is_empty() {
+                            stand.kvik_port = port.to_owned();
+                        }
                     }
                     if let Some(arr) = v.get("protocols").and_then(|p| p.as_array()) {
                         for item in arr {
@@ -341,6 +418,12 @@ impl Stand {
             "user": self.user,
             "stack_auto": self.stack_auto,
             "stack": self.stack,
+            "build": build_key(self.build),
+            "binary": self.binary,
+            "ssh_key": self.ssh_key,
+            "key_source": key_source_key(self.key_source),
+            "mwg_port": self.mwg_port,
+            "kvik_port": self.kvik_port,
             "protocols": protocols,
             "kill": kill_key(self.kill),
             "dns": self.dns,
@@ -556,7 +639,154 @@ impl Stand {
     /// it could publish, the second one installs with the faces the person
     /// chose.
     pub fn install(&mut self) {
-        self.install_with(!self.faces_from_box);
+        match self.build {
+            Build::Ready => self.install_with(!self.faces_from_box),
+            Build::Own => self.install_own(),
+        }
+    }
+
+    /// Put the client's own binary on the box and take the artefact back.
+    ///
+    /// The GUI installs nothing itself: it runs the very binary the customer
+    /// client ships, with the very command the headless run uses, and the
+    /// artefact that comes back is the same one the cabinet's panel issues.
+    ///
+    /// The password goes into the pipe and dies there. It is never written
+    /// down, never in the command line, and never in the profile.
+    pub fn install_own(&mut self) {
+        if self.bus.running.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let Some((host, port)) = split_host(&self.host) else {
+            self.bus.running.store(false, Ordering::Relaxed);
+            self.say(tr("say.need_host"));
+            return;
+        };
+        if self.user.trim().is_empty() {
+            self.bus.running.store(false, Ordering::Relaxed);
+            self.say(tr("say.need_login"));
+            return;
+        }
+        let binary = self.box_binary();
+        if !binary.is_file() {
+            self.bus.running.store(false, Ordering::Relaxed);
+            self.say(tr("say.need_binary"));
+            return;
+        }
+        let Some(mwg) = port_of(&self.mwg_port) else {
+            self.bus.running.store(false, Ordering::Relaxed);
+            self.say(tr("say.need_port"));
+            return;
+        };
+        let Some(kvik) = port_of(&self.kvik_port) else {
+            self.bus.running.store(false, Ordering::Relaxed);
+            self.say(tr("say.need_port"));
+            return;
+        };
+        let paths = match crate::backend::oss_paths() {
+            Ok(paths) => paths,
+            Err(err) => {
+                self.bus.running.store(false, Ordering::Relaxed);
+                self.say(&format!("{err}"));
+                return;
+            }
+        };
+        self.save_profile();
+
+        let args = oss_command(
+            &format!("{}@{}:{}", self.user.trim(), host, port),
+            &binary.to_string_lossy(),
+            mwg,
+            kvik,
+            &paths.state.to_string_lossy(),
+            &paths.key.to_string_lossy(),
+            &paths.artefact.to_string_lossy(),
+            match self.key_source {
+                // The client's own key, made once and kept: the installer
+                // takes it from the state directory.
+                KeySource::Own => "",
+                // A key the person brought in.
+                KeySource::File => self.ssh_key.trim(),
+            },
+        );
+        let password = std::mem::take(&mut self.pass);
+        self.pass_epoch = self.pass_epoch.wrapping_add(1);
+        if self.pass_epoch == 0 {
+            self.pass_epoch = 1;
+        }
+        if let Err(err) = crate::backend::spawn_oss_install(
+            &args,
+            &password,
+            Arc::clone(&self.bus),
+            &paths.artefact,
+        ) {
+            self.bus.running.store(false, Ordering::Relaxed);
+            self.say(&format!("{err}"));
+        }
+    }
+
+    /// Where the box's binary is.
+    ///
+    /// The path the person wrote down wins; otherwise the binary is looked
+    /// for beside the executable — the place the app keeps its helpers.
+    fn box_binary(&self) -> std::path::PathBuf {
+        let given = self.binary.trim();
+        if !given.is_empty() {
+            return std::path::PathBuf::from(given);
+        }
+        crate::backend::find_box_binary().unwrap_or_else(|| std::path::PathBuf::from("mirage-vpn"))
+    }
+
+    /// The mode of the install: the ready-made stack, or the client's own
+    /// binary on the box.
+    pub fn cycle_build(&mut self) {
+        self.build = match self.build {
+            Build::Ready => Build::Own,
+            Build::Own => Build::Ready,
+        };
+        self.save_profile();
+    }
+
+    /// Which key the client comes into the box with.
+    pub fn cycle_key_source(&mut self) {
+        self.key_source = match self.key_source {
+            KeySource::Own => KeySource::File,
+            KeySource::File => KeySource::Own,
+        };
+        self.save_profile();
+    }
+
+    /// The client's own key for this box, in the form the box takes.
+    ///
+    /// The person puts this line into the box's list of keys — through the
+    /// hoster's panel, or by hand — and the client comes in by key from then
+    /// on, with no password at all. The private half stays on this machine.
+    pub fn show_my_key(&mut self) {
+        let paths = match crate::backend::oss_paths() {
+            Ok(paths) => paths,
+            Err(err) => {
+                self.say(&format!("{err}"));
+                return;
+            }
+        };
+        let key = match mirage_client_chain::oss_install::oss_key(Some(&paths.state)) {
+            Ok(key) => key,
+            Err(err) => {
+                self.say(&format!("{err}"));
+                return;
+            }
+        };
+        if let Err(err) = mirage_client_chain::provision::ensure_key(&key.priv_path, &key.pub_path) {
+            self.say(&format!("{err}"));
+            return;
+        }
+        let Ok(line) = std::fs::read_to_string(&key.pub_path) else {
+            self.say(tr("say.no_key"));
+            return;
+        };
+        let line = line.trim().to_owned();
+        self.copy_text(&line);
+        self.say(tr("say.my_key"));
     }
 
     pub fn remove_remote(&mut self) {
@@ -897,6 +1127,10 @@ impl Stand {
                 let i = self.active_index()?;
                 Some(&mut self.protocols[i].mtu)
             }
+            Focus::Binary => Some(&mut self.binary),
+            Focus::SshKey => Some(&mut self.ssh_key),
+            Focus::MwgPort => Some(&mut self.mwg_port),
+            Focus::KvikPort => Some(&mut self.kvik_port),
             Focus::None => None,
         }
     }
@@ -908,6 +1142,7 @@ impl Stand {
             Focus::Port => 8,
             Focus::Mtu => 5,
             Focus::Guest => 64,
+            Focus::MwgPort | Focus::KvikPort => 5,
             Focus::None => return,
             _ => 240,
         };
@@ -1035,9 +1270,86 @@ fn section_key(section: Section) -> &'static str {
     }
 }
 
+/// The mode of the install, as the profile writes it down.
+fn build_key(build: Build) -> &'static str {
+    match build {
+        Build::Ready => "ready",
+        Build::Own => "own",
+    }
+}
+
+/// Which key the client comes in by, as the profile writes it down.
+fn key_source_key(source: KeySource) -> &'static str {
+    match source {
+        KeySource::Own => "own",
+        KeySource::File => "file",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The command the GUI gives the client: the password travels in the pipe,
+    /// never in the command line.
+    #[test]
+    fn the_password_travels_in_the_pipe_not_in_the_command_line() {
+        let args = oss_command(
+            "root@box.example:22",
+            "boxes/mirage-vpn",
+            41443,
+            41444,
+            "state",
+            "state/client.key.json",
+            "state/artefact.json",
+            "",
+        );
+        assert!(args.iter().any(|arg| arg == "--password-stdin"));
+        assert!(
+            !args.iter().any(|arg| arg == "--password"),
+            "the password must not be a flag of its own"
+        );
+        let flag = |name: &str| {
+            args.iter()
+                .position(|arg| arg == name)
+                .map(|at| args[at + 1].clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(flag("--box"), "root@box.example:22");
+        assert_eq!(flag("--binary"), "boxes/mirage-vpn");
+        assert_eq!(flag("--mwg-port"), "41443");
+        assert_eq!(flag("--mkvik-port"), "41444");
+        assert_eq!(flag("--key-out"), "state/client.key.json");
+        assert_eq!(flag("--out"), "state/artefact.json");
+        assert_eq!(
+            flag("--ssh-key"),
+            "",
+            "no key named, no key flag"
+        );
+    }
+
+    /// The operator's own key for the box is passed on when the person named
+    /// one; without it the client makes a key of its own.
+    #[test]
+    fn the_named_key_is_passed_on() {
+        let args = oss_command(
+            "root@box.example:22",
+            "mirage-vpn",
+            41443,
+            41444,
+            "state",
+            "key.json",
+            "artefact.json",
+            "  env/keys/box  ",
+        );
+        let flag = |name: &str| {
+            args.iter()
+                .position(|arg| arg == name)
+                .map(|at| args[at + 1].clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(flag("--ssh-key"), "env/keys/box");
+    }
 
     /// A proposed face, as the box would write it.
     fn face(mask: &str, port: u16) -> provision::ProposedFace {
@@ -1130,6 +1442,57 @@ fn decode_qr_rgba(rgba: &[u8], w: usize, h: usize) -> Result<String, String> {
     Ok(content)
 }
 
+/// The command the GUI gives the client's own binary.
+///
+/// The GUI installs nothing itself: it runs the very binary the customer
+/// client ships, with the very command the headless run uses, and the
+/// artefact that comes back is the same one the cabinet's panel issues.
+///
+/// The password travels in the pipe, never in the command line: the process
+/// list on the machine is readable by everything, the pipe is not. The
+/// command is kept apart from the spawn so that it can be read — and
+/// checked — without a box.
+pub fn oss_command(
+    box_addr: &str,
+    binary: &str,
+    mwg_port: u16,
+    kvik_port: u16,
+    state: &str,
+    key: &str,
+    artefact: &str,
+    ssh_key: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "--box".to_owned(),
+        box_addr.to_owned(),
+        "--password-stdin".to_owned(),
+        "--binary".to_owned(),
+        binary.to_owned(),
+        "--mwg-port".to_owned(),
+        mwg_port.to_string(),
+        "--mkvik-port".to_owned(),
+        kvik_port.to_string(),
+        "--state".to_owned(),
+        state.to_owned(),
+        "--key-out".to_owned(),
+        key.to_owned(),
+        "--out".to_owned(),
+        artefact.to_owned(),
+    ];
+    // The operator's own key for this box, when the person named one. Without
+    // it the client mints a key of its own and plants it with the password.
+    if !ssh_key.trim().is_empty() {
+        args.push("--ssh-key".to_owned());
+        args.push(ssh_key.trim().to_owned());
+    }
+    args
+}
+
+/// A port from the field, when the field holds one.
+fn port_of(raw: &str) -> Option<u16> {
+    raw.trim().parse::<u16>().ok().filter(|port| *port > 0)
+}
+
 pub(crate) fn split_host(raw: &str) -> Option<(String, u16)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -1175,6 +1538,7 @@ enum ButtonText {
     Clip,
     InviteConn,
     InviteFull,
+    MyKey,
 }
 
 enum Choice {
@@ -1183,6 +1547,8 @@ enum Choice {
     Split,
     Lang,
     Style,
+    Build,
+    Key,
 }
 
 enum Row {
@@ -1209,6 +1575,9 @@ enum HitKind {
     Split,
     Lang,
     Style,
+    Build,
+    Key,
+    MyKey,
     Invite(bool),
     Proto(usize),
     ProtoOn(usize),
@@ -1286,6 +1655,14 @@ impl Lay {
         self.rows.push(Row::Button { rect: b, text: right.1 });
         self.hit(left.0.to_owned(), a, left.2);
         self.hit(right.0.to_owned(), b, right.2);
+    }
+
+    /// One button across the whole row — the row where a pair would leave a
+    /// half-empty half.
+    fn solo(&mut self, id: (&'static str, ButtonText, HitKind)) {
+        let rect = self.row_rect();
+        self.rows.push(Row::Button { rect, text: id.1 });
+        self.hit(id.0.to_owned(), rect, id.2);
     }
 
     fn thirds(
@@ -1367,27 +1744,49 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
             lay.field("st-host", tr("f.host"), Focus::Host, tr("f.host"), 240, false);
             lay.field("st-user", tr("f.user"), Focus::User, tr("f.user"), 240, false);
             lay.field("st-pass", tr("f.pass"), Focus::Pass, tr("f.pass"), 240, true);
-            lay.pair(
-                ("st-go", ButtonText::Install, HitKind::Install),
-                ("st-down", ButtonText::Remove, HitKind::Remove),
-            );
+            lay.choice("st-build", tr("f.build"), Choice::Build, HitKind::Build);
+            if stand.build == Build::Own {
+                lay.field("st-bin", tr("f.binary"), Focus::Binary, tr("f.binary"), 240, false);
+                lay.choice("st-keysrc", tr("f.keysrc"), Choice::Key, HitKind::Key);
+                if stand.key_source == KeySource::File {
+                    lay.field("st-key", tr("f.sshkey"), Focus::SshKey, tr("f.sshkey"), 240, false);
+                }
+                // The ready-made stack is taken down by a button of its own;
+                // the own binary is not, so the install takes the whole row.
+                lay.pair(
+                    ("st-go", ButtonText::Install, HitKind::Install),
+                    ("st-mykey", ButtonText::MyKey, HitKind::MyKey),
+                );
+            } else {
+                lay.pair(
+                    ("st-go", ButtonText::Install, HitKind::Install),
+                    ("st-down", ButtonText::Remove, HitKind::Remove),
+                );
+            }
             lay.choice("st-lang", tr("f.lang"), Choice::Lang, HitKind::Lang);
             lay.choice("st-style", tr("f.style"), Choice::Style, HitKind::Style);
         }
         Section::Protocols => {
-            lay.choice("st-stack", tr("f.stack"), Choice::Stack, HitKind::Stack);
-            for index in 0..stand.protocols.len() {
-                lay.proto(index);
-            }
-            if stand.active_index().is_some() {
-                lay.field("st-port", tr("f.port"), Focus::Port, tr("f.port"), 8, false);
-                lay.field("st-mtu", "mtu", Focus::Mtu, "mtu", 5, false);
-                // The box's own reason for the face the person is on. It is
-                // the sentence that says what this port looks like from
-                // outside — and, when the port was not the one first in
-                // mind, what happened to it.
-                if let Some(why) = stand.active_why() {
-                    lay.note(why);
+            if stand.build == Build::Own {
+                // The own binary opens two doors: the two carriers. The masks
+                // of the ready-made stack mean nothing here.
+                lay.field("st-mwg", tr("f.mwg"), Focus::MwgPort, tr("f.port"), 5, false);
+                lay.field("st-kvik", tr("f.kvik"), Focus::KvikPort, tr("f.port"), 5, false);
+            } else {
+                lay.choice("st-stack", tr("f.stack"), Choice::Stack, HitKind::Stack);
+                for index in 0..stand.protocols.len() {
+                    lay.proto(index);
+                }
+                if stand.active_index().is_some() {
+                    lay.field("st-port", tr("f.port"), Focus::Port, tr("f.port"), 8, false);
+                    lay.field("st-mtu", "mtu", Focus::Mtu, "mtu", 5, false);
+                    // The box's own reason for the face the person is on. It is
+                    // the sentence that says what this port looks like from
+                    // outside — and, when the port was not the one first in
+                    // mind, what happened to it.
+                    if let Some(why) = stand.active_why() {
+                        lay.note(why);
+                    }
                 }
             }
         }
@@ -1497,6 +1896,9 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Split => stand.toggle_split(),
         HitKind::Lang => crate::text::cycle(),
         HitKind::Style => crate::theme::cycle(),
+        HitKind::Build => stand.cycle_build(),
+        HitKind::Key => stand.cycle_key_source(),
+        HitKind::MyKey => stand.show_my_key(),
         HitKind::Invite(full) => stand.invite(full),
         HitKind::Proto(index) => stand.select_proto(index),
         HitKind::ProtoOn(index) => stand.toggle_proto(index),
@@ -1740,6 +2142,7 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
         ButtonText::Clip => tr("b.clip"),
         ButtonText::InviteConn => tr("b.invite_conn"),
         ButtonText::InviteFull => tr("b.invite_full"),
+        ButtonText::MyKey => tr("b.my_key"),
     }
 }
 
@@ -1778,6 +2181,14 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
                 tr("theme.dark").into()
             }
         }
+        Choice::Build => match stand.build {
+            Build::Ready => tr("c.build_ready").into(),
+            Build::Own => tr("c.build_own").into(),
+        },
+        Choice::Key => match stand.key_source {
+            KeySource::Own => tr("c.key_own").into(),
+            KeySource::File => tr("c.key_file").into(),
+        },
     }
 }
 

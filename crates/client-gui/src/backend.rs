@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use mirage_client_chain::provision::InstallBus;
+
 /// Lab and older installs listen here. A second window must not adopt that process.
 const DEFAULT_CONTROL_PORT: u16 = 19421;
 /// Cabinet catalog. Same route the cabinet order form uses for exit countries.
@@ -556,6 +558,179 @@ fn subscriber_bin() -> std::io::Result<PathBuf> {
         return Ok(nested);
     }
     Ok(sibling)
+}
+
+/// The paths the self-assembly keeps.
+///
+/// One directory beside the executable: the box's own state (the key the
+/// client plants on the box and the pin of that box's host key), the client's
+/// own key pair, and the artefact the install writes. A second box gets a
+/// second directory, so one box's key never overwrites another's.
+pub struct OssPaths {
+    /// The directory the install works in.
+    pub state: PathBuf,
+    /// The client's own key pair.
+    pub key: PathBuf,
+    /// The artefact the install writes.
+    pub artefact: PathBuf,
+}
+
+/// Where the self-assembly keeps its files.
+pub fn oss_paths() -> std::io::Result<OssPaths> {
+    let dir = exe_dir()?.join("standalone").join("oss");
+    std::fs::create_dir_all(&dir)?;
+    Ok(OssPaths {
+        state: dir.clone(),
+        key: dir.join("client.key.json"),
+        artefact: dir.join("artefact.json"),
+    })
+}
+
+/// The box's own binary, when the app carries it.
+///
+/// The file is the LINUX build of the server that goes ON the box: it is
+/// uploaded there, never run here. It sits beside the executable, in a `box`
+/// folder, or is named by `MIRAGE_VPN_BIN`.
+pub fn find_box_binary() -> Option<PathBuf> {
+    if let Some(path) = env_path("MIRAGE_VPN_BIN") {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let dir = exe_dir().ok()?;
+    for candidate in [dir.join("mirage-vpn"), dir.join("box").join("mirage-vpn")] {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The line the client prints when the self-assembly fails.
+///
+/// The windowed caller cannot read the client's log, so the failure travels
+/// back on the standard output, marked.
+const OSS_ERROR: &str = "mirage-oss-error:";
+
+/// Run the self-assembly and take the artefact back.
+///
+/// The GUI installs nothing itself: it runs the very binary the customer
+/// client ships, with the very command the headless run uses, and the
+/// artefact that comes back is the same one the cabinet's panel issues. One
+/// implementation, two callers.
+///
+/// The password goes into the pipe and dies there — the process list on the
+/// machine is readable by everything, the pipe is not.
+pub fn spawn_oss_install(
+    args: &[String],
+    password: &str,
+    bus: Arc<InstallBus>,
+    artefact: &std::path::Path,
+) -> std::io::Result<()> {
+    let bin = subscriber_bin()?;
+    let mut cmd = Command::new(bin);
+    cmd.arg("oss");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn()?;
+    let mut stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let artefact = artefact.to_path_buf();
+
+    if let Some(mut pipe) = stdin.take() {
+        use std::io::Write;
+        let secret = password.trim_end_matches(['\r', '\n']);
+        let _ = pipe.write_all(secret.as_bytes());
+        let _ = pipe.write_all(b"\n");
+        let _ = pipe.flush();
+        // The pipe is dropped here: the client sees the end of the secret.
+    }
+
+    // The client's progress is copied into the bus, so the operator watches
+    // the same line the headless run prints.
+    let out_bus = Arc::clone(&bus);
+    let out_thread = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let Some(stdout) = stdout else {
+            return String::new();
+        };
+        let reader = std::io::BufReader::new(stdout);
+        let mut failure = String::new();
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim().to_owned();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix(OSS_ERROR) {
+                failure = rest.trim().to_owned();
+                continue;
+            }
+            let progress = line.strip_prefix("... ").unwrap_or(&line);
+            *out_bus.text.lock().unwrap_or_else(|p| p.into_inner()) = progress.to_owned();
+        }
+        failure
+    });
+
+    let err_thread = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let Some(stderr) = stderr else {
+            return String::new();
+        };
+        let reader = std::io::BufReader::new(stderr);
+        let mut tail = String::new();
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim();
+            if !line.is_empty() {
+                tail = line.to_owned();
+            }
+        }
+        tail
+    });
+
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let failure = out_thread.join().unwrap_or_default();
+        let tail = err_thread.join().unwrap_or_default();
+        let mut text = bus.text.lock().unwrap_or_else(|p| p.into_inner());
+        match status {
+            Ok(status) if status.success() => match std::fs::read_to_string(artefact) {
+                Ok(json) => {
+                    *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(json);
+                    *text = mirage_client_chain::i18n::tr("p.oss_up").to_owned();
+                }
+                Err(err) => {
+                    *text = format!(
+                        "{}: {err}",
+                        mirage_client_chain::i18n::tr("p.oss_no_publication")
+                    );
+                }
+            },
+            Ok(_) => {
+                let reason = if failure.is_empty() { tail } else { failure };
+                *text = if reason.is_empty() {
+                    mirage_client_chain::i18n::tr("p.oss_install_failed").to_owned()
+                } else {
+                    reason
+                };
+            }
+            Err(err) => {
+                *text = format!("{err}");
+            }
+        }
+        drop(text);
+        bus.running.store(false, Ordering::Relaxed);
+    });
+    Ok(())
 }
 
 /// Redeemed device file next to the GUI. This is the only credential the child gets.
