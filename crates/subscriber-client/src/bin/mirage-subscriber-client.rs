@@ -28,8 +28,9 @@ use mirage_client_chain::chain_install::{self, ChainRequest};
 use mirage_client_chain::oss_install::OssCarrier;
 use mirage_client_chain::provision::InstallBus;
 use mirage_subscriber_client::{
-    control, exit_preference_from_mode, http_connect, oss_setup, publish_fatal, tun_mode, EdgeReason,
-    EdgeSession, EdgeState, EgressScope, EntranceArtefact, OssSetup, SubscriberClient,
+    chain_artefact, control, exit_preference_from_mode, http_connect, oss_setup, publish_fatal,
+    tun_mode, EdgeReason, EdgeSession, EdgeState, EgressScope, EntranceArtefact, OssSetup,
+    SubscriberClient,
     SubscriberClientError, SubscriberClientOptions, TunMode,
 };
 use tracing::{error, info, warn};
@@ -1412,6 +1413,45 @@ async fn run_chain(
         out.join("chain.json").display(),
         out.join("link.txt").display()
     );
+
+    // The onion artefact: the circuit the client walks itself. A chain of one
+    // box has no hops, and then there is nothing to walk — the link above is
+    // the whole story of that chain.
+    let keypair = match oss_setup::load_or_make_keypair(Some(&out.join("client.key.json"))) {
+        Ok(keypair) => keypair,
+        Err(err) => {
+            error!(dir = %out.display(), error = %err, "cannot keep the client's key");
+            return ExitCode::FAILURE;
+        }
+    };
+    match chain_artefact::build_onion_artefact(
+        &outcome.chain,
+        &keypair,
+        &outcome.chain.chain_id,
+        chain_artefact::now_ms(),
+    ) {
+        Ok(artefact) => match artefact.to_json() {
+            Ok(json) => {
+                let path = out.join("onion-artefact.json");
+                if let Err(err) = std::fs::write(&path, json.as_bytes()) {
+                    error!(path = %path.display(), error = %err, "cannot write the onion artefact");
+                    return ExitCode::FAILURE;
+                }
+                println!("wrote {}", path.display());
+            }
+            Err(err) => {
+                error!(error = %err, "the onion artefact did not serialize");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(chain_artefact::ChainArtefactError::NoHops) => {
+            println!("the chain has no hops — there is no onion artefact to write");
+        }
+        Err(err) => {
+            error!(error = %err, "the onion artefact did not build");
+            return ExitCode::FAILURE;
+        }
+    }
     ExitCode::SUCCESS
 }
 

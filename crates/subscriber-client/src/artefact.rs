@@ -245,6 +245,74 @@ impl ArtefactEntrance {
     }
 }
 
+/// The two kinds of artefact this client understands.
+///
+/// The VPN artefact names ONE box — its faces. The onion artefact names a
+/// CHAIN — the hops the client walks itself. They are told apart by the
+/// `kind` field: `"onion"` is the onion artefact, and **its absence means
+/// the VPN one** — the fleet's own shape, which this crate does not change
+/// by a byte.
+#[derive(Debug, Clone)]
+pub enum DeliveryArtefact {
+    /// The VPN artefact: the faces of one box.
+    Vpn(EntranceArtefact),
+    /// The onion artefact: the hops of one chain.
+    Onion(crate::onion_artefact::OnionArtefact),
+}
+
+/// Every way reading an artefact of either kind can fail, by name.
+#[derive(Debug, Error)]
+pub enum DeliveryArtefactError {
+    #[error(transparent)]
+    Vpn(#[from] ArtefactError),
+
+    #[error(transparent)]
+    Onion(#[from] crate::onion_artefact::OnionArtefactError),
+
+    #[error("the artefact names an unknown kind {0:?}")]
+    UnknownKind(String),
+}
+
+impl DeliveryArtefact {
+    /// Read an artefact of either kind.
+    ///
+    /// The discriminant is read first: `"kind": "onion"` means the onion
+    /// artefact; an artefact without `kind` is the VPN one.
+    pub fn from_json(raw: &str) -> Result<Self, DeliveryArtefactError> {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(ArtefactError::Json)?;
+        let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        if kind == crate::onion_artefact::ONION_KIND {
+            return Ok(Self::Onion(crate::onion_artefact::OnionArtefact::from_json(
+                raw,
+            )?));
+        }
+        if !kind.is_empty() {
+            return Err(DeliveryArtefactError::UnknownKind(kind.to_owned()));
+        }
+        Ok(Self::Vpn(EntranceArtefact::from_json(raw)?))
+    }
+
+    /// Validate whichever artefact this is.
+    pub fn validate(&self) -> Result<(), DeliveryArtefactError> {
+        match self {
+            Self::Vpn(artefact) => artefact.validate().map_err(DeliveryArtefactError::Vpn),
+            Self::Onion(artefact) => artefact.validate().map_err(DeliveryArtefactError::Onion),
+        }
+    }
+
+    /// The client's own persistent static key, whichever artefact this is.
+    pub fn client_static_priv(&self) -> Result<[u8; 32], DeliveryArtefactError> {
+        match self {
+            Self::Vpn(artefact) => artefact
+                .client_static_priv()
+                .map_err(DeliveryArtefactError::Vpn),
+            Self::Onion(artefact) => artefact
+                .client_static_priv()
+                .map_err(DeliveryArtefactError::Onion),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

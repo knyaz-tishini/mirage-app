@@ -51,11 +51,13 @@
 
 pub mod artefact;
 pub mod assembly;
+pub mod chain_artefact;
 pub mod claim;
 pub mod claim_image;
 pub mod control;
 pub mod dial;
 pub mod http_connect;
+pub mod onion_artefact;
 pub mod oss_artefact;
 pub mod oss_setup;
 pub mod peer;
@@ -69,9 +71,14 @@ pub mod udp_associate;
 pub mod udp_flow;
 pub mod watchdog;
 
-pub use artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefact};
+pub use artefact::{
+    ArtefactEntrance, ArtefactError, ArtefactMode, DeliveryArtefact, DeliveryArtefactError,
+    EntranceArtefact,
+};
+pub use chain_artefact::{build_onion_artefact, ChainArtefactError};
 pub use claim::redeem_artefact_json;
 pub use assembly::{SubscriberClient, SubscriberClientError, SubscriberClientOptions};
+pub use onion_artefact::{OnionArtefact, OnionArtefactError, OnionHop, ONION_KIND, ONION_VERSION};
 pub use oss_artefact::{build as build_oss_artefact, OssArtefactError};
 pub use oss_setup::{OssSetup, OssSetupOutcome};
 pub use scope::EgressScope;
