@@ -57,6 +57,7 @@ pub mod control;
 pub mod dial;
 pub mod http_connect;
 pub mod oss_artefact;
+pub mod oss_setup;
 pub mod peer;
 pub mod scope;
 pub mod session;
@@ -72,6 +73,7 @@ pub use artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefa
 pub use claim::redeem_artefact_json;
 pub use assembly::{SubscriberClient, SubscriberClientError, SubscriberClientOptions};
 pub use oss_artefact::{build as build_oss_artefact, OssArtefactError};
+pub use oss_setup::{OssSetup, OssSetupOutcome};
 pub use scope::EgressScope;
 pub use tun_mode::TunMode;
 pub use session::{

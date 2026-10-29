@@ -175,6 +175,31 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "p.ssh_timeout" => ("таймаут", "timed out"),
         "p.ssh_host" => ("ключ хоста сменился", "host key changed"),
         "p.sftp_size" => ("размер не сошёлся", "size did not match"),
+        "p.oss_no_client_key" => (
+            "у клиента нет публичного ключа",
+            "the client has no public key",
+        ),
+        "p.oss_no_carrier" => (
+            "боксу не задан ни один носитель",
+            "the box was given no carrier",
+        ),
+        "p.oss_binary" => (
+            "не удалось прочитать бинарь mirage-vpn",
+            "could not read the mirage-vpn binary",
+        ),
+        "p.oss_installing" => ("бокс ставится", "the box is being installed"),
+        "p.oss_install_failed" => (
+            "установка бокса не удалась",
+            "the box install failed",
+        ),
+        "p.oss_no_publication" => (
+            "бокс не опубликовал себя",
+            "the box did not publish itself",
+        ),
+        "p.oss_up" => (
+            "бокс поднят и опубликовал себя",
+            "the box is up and published itself",
+        ),
         _ => (id, id),
     }
 }
@@ -213,6 +238,13 @@ mod tests {
             "p.ssh_timeout",
             "p.ssh_host",
             "p.sftp_size",
+            "p.oss_no_client_key",
+            "p.oss_no_carrier",
+            "p.oss_binary",
+            "p.oss_installing",
+            "p.oss_install_failed",
+            "p.oss_no_publication",
+            "p.oss_up",
         ] {
             let (ru, en) = row(id);
             assert_ne!(ru, id, "{id} has no Russian copy");

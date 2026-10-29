@@ -212,7 +212,7 @@ async fn take_down(host: &str, port: u16, user: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn set_text(bus: &InstallBus, line: &str) {
+pub(crate) fn set_text(bus: &InstallBus, line: &str) {
     *bus.text.lock().unwrap_or_else(|p| p.into_inner()) = line.to_owned();
 }
 
@@ -430,7 +430,7 @@ fn with_warning(err: String, warn: &Option<String>) -> String {
 /// access, no `sshd` on the PATH, a `sudo` that wants a password) keeps its
 /// password door, and the reason comes back to the operator as a warning
 /// rather than as a failed install.
-async fn disable_password_auth(
+pub(crate) async fn disable_password_auth(
     session: &client::Handle<Handler>,
 ) -> Result<(), String> {
     let out = exec(session, &disable_password_script()).await?;
@@ -651,7 +651,7 @@ fn image_tar() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-fn ensure_key(priv_path: &Path, pub_path: &Path) -> Result<(), String> {
+pub(crate) fn ensure_key(priv_path: &Path, pub_path: &Path) -> Result<(), String> {
     if priv_path.is_file() && pub_path.is_file() {
         return Ok(());
     }
@@ -669,13 +669,13 @@ fn ensure_key(priv_path: &Path, pub_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-struct ExecOut {
-    exit: Option<u32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct ExecOut {
+    pub(crate) exit: Option<u32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
-struct Handler {
+pub(crate) struct Handler {
     addr: String,
     pins: PathBuf,
     mismatch: Arc<Mutex<Option<String>>>,
@@ -720,7 +720,7 @@ fn pin(path: &Path, addr: &str, fp: &str) -> Result<bool, String> {
     }
 }
 
-async fn connect_key(
+pub(crate) async fn connect_key(
     addr: &str,
     user: &str,
     pem: &[u8],
@@ -786,7 +786,7 @@ const PASSWORD_ATTEMPTS: usize = 8;
 const PASSWORD_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Install the key with the password, waiting for the box to be ready.
-async fn password_install_key_when_ready(
+pub(crate) async fn password_install_key_when_ready(
     addr: &str,
     user: &str,
     password: &str,
@@ -854,7 +854,7 @@ async fn connect(addr: &str, pins: &Path) -> Result<client::Handle<Handler>, Str
     }
 }
 
-async fn exec(session: &client::Handle<Handler>, command: &str) -> Result<ExecOut, String> {
+pub(crate) async fn exec(session: &client::Handle<Handler>, command: &str) -> Result<ExecOut, String> {
     let mut channel = session.channel_open_session().await.map_err(|e| format!("ssh: {e}"))?;
     channel
         .exec(true, format!("sh -lc {}", sh_quote(command)))
@@ -880,7 +880,7 @@ async fn exec(session: &client::Handle<Handler>, command: &str) -> Result<ExecOu
     })
 }
 
-async fn upload(session: &client::Handle<Handler>, bytes: &[u8], remote: &str) -> Result<(), String> {
+pub(crate) async fn upload(session: &client::Handle<Handler>, bytes: &[u8], remote: &str) -> Result<(), String> {
     let channel = session.channel_open_session().await.map_err(|e| format!("sftp: {e}"))?;
     channel.request_subsystem(true, "sftp").await.map_err(|e| format!("sftp: {e}"))?;
     let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| format!("sftp: {e}"))?;

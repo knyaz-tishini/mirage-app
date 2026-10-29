@@ -15,6 +15,9 @@
 //!   is given.
 //! - [`provision`] — how a box is installed: password once, an ed25519 key
 //!   after that, then Docker, then the face proposal.
+//! - [`oss_install`] — how a SELF-ASSEMBLED box is installed: the same door
+//!   and the same key, but the OSS `mirage-vpn` binary instead of Docker, and
+//!   the publication the box makes about itself.
 //! - [`chain_install`] — putting several boxes together into one chain.
 //! - [`i18n`] — the copy of the installer's status lines, in Russian and
 //!   English. It travels WITH the installer, so a headless client speaks the
@@ -28,6 +31,7 @@ pub mod chain;
 pub mod chain_install;
 pub mod i18n;
 pub mod oss;
+pub mod oss_install;
 pub mod provision;
 
 pub use chain::{Chain, ChainBox, ChainError, ChainFace, ChainKeys, ChainRole, HopRole};
@@ -35,4 +39,5 @@ pub use chain_install::{
     install_chain, save_chain, ChainOutcome, ChainRequest, InstalledBox,
 };
 pub use oss::{OssFace, OssProposal, PROPOSAL_VERSION};
+pub use oss_install::{OssCarrier, OssJob, OssOutcome};
 pub use provision::{InstallBus, Job, Outcome, ProposedFace};

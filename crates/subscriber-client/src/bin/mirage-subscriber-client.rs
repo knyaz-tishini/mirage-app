@@ -25,13 +25,14 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use mirage_control_plane::ExitPreference;
 use mirage_client_chain::chain_install::{self, ChainRequest};
+use mirage_client_chain::oss_install::OssCarrier;
 use mirage_client_chain::provision::InstallBus;
 use mirage_subscriber_client::{
-    control, exit_preference_from_mode, http_connect, publish_fatal, tun_mode, EdgeReason,
-    EdgeSession, EdgeState, EgressScope, EntranceArtefact, SubscriberClient, SubscriberClientError,
-    SubscriberClientOptions, TunMode,
+    control, exit_preference_from_mode, http_connect, oss_setup, publish_fatal, tun_mode, EdgeReason,
+    EdgeSession, EdgeState, EgressScope, EntranceArtefact, OssSetup, SubscriberClient,
+    SubscriberClientError, SubscriberClientOptions, TunMode,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(
@@ -135,6 +136,57 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Install a self-assembled box and write the artefact it publishes.
+    ///
+    /// The client makes its own key, installs the box with that key's public
+    /// half in the box's allowlist, reads back what the box published, and
+    /// writes the artefact — the same artefact the fleet's panel issues. No
+    /// session is opened and no traffic is carried: the artefact is written
+    /// for the client that dials it.
+    Oss {
+        /// The box, as `user@host:port`. The port defaults to 22.
+        #[arg(long = "box", value_name = "USER@HOST:PORT")]
+        box_addr: String,
+        /// The password of the box's ssh door. Used once, to plant the key.
+        #[arg(long)]
+        password: Option<String>,
+        /// A file with the password, for when the password must not sit in
+        /// the shell's history.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+        /// The `mirage-vpn` binary that goes on the box.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The MirageVG port the box opens.
+        #[arg(long)]
+        mwg_port: Option<u16>,
+        /// The MirageKVIC port the box opens.
+        #[arg(long)]
+        mkvik_port: Option<u16>,
+        /// The id both ends bake into the handshake.
+        #[arg(long, default_value = "mirage-vpn")]
+        mesh_id: String,
+        /// The name the client goes under in the box's peer table.
+        #[arg(long, default_value = "customer")]
+        client_name: String,
+        /// The label the artefact carries.
+        #[arg(long, default_value = "self-built")]
+        label: String,
+        /// Where the client's own key pair is kept between runs.
+        #[arg(long)]
+        key_out: Option<PathBuf>,
+        /// This box's own state directory: the ssh key and the host-key pin.
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// The ssh key the client uses for this box's door — the operator's
+        /// own key, the one the box already knows. The public half is the
+        /// same path with `.pub` beside it.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// Where the artefact is written.
+        #[arg(long, default_value = "artefact.json")]
+        out: PathBuf,
+    },
     /// Build a chain of boxes: install every box, wire them into one relay
     /// path, and write the chain down.
     ///
@@ -227,6 +279,40 @@ async fn main() -> ExitCode {
 
     // A chain is built before anything is dialled: it needs no artefact and
     // opens no session, so it is answered before the artefact is demanded.
+    if let Some(Command::Oss {
+        box_addr,
+        password,
+        password_file,
+        binary,
+        mwg_port,
+        mkvik_port,
+        mesh_id,
+        client_name,
+        label,
+        key_out,
+        state,
+        ssh_key,
+        out,
+    }) = &args.command
+    {
+        return run_oss(
+            box_addr,
+            password.as_deref(),
+            password_file.as_deref(),
+            binary,
+            *mwg_port,
+            *mkvik_port,
+            mesh_id,
+            client_name,
+            label,
+            key_out.as_deref(),
+            state.as_deref(),
+            ssh_key.as_deref(),
+            out,
+        )
+        .await;
+    }
+
     if let Some(Command::Chain {
         chain_id,
         boxes,
@@ -289,6 +375,7 @@ async fn main() -> ExitCode {
         Some(Command::Countries) => run_countries(&artefact).await,
         Some(Command::Claim { .. }) => ExitCode::FAILURE,
         Some(Command::Chain { .. }) => ExitCode::FAILURE,
+        Some(Command::Oss { .. }) => ExitCode::FAILURE,
         None => run_proxy(&artefact, &args).await,
     }
 }
@@ -1053,6 +1140,100 @@ async fn run_claim(panel: &str, claim: Option<&str>, poll: Option<&str>, out: &P
         error!(status = state, "credential was already delivered");
         return ExitCode::FAILURE;
     }
+}
+
+/// Install a self-assembled box and write the artefact it published.
+///
+/// The client makes its own key, the box is installed with that key's public
+/// half in its allowlist, the box publishes itself, and the artefact is built
+/// from the publication — the same artefact the fleet's panel issues.
+#[allow(clippy::too_many_arguments)]
+async fn run_oss(
+    box_addr: &str,
+    password: Option<&str>,
+    password_file: Option<&Path>,
+    binary: &Path,
+    mwg_port: Option<u16>,
+    mkvik_port: Option<u16>,
+    mesh_id: &str,
+    client_name: &str,
+    label: &str,
+    key_out: Option<&Path>,
+    state: Option<&Path>,
+    ssh_key: Option<&Path>,
+    out: &Path,
+) -> ExitCode {
+    let password = match (password, password_file) {
+        (Some(_), Some(_)) => {
+            error!("refusing: pass --password or --password-file, not both");
+            return ExitCode::FAILURE;
+        }
+        (Some(password), None) => password.to_owned(),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(text) => text.trim_end_matches(['\r', '\n']).to_owned(),
+            Err(err) => {
+                error!(path = %path.display(), error = %err, "cannot read the password file");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => String::new(),
+    };
+
+    let mut carriers = Vec::new();
+    if let Some(port) = mwg_port {
+        carriers.push(OssCarrier::mwg(port));
+    }
+    if let Some(port) = mkvik_port {
+        carriers.push(OssCarrier::mkvik(port));
+    }
+    if carriers.is_empty() {
+        error!("refusing: name at least one port for the box (--mwg-port or --mkvik-port)");
+        return ExitCode::FAILURE;
+    }
+    if !binary.is_file() {
+        error!(path = %binary.display(), "refusing: the mirage-vpn binary is not there");
+        return ExitCode::FAILURE;
+    }
+
+    let bus = Arc::new(InstallBus::new());
+    let stop = watch_progress(Arc::clone(&bus));
+    let outcome = oss_setup::setup(
+        OssSetup {
+            box_addr: box_addr.to_owned(),
+            password,
+            binary: binary.to_owned(),
+            carriers,
+            mesh_id: mesh_id.to_owned(),
+            client_name: client_name.to_owned(),
+            label: label.to_owned(),
+            state: state.map(Path::to_owned),
+            ssh_key: ssh_key.map(Path::to_owned),
+            key_path: key_out.map(Path::to_owned),
+        },
+        bus.as_ref(),
+    )
+    .await;
+    stop.store(true, Ordering::Relaxed);
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            error!(error = %err, "the box did not come up");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(warn) = &outcome.warn {
+        warn!(warning = %warn, "the box is up, with a warning");
+    }
+    if let Err(err) = std::fs::write(out, &outcome.artefact_json) {
+        error!(path = %out.display(), error = %err, "cannot write the artefact");
+        return ExitCode::FAILURE;
+    }
+    println!("the box is up, the artefact is written: {}", out.display());
+    for entrance in &outcome.artefact.entrances {
+        println!("  face {}", entrance.addr);
+    }
+    ExitCode::SUCCESS
 }
 
 /// Build a chain of boxes and write it down.
