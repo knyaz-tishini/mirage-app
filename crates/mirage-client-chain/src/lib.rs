@@ -27,10 +27,12 @@
 pub mod chain;
 pub mod chain_install;
 pub mod i18n;
+pub mod oss;
 pub mod provision;
 
 pub use chain::{Chain, ChainBox, ChainError, ChainFace, ChainKeys, ChainRole, HopRole};
 pub use chain_install::{
     install_chain, save_chain, ChainOutcome, ChainRequest, InstalledBox,
 };
+pub use oss::{OssFace, OssProposal, PROPOSAL_VERSION};
 pub use provision::{InstallBus, Job, Outcome, ProposedFace};
