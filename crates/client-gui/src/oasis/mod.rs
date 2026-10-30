@@ -408,8 +408,11 @@ impl App for Oasis {
         self.poll_scan();
         // The list of what exists is what can be picked.
         self.sync_picked();
-        // The window comes back to the target the person was on, and the link
-        // goes up on its own: the client must not need a click to be a client.
+        // The window comes back to the target the person was on -- the row in
+        // the list, nothing more. It does NOT come back connected: the link
+        // goes up when the person presses connect and not before. A client
+        // that raises the tunnel on its own takes the machine's internet away
+        // without anyone having asked for it.
         if !self.restored {
             self.restored = true;
             self.restore_link(now);
@@ -668,16 +671,15 @@ impl Oasis {
         self.remember_picked();
     }
 
-    /// Put the last target back and bring the link up.
+    /// Put the last target back.
     ///
-    /// The client is a client when it is connected, not when it is clicked.
-    fn restore_link(&mut self, now: f64) {
-        if !self.connection_ready() {
-            return;
-        }
+    /// The target is the ROW in the list -- which configuration or the cabinet
+    /// the person was on. Restoring it is not connecting: the link goes up
+    /// when the person presses connect. All this does at startup is tell the
+    /// device which entrances the tunnel has to keep outside itself, so that
+    /// a switch of target does not have to restart the adapter.
+    fn restore_link(&mut self, _now: f64) {
         self.tell_relay_addrs();
-        self.linked = self.raise_link();
-        self.link_sent_at = now;
     }
 
     /// Remember the target the person is on, so the window comes back to it.
