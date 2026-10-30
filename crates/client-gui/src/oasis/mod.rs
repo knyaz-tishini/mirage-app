@@ -1329,14 +1329,23 @@ fn target_rows(content: Rect, stand: &Stand, bound: bool) -> Vec<TargetRow> {
         y += TARGET_ROW_H + 8.0;
     }
     for (index, config) in stand.configs.iter().enumerate() {
+        let kind = if config.kind == "onion" {
+            crate::text::tr("t.onion").to_owned()
+        } else {
+            crate::text::tr("t.vpn").to_owned()
+        };
+        // The configuration says which protocol it speaks. The row says so
+        // too: a row that does not name the protocol is a row nobody can
+        // tell apart from another.
+        let protocol = config.protocol();
         rows.push(TargetRow {
             rect: Rect::new(x, y, w, TARGET_ROW_H),
             target: Target::Config(index),
             title: config.name.clone(),
-            subtitle: if config.kind == "onion" {
-                crate::text::tr("t.onion").to_owned()
+            subtitle: if protocol.is_empty() {
+                kind
             } else {
-                crate::text::tr("t.vpn").to_owned()
+                format!("{kind} · {protocol}")
             },
         });
         y += TARGET_ROW_H + 8.0;

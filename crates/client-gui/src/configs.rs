@@ -34,6 +34,16 @@ impl Config {
     pub fn read(&self) -> Option<String> {
         std::fs::read_to_string(self.artefact()).ok()
     }
+
+    /// The protocol this configuration speaks, in the person's words.
+    ///
+    /// The artefact says it: the entrance's camouflage IS the protocol — the
+    /// QUIC carrier (M-KVIK), the WireGuard-like carrier (M-VG), a plain
+    /// TCP face, and so on. A configuration that does not say is shown
+    /// without one.
+    pub fn protocol(&self) -> String {
+        self.read().as_deref().and_then(read_protocol).unwrap_or_default()
+    }
 }
 
 /// Where the app keeps what it made.
@@ -185,10 +195,47 @@ fn free_id(wanted: &str) -> String {
 
 /// What the artefact says it is, and what it is called.
 ///
+/// The protocol an artefact speaks, in the person's words.
+///
+/// The entrance's camouflage is the protocol: the QUIC carrier is M-KVIK,
+/// the WireGuard-like carrier is M-VG, and a face without a mask is a plain
+/// TCP face. A configuration whose artefact says nothing is shown without a
+/// protocol rather than with a guess.
+pub fn read_protocol(artefact: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(artefact).ok()?;
+    let kind = value
+        .get("entrances")
+        .and_then(|list| list.as_array())
+        .and_then(|list| list.first())
+        .and_then(|entrance| entrance.get("camouflage"))
+        .and_then(|mask| mask.get("type"))
+        .and_then(|kind| kind.as_str())?;
+    Some(
+        match kind {
+            "quic" => "M-KVIK",
+            "wire_guard" => "M-VG",
+            "none" => "TCP",
+            "tls_real" => "M-TLS",
+            "http3" => "M-H3",
+            "ssh" => "M-SSH",
+            "websocket" => "M-WS",
+            "grpc" => "M-GRPC",
+            "reality" => "M-REALITY",
+            "webtransport" => "M-WT",
+            "xhttp" => "M-XHTTP",
+            "raw_udp" => "M-UDP",
+            "icmp" => "M-ICMP",
+            "dns_tunnel" => "M-DNS",
+            "pipeline" => "M-PIPE",
+            other => other,
+        }
+        .to_owned(),
+    )
+}
+
 /// The kind is the artefact's own word: `onion` is a chain, and the absence
 /// of the word is the classic one-box entrance.
-pub fn read_name(artefact: &str) -> (String, String) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(artefact) else {
+pub fn read_name(artefact: &str) -> (String, String) {    let Ok(value) = serde_json::from_str::<serde_json::Value>(artefact) else {
         return (String::new(), String::new());
     };
     let kind = match value.get("kind").and_then(|item| item.as_str()) {
