@@ -27,7 +27,9 @@ use uzor_framework::{
     WindowSpec,
 };
 
-use crate::backend::{EngineLink, LocalHttp};
+use crate::backend::EngineLink;
+use crate::engine::LocalEngine;
+
 use crate::shell::menu::{self, MenuTab};
 
 mod palm_mark;
@@ -126,6 +128,42 @@ enum Target {
     Config(usize),
 }
 
+/// The target the person was on last, read from the profile.
+///
+/// The window comes back to it instead of to the first row of the list: the
+/// cabinet is not the default, it is only one of the rows.
+fn restore_picked(stand: &Stand) -> Target {
+    let last = stand.last_target.trim();
+    if last.is_empty() {
+        return Target::Cabinet;
+    }
+    if last == "cabinet" {
+        return Target::Cabinet;
+    }
+    if let Some(path) = last.strip_prefix("config:") {
+        if let Some(index) = stand
+            .configs
+            .iter()
+            .position(|config| config.dir.to_string_lossy() == path)
+        {
+            return Target::Config(index);
+        }
+    }
+    Target::Cabinet
+}
+
+/// The profile key of a target.
+fn target_key(target: Target, stand: &Stand) -> String {
+    match target {
+        Target::Cabinet => "cabinet".to_owned(),
+        Target::Config(index) => match stand.configs.get(index) {
+            Some(config) => format!("config:{}", config.dir.to_string_lossy()),
+            None => String::new(),
+        },
+        Target::None => String::new(),
+    }
+}
+
 struct Oasis {
     host: JsAnimHost,
     link: f64,
@@ -143,13 +181,15 @@ struct Oasis {
     /// What the engine's child runs right now. The child runs one entrance
     /// at a time, so switching the target means spawning it again.
     running: Option<Target>,
-    engine: LocalHttp,
+    engine: LocalEngine,
     unlink_armed: bool,
     note: String,
     fell_back: bool,
     stand: Stand,
     /// Scene button has started the configured connection. The boot picture is not this.
     linked: bool,
+    /// The window has already put the last target back. Once.
+    restored: bool,
     /// Time of the last raise or stop. See [`LINK_RETRY_S`].
     link_sent_at: f64,
     /// Last standalone link handed to the subscriber. Stops a re-spawn every frame.
@@ -368,6 +408,12 @@ impl App for Oasis {
         self.poll_scan();
         // The list of what exists is what can be picked.
         self.sync_picked();
+        // The window comes back to the target the person was on, and the link
+        // goes up on its own: the client must not need a click to be a client.
+        if !self.restored {
+            self.restored = true;
+            self.restore_link(now);
+        }
         // The sheet carries the cabinet's claim code and the wish to be
         // unlinked; the engine does the work.
         self.stand.cabinet_bound = self.engine.is_bound();
@@ -619,6 +665,76 @@ impl Oasis {
         self.picked = rows.first().map(|row| row.target).unwrap_or(Target::None);
         self.running = None;
         self.adopted.clear();
+        self.remember_picked();
+    }
+
+    /// Put the last target back and bring the link up.
+    ///
+    /// The client is a client when it is connected, not when it is clicked.
+    fn restore_link(&mut self, now: f64) {
+        if !self.connection_ready() {
+            return;
+        }
+        self.tell_relay_addrs();
+        self.linked = self.raise_link();
+        self.link_sent_at = now;
+    }
+
+    /// Remember the target the person is on, so the window comes back to it.
+    fn remember_picked(&mut self) {
+        let key = target_key(self.picked, &self.stand);
+        if self.stand.last_target != key {
+            self.stand.last_target = key;
+            self.stand.save_profile();
+        }
+        self.tell_relay_addrs();
+    }
+
+    /// Every entrance this window knows, as bare hosts.
+    ///
+    /// The device keeps these out of its own tunnel: the socket to the box
+    /// must not be routed into the tunnel that carries it. The list covers
+    /// every target, so the device's config never changes when the target
+    /// does — the device stays up.
+    fn relay_addrs(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        let mut take = |json: &str| {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+                return;
+            };
+            let Some(entrances) = value.get("entrances").and_then(|item| item.as_array()) else {
+                return;
+            };
+            for entrance in entrances {
+                let Some(addr) = entrance.get("addr").and_then(|item| item.as_str()) else {
+                    continue;
+                };
+                let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
+                let host = host.trim_matches(|c| c == '[' || c == ']');
+                if !host.is_empty() && !hosts.iter().any(|item| item == host) {
+                    hosts.push(host.to_owned());
+                }
+            }
+        };
+        for index in 0..self.stand.configs.len() {
+            if let Some(json) = self.config_artefact(index) {
+                take(&json);
+            }
+        }
+        if let Ok(path) = crate::backend::bound_device_path() {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                take(&text);
+            }
+        }
+        hosts
+    }
+
+    /// Tell the engine which addresses the device must not capture.
+    fn tell_relay_addrs(&mut self) {
+        let hosts = self.relay_addrs();
+        if !hosts.is_empty() {
+            self.engine.relay_addrs(&hosts);
+        }
     }
 
     /// The entrance of one configuration, when it is still there.
@@ -696,11 +812,9 @@ impl Oasis {
         match self.picked {
             Target::None => return false,
             Target::Cabinet => {
-                // The cabinet is the redeemed device. The child runs one
-                // entrance at a time, so coming back to the cabinet means
-                // spawning it from the device file again.
+                // The cabinet is the redeemed device. The session takes it in
+                // place: the device and the window stay up.
                 if self.running != Some(Target::Cabinet) {
-                    self.stop_link();
                     if let Err(err) = self.engine.adopt_device() {
                         #[cfg(not(target_os = "ios"))]
                         {
@@ -721,10 +835,10 @@ impl Oasis {
                     return false;
                 };
                 if self.adopted != json {
-                    // The old adapter must be down before the new entrance is
-                    // dialled: the handshake to the box would go into the
-                    // tunnel it is replacing and die there.
-                    self.stop_link();
+                    // The session takes the new entrance in place. The device
+                    // stays up: the addresses of every entrance are kept out
+                    // of the tunnel, so the handshake to the new box does not
+                    // go into the tunnel it is replacing.
                     match self.engine.adopt_artefact(&json) {
                         Ok(()) => self.adopted = json,
                         Err(err) => {
@@ -995,6 +1109,7 @@ impl Oasis {
                 self.picked = row.target;
                 self.running = None;
                 self.adopted.clear();
+                self.remember_picked();
                 for ui in self.ui.values_mut() {
                     ui.menu = false;
                 }
@@ -1617,6 +1732,10 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         tick: TickRate::Capped(60),
         ..RuntimeConfig::default()
     };
+    // The window comes back to where the person left it: the target they were
+    // on, not the first row of the list.
+    let stand = Stand::load();
+    let picked = restore_picked(&stand);
     run_native(
         Oasis {
             host,
@@ -1630,14 +1749,15 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             eased_at: f64::NAN,
             ui: HashMap::new(),
             sheet: sheet_mode(),
-            picked: Target::Cabinet,
+            picked,
             running: None,
-            engine: LocalHttp::start(),
+            engine: LocalEngine::start(),
             unlink_armed: false,
             note: String::new(),
             fell_back: false,
-            stand: Stand::load(),
+            stand,
             linked: false,
+            restored: false,
             link_sent_at: f64::NEG_INFINITY,
             adopted: String::new(),
             pending_submit: None,

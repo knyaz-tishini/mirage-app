@@ -29,11 +29,12 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
-use crate::artefact::{ArtefactError, ArtefactEntrance, DeliveryArtefact, EntranceArtefact};
+use crate::artefact::{ArtefactError, DeliveryArtefact, EntranceArtefact};
 use crate::onion_artefact::OnionArtefact;
 use crate::scope::EgressScope;
 use crate::session::{exit_preference_from_mode, EdgeDialError, EdgeSessionSupervisor};
 use crate::status::{EdgeReason, StatusWriter};
+use crate::supervisor_slot::SupervisorSlot;
 use crate::tun_feed::TunFeed;
 
 /// Every way [`SubscriberClient::build`] refuses.
@@ -100,10 +101,16 @@ impl Default for SubscriberClientOptions {
 /// A running subscriber connector: the edge-session supervisor and the
 /// background tasks serving the local proxy (and, optionally, TUN).
 pub struct SubscriberClient {
-    pub supervisor: Arc<EdgeSessionSupervisor>,
+    /// The live session, swappable. A new configuration replaces it in place:
+    /// the local listener, the process and the tunnel device stay up.
+    pub supervisor: Arc<SupervisorSlot>,
     pub socks5_bind: SocketAddr,
     socks5_task: Option<tokio::task::JoinHandle<()>>,
-    status_writer: Option<StatusWriter>,
+    status_file: Option<PathBuf>,
+    status_writer: std::sync::Mutex<Option<StatusWriter>>,
+    /// The destinations the local capture sends through. Shared with the
+    /// listeners, so the lists can be replaced while they run.
+    pub scope: Arc<EgressScope>,
     _tun_feed: Option<TunFeed>,
 }
 
@@ -227,12 +234,13 @@ impl SubscriberClient {
         supervisor: Arc<EdgeSessionSupervisor>,
         options: SubscriberClientOptions,
     ) -> Result<Self, SubscriberClientError> {
+        let slot = SupervisorSlot::new(supervisor);
         // Started before anything else is bound so an unwritable path refuses
         // the build (dropping `supervisor` aborts its dial loop) instead of
         // leaving a connector running that nobody can observe.
-        let status_writer = match options.status_file {
+        let status_writer = match options.status_file.clone() {
             Some(path) => Some(
-                StatusWriter::start(path.clone(), supervisor.status())
+                StatusWriter::start(path.clone(), slot.current().status())
                     .map_err(|source| SubscriberClientError::StatusFile { path, source })?,
             ),
             None => None,
@@ -241,10 +249,13 @@ impl SubscriberClient {
         let socks5_bind = options.socks5_bind;
         let scope = Arc::new(options.scope);
         let socks5_task = if options.start_socks {
-            let socks5_supervisor = Arc::clone(&supervisor);
+            let socks5_slot = Arc::clone(&slot);
+            let socks5_scope = Arc::clone(&scope);
             info!(bind = %socks5_bind, "subscriber-client: SOCKS5 listener starting");
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::socks5::serve(socks5_bind, socks5_supervisor, scope).await {
+                if let Err(e) =
+                    crate::socks5::serve_slot(socks5_bind, socks5_slot, socks5_scope).await
+                {
                     tracing::error!(error = %e, "subscriber-client: SOCKS5 listener exited");
                 }
             }))
@@ -260,7 +271,76 @@ impl SubscriberClient {
             None => None,
         };
 
-        Ok(Self { supervisor, socks5_bind, socks5_task, status_writer, _tun_feed: tun_feed })
+        Ok(Self {
+            supervisor: slot,
+            socks5_bind,
+            socks5_task,
+            status_file: options.status_file,
+            status_writer: std::sync::Mutex::new(status_writer),
+            scope,
+            _tun_feed: tun_feed,
+        })
+    }
+
+    /// Build the edge-session supervisor for `artefact` — the dial loop over
+    /// its entrances, without touching the local listener.
+    ///
+    /// The configuration says where to go and with what protocol; the session
+    /// follows it and decides nothing itself.
+    pub async fn supervisor_for(
+        artefact: &DeliveryArtefact,
+        stream_failure_threshold: u32,
+    ) -> Result<Arc<EdgeSessionSupervisor>, SubscriberClientError> {
+        match artefact {
+            DeliveryArtefact::Vpn(vpn) => {
+                vpn.validate()?;
+                let exit = exit_preference_from_mode(&vpn.mode)?;
+                let client_static_priv = vpn.client_static_priv()?;
+                let mesh_id = vpn.mesh_id.as_bytes().to_vec();
+                let entrances = vpn.entrances.clone();
+                Ok(EdgeSessionSupervisor::spawn_with_threshold(
+                    entrances,
+                    mesh_id,
+                    client_static_priv,
+                    exit,
+                    stream_failure_threshold,
+                ))
+            }
+            DeliveryArtefact::Onion(onion) => {
+                onion.validate()?;
+                let spec = onion.to_spec()?;
+                Ok(crate::onion_session::spawn_onion(spec, stream_failure_threshold))
+            }
+        }
+    }
+
+    /// Adopt a new configuration in place.
+    ///
+    /// The local listener keeps running and the session is replaced: the old
+    /// target's dial loop stops at once, the new entrances are dialled, and
+    /// the process, the listener and the tunnel device stay up. This is what
+    /// a target change does — nothing is torn down and rebuilt.
+    pub async fn adopt_artefact(
+        &self,
+        artefact: &DeliveryArtefact,
+        stream_failure_threshold: u32,
+    ) -> Result<(), SubscriberClientError> {
+        let next = Self::supervisor_for(artefact, stream_failure_threshold).await?;
+        // The status file follows the live session.
+        if let Some(path) = self.status_file.clone() {
+            let writer = StatusWriter::start(path.clone(), next.status())
+                .map_err(|source| SubscriberClientError::StatusFile { path, source })?;
+            let mut slot = self
+                .status_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(old) = slot.take() {
+                old.stop();
+            }
+            *slot = Some(writer);
+        }
+        self.supervisor.replace(next);
+        Ok(())
     }
 
     /// Abort the SOCKS5 accept loop and, if a status file is kept, stop
@@ -271,7 +351,11 @@ impl SubscriberClient {
         if let Some(task) = &self.socks5_task {
             task.abort();
         }
-        if let Some(writer) = &self.status_writer {
+        let mut slot = self
+            .status_writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(writer) = slot.take() {
             writer.stop();
         }
     }

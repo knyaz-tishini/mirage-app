@@ -109,7 +109,10 @@ pub fn write_config(
     let doc = json!({
         "tun_name": tun_device_name(),
         "tun_addr": "10.77.0.1/24",
-        "mtu": 1280,
+        // The chain's UDP path refuses anything above 1200 bytes, and QUIC
+        // needs 1200 as its floor anyway. An adapter that hands out more
+        // than the chain accepts turns every datagram into a dropped one.
+        "mtu": 1200,
         "chains": [{
             "name": CHAIN_NAME,
             "socks5_addr": socks_bind.to_string(),
@@ -130,21 +133,29 @@ pub fn spawn(bin: &Path, config: &Path) -> io::Result<Child> {
     let log = File::options().create(true).append(true).open(&log_path)?;
     let err = log.try_clone()?;
     let mut cmd = Command::new(bin);
-    // The Windows binary is a foreground process (`debug-run`). It reads
-    // `tun.json` beside itself. Other systems take `--config`.
     #[cfg(windows)]
     {
         let dir = bin.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "mirage2tun has no directory")
         })?;
-        std::fs::copy(config, dir.join("tun.json"))?;
+        let target = dir.join("tun.json");
+        // The device reads `tun.json` beside itself. When the config already
+        // lives there, copying it onto itself would fail with a sharing
+        // violation — the copy is skipped instead.
+        let same = match (config.canonicalize(), target.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => config == &target,
+        };
+        if !same {
+            std::fs::copy(config, &target)?;
+        }
         cmd.arg("debug-run");
     }
     #[cfg(not(windows))]
     {
         cmd.arg("--config").arg(config).arg("--log-level").arg("info");
     }
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err));
     #[cfg(windows)]

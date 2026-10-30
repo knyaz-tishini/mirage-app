@@ -267,6 +267,9 @@ pub struct Stand {
     pub carry: Carry,
     /// The carry changed. The shell pushes it to the engine and clears this.
     pub carry_dirty: bool,
+    /// The target the person was on last: `cabinet`, or `config:<path>`.
+    /// The window comes back to it instead of to the first row of the list.
+    pub last_target: String,
 }
 
 impl Stand {
@@ -302,6 +305,7 @@ impl Stand {
             split_bypass: false,
             carry: Carry::Tun,
             carry_dirty: false,
+            last_target: String::new(),
             sites: Vec::new(),
             apps: Vec::new(),
             site_draft: String::new(),
@@ -405,6 +409,9 @@ impl Stand {
                             _ => Carry::Tun,
                         };
                     }
+                    if let Some(target) = v.get("last_target").and_then(|s| s.as_str()) {
+                        stand.last_target = target.to_owned();
+                    }
                     if let Some(sites) = string_list(&v, "sites") {
                         stand.sites = sites;
                     }
@@ -474,6 +481,7 @@ impl Stand {
             "except": self.except,
             "split_bypass": self.split_bypass,
             "carry": carry_key(self.carry),
+            "last_target": self.last_target,
             "sites": self.sites,
             "apps": self.apps,
         });

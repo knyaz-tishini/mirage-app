@@ -78,12 +78,25 @@ pub async fn serve(
     supervisor: Arc<EdgeSessionSupervisor>,
     scope: Arc<EgressScope>,
 ) -> std::io::Result<()> {
+    serve_slot(bind, crate::supervisor_slot::SupervisorSlot::new(supervisor), scope).await
+}
+
+/// Serve SOCKS5 against a swappable supervisor.
+///
+/// Every connection uses the supervisor that is live when the connection
+/// arrives, so a new configuration takes effect over the same listener: the
+/// listener, the process and the tunnel device all stay up.
+pub async fn serve_slot(
+    bind: SocketAddr,
+    slot: Arc<crate::supervisor_slot::SupervisorSlot>,
+    scope: Arc<EgressScope>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "subscriber-client: SOCKS5 listener ready");
     loop {
         let (stream, peer) = listener.accept().await?;
         debug!(%peer, "socks5: accepted connection");
-        let supervisor = Arc::clone(&supervisor);
+        let supervisor = slot.current();
         let scope = Arc::clone(&scope);
         tokio::spawn(async move {
             handle_connection(stream, supervisor, scope).await;
@@ -151,14 +164,32 @@ async fn handle_connect(
             if write_reply(&mut stream, REP_SUCCESS).await.is_err() {
                 return;
             }
+            // One line per flow, at info: the tunnel's own log says what
+            // the device did, this says what the edge did with it. A flow
+            // that dies silently is the one thing that cannot be debugged
+            // from the outside.
+            let started = std::time::Instant::now();
+            info!(target = %target, "socks5: CONNECT flow opened");
             match crate::relay::copy_bidirectional_with_flow_idle_timeout(&mut stream, &mut edge_stream)
                 .await
             {
                 Ok((to_edge, from_edge)) => {
-                    debug!(target = %target, to_edge, from_edge, "socks5: CONNECT flow ended");
+                    info!(
+                        target = %target,
+                        to_edge,
+                        from_edge,
+                        ms = started.elapsed().as_millis() as u64,
+                        "socks5: CONNECT flow ended"
+                    );
                 }
                 Err(e) => {
-                    debug!(target = %target, error = %e, "socks5: CONNECT flow ended with an error");
+                    warn!(
+                        target = %target,
+                        error = %e,
+                        kind = ?e.kind(),
+                        ms = started.elapsed().as_millis() as u64,
+                        "socks5: CONNECT flow ended with an error"
+                    );
                 }
             }
         }

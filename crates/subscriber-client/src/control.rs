@@ -19,8 +19,8 @@ use tracing::{debug, error, info};
 use mirage_control_plane::{CountryCode, ExitPreference};
 
 use crate::scope::EgressScope;
-use crate::session::EdgeSessionSupervisor;
 use crate::status::EdgeState;
+use crate::supervisor_slot::SupervisorSlot;
 use crate::tun_mode::{self, TunMode};
 
 const READ_CAP: usize = 16 * 1024;
@@ -186,7 +186,7 @@ pub fn dispatch(method: &str, path: &str, body: &str, wish: &Wish) -> Decision {
 /// Serve the control API until the listener fails. `bind` must be loopback.
 pub async fn serve(
     bind: SocketAddr,
-    supervisor: Arc<EdgeSessionSupervisor>,
+    supervisor: Arc<SupervisorSlot>,
     scope: Arc<EgressScope>,
     tun_bin: Option<PathBuf>,
     relay_addrs: Vec<String>,
@@ -501,7 +501,7 @@ struct Runtime {
     wish: Wish,
     socks_task: Option<JoinHandle<()>>,
     http_task: Option<JoinHandle<()>>,
-    supervisor: Arc<EdgeSessionSupervisor>,
+    supervisor: Arc<SupervisorSlot>,
     scope: Arc<EgressScope>,
     tun_bin: Option<PathBuf>,
     /// Entrance addresses the tun routes around itself. Not a status field.
@@ -546,7 +546,7 @@ async fn handle_client(stream: &mut TcpStream, rt: &mut Runtime) -> std::io::Res
         apply_wish(&mut rt.wish, &patch);
         if let Patch::Exit(label) = &patch {
             if let Some(pref) = exit_preference(label) {
-                rt.supervisor.set_exit(pref);
+                rt.supervisor.current().set_exit(pref);
             }
         }
         if !matches!(patch, Patch::None) {
@@ -570,7 +570,7 @@ async fn handle_client(stream: &mut TcpStream, rt: &mut Runtime) -> std::io::Res
 }
 
 fn live_view(rt: &mut Runtime) -> View {
-    let rx = rt.supervisor.status();
+    let rx = rt.supervisor.current().status();
     let snap = rx.borrow().clone();
     let tun_up = tun_child_alive(&mut rt.tun_child);
     if !tun_up {
@@ -621,7 +621,7 @@ fn sync_listeners(rt: &mut Runtime) {
     ensure_task(&mut rt.socks_task, run_socks, move || {
         tokio::spawn(async move {
             let bind = SocketAddr::from(([127, 0, 0, 1], 1080));
-            if let Err(e) = crate::socks5::serve(bind, socks_supervisor, socks_scope).await {
+            if let Err(e) = crate::socks5::serve_slot(bind, socks_supervisor, socks_scope).await {
                 error!(error = %e, "subscriber-client: SOCKS5 listener exited");
             }
         })
@@ -725,7 +725,7 @@ fn sync_tun(rt: &mut Runtime) {
     if rt.tun_retry_at.is_some_and(|at| at.elapsed() < Duration::from_secs(3)) {
         return;
     }
-    let snap = rt.supervisor.status().borrow().clone();
+    let snap = rt.supervisor.current().status().borrow().clone();
     if snap.state != EdgeState::Connected || !task_running(&rt.socks_task) {
         if matches!(snap.state, EdgeState::Refused | EdgeState::Fatal) {
             rt.tun_fault = Some(format!("mirage2tun did not start: dial {}", edge_label(snap.state)));

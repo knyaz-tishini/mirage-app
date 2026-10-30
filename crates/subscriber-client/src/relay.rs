@@ -27,6 +27,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// at the same point.
 pub const FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long the relay waits for the peer after the local side is done.
+///
+/// The local side closing means the device has finished with the flow. The
+/// peer usually answers with its own FIN within a moment, but a peer that
+/// stays silent would hold the socket open for as long as the idle timeout
+/// -- and every held socket is one slot of the accept backlog. The backlog
+/// on Windows is a few hundred connections, and a device that retries a
+/// dead flow fills it in seconds: the SOCKS5 listener then refuses new
+/// connections and the whole client looks dead.
+pub const FLOW_LINGER: Duration = Duration::from_secs(15);
+
 /// Copy bytes between `a` and `b` until one side is done, and give up on a
 /// flow that carries nothing in either direction for `idle_timeout`.
 ///
@@ -52,7 +63,12 @@ where
             break;
         }
 
-        let timer = tokio::time::sleep(idle_timeout);
+        // Once the local side is done, the flow is only waiting for the
+        // peer's leftovers. That wait is short: the peer's own FIN usually
+        // arrives at once, and a socket held open for minutes is a socket
+        // the accept backlog cannot afford.
+        let cap = if a_eof { FLOW_LINGER } else { idle_timeout };
+        let timer = tokio::time::sleep(cap);
         tokio::pin!(timer);
 
         tokio::select! {
@@ -62,8 +78,9 @@ where
                 tracing::debug!(
                     a_to_b,
                     b_to_a,
-                    idle_secs = idle_timeout.as_secs(),
-                    "flow idle timeout -- closing the relay"
+                    linger = a_eof,
+                    cap_secs = cap.as_secs(),
+                    "flow ended by the timer"
                 );
                 return Ok((a_to_b, b_to_a));
             }

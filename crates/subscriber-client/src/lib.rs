@@ -67,6 +67,7 @@ pub mod scope;
 pub mod session;
 pub mod socks5;
 pub mod status;
+pub mod supervisor_slot;
 pub mod tun_feed;
 pub mod tun_mode;
 pub mod udp_associate;
@@ -91,6 +92,7 @@ pub use session::{
 pub use status::{
     exit_label, publish_fatal, EdgeReason, EdgeState, EdgeStatusFile, ExitStatus, StatusWriter,
 };
+pub use supervisor_slot::SupervisorSlot;
 pub use udp_associate::{serve_udp_association, UdpAssociateError};
 pub use udp_flow::EdgeUdpFlow;
 pub use watchdog::{StreamHealth, WatchedStream, DEFAULT_STREAM_FAILURE_THRESHOLD};

@@ -364,6 +364,16 @@ impl EdgeSession {
         let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
         let stream = match handle.open_stream().await {
             Ok(stream) => stream,
+            Err(MuxError::TooManyStreams) => {
+                // The session has no stream credit right now. That is
+                // backpressure, not a broken session: the credit comes back
+                // when a flow ends. QUIC and HTTP/2 both wait here instead of
+                // tearing the connection down, and so does this client — a
+                // saturated session must not kill the flows that are already
+                // running through it.
+                warn!("edge session: no stream credit — this flow waits, the session stays");
+                return Err(EdgeStreamError::Mux(MuxError::TooManyStreams));
+            }
             Err(e) => {
                 // The session itself could not give us a stream — that is a
                 // failed open like any other.
@@ -395,6 +405,11 @@ impl EdgeSession {
         let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
         let stream = match handle.open_stream().await {
             Ok(stream) => stream,
+            Err(MuxError::TooManyStreams) => {
+                // Backpressure, not a broken session — see `open_tcp_stream`.
+                warn!("edge session: no stream credit — this flow waits, the session stays");
+                return Err(EdgeStreamError::Mux(MuxError::TooManyStreams));
+            }
             Err(e) => {
                 self.health.record_failure();
                 return Err(e.into());
@@ -976,6 +991,32 @@ impl EdgeSessionSupervisor {
         let label = crate::status::exit_label(&exit);
         ctrl.set(exit);
         self.status.send_modify(|status| status.exit.requested = label.clone());
+    }
+
+    /// Set the exit by its label: `auto` or an ISO alpha-2 country code.
+    /// Returns `false` when the label is neither.
+    pub fn set_exit_label(&self, label: &str) -> bool {
+        use mirage_control_plane::CountryCode;
+        let pref = if label == "auto" {
+            ExitPreference::Auto
+        } else {
+            match CountryCode::new(label) {
+                Ok(code) => ExitPreference::Country(code),
+                Err(_) => return false,
+            }
+        };
+        self.set_exit(pref);
+        true
+    }
+
+    /// Stop the dial loop. The live session, if any, is dropped with it and
+    /// nothing is dialed again. Idempotent.
+    ///
+    /// This is what a target change uses: the old target's session goes away
+    /// at once instead of being dialed behind the new one until its last
+    /// `Arc` drops.
+    pub fn stop(&self) {
+        self.driver.abort();
     }
 
     /// A receiver for the connector's published state. Its current value is

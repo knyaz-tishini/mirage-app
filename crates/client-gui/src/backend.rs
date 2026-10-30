@@ -21,7 +21,7 @@ const DEFAULT_CONTROL_PORT: u16 = 19421;
 /// The edge welcome is not this list.
 const CABINET_CATALOG: &str = "https://m1r4g3.bid/api/public/catalog";
 /// Claim redeem origin. The catalog host is a different service.
-const PANEL_ORIGIN: &str = "https://panel.m1r4g3.bid";
+pub(crate) const PANEL_ORIGIN: &str = "https://panel.m1r4g3.bid";
 
 /// Snapshot the GUI reflects. `online` is false when the control API did not answer.
 /// `tun_alive` is true only when `state` is `"connected"` — the name is a leftover
@@ -77,6 +77,10 @@ pub trait EngineLink: Send + Sync {
     }
     /// `auto` or an ISO alpha-2 country. The engine redials on the next session.
     fn set_exit(&self, _exit: &str) {}
+    /// The addresses the tunnel device must never capture — every entrance the
+    /// window knows. The device keeps them out of its own tunnel, so the
+    /// carrier is never routed into the tunnel it carries.
+    fn relay_addrs(&self, _addrs: &[String]) {}
     /// Redeem a claim code or `/c/` link, write a new file, and respawn only this child.
     fn bind_claim(&self, _text: &str) {}
     /// True only after a cabinet claim has been redeemed into the device file.
@@ -769,7 +773,7 @@ pub fn spawn_oss_install(
 }
 
 /// Redeemed device file next to the GUI. This is the only credential the child gets.
-fn bound_device_path() -> std::io::Result<PathBuf> {
+pub(crate) fn bound_device_path() -> std::io::Result<PathBuf> {
     Ok(exe_dir()?.join("bound-device.json"))
 }
 

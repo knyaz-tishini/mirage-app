@@ -632,7 +632,7 @@ fn remove_ifscope_default(iface: &str, gateway: &str) {
 }
 
 async fn wait_connected(client: &SubscriberClient) -> bool {
-    let mut rx = client.supervisor.status();
+    let mut rx = client.supervisor.current().status();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
     loop {
         {

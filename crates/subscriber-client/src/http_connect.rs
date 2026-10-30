@@ -14,13 +14,14 @@ use tracing::{debug, info, warn};
 
 use crate::scope::EgressScope;
 use crate::session::EdgeSessionSupervisor;
+use crate::supervisor_slot::SupervisorSlot;
 
 const HEADER_CAP: usize = 8 * 1024;
 const SESSION_WAIT: Duration = Duration::from_secs(5);
 
 pub async fn serve(
     bind: SocketAddr,
-    supervisor: Arc<EdgeSessionSupervisor>,
+    supervisor: Arc<SupervisorSlot>,
     scope: Arc<EgressScope>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
@@ -28,7 +29,7 @@ pub async fn serve(
     loop {
         let (stream, peer) = listener.accept().await?;
         debug!(%peer, "http: accepted connection");
-        let supervisor = Arc::clone(&supervisor);
+        let supervisor = supervisor.current();
         let scope = Arc::clone(&scope);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, supervisor, scope).await {

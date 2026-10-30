@@ -212,8 +212,8 @@ pub fn read_protocol(artefact: &str) -> Option<String> {
         .and_then(|kind| kind.as_str())?;
     Some(
         match kind {
-            "quic" => "M-KVIK",
-            "wire_guard" => "M-VG",
+            "quic" => "M-QUIK",
+            "wire_guard" => "M-WG",
             "none" => "TCP",
             "tls_real" => "M-TLS",
             "http3" => "M-H3",
