@@ -195,7 +195,8 @@ impl EngineLink for LocalHttp {
             let mut guard = self.status.lock().unwrap_or_else(PoisonError::into_inner);
             guard.socks = false;
             guard.http = false;
-            guard.tun = false;
+            // `tun` is the adapter, written by the status poll. Clearing it
+            // here paints the rider off while the adapter is still up.
             if enabled {
                 guard.mode = "tun".to_owned();
             } else {

@@ -7,7 +7,8 @@
 //! those words and the caption buttons stays the sheet colour and still
 //! drags. Text rows are
 //! framework text fields. A click on the
-//! scene eases the link over 0.55s.
+//! scene is the connection. The rider eases over 0.55s only while the
+//! adapter is up, and the empty desert is the adapter being down.
 
 use std::collections::HashMap;
 
@@ -36,6 +37,8 @@ use stand::Stand;
 
 const HIT_SCENE: &str = "scene";
 const TRANSITION_S: f64 = 0.55;
+/// A click the adapter has not met is sent again, no faster than this.
+const LINK_RETRY_S: f64 = 1.5;
 const SCALE: f64 = 1.75 * 0.75;
 const CHROME_H: f64 = 32.0 * SCALE;
 const MARK: f64 = 28.0 * SCALE;
@@ -122,6 +125,8 @@ struct Oasis {
     stand: Stand,
     /// Scene button has started the configured connection. The boot picture is not this.
     linked: bool,
+    /// Time of the last raise or stop. See [`LINK_RETRY_S`].
+    link_sent_at: f64,
     /// Last standalone link handed to the subscriber. Stops a re-spawn every frame.
     adopted: String,
     pending_submit: Option<String>,
@@ -335,7 +340,7 @@ impl App for Oasis {
         }
         self.stand.pull_bus();
         self.poll_scan();
-        if !self.take_entrance() {
+        if !self.take_entrance(now) {
             self.sync_standalone_link();
         }
 
@@ -370,7 +375,7 @@ impl App for Oasis {
                 if self.stand.take_scope() {
                     self.apply_scope();
                 }
-                self.take_entrance();
+                self.take_entrance(now);
             }
             if cx.view.clicked(&WidgetId::from("scrim")) {
                 ui.menu = false;
@@ -413,19 +418,26 @@ impl App for Oasis {
             && !min_click
             && !close_click
         {
-            if self.linked {
+            let tun_up = {
+                let st = self.engine.status();
+                st.online && st.tun
+            };
+            // The picture is the switch. Desert turns the adapter on.
+            // A visible rider turns it off.
+            if tun_up {
                 self.linked = false;
-                self.target = 0.0;
+                self.link_sent_at = now;
                 self.style = (self.toggles % 4) as f64;
                 self.toggles = self.toggles.wrapping_add(1);
                 self.stop_link();
             } else if self.connection_ready() && self.raise_link() {
                 self.linked = true;
-                self.target = 1.0;
+                self.link_sent_at = now;
                 self.style = (self.toggles % 4) as f64;
                 self.toggles = self.toggles.wrapping_add(1);
             }
         }
+        self.bind_rider(now);
         if menu_click {
             ui.menu = !ui.menu;
         }
@@ -515,7 +527,7 @@ impl App for Oasis {
             if let Some(id) = self.pending_submit.take() {
                 self.on_submit(&id);
             }
-            self.take_entrance();
+            self.take_entrance(now);
             let g = open_geom(w, h, panel_h);
             self.mount_fields(cx, rect, &g);
         }
@@ -705,10 +717,35 @@ impl Oasis {
     }
 
     fn stop_link(&mut self) {
+        // Clearing the tun wish matters. Session-down alone leaves the wish
+        // set, and the next session-up brings the adapter back with no click.
+        self.engine.set_tun(false);
         self.engine.disconnect();
         self.fell_back = false;
         #[cfg(target_os = "ios")]
         crate::ios_host::tunnel_stop();
+    }
+
+    /// The rider is the adapter. `linked` is the click. A wish the status
+    /// has not met is repeated until the picture and the adapter are the same.
+    fn bind_rider(&mut self, now: f64) {
+        let tun_up = {
+            let st = self.engine.status();
+            st.online && st.tun
+        };
+        if now - self.link_sent_at >= LINK_RETRY_S {
+            if self.linked {
+                if !tun_up && self.connection_ready() {
+                    self.link_sent_at = now;
+                    let _ = self.raise_link();
+                }
+            } else if tun_up {
+                self.link_sent_at = now;
+                self.stop_link();
+            }
+        }
+        let st = self.engine.status();
+        self.target = if st.online && st.tun { 1.0 } else { 0.0 };
     }
 
     fn poll_scan(&mut self) {
@@ -728,7 +765,7 @@ impl Oasis {
 
     /// A camera, file, clipboard, or Enter replaced the link. JSON connects.
     /// Anything else stays on the sheet as text and a QR.
-    fn take_entrance(&mut self) -> bool {
+    fn take_entrance(&mut self, now: f64) -> bool {
         if !self.stand.take_relink() {
             return false;
         }
@@ -747,7 +784,7 @@ impl Oasis {
             && self.raise_link()
         {
             self.linked = true;
-            self.target = 1.0;
+            self.link_sent_at = now;
             self.style = (self.toggles % 4) as f64;
             self.toggles = self.toggles.wrapping_add(1);
         }
@@ -1462,6 +1499,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             fell_back: false,
             stand: Stand::load(),
             linked: false,
+            link_sent_at: f64::NEG_INFINITY,
             adopted: String::new(),
             pending_submit: None,
             bind_reset_epoch: 0,
