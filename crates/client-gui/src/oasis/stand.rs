@@ -134,6 +134,8 @@ pub enum Focus {
     MwgPort,
     /// The port the MirageKVIC carrier sits on.
     KvikPort,
+    /// The claim code the cabinet is redeemed with.
+    Bind,
 }
 
 /// Where the box's stack comes from.
@@ -209,6 +211,20 @@ pub struct Stand {
     pub mwg_port: String,
     /// The port the MirageKVIC carrier sits on.
     pub kvik_port: String,
+    /// The person's own configurations — the ways out the client knows.
+    pub configs: Vec<crate::configs::Config>,
+    /// The claim code the cabinet is redeemed with. The engine holds the
+    /// redemption; the field only holds the text.
+    pub bind_draft: String,
+    /// Set when the person pressed ENTER on the claim field.
+    pub bind_submit: bool,
+    /// The claim code to redeem, waiting for the engine.
+    pub claim: String,
+    /// The cabinet is redeemed. The sheet shows the way out of it instead of
+    /// the way in.
+    pub cabinet_bound: bool,
+    /// The person asked to be unlinked.
+    pub unlink: bool,
     guests: Vec<Guest>,
     guest_draft: String,
     qr_guest: Option<usize>,
@@ -257,6 +273,12 @@ impl Stand {
             key_source: KeySource::Own,
             mwg_port: DEFAULT_MWG_PORT.to_owned(),
             kvik_port: DEFAULT_KVIK_PORT.to_owned(),
+            configs: crate::configs::list(),
+            bind_draft: String::new(),
+            bind_submit: false,
+            claim: String::new(),
+            cabinet_bound: false,
+            unlink: false,
             guests: Vec::new(),
             guest_draft: String::new(),
             qr_guest: None,
@@ -467,6 +489,44 @@ impl Stand {
         self.link = link;
         self.bump_link_epoch();
         self.save_link();
+        // A box was just installed: it is a configuration now.
+        self.refresh_configs();
+    }
+
+    /// Read the list of configurations again.
+    ///
+    /// The list grows when a box is installed and when an artefact is
+    /// imported, so it is read fresh whenever something happened.
+    pub fn refresh_configs(&mut self) {
+        self.configs = crate::configs::list();
+    }
+
+    /// The person pressed ENTER on the claim field.
+    ///
+    /// The engine does the redemption; the sheet only carries the text and
+    /// the wish.
+    pub fn submit_bind(&mut self) {
+        let text = self.bind_draft.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        self.bind_draft.clear();
+        self.claim = text;
+        self.bind_submit = true;
+    }
+
+    /// The claim code the person asked to redeem.
+    pub fn take_claim(&mut self) -> Option<String> {
+        if !self.bind_submit {
+            return None;
+        }
+        self.bind_submit = false;
+        Some(std::mem::take(&mut self.claim))
+    }
+
+    /// The person asked to be unlinked.
+    pub fn take_unlink(&mut self) -> bool {
+        std::mem::take(&mut self.unlink)
     }
 
     /// Put the box's proposal into the protocol list.
@@ -683,7 +743,7 @@ impl Stand {
             self.say(tr("say.need_port"));
             return;
         };
-        let paths = match crate::backend::oss_paths() {
+        let paths = match crate::backend::oss_paths_for(&host) {
             Ok(paths) => paths,
             Err(err) => {
                 self.bus.running.store(false, Ordering::Relaxed);
@@ -718,7 +778,8 @@ impl Stand {
             &args,
             &password,
             Arc::clone(&self.bus),
-            &paths.artefact,
+            &host,
+            &paths,
         ) {
             self.bus.running.store(false, Ordering::Relaxed);
             self.say(&format!("{err}"));
@@ -762,7 +823,7 @@ impl Stand {
     /// hoster's panel, or by hand — and the client comes in by key from then
     /// on, with no password at all. The private half stays on this machine.
     pub fn show_my_key(&mut self) {
-        let paths = match crate::backend::oss_paths() {
+        let paths = match crate::backend::oss_paths_for(self.host.trim()) {
             Ok(paths) => paths,
             Err(err) => {
                 self.say(&format!("{err}"));
@@ -1131,6 +1192,7 @@ impl Stand {
             Focus::SshKey => Some(&mut self.ssh_key),
             Focus::MwgPort => Some(&mut self.mwg_port),
             Focus::KvikPort => Some(&mut self.kvik_port),
+            Focus::Bind => Some(&mut self.bind_draft),
             Focus::None => None,
         }
     }
@@ -1143,6 +1205,7 @@ impl Stand {
             Focus::Mtu => 5,
             Focus::Guest => 64,
             Focus::MwgPort | Focus::KvikPort => 5,
+            Focus::Bind => 512,
             Focus::None => return,
             _ => 240,
         };
@@ -1539,6 +1602,7 @@ enum ButtonText {
     InviteConn,
     InviteFull,
     MyKey,
+    Unlink,
 }
 
 enum Choice {
@@ -1579,6 +1643,7 @@ enum HitKind {
     Key,
     MyKey,
     Invite(bool),
+    Unlink,
     Proto(usize),
     ProtoOn(usize),
     Guest(usize),
@@ -1741,6 +1806,14 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
     };
     match stand.section {
         Section::Server => {
+            // The cabinet is one of the ways out, so its claim code sits at
+            // the top of the server sheet: the person looks for it first,
+            // next to the boxes of their own.
+            if stand.cabinet_bound {
+                lay.solo(("st-unlink", ButtonText::Unlink, HitKind::Unlink));
+            } else {
+                lay.field("st-bind", tr("f.cabinet"), Focus::Bind, tr("bind.ph"), 512, false);
+            }
             lay.field("st-host", tr("f.host"), Focus::Host, tr("f.host"), 240, false);
             lay.field("st-user", tr("f.user"), Focus::User, tr("f.user"), 240, false);
             lay.field("st-pass", tr("f.pass"), Focus::Pass, tr("f.pass"), 240, true);
@@ -1899,6 +1972,7 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Build => stand.cycle_build(),
         HitKind::Key => stand.cycle_key_source(),
         HitKind::MyKey => stand.show_my_key(),
+        HitKind::Unlink => stand.unlink = true,
         HitKind::Invite(full) => stand.invite(full),
         HitKind::Proto(index) => stand.select_proto(index),
         HitKind::ProtoOn(index) => stand.toggle_proto(index),
@@ -2143,6 +2217,7 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
         ButtonText::InviteConn => tr("b.invite_conn"),
         ButtonText::InviteFull => tr("b.invite_full"),
         ButtonText::MyKey => tr("b.my_key"),
+        ButtonText::Unlink => tr("b.unlink"),
     }
 }
 

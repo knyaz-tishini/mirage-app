@@ -57,12 +57,24 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "mode.mesh" => ("меш", "mesh"),
         "mode.own" => ("свой сервер", "own server"),
 
+        "h.connections" => ("подключения", "connections"),
+        "h.settings" => ("настройки", "settings"),
+
+        "t.cabinet" => ("кабинет", "cabinet"),
+        "t.bound" => ("флот: привязан", "fleet: bound"),
+        "t.unbound" => ("флот: не привязан", "fleet: not bound"),
+        "t.vpn" => ("vpn — один бокс", "vpn — one box"),
+        "t.onion" => ("onion — цепочка", "onion — a chain"),
+        "t.none" => ("ничего не выбрано", "nothing picked"),
+        "t.empty" => ("пока пусто", "nothing yet"),
+
         "nav.server" => ("сервер", "server"),
         "nav.proto" => ("протоколы", "protocols"),
         "nav.access" => ("доступ", "access"),
         "nav.link" => ("связь", "link"),
 
         "f.host" => ("хост", "host"),
+        "f.cabinet" => ("кабинет", "cabinet"),
         "f.user" => ("логин", "user"),
         "f.pass" => ("пароль", "password"),
         "f.build" => ("режим", "mode"),
@@ -104,6 +116,7 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "b.invite_conn" => ("подключение", "connection"),
         "b.invite_full" => ("полный", "full"),
         "b.my_key" => ("мой ключ", "my key"),
+        "b.unlink" => ("отвязать", "unlink"),
         "b.on" => ("вкл", "on"),
         "b.off" => ("выкл", "off"),
         "b.revoke" => ("отозвать", "revoke"),

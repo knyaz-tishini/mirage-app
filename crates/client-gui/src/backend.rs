@@ -314,6 +314,30 @@ impl LocalHttp {
         self.bound.store(true, Ordering::Relaxed);
         Ok(())
     }
+
+    /// Put the subscriber back on the cabinet device.
+    ///
+    /// The cabinet and a configuration are two different entrances, and the
+    /// child runs one of them at a time. Coming back to the cabinet means
+    /// spawning the child from the redeemed device file again.
+    pub fn adopt_device(&self) -> Result<(), String> {
+        let path = bound_device_path().map_err(|e| e.to_string())?;
+        if !path.is_file() {
+            return Err(crate::text::tr("bind.not_started").into());
+        }
+        let url = {
+            let mut slot = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(pick_control_url());
+            }
+            slot.clone()
+                .unwrap_or_else(|| format!("http://127.0.0.1:{DEFAULT_CONTROL_PORT}"))
+        };
+        replace_child(&self.child, &path, &url)
+            .map_err(|e| format!("{}: {e}", crate::text::tr("bind.client")))?;
+        self.bound.store(true, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// Cabinet page in the machine browser. No token. Only an install that has
@@ -507,7 +531,7 @@ fn parse_status(body: &str) -> EngineStatus {
     }
 }
 
-fn exe_dir() -> std::io::Result<PathBuf> {
+pub(crate) fn exe_dir() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     exe.parent()
         .map(|path| path.to_path_buf())
@@ -563,10 +587,11 @@ fn subscriber_bin() -> std::io::Result<PathBuf> {
 
 /// The paths the self-assembly keeps.
 ///
-/// One directory beside the executable: the box's own state (the key the
-/// client plants on the box and the pin of that box's host key), the client's
-/// own key pair, and the artefact the install writes. A second box gets a
-/// second directory, so one box's key never overwrites another's.
+/// One directory per box: the box's own state (the key the client plants on
+/// the box and the pin of that box's host key), the client's own key pair,
+/// and the artefact the install writes. A second box gets a second
+/// directory, so one box's key never overwrites another's — and the box can
+/// be found again later, by its address.
 pub struct OssPaths {
     /// The directory the install works in.
     pub state: PathBuf,
@@ -576,9 +601,13 @@ pub struct OssPaths {
     pub artefact: PathBuf,
 }
 
-/// Where the self-assembly keeps its files.
-pub fn oss_paths() -> std::io::Result<OssPaths> {
-    let dir = exe_dir()?.join("standalone").join("oss");
+/// Where the self-assembly keeps its files for one box.
+///
+/// The directory is named after the box's address, so the list of
+/// configurations and the files on disk agree.
+pub fn oss_paths_for(host: &str) -> std::io::Result<OssPaths> {
+    let dir = crate::configs::dir_for(host)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "exe has no parent"))?;
     std::fs::create_dir_all(&dir)?;
     Ok(OssPaths {
         state: dir.clone(),
@@ -626,7 +655,8 @@ pub fn spawn_oss_install(
     args: &[String],
     password: &str,
     bus: Arc<InstallBus>,
-    artefact: &std::path::Path,
+    host: &str,
+    paths: &OssPaths,
 ) -> std::io::Result<()> {
     let bin = subscriber_bin()?;
     let mut cmd = Command::new(bin);
@@ -646,7 +676,8 @@ pub fn spawn_oss_install(
     let mut stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let artefact = artefact.to_path_buf();
+    let artefact = paths.artefact.clone();
+    let host = host.to_owned();
 
     if let Some(mut pipe) = stdin.take() {
         use std::io::Write;
@@ -704,8 +735,11 @@ pub fn spawn_oss_install(
         let tail = err_thread.join().unwrap_or_default();
         let mut text = bus.text.lock().unwrap_or_else(|p| p.into_inner());
         match status {
-            Ok(status) if status.success() => match std::fs::read_to_string(artefact) {
+            Ok(status) if status.success() => match std::fs::read_to_string(&artefact) {
                 Ok(json) => {
+                    // The box is a configuration now: it takes its place in the
+                    // list of what one can connect to, under its own address.
+                    crate::configs::take_install(&host);
                     *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(json);
                     *text = mirage_client_chain::i18n::tr("p.oss_up").to_owned();
                 }

@@ -45,6 +45,8 @@ const MARK: f64 = 28.0 * SCALE;
 const GLYPH: f64 = 22.0 * SCALE;
 const LIP: f64 = 8.0;
 const SEG_H: f64 = 30.0;
+/// One row of the list of what one can connect to.
+const TARGET_ROW_H: f64 = 44.0;
 // Straight RGBA of assets/palm.svg at 64. The caption slot is ICON_SMALL:
 // a 256 bitmap there is what Windows crushes. The exe icon carries
 // 16/32/48/64/128/256 from the same vectors for the taskbar and Alt-Tab.
@@ -99,10 +101,29 @@ impl Default for WinUi {
     }
 }
 
+/// Which sheet the chrome opens.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Product {
+enum Sheet {
+    /// The list of what one can connect to.
+    Targets,
+    /// The form: make a box, bind the cabinet.
+    Settings,
+}
+
+/// What one can connect to.
+///
+/// The cabinet is the fleet mesh, by a redeemed device. A configuration is
+/// the person's own way out: a box the client assembled itself, or a chain
+/// it was given. The artefact says which — this enum only says which row of
+/// the list the person picked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    /// Nothing is picked. There is nothing to connect to.
+    None,
+    /// The cabinet: the fleet mesh.
     Cabinet,
-    Standalone,
+    /// One of the person's own configurations.
+    Config(usize),
 }
 
 struct Oasis {
@@ -115,10 +136,14 @@ struct Oasis {
     paint_err: bool,
     eased_at: f64,
     ui: HashMap<WindowId, WinUi>,
-    product: Product,
+    /// Which sheet the chrome opens.
+    sheet: Sheet,
+    /// What one can connect to. The scene connects to this.
+    picked: Target,
+    /// What the engine's child runs right now. The child runs one entrance
+    /// at a time, so switching the target means spawning it again.
+    running: Option<Target>,
     engine: LocalHttp,
-    bind_draft: String,
-    bind_focused: bool,
     unlink_armed: bool,
     note: String,
     fell_back: bool,
@@ -130,9 +155,6 @@ struct Oasis {
     /// Last standalone link handed to the subscriber. Stops a re-spawn every frame.
     adopted: String,
     pending_submit: Option<String>,
-    /// Bumped when BIND clears the draft. Each window wipes its own field store once.
-    bind_reset_epoch: u64,
-    bind_reset_seen: HashMap<WindowId, u64>,
     /// Windows that already applied [`Stand::pass_epoch`].
     pass_reset_seen: HashMap<WindowId, u64>,
     /// Windows that already applied [`Stand::clear_epoch`].
@@ -340,6 +362,22 @@ impl App for Oasis {
         }
         self.stand.pull_bus();
         self.poll_scan();
+        // The list of what exists is what can be picked.
+        self.sync_picked();
+        // The sheet carries the cabinet's claim code and the wish to be
+        // unlinked; the engine does the work.
+        self.stand.cabinet_bound = self.engine.is_bound();
+        if let Some(claim) = self.stand.take_claim() {
+            self.engine.bind_claim(&claim);
+        }
+        if self.stand.take_unlink() {
+            if self.unlink_armed {
+                self.engine.unlink();
+                self.unlink_armed = false;
+            } else {
+                self.unlink_armed = true;
+            }
+        }
         if !self.take_entrance(now) {
             self.sync_standalone_link();
         }
@@ -347,7 +385,7 @@ impl App for Oasis {
         let mut ui = self.ui.get(&win).cloned().unwrap_or_default();
         let panel_h = self.sheet_panel_h(h);
         let g = open_geom(w, h, panel_h);
-        let (mode_cab, mode_std) = mode_pair(w);
+        let (sheet_targets, sheet_settings) = sheet_pair(w);
 
         if ui.menu {
             // Hover on the body only. The chrome gap has no widget, so the
@@ -365,9 +403,7 @@ impl App for Oasis {
             if bottom < h {
                 hit(cx.widgets.coord, "scrim", at(Rect::new(0.0, bottom, w, (h - bottom).max(0.0))));
             }
-            if self.product == Product::Cabinet {
-                self.register_bind(cx.widgets.coord, &cx.view, &layer, &at, &g, w);
-            } else {
+            if self.sheet == Sheet::Settings {
                 stand::register(cx.widgets.coord, &cx.view, &layer, &at, &g, &mut self.stand);
                 if self.stand.take_scan_request() {
                     self.scan = Some(crate::camera::CameraScan::start());
@@ -376,18 +412,19 @@ impl App for Oasis {
                     self.apply_scope();
                 }
                 self.take_entrance(now);
+            } else {
+                self.register_targets(cx.widgets.coord, &cx.view, &layer, &at, &g);
             }
             if cx.view.clicked(&WidgetId::from("scrim")) {
                 ui.menu = false;
-                self.bind_focused = false;
             }
-            hit(cx.widgets.coord, "mode-cab", at(mode_cab));
-            hit(cx.widgets.coord, "mode-std", at(mode_std));
-            if cx.view.clicked(&WidgetId::from("mode-cab")) {
-                self.set_mode(Product::Cabinet);
+            hit(cx.widgets.coord, "sheet-targets", at(sheet_targets));
+            hit(cx.widgets.coord, "sheet-settings", at(sheet_settings));
+            if cx.view.clicked(&WidgetId::from("sheet-targets")) {
+                self.set_sheet(Sheet::Targets);
             }
-            if cx.view.clicked(&WidgetId::from("mode-std")) {
-                self.set_mode(Product::Standalone);
+            if cx.view.clicked(&WidgetId::from("sheet-settings")) {
+                self.set_sheet(Sheet::Settings);
             }
         } else {
             hit(cx.widgets.coord, HIT_SCENE, at(Rect::new(0.0, CHROME_H, w, scene_h)));
@@ -466,57 +503,18 @@ impl App for Oasis {
         render.restore();
         if menu_now.menu {
             let g = open_geom(w, h, panel_h);
-            if self.product == Product::Cabinet {
-                let rows = menu::cabinet_rows();
-                let (laid, content_h) = menu::layout_rows(&rows, 0, 0, 0);
-                let note = if self.note.is_empty() { None } else { Some(self.note.as_str()) };
-                menu::draw_menu(
-                    render,
-                    w,
-                    h,
-                    &g,
-                    MenuTab::Setup,
-                    &[],
-                    &laid,
-                    content_h,
-                    menu_now.scroll,
-                    0.0,
-                    &[],
-                    None,
-                    true,
-                    note,
-                    "",
-                    false,
-                    false,
-                    false,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    false,
-                    false,
-                    "",
-                    false,
-                    "",
-                    self.engine.is_bound(),
-                    self.unlink_armed,
-                    self.engine.cabinet_open(),
-                    self.engine.bound_name().as_deref(),
-                    now,
-                    &[],
-                    false,
-                    false,
-                    pointer,
-                );
-            } else {
+            if self.sheet == Sheet::Settings {
                 let note = if self.note.is_empty() { None } else { Some(self.note.as_str()) };
                 stand::paint(render, &g, &self.stand, false, note);
+            } else {
+                self.paint_targets(render, &g);
             }
         }
         if menu_now.menu {
-            let (mode_cab, mode_std) = mode_pair(w);
-            paint_modes(render, mode_cab, mode_std, self.product);
+            let (sheet_targets, sheet_settings) = sheet_pair(w);
+            paint_sheets(render, sheet_targets, sheet_settings, self.sheet);
         }
+        paint_target_chip(render, w, &self.target_name());
         paint_menu(render);
         paint_controls(render, w, pointer);
         if let Some(scan) = self.scan.as_ref() {
@@ -583,56 +581,65 @@ impl App for Oasis {
 }
 
 impl Oasis {
-    fn on_bind_row(&mut self, x: f64, w: f64) {
-        if self.engine.is_bound() {
-            let unlink_x = menu::unlink_button_x(w);
-            if x >= unlink_x {
-                if self.unlink_armed {
-                    self.engine.unlink();
-                    self.unlink_armed = false;
-                    self.bind_focused = false;
-                    self.note.clear();
-                } else {
-                    self.unlink_armed = true;
-                }
-                return;
-            }
-            self.unlink_armed = false;
-            if self.engine.cabinet_open() && x >= menu::cabinet_button_x(w) {
-                crate::backend::open_marked_cabinet();
-            }
-            return;
-        }
-        self.unlink_armed = false;
-        if x >= menu::bind_button_x(w) {
-            self.submit_bind();
-        } else if x >= 108.0 {
-            self.bind_focused = true;
-        } else {
-            self.bind_focused = false;
-        }
-    }
-
-    fn submit_bind(&mut self) {
-        let text = self.bind_draft.trim().to_owned();
-        if text.is_empty() {
-            return;
-        }
-        self.engine.bind_claim(&text);
-        self.bind_draft.clear();
-        self.bind_focused = false;
-        self.bind_reset_epoch = self.bind_reset_epoch.wrapping_add(1);
-        if self.bind_reset_epoch == 0 {
-            self.bind_reset_epoch = 1;
-        }
-    }
-
-    /// Cabinet is a redeemed device. Standalone is a JSON entrance artefact.
-    /// Anything else is not a connection, and the scene button does not start one.
+    /// The cabinet is a redeemed device. A configuration is a JSON entrance
+    /// artefact. Anything else is not a connection, and the scene button does
+    /// not start one.
     fn connection_ready(&self) -> bool {
-        match self.product {
-            Product::Cabinet => self.cabinet_ready(),
-            Product::Standalone => self.standalone_artefact().is_some(),
+        match self.picked {
+            Target::None => false,
+            Target::Cabinet => self.cabinet_ready(),
+            Target::Config(index) => self.config_artefact(index).is_some(),
+        }
+    }
+
+    /// Keep the picked target inside the list.
+    ///
+    /// The list is what exists: a cabinet that was redeemed, and the
+    /// configurations the person made. A target that is not in the list is
+    /// not a target any more.
+    fn sync_picked(&mut self) {
+        let bound = self.engine.is_bound();
+        let rows = target_rows(Rect::new(0.0, 0.0, 1.0, 1.0), &self.stand, bound);
+        if rows.iter().any(|row| row.target == self.picked) {
+            return;
+        }
+        self.picked = rows.first().map(|row| row.target).unwrap_or(Target::None);
+        self.running = None;
+        self.adopted.clear();
+    }
+
+    /// The entrance of one configuration, when it is still there.
+    fn config_artefact(&self, index: usize) -> Option<String> {
+        let config = self.stand.configs.get(index)?;
+        config.read()
+    }
+
+    /// The configuration that carries this artefact, made when there is none.
+    ///
+    /// A pasted artefact is a configuration: it takes its place in the list of
+    /// what one can connect to, and it becomes the picked target.
+    fn config_for(&mut self, artefact: &str) -> Option<usize> {
+        if let Some(config) = crate::configs::find_by_artefact(artefact) {
+            if let Some(index) = self.stand.configs.iter().position(|item| item.dir == config.dir) {
+                return Some(index);
+            }
+        }
+        let config = crate::configs::take_artefact(artefact, "")?;
+        self.stand.refresh_configs();
+        self.stand.configs.iter().position(|item| item.dir == config.dir)
+    }
+
+    /// What the chrome says the picked target is.
+    fn target_name(&self) -> String {
+        match self.picked {
+            Target::None => crate::text::tr("t.none").to_owned(),
+            Target::Cabinet => crate::text::tr("t.cabinet").to_owned(),
+            Target::Config(index) => self
+                .stand
+                .configs
+                .get(index)
+                .map(|config| config.name.clone())
+                .unwrap_or_else(|| crate::text::tr("t.none").to_owned()),
         }
     }
 
@@ -673,14 +680,15 @@ impl Oasis {
         if !self.connection_ready() {
             return false;
         }
-        if self.product == Product::Standalone {
-            let Some(json) = self.standalone_artefact() else {
-                return false;
-            };
-            if self.adopted != json {
-                match self.engine.adopt_artefact(&json) {
-                    Ok(()) => self.adopted = json,
-                    Err(err) => {
+        match self.picked {
+            Target::None => return false,
+            Target::Cabinet => {
+                // The cabinet is the redeemed device. The child runs one
+                // entrance at a time, so coming back to the cabinet means
+                // spawning it from the device file again.
+                if self.running != Some(Target::Cabinet) {
+                    self.stop_link();
+                    if let Err(err) = self.engine.adopt_device() {
                         #[cfg(not(target_os = "ios"))]
                         {
                             self.note = err;
@@ -689,10 +697,38 @@ impl Oasis {
                         #[cfg(target_os = "ios")]
                         {
                             let _ = err;
-                            self.adopted = json;
+                        }
+                    }
+                    self.running = Some(Target::Cabinet);
+                    self.adopted.clear();
+                }
+            }
+            Target::Config(index) => {
+                let Some(json) = self.config_artefact(index) else {
+                    return false;
+                };
+                if self.adopted != json {
+                    // The old adapter must be down before the new entrance is
+                    // dialled: the handshake to the box would go into the
+                    // tunnel it is replacing and die there.
+                    self.stop_link();
+                    match self.engine.adopt_artefact(&json) {
+                        Ok(()) => self.adopted = json,
+                        Err(err) => {
+                            #[cfg(not(target_os = "ios"))]
+                            {
+                                self.note = err;
+                                return false;
+                            }
+                            #[cfg(target_os = "ios")]
+                            {
+                                let _ = err;
+                                self.adopted = json;
+                            }
                         }
                     }
                 }
+                self.running = Some(Target::Config(index));
             }
         }
         self.engine.set_exit("auto");
@@ -705,9 +741,9 @@ impl Oasis {
         self.engine.connect();
         #[cfg(target_os = "ios")]
         {
-            let arg = match self.product {
-                Product::Standalone => self.standalone_artefact(),
-                Product::Cabinet => None,
+            let arg = match self.picked {
+                Target::Config(index) => self.config_artefact(index),
+                Target::Cabinet | Target::None => None,
             };
             if !crate::ios_host::tunnel_start(arg.as_deref()) {
                 return false;
@@ -777,8 +813,7 @@ impl Oasis {
             self.stand.say(&err);
         }
         let link = self.stand.link.trim();
-        if self.product == Product::Standalone
-            && !link.is_empty()
+        if !link.is_empty()
             && link == self.adopted
             && self.note.is_empty()
             && self.raise_link()
@@ -792,15 +827,18 @@ impl Oasis {
     }
 
     fn sync_standalone_link(&mut self) {
-        if self.product != Product::Standalone {
-            return;
-        }
         let link = self.stand.link.trim().to_owned();
         if link.is_empty() || link == self.adopted {
             return;
         }
         if serde_json::from_str::<serde_json::Value>(&link).ok().filter(|v| v.is_object()).is_none() {
             return;
+        }
+        // A pasted artefact is a configuration: it takes its place in the list
+        // and becomes the picked target.
+        if let Some(index) = self.config_for(&link) {
+            self.picked = Target::Config(index);
+            self.running = Some(Target::Config(index));
         }
         match self.engine.adopt_artefact(&link) {
             Ok(()) => {
@@ -825,9 +863,9 @@ impl Oasis {
 
     /// Sheet height is the chrome band, the rows, and a 1px lip.
     fn sheet_panel_h(&self, window_h: f64) -> f64 {
-        let body = if self.product == Product::Cabinet {
-            let (_, content_h) = menu::layout_rows(&menu::cabinet_rows(), 0, 0, 0);
-            content_h + if self.note.is_empty() { 0.0 } else { 26.0 }
+        let body = if self.sheet == Sheet::Targets {
+            targets_height(&self.stand, self.engine.is_bound())
+                + if self.note.is_empty() { 0.0 } else { 26.0 }
         } else {
             stand::content_height(&self.stand, !self.note.is_empty())
         };
@@ -836,7 +874,7 @@ impl Oasis {
 
     fn on_submit(&mut self, id: &str) {
         match id {
-            "bind" => self.submit_bind(),
+            "st-bind" => self.stand.submit_bind(),
             "st-link" => self.stand.mark_relink(),
             "st-host" | "st-user" | "st-pass" => self.stand.install(),
             "st-site" => {
@@ -858,12 +896,11 @@ impl Oasis {
         self.engine.set_scope(&services, &apps, &bypass_services, &bypass_apps);
     }
 
-    fn set_mode(&mut self, product: Product) {
-        if self.product == product {
+    fn set_sheet(&mut self, sheet: Sheet) {
+        if self.sheet == sheet {
             return;
         }
-        self.product = product;
-        self.bind_focused = false;
+        self.sheet = sheet;
         self.stand.focus = stand::Focus::None;
         let Some(path) = std::env::current_exe()
             .ok()
@@ -871,9 +908,9 @@ impl Oasis {
         else {
             return;
         };
-        let text = match product {
-            Product::Standalone => "standalone\n",
-            Product::Cabinet => "cabinet\n",
+        let text = match sheet {
+            Sheet::Settings => "settings\n",
+            Sheet::Targets => "targets\n",
         };
         let _ = std::fs::write(path, text);
     }
@@ -887,119 +924,84 @@ impl Oasis {
         if text.is_empty() || !self.sheet_open() {
             return;
         }
-        match self.product {
-            Product::Cabinet if self.bind_focused => {
-                if self.bind_draft.len() + text.len() <= 512 {
-                    self.bind_draft.push_str(text);
-                }
-            }
-            Product::Standalone => {
-                let into_link = self.stand.focus == stand::Focus::None
-                    || self.stand.focus == stand::Focus::Link
-                    || text.starts_with('{');
-                if into_link {
-                    self.stand.set_link(text);
-                    self.adopted.clear();
-                } else {
-                    self.stand.type_text(text);
-                }
-            }
-            Product::Cabinet => {}
+        if self.sheet != Sheet::Settings {
+            return;
+        }
+        let into_link = self.stand.focus == stand::Focus::None
+            || self.stand.focus == stand::Focus::Link
+            || text.starts_with('{');
+        if into_link {
+            self.stand.set_link(text);
+            self.adopted.clear();
+        } else {
+            self.stand.type_text(text);
         }
     }
 
-    fn register_bind(
+    fn mount_fields(&mut self, cx: &mut PanelCx<'_, Vocab>, origin: Rect, g: &menu::Geom) {
+        if self.sheet != Sheet::Settings {
+            return;
+        }
+        let at = |local: Rect| Rect::new(origin.x + local.x, origin.y + local.y, local.width, local.height);
+        self.mount_stand(cx, &at, g);
+    }
+
+    /// The list of what one can connect to.
+    ///
+    /// A click picks the row and nothing else: the scene is what connects.
+    /// The sheet closes on the pick, so the scene is under the finger.
+    fn register_targets(
         &mut self,
         coord: &mut uzor::input::InputCoordinator,
         view: &uzor_framework::VisualView<Vocab>,
         layer: &uzor::input::LayerId,
         at: &impl Fn(Rect) -> Rect,
         g: &menu::Geom,
-        w: f64,
     ) {
-        let (laid, _) = menu::layout_rows(&menu::cabinet_rows(), 0, 0, 0);
-        let Some(row) = laid.iter().find(|lr| matches!(lr.row, menu::MenuRow::Bind)) else {
-            return;
-        };
-        let ry = g.content.y + row.y;
-        let field_h = 32.0;
-        let by = ry + (row.h - field_h) / 2.0;
-        if self.engine.is_bound() {
-            let unlink_x = menu::unlink_button_x(w);
-            let unlink_w = (w - 16.0 - unlink_x).max(0.0);
-            let unlink = Rect::new(unlink_x, by, unlink_w, field_h);
-            coord.register_atomic("bind-unlink", WidgetKind::Button, at(unlink), Sense::CLICK, layer);
-            if view.clicked(&WidgetId::from("bind-unlink")) {
-                if self.unlink_armed {
-                    self.engine.unlink();
-                    self.unlink_armed = false;
-                    self.bind_focused = false;
-                    self.note.clear();
-                } else {
-                    self.unlink_armed = true;
+        let rows = target_rows(g.content, &self.stand, self.engine.is_bound());
+        for row in rows {
+            let id = match row.target {
+                Target::Cabinet => "tg-cabinet".to_owned(),
+                Target::Config(index) => format!("tg-config-{index}"),
+                Target::None => continue,
+            };
+            coord.register_atomic(id.as_str(), WidgetKind::Button, at(row.rect), Sense::CLICK, layer);
+            if view.clicked(&WidgetId::from(id.as_str())) {
+                self.picked = row.target;
+                self.running = None;
+                self.adopted.clear();
+                for ui in self.ui.values_mut() {
+                    ui.menu = false;
                 }
             }
-            if self.engine.cabinet_open() {
-                let cabinet_x = menu::cabinet_button_x(w);
-                let cabinet_w = (unlink_x - 6.0 - cabinet_x).max(0.0);
-                let cabinet = Rect::new(cabinet_x, by, cabinet_w, field_h);
-                coord.register_atomic(
-                    "bind-cabinet",
-                    WidgetKind::Button,
-                    at(cabinet),
-                    Sense::CLICK,
-                    layer,
-                );
-                if view.clicked(&WidgetId::from("bind-cabinet")) {
-                    crate::backend::open_marked_cabinet();
-                }
-            }
-            return;
-        }
-        let button_x = menu::bind_button_x(w);
-        let go = Rect::new(button_x, by, 92.0, field_h);
-        coord.register_atomic("bind-go", WidgetKind::Button, at(go), Sense::CLICK, layer);
-        if view.clicked(&WidgetId::from("bind-go")) {
-            self.submit_bind();
         }
     }
 
-    fn mount_fields(&mut self, cx: &mut PanelCx<'_, Vocab>, origin: Rect, g: &menu::Geom) {
-        let at = |local: Rect| Rect::new(origin.x + local.x, origin.y + local.y, local.width, local.height);
-        match self.product {
-            Product::Cabinet => self.mount_bind(cx, &at, g),
-            Product::Standalone => self.mount_stand(cx, &at, g),
-        }
-    }
-
-    fn mount_bind(
-        &mut self,
-        cx: &mut PanelCx<'_, Vocab>,
-        at: &impl Fn(Rect) -> Rect,
-        g: &menu::Geom,
-    ) {
-        if self.engine.is_bound() {
-            self.bind_focused = false;
+    /// The list of what one can connect to, painted.
+    fn paint_targets(&self, render: &mut dyn RenderContext, g: &menu::Geom) {
+        crate::theme::paint_sheet(render, g.panel.x, g.panel.y, g.panel.width, g.panel.height);
+        let rows = target_rows(g.content, &self.stand, self.engine.is_bound());
+        let light = crate::theme::light();
+        let strong = if light { "#141416" } else { "#f4f4f5" };
+        let quiet = if light { "#5c5c64" } else { "#9a9aa2" };
+        render.set_font("14px PT Root UI");
+        render.set_text_baseline(TextBaseline::Middle);
+        if rows.is_empty() {
+            render.set_text_align(TextAlign::Center);
+            render.set_fill_color(quiet);
+            let y = g.content.y + 24.0;
+            render.fill_text(crate::text::tr("t.empty"), g.content.x + g.content.width / 2.0, y);
             return;
         }
-        let Some(local) = bind_field_local(g, g.panel.width) else {
-            return;
-        };
-        let win = cx.window;
-        let epoch = self.bind_reset_epoch;
-        let reset = epoch_due(&mut self.bind_reset_seen, win, epoch);
-        let (focused, _) = sync_field(
-            cx,
-            "bind",
-            at(local),
-            crate::text::tr("bind.ph"),
-            512,
-            false,
-            &mut self.bind_draft,
-            reset,
-            false,
-        );
-        self.bind_focused = focused;
+        for row in rows {
+            let hot = row.target == self.picked;
+            target_plate(render, row.rect, hot);
+            render.set_text_align(TextAlign::Left);
+            render.set_fill_color(strong);
+            render.fill_text(&row.title, row.rect.x + 10.0, row.rect.y + 14.0);
+            render.set_fill_color(quiet);
+            render.fill_text(&row.subtitle, row.rect.x + 10.0, row.rect.y + 30.0);
+        }
     }
 
     fn mount_stand(
@@ -1208,9 +1210,9 @@ fn open_geom(w: f64, h: f64, panel_h: f64) -> menu::Geom {
     menu::geom_at(w, h, panel_h, 1, 0.0, CHROME_H, LIP)
 }
 
-/// Palm, then the two mode words, then empty drag space, then the caption.
+/// Palm, then the two sheet words, then empty drag space, then the caption.
 /// The words sit in one segment. The gap after it still drags.
-fn mode_pair(width: f64) -> (Rect, Rect) {
+fn sheet_pair(width: f64) -> (Rect, Rect) {
     let y = (CHROME_H - SEG_H) / 2.0;
     let x = 4.0 + MARK + 8.0;
     let min_x = glyph_rect(width, 1).x;
@@ -1219,13 +1221,27 @@ fn mode_pair(width: f64) -> (Rect, Rect) {
     (Rect::new(x, y, half, SEG_H), Rect::new(x + half, y, avail - half, SEG_H))
 }
 
-fn paint_modes(render: &mut dyn RenderContext, cab: Rect, solo: Rect, product: Product) {
+/// The chip in the chrome: what is picked right now.
+///
+/// It is always there, sheet or no sheet: the scene connects to this, so the
+/// person must see what it will connect to.
+fn chip_rect(width: f64) -> Rect {
+    let y = (CHROME_H - SEG_H) / 2.0;
+    let right = glyph_rect(width, 1).x - 10.0;
+    let w = 160.0_f64.min((right - 8.0).max(0.0));
+    Rect::new(right - w, y, w, SEG_H)
+}
+
+fn paint_sheets(render: &mut dyn RenderContext, targets: Rect, settings: Rect, sheet: Sheet) {
     let light = crate::theme::light();
-    let x = cab.x;
-    let y = cab.y;
-    let w = solo.x + solo.width - cab.x;
-    let h = cab.height;
-    let on = if product == Product::Cabinet { cab } else { solo };
+    let x = targets.x;
+    let y = targets.y;
+    let w = settings.x + settings.width - targets.x;
+    let h = targets.height;
+    let on = match sheet {
+        Sheet::Targets => targets,
+        Sheet::Settings => settings,
+    };
     crate::theme::paint_segment(render, Rect::new(x, y, w, h), on);
     render.set_font("13px PT Root UI");
     render.set_text_align(TextAlign::Center);
@@ -1236,8 +1252,97 @@ fn paint_modes(render: &mut dyn RenderContext, cab: Rect, solo: Rect, product: P
         render.set_fill_color(if active { hot } else { idle });
         render.fill_text(label, r.x + r.width / 2.0, crate::theme::label_baseline(r.y, r.height, 13.0));
     };
-    word(render, cab, crate::text::tr("mode.mesh"), product == Product::Cabinet);
-    word(render, solo, crate::text::tr("mode.own"), product == Product::Standalone);
+    word(render, targets, crate::text::tr("h.connections"), sheet == Sheet::Targets);
+    word(render, settings, crate::text::tr("h.settings"), sheet == Sheet::Settings);
+}
+
+/// The name of the picked target, in the chrome.
+fn paint_target_chip(render: &mut dyn RenderContext, width: f64, name: &str) {
+    let light = crate::theme::light();
+    let rect = chip_rect(width);
+    if rect.width <= 8.0 {
+        return;
+    }
+    render.set_font("12px PT Root UI");
+    render.set_text_align(TextAlign::Right);
+    render.set_text_baseline(TextBaseline::Alphabetic);
+    render.set_fill_color(if light { "#5c5c64" } else { "#b4b4bc" });
+    let y = crate::theme::label_baseline(rect.y, rect.height, 12.0);
+    let mut shown = name.to_owned();
+    while shown.chars().count() > 22 {
+        shown.pop();
+    }
+    render.fill_text(&shown, rect.x + rect.width, y);
+}
+
+/// One row of the list of what one can connect to.
+struct TargetRow {
+    rect: Rect,
+    target: Target,
+    title: String,
+    subtitle: String,
+}
+
+/// The list of what one can connect to.
+///
+/// The cabinet is the fleet mesh — but only when there IS a cabinet. Every
+/// configuration of the person's own is one row more. The artefact says what
+/// a configuration is — the row says so too. Nothing to connect to means an
+/// empty list, not a list of wishes.
+fn target_rows(content: Rect, stand: &Stand, bound: bool) -> Vec<TargetRow> {
+    let mut rows = Vec::new();
+    let mut y = content.y + 8.0;
+    let x = content.x + 16.0;
+    let w = (content.width - 32.0).max(0.0);
+    if bound {
+        rows.push(TargetRow {
+            rect: Rect::new(x, y, w, TARGET_ROW_H),
+            target: Target::Cabinet,
+            title: crate::text::tr("t.cabinet").to_owned(),
+            subtitle: crate::text::tr("t.bound").to_owned(),
+        });
+        y += TARGET_ROW_H + 8.0;
+    }
+    for (index, config) in stand.configs.iter().enumerate() {
+        rows.push(TargetRow {
+            rect: Rect::new(x, y, w, TARGET_ROW_H),
+            target: Target::Config(index),
+            title: config.name.clone(),
+            subtitle: if config.kind == "onion" {
+                crate::text::tr("t.onion").to_owned()
+            } else {
+                crate::text::tr("t.vpn").to_owned()
+            },
+        });
+        y += TARGET_ROW_H + 8.0;
+    }
+    rows
+}
+
+/// How tall the list of targets is.
+fn targets_height(stand: &Stand, bound: bool) -> f64 {
+    let rows = if bound { 1.0 } else { 0.0 } + stand.configs.len() as f64;
+    8.0 + rows * (TARGET_ROW_H + 8.0)
+}
+
+/// The plate of one row of the list.
+fn target_plate(ctx: &mut dyn RenderContext, rect: Rect, hot: bool) {
+    let (fill, line) = if crate::theme::light() {
+        (
+            if hot { "rgba(255,255,255,0.82)" } else { "rgba(255,255,255,0.5)" },
+            "rgba(255,255,255,0.72)",
+        )
+    } else if hot {
+        ("rgba(255,255,255,0.22)", "rgba(255,255,255,0.50)")
+    } else {
+        ("rgba(24,24,28,0.82)", "rgba(255,255,255,0.38)")
+    };
+    ctx.set_fill_color(fill);
+    ctx.fill_rounded_rect(rect.x, rect.y, rect.width, rect.height, 10.0);
+    ctx.set_stroke_color(line);
+    ctx.set_stroke_width(1.0);
+    ctx.set_line_dash(&[]);
+    ctx.stroke_rounded_rect(rect.x, rect.y, rect.width, rect.height, 10.0);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1490,10 +1595,10 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             paint_err: false,
             eased_at: f64::NAN,
             ui: HashMap::new(),
-            product: product_mode(),
+            sheet: sheet_mode(),
+            picked: Target::Cabinet,
+            running: None,
             engine: LocalHttp::start(),
-            bind_draft: String::new(),
-            bind_focused: false,
             unlink_armed: false,
             note: String::new(),
             fell_back: false,
@@ -1502,8 +1607,6 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             link_sent_at: f64::NEG_INFINITY,
             adopted: String::new(),
             pending_submit: None,
-            bind_reset_epoch: 0,
-            bind_reset_seen: HashMap::new(),
             pass_reset_seen: HashMap::new(),
             clear_seen: HashMap::new(),
             link_force_seen: HashMap::new(),
@@ -1531,26 +1634,28 @@ fn json_object(text: &str) -> bool {
         .is_some_and(|value| value.is_object())
 }
 
-/// Cabinet unless this launch passed `--standalone` or a previous launch wrote
-/// `client-mode` beside the exe. The flag writes that file. Being unbound is
-/// still cabinet.
-fn product_mode() -> Product {
-    let flag = std::env::args().skip(1).any(|arg| arg == "--standalone");
+/// The list of targets unless this launch passed `--settings` or a previous
+/// launch wrote `client-mode` beside the exe. The flag writes that file.
+fn sheet_mode() -> Sheet {
+    let flag = std::env::args().skip(1).any(|arg| arg == "--settings");
     let path = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join("client-mode")));
     if flag {
         if let Some(path) = &path {
-            let _ = std::fs::write(path, "standalone\n");
+            let _ = std::fs::write(path, "settings\n");
         }
-        return Product::Standalone;
+        return Sheet::Settings;
     }
     if let Some(path) = path {
         if let Ok(text) = std::fs::read_to_string(path) {
-            if text.trim() == "standalone" {
-                return Product::Standalone;
+            // The old file said `cabinet` or `standalone`; the cabinet sheet
+            // is now the list of targets.
+            match text.trim() {
+                "settings" | "standalone" => return Sheet::Settings,
+                _ => return Sheet::Targets,
             }
         }
     }
-    Product::Cabinet
+    Sheet::Targets
 }
 
 fn app_window(key: &str, w: u32, h: u32, x: i32, y: i32) -> WindowSpec {
