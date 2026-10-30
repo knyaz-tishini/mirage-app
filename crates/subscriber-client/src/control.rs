@@ -673,6 +673,11 @@ fn sync_tun(rt: &mut Runtime) {
     if rt.wish.tun && rt.tun_bin.is_none() {
         rt.tun_fault = Some("mirage2tun binary is not set".to_owned());
     }
+    // The adapter follows the WISH, not the live session: the tunnel comes up
+    // when the connection starts, the way Amnezia raises its adapter, and it
+    // stays up when the session drops. While the session is not live the
+    // chain refuses every packet, so the traffic is blocked — the kill
+    // switch — and nothing leaks outside.
     let want = rt.wish.session_up && rt.wish.tun;
     if !want {
         stop_tun(&mut rt.tun_child);

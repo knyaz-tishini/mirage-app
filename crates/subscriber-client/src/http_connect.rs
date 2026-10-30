@@ -85,7 +85,7 @@ async fn handle_connection(
     stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut edge).await;
+    let _ = crate::relay::copy_bidirectional_with_flow_idle_timeout(&mut stream, &mut edge).await;
     Ok(())
 }
 

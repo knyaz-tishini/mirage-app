@@ -62,6 +62,7 @@ pub(crate) mod onion_session;
 pub mod oss_artefact;
 pub mod oss_setup;
 pub mod peer;
+pub mod relay;
 pub mod scope;
 pub mod session;
 pub mod socks5;

@@ -151,7 +151,9 @@ async fn handle_connect(
             if write_reply(&mut stream, REP_SUCCESS).await.is_err() {
                 return;
             }
-            match tokio::io::copy_bidirectional(&mut stream, &mut edge_stream).await {
+            match crate::relay::copy_bidirectional_with_flow_idle_timeout(&mut stream, &mut edge_stream)
+                .await
+            {
                 Ok((to_edge, from_edge)) => {
                     debug!(target = %target, to_edge, from_edge, "socks5: CONNECT flow ended");
                 }
