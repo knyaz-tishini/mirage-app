@@ -527,7 +527,13 @@ impl Engine {
     fn stop_tun(&mut self) {
         if let Some(mut device) = self.tun.take() {
             device.stdin.take();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            // The device has to take the routes back before it goes. A device
+            // whose queue is full takes a while to notice the closed pipe and
+            // to drain, and three seconds was not enough: the device was
+            // killed with its routes still up, which is exactly the state
+            // where the machine's internet vanishes. Ten seconds is still
+            // shorter than the time a person waits for the window to answer.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 match device.child.try_wait() {
                     Ok(Some(_)) => break,

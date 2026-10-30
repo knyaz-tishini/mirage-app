@@ -46,7 +46,7 @@ use mirage_control_plane::edge_session::{face_transport, filter_offered_faces_by
 use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
 use mirage_core::error::MirageError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
-use mirage_mux::MuxError;
+use mirage_mux::{MuxError, MuxStream};
 use mirage_protocol::traits::{TcpProtocol, Tunnel};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -63,6 +63,13 @@ use crate::watchdog::{StreamHealth, WatchedStream, DEFAULT_STREAM_FAILURE_THRESH
 const EDGE_SESSION_WIRE_VERSION: u8 = 1;
 const EDGE_SESSION_WIRE_VERSION_V2: u8 = 2;
 const EDGE_SESSION_WIRE_VERSION_V3: u8 = 3;
+
+/// How long a flow waits before asking for stream credit again.
+///
+/// The mux waits for the credit on its own (and wakes the flow the moment it
+/// is back); this is only the pause between two asks, so a saturated session
+/// does not turn into a spin.
+const STREAM_CREDIT_RETRY: Duration = Duration::from_millis(250);
 
 /// Mix input for the probe-face start. Not a `rand` source.
 static PROBE_DRAW: AtomicU64 = AtomicU64::new(0);
@@ -361,32 +368,54 @@ impl EdgeSession {
     /// The returned stream reports how the open ended to this session's
     /// watchdog — see [`crate::watchdog`].
     pub async fn open_tcp_stream(&self, target: &str) -> Result<WatchedStream, EdgeStreamError> {
-        let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
-        let stream = match handle.open_stream().await {
-            Ok(stream) => stream,
-            Err(MuxError::TooManyStreams) => {
-                // The session has no stream credit right now. That is
-                // backpressure, not a broken session: the credit comes back
-                // when a flow ends. QUIC and HTTP/2 both wait here instead of
-                // tearing the connection down, and so does this client — a
-                // saturated session must not kill the flows that are already
-                // running through it.
-                warn!("edge session: no stream credit — this flow waits, the session stays");
-                return Err(EdgeStreamError::Mux(MuxError::TooManyStreams));
-            }
-            Err(e) => {
-                // The session itself could not give us a stream — that is a
-                // failed open like any other.
-                self.health.record_failure();
-                return Err(e.into());
-            }
-        };
+        let stream = self.open_stream_with_backpressure().await?;
         let mut stream = WatchedStream::new(TokioMuxStream(stream), Arc::clone(&self.health));
         if let Err(e) = self.framing.write_target(&mut stream, target).await {
             self.health.record_failure();
             return Err(e);
         }
         Ok(stream)
+    }
+
+    /// Open one mux stream, waiting for stream credit instead of failing the
+    /// flow.
+    ///
+    /// A session hands out a bounded number of concurrent streams — the mux's
+    /// stream credit. A machine behind the tunnel asks for more than that all
+    /// the time: every browser tab, every DNS lookup, every chat socket is a
+    /// stream of its own. When the session is at its limit the extra flows
+    /// have to WAIT, the way TCP waits for a slot in the accept queue and the
+    /// way QUIC waits for `MAX_STREAMS` (RFC 9000, section 4.6).
+    ///
+    /// Failing them instead is what used to kill the client every minute:
+    /// three failed opens in a row tear the session down (see
+    /// [`crate::watchdog`]), every running flow dies with it, and the machine
+    /// reconnects en masse into a fresh session that saturates again. The
+    /// session stays; the flow waits.
+    async fn open_stream_with_backpressure(&self) -> Result<MuxStream, EdgeStreamError> {
+        loop {
+            let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
+            match handle.open_stream().await {
+                Ok(stream) => return Ok(stream),
+                Err(MuxError::TooManyStreams) => {
+                    // The session is at its stream limit. This is
+                    // backpressure, not a broken session: the credit comes
+                    // back when a flow ends. NOT a failure — counting it
+                    // would tear down a perfectly healthy session.
+                    info!(
+                        "edge session: no stream credit — this flow waits for a slot, the session stays"
+                    );
+                    tokio::time::sleep(STREAM_CREDIT_RETRY).await;
+                    continue;
+                }
+                Err(e) => {
+                    // The session itself could not give us a stream — that is a
+                    // failed open like any other.
+                    self.health.record_failure();
+                    return Err(e.into());
+                }
+            }
+        }
     }
 
     /// Open one mux stream for a UDP flow, writing the [`StreamOpen`] header
@@ -402,19 +431,7 @@ impl EdgeSession {
             return Err(EdgeStreamError::DatagramsRefused);
         }
         let target = StreamTarget::new(target).map_err(EdgeStreamError::BadTarget)?;
-        let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
-        let stream = match handle.open_stream().await {
-            Ok(stream) => stream,
-            Err(MuxError::TooManyStreams) => {
-                // Backpressure, not a broken session — see `open_tcp_stream`.
-                warn!("edge session: no stream credit — this flow waits, the session stays");
-                return Err(EdgeStreamError::Mux(MuxError::TooManyStreams));
-            }
-            Err(e) => {
-                self.health.record_failure();
-                return Err(e.into());
-            }
-        };
+        let stream = self.open_stream_with_backpressure().await?;
         let mut stream = WatchedStream::new(TokioMuxStream(stream), Arc::clone(&self.health));
         let open = StreamOpen { kind: StreamKind::Udp, target };
         if let Err(e) = stream.write_all(&open.encode()).await {

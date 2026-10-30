@@ -49,7 +49,21 @@ pub const UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// MTU-safe payload cap enforced at this SOCKS5 ingestion boundary — see the
 /// module doc.
-pub const UDP_PAYLOAD_MTU_SAFE_LEN: usize = 1200;
+///
+/// This is the PATH MTU, not the QUIC floor. The two used to be the same
+/// number, 1200, and that was wrong in both directions:
+///
+/// - QUIC's floor is 1200: an Initial datagram must be at least that big
+///   (RFC 9000, section 14.1). It is a MINIMUM, not a maximum.
+////// - A real QUIC client pads its Initial to the PATH MTU minus the IP and
+///   UDP headers. Chrome uses 1252 bytes -- a 1280-byte path MTU, the
+///   IPv6 minimum -- which is exactly what YouTube's QUIC handshake sends.
+///
+/// With the cap at 1200 every one of those datagrams was dropped on the
+/// floor, and the browser sat waiting for a QUIC handshake that could never
+/// arrive. The path carries 1500-byte IP packets, so the safe payload is
+/// 1500 - 20 (IPv4) - 8 (UDP) = 1472.
+pub const UDP_PAYLOAD_MTU_SAFE_LEN: usize = 1472;
 
 /// Cap on distinct destinations one association will track — bounds one
 /// SOCKS5 client's worst case (e.g. a UDP port scan through one ASSOCIATE)

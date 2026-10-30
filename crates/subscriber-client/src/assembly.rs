@@ -361,14 +361,6 @@ impl SubscriberClient {
     }
 }
 
-/// The entrances the edge session may use.
-///
-/// The configuration says where to go and with what protocol; this helper
-/// exists only for the tests that pin the contract.
-#[cfg(test)]
-fn entrances_for_session(entrances: Vec<ArtefactEntrance>) -> Vec<ArtefactEntrance> {
-    entrances
-}
 #[cfg(test)]
 mod tests {
     use super::*;

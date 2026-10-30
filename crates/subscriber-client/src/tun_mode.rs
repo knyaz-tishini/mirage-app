@@ -109,10 +109,14 @@ pub fn write_config(
     let doc = json!({
         "tun_name": tun_device_name(),
         "tun_addr": "10.77.0.1/24",
-        // The chain's UDP path refuses anything above 1200 bytes, and QUIC
-        // needs 1200 as its floor anyway. An adapter that hands out more
-        // than the chain accepts turns every datagram into a dropped one.
-        "mtu": 1200,
+        // The path MTU, not QUIC's floor. QUIC wants an Initial datagram of
+        // at least 1200 bytes (RFC 9000, section 14.1) -- that is a MINIMUM.
+        // A real client pads its Initial to the path MTU minus the IP and UDP
+        // headers: Chrome sends 1252 bytes, and with an adapter MTU of 1200
+        // that datagram did not fit the adapter at all. 1500 is the ordinary
+        // Ethernet MTU; the chain carries whole IP packets, so nothing above
+        // it needs to fit.
+        "mtu": 1500,
         "chains": [{
             "name": CHAIN_NAME,
             "socks5_addr": socks_bind.to_string(),
