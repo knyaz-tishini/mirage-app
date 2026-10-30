@@ -835,8 +835,8 @@ fn draw_bind_row(
     w: f64,
     ry: f64,
     h: f64,
-    focused: bool,
-    draft: &str,
+    _focused: bool,
+    _draft: &str,
     bound: bool,
     unlink_armed: bool,
     cabinet: bool,
@@ -925,39 +925,8 @@ fn draw_bind_row(
     ctx.set_stroke_width(1.0);
     ctx.set_line_dash(&[]);
     ctx.stroke_rounded_rect(field_x, field_y, field_w, field_h, 10.0);
-    ctx.set_font("14px PT Root UI");
-    ctx.set_text_align(TextAlign::Left);
-    ctx.set_text_baseline(TextBaseline::Alphabetic);
-    if draft.is_empty() {
-        ctx.set_fill_color(DIMC);
-        fill_clipped(
-            ctx,
-            crate::text::tr("bind.ph"),
-            field_x + 8.0,
-            crate::theme::label_baseline(field_y, field_h, 14.0),
-            field_x + 4.0,
-            field_y,
-            (field_w - 8.0).max(0.0),
-            field_h,
-        );
-    } else {
-        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
-        fill_clipped(
-            ctx,
-            draft,
-            field_x + 8.0,
-            crate::theme::label_baseline(field_y, field_h, 14.0),
-            field_x + 4.0,
-            field_y,
-            (field_w - 12.0).max(0.0),
-            field_h,
-        );
-    }
-    if focused {
-        let caret_x = (field_x + 8.0 + draft.chars().count() as f64 * 7.2).min(field_x + field_w - 6.0);
-        ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { AMBER });
-        ctx.fill_rect(caret_x, field_y + 6.0, 1.0, (field_h - 12.0).max(0.0));
-    }
+    // The kit field paints the placeholder and the draft. A second string
+    // here used to sit on top of it.
     let bind_w = 92.0;
     if crate::theme::light() {
         ctx.set_fill_color("#1c1c1f");

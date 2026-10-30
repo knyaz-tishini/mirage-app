@@ -955,7 +955,7 @@ impl Oasis {
             cx,
             "bind",
             at(local),
-            "claim or /c/ link",
+            crate::text::tr("bind.ph"),
             512,
             false,
             &mut self.bind_draft,
