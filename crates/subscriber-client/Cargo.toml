@@ -15,6 +15,10 @@ mirage-mux           = { workspace = true }
 # The chain of boxes and its installer — the same crate the desktop client
 # builds its chains with, so a chain built here is the chain it reads.
 mirage-client-chain   = { path = "../mirage-client-chain" }
+# The onion plane: the client walks the chain itself. A separate crate so this
+# one keeps holding no mesh credential - see the crate doc's own boundary.
+mirage-onion-client   = { path = "../mirage-onion-client" }
+uuid                 = { version = "1", features = ["v4"] }
 tokio                = { workspace = true }
 tracing              = { workspace = true }
 tracing-subscriber   = { workspace = true }

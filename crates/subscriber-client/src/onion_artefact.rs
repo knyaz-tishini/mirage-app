@@ -63,6 +63,11 @@ pub struct OnionArtefact {
     /// The same key the VPN artefact carries: the customer's own identity,
     /// not the chain's.
     pub private_key_hex: String,
+    /// The client's own identity in the mesh — the one the chain leg's
+    /// credential names.
+    ///
+    /// A UUID in its canonical hyphenated form.
+    pub self_id: String,
     /// Mesh identifier folded into every handshake inside the chain.
     pub mesh_id: String,
     /// The circuit's hops, in the order the traffic walks them: entry first,
@@ -77,6 +82,11 @@ pub struct OnionArtefact {
     /// so the secret travels in the artefact — to the customer, who is the
     /// operator of this chain.
     pub operator_secret_hex: String,
+    /// Unix-ms after which the identity must not be honoured — the
+    /// subscription's paid-through time.
+    ///
+    /// The exit refuses a chain leg whose identity bound has passed.
+    pub identity_not_after_ms: u64,
     /// Full-auto, or a named egress country — the same choice the VPN
     /// artefact carries.
     pub mode: ArtefactMode,
@@ -88,6 +98,11 @@ pub struct OnionArtefact {
 /// One hop of the circuit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnionHop {
+    /// This hop's identity in the mesh.
+    ///
+    /// Not decoration: the exit binds its credential check to this string,
+    /// and the chain builder refuses a hop without it.
+    pub node_id: String,
     /// `host:port` of this hop.
     pub addr: String,
     /// The role this hop plays: entry, middle or exit.
@@ -120,6 +135,15 @@ pub enum OnionArtefactError {
 
     #[error("onion artefact: the operator secret is empty")]
     EmptyOperatorSecret,
+
+    #[error("onion artefact: the identity bound is zero - the chain leg would expire at once")]
+    EmptyIdentityBound,
+
+    #[error("onion artefact: self_id {value:?} is not a UUID")]
+    BadSelfId { value: String },
+
+    #[error("onion artefact: hops[{index}].node_id is empty - the exit binds its credential check to it")]
+    EmptyNodeId { index: usize },
 
     #[error("onion artefact: no hops — there is no chain to walk")]
     NoHops,
@@ -209,6 +233,12 @@ impl OnionArtefact {
         if self.operator_secret_hex.trim().is_empty() {
             return Err(OnionArtefactError::EmptyOperatorSecret);
         }
+        if self.identity_not_after_ms == 0 {
+            return Err(OnionArtefactError::EmptyIdentityBound);
+        }
+        if uuid::Uuid::parse_str(self.self_id.trim()).is_err() {
+            return Err(OnionArtefactError::BadSelfId { value: self.self_id.clone() });
+        }
         check_hex_field("private_key_hex", &self.private_key_hex, HEX32_BYTES)?;
         check_hex_field("operator_pubkey_hex", &self.operator_pubkey_hex, HEX32_BYTES)?;
         if self.hops.is_empty() {
@@ -216,6 +246,9 @@ impl OnionArtefact {
         }
         let count = self.hops.len();
         for (index, hop) in self.hops.iter().enumerate() {
+            if hop.node_id.trim().is_empty() {
+                return Err(OnionArtefactError::EmptyNodeId { index });
+            }
             if !looks_like_host_port(&hop.addr) {
                 return Err(OnionArtefactError::BadHopAddr {
                     index,
@@ -270,7 +303,7 @@ impl OnionArtefact {
             .map(|hop| HopConfig {
                 addr: hop.addr.clone(),
                 public_key: Some(hop.server_pubkey_hex.clone()),
-                node_id: None,
+                node_id: Some(hop.node_id.clone()),
                 sni: None,
                 role: hop.role,
                 display_name: None,
@@ -298,6 +331,38 @@ impl OnionArtefact {
             nature: None,
         })
     }
+
+    /// The chain the onion plane walks — the delivery artefact in the shape
+    /// the dial path consumes.
+    ///
+    /// The two contracts are separate on purpose: the artefact is what the
+    /// operator hands over, the spec is what the dialer eats. This is the one
+    /// place they meet.
+    pub fn to_spec(&self) -> Result<mirage_onion_client::OnionChainSpec, OnionArtefactError> {
+        self.validate()?;
+        let self_id = uuid::Uuid::parse_str(self.self_id.trim()).map_err(|_| {
+            OnionArtefactError::BadSelfId { value: self.self_id.clone() }
+        })?;
+        Ok(mirage_onion_client::OnionChainSpec {
+            chain_id: self.chain_id.clone(),
+            mesh_id: self.mesh_id.clone(),
+            self_id,
+            operator_pubkey_hex: self.operator_pubkey_hex.clone(),
+            operator_secret_hex: self.operator_secret_hex.clone(),
+            identity_not_after_ms: self.identity_not_after_ms,
+            client_static_priv: self.client_static_priv()?,
+            hops: self
+                .hops
+                .iter()
+                .map(|hop| mirage_onion_client::OnionHopSpec {
+                    node_id: hop.node_id.clone(),
+                    addr: hop.addr.clone(),
+                    server_pubkey_hex: hop.server_pubkey_hex.clone(),
+                    camouflage: hop.camouflage.clone(),
+                })
+                .collect(),
+        })
+    }
 }
 
 /// The role a hop plays at `position` among `count` hops.
@@ -323,6 +388,7 @@ mod tests {
 
     fn hop(index: usize, count: usize) -> OnionHop {
         OnionHop {
+            node_id: format!("node-{index}"),
             addr: format!("203.0.113.{}:41443", index + 1),
             role: role_for_position(index, count),
             server_pubkey_hex: format!("{:02x}", index + 1).repeat(HEX32_BYTES),
@@ -342,10 +408,12 @@ mod tests {
             kind: ONION_KIND.to_owned(),
             chain_id: "stand".to_owned(),
             private_key_hex: "11".repeat(HEX32_BYTES),
+            self_id: "6f1a0000-0000-4000-8000-000000000000".to_owned(),
             mesh_id: "mirage-vpn".to_owned(),
             hops: (0..count).map(|i| hop(i, count)).collect(),
             operator_pubkey_hex: "22".repeat(HEX32_BYTES),
             operator_secret_hex: "33".repeat(HEX32_BYTES),
+            identity_not_after_ms: 1_726_086_400_000,
             mode: ArtefactMode::FullAuto,
             label: "onion-1".to_owned(),
             issued_at_ms: 1_726_000_000_000,
@@ -456,5 +524,62 @@ mod tests {
             Some(artefact.hops[0].server_pubkey_hex.as_str()),
             "the hop's key must reach the chain config"
         );
+        assert_eq!(
+            chain.hops[0].node_id.as_deref(),
+            Some("node-0"),
+            "the hop's identity must reach the chain config"
+        );
+    }
+
+    #[test]
+    fn the_chain_config_passes_the_builders_own_validation() {
+        let chain = sample(2).chain_config().expect("the chain config");
+        assert!(
+            chain.validate().is_ok(),
+            "the onion builder refuses a chain without node ids"
+        );
+    }
+
+    #[test]
+    fn a_hop_without_a_node_id_is_refused() {
+        let mut artefact = sample(2);
+        artefact.hops[1].node_id = String::new();
+        assert!(matches!(
+            artefact.validate(),
+            Err(OnionArtefactError::EmptyNodeId { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_self_id_that_is_not_a_uuid_is_refused() {
+        let mut artefact = sample(2);
+        artefact.self_id = "not-a-uuid".to_owned();
+        assert!(matches!(
+            artefact.validate(),
+            Err(OnionArtefactError::BadSelfId { .. })
+        ));
+    }
+
+    #[test]
+    fn an_identity_bound_of_zero_is_refused() {
+        let mut artefact = sample(2);
+        artefact.identity_not_after_ms = 0;
+        assert!(matches!(
+            artefact.validate(),
+            Err(OnionArtefactError::EmptyIdentityBound)
+        ));
+    }
+
+    #[test]
+    fn the_spec_carries_everything_the_dial_needs() {
+        let artefact = sample(2);
+        let spec = artefact.to_spec().expect("the spec");
+        assert_eq!(spec.chain_id, "stand");
+        assert_eq!(spec.mesh_id, "mirage-vpn");
+        assert_eq!(spec.hops.len(), 2);
+        assert_eq!(spec.hops[0].node_id, "node-0");
+        assert_eq!(spec.exit_node_id(), "node-1");
+        assert_eq!(spec.identity_not_after_ms, artefact.identity_not_after_ms);
+        assert_eq!(spec.client_static_priv, [0x11u8; 32]);
     }
 }

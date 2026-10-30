@@ -121,6 +121,9 @@ pub enum EdgeDialError {
 
     #[error("edge session: {count} entrances of one transport exceeds the {max} a version-2 hello can offer")]
     TooManyFaces { count: usize, max: usize },
+
+    #[error("edge session: the onion chain is unusable: {0}")]
+    BadOnionChain(String),
 }
 
 /// Every way opening a mux stream on a live [`EdgeSession`] fails.
@@ -140,6 +143,55 @@ pub enum EdgeStreamError {
 
     #[error("edge stream: this exit does not carry datagrams")]
     DatagramsRefused,
+
+    #[error("edge stream: target is {len} bytes - the length-prefixed frame carries at most 65535")]
+    TargetTooLong { len: usize },
+}
+
+/// How a stream's destination is framed to the far end.
+///
+/// The two are not interchangeable: the edge session speaks the fleet's own
+/// `StreamOpen` header, while an onion exit reads a bare length-prefixed
+/// target. Sending the wrong one to the right end is a silent stall, so the
+/// framing travels with the session instead of being decided at the call
+/// site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFraming {
+    /// The fleet's own `StreamOpen` header — kind plus target. What the edge
+    /// session speaks.
+    EdgeHeader,
+    /// `[2B BE len][target]` — the onion exit's own frame. What a chain's
+    /// terminal hop reads on every stream.
+    LengthPrefixedTarget,
+}
+
+impl StreamFraming {
+    /// Write this framing's target frame onto `stream`.
+    async fn write_target<W>(&self, stream: &mut W, target: &str) -> Result<(), EdgeStreamError>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        match self {
+            Self::EdgeHeader => {
+                let open = StreamOpen {
+                    kind: StreamKind::Tcp,
+                    target: StreamTarget::new(target).map_err(EdgeStreamError::BadTarget)?,
+                };
+                stream.write_all(&open.encode()).await?;
+            }
+            Self::LengthPrefixedTarget => {
+                let bytes = target.as_bytes();
+                if bytes.len() > u16::MAX as usize {
+                    return Err(EdgeStreamError::TargetTooLong { len: bytes.len() });
+                }
+                let mut frame = Vec::with_capacity(2 + bytes.len());
+                frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                frame.extend_from_slice(bytes);
+                stream.write_all(&frame).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Map an artefact's [`ArtefactMode`] onto the wire's [`ExitPreference`].
@@ -166,6 +218,10 @@ pub struct EdgeSession {
     welcome: EdgeWelcome,
     /// Which entrance this session dialed — logs only.
     entrance_label: String,
+    /// How this session frames a stream's destination — see
+    /// [`StreamFraming`]. The edge session speaks the fleet's header; a chain
+    /// session speaks the onion exit's own frame.
+    framing: StreamFraming,
     /// Consecutive failed stream opens on THIS session — see
     /// [`crate::watchdog`].
     health: Arc<StreamHealth>,
@@ -297,15 +353,14 @@ impl EdgeSession {
         drop(taken);
     }
 
-    /// Open one mux stream for a TCP flow, writing the [`StreamOpen`] header
-    /// as its first bytes. `target` is the raw `host:port` string the flow
-    /// asked for — a domain name travels through unresolved so DNS resolves
-    /// at the exit (see `crate::socks5`).
+    /// Open one mux stream for a TCP flow, writing this session's target
+    /// frame as its first bytes. `target` is the raw `host:port` string the
+    /// flow asked for — a domain name travels through unresolved so DNS
+    /// resolves at the exit (see `crate::socks5`).
     ///
     /// The returned stream reports how the open ended to this session's
     /// watchdog — see [`crate::watchdog`].
     pub async fn open_tcp_stream(&self, target: &str) -> Result<WatchedStream, EdgeStreamError> {
-        let target = StreamTarget::new(target).map_err(EdgeStreamError::BadTarget)?;
         let handle = self.handle().ok_or(EdgeStreamError::Mux(MuxError::Closed))?;
         let stream = match handle.open_stream().await {
             Ok(stream) => stream,
@@ -317,10 +372,9 @@ impl EdgeSession {
             }
         };
         let mut stream = WatchedStream::new(TokioMuxStream(stream), Arc::clone(&self.health));
-        let open = StreamOpen { kind: StreamKind::Tcp, target };
-        if let Err(e) = stream.write_all(&open.encode()).await {
+        if let Err(e) = self.framing.write_target(&mut stream, target).await {
             self.health.record_failure();
-            return Err(e.into());
+            return Err(e);
         }
         Ok(stream)
     }
@@ -359,12 +413,33 @@ impl EdgeSession {
         Ok(crate::udp_flow::EdgeUdpFlow::new(stream))
     }
 
+    /// Build a session over a mux handle this crate did not dial itself.
+    ///
+    /// The onion chain's session: the tunnel is already upgraded to the exit's
+    /// mux server, so there is no edge hello to exchange and no entrance to
+    /// name - the chain's id is the label.
+    pub(crate) fn from_mux_session(
+        session: SessionHandle,
+        welcome: EdgeWelcome,
+        entrance_label: String,
+        framing: StreamFraming,
+    ) -> Self {
+        Self {
+            session: Mutex::new(Some(Arc::new(session))),
+            welcome,
+            entrance_label,
+            framing,
+            health: Arc::new(StreamHealth::new()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(session: SessionHandle, welcome: EdgeWelcome) -> Self {
         Self {
             session: Mutex::new(Some(Arc::new(session))),
             welcome,
             entrance_label: "test".to_owned(),
+            framing: StreamFraming::EdgeHeader,
             health: Arc::new(StreamHealth::new()),
         }
     }
@@ -406,6 +481,7 @@ fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label
         session: Mutex::new(Some(Arc::new(session))),
         welcome,
         entrance_label,
+        framing: StreamFraming::EdgeHeader,
         health: Arc::new(StreamHealth::new()),
     }
 }
@@ -833,6 +909,20 @@ impl EdgeSessionSupervisor {
     #[cfg(test)]
     pub(crate) fn spawn_with_dialer(dialer: impl EdgeDialer, requested: ExitPreference) -> Arc<Self> {
         Self::spawn_with_dialer_exit(dialer, requested, None, DEFAULT_STREAM_FAILURE_THRESHOLD)
+    }
+
+    /// Spawn the supervisor over a dialer of this crate's own making - the
+    /// onion chain's dialer. `requested` is the exit the status file reports
+    /// as asked-for; a chain has no exit choice, so it is always auto.
+    ///
+    /// There is no live exit control behind this supervisor: a chain's exit
+    /// is the chain's exit.
+    pub(crate) fn spawn_with_custom_dialer(
+        dialer: impl EdgeDialer,
+        requested: ExitPreference,
+        stream_failure_threshold: u32,
+    ) -> Arc<Self> {
+        Self::spawn_with_dialer_exit(dialer, requested, None, stream_failure_threshold.max(1))
     }
 
     /// [`Self::spawn_with_dialer`] with an explicit stream-failure threshold.

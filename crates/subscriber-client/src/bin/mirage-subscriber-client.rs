@@ -29,9 +29,8 @@ use mirage_client_chain::oss_install::OssCarrier;
 use mirage_client_chain::provision::InstallBus;
 use mirage_subscriber_client::{
     chain_artefact, control, exit_preference_from_mode, http_connect, oss_setup, publish_fatal,
-    tun_mode, EdgeReason, EdgeSession, EdgeState, EgressScope, EntranceArtefact, OssSetup,
-    SubscriberClient,
-    SubscriberClientError, SubscriberClientOptions, TunMode,
+    tun_mode, DeliveryArtefact, EdgeReason, EdgeSession, EdgeState, EgressScope,
+    OssSetup, SubscriberClient, SubscriberClientError, SubscriberClientOptions, TunMode,
 };
 use tracing::{error, info, warn};
 
@@ -258,14 +257,15 @@ fn install_panic_hook() {
     }));
 }
 
-fn read_and_validate_artefact(path: &PathBuf) -> Result<EntranceArtefact, ExitCode> {
+fn read_and_validate_artefact(path: &PathBuf) -> Result<DeliveryArtefact, ExitCode> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         error!(path = %path.display(), error = %e, "refusing: cannot read artefact file");
         ExitCode::FAILURE
     })?;
 
-    // Step 1: parse — never validates (`EntranceArtefact::from_json`).
-    let artefact = EntranceArtefact::from_json(&raw).map_err(|e| {
+    // Step 1: parse — never validates. The artefact's own `kind` says which
+    // of the two it is; an artefact without one is the VPN one.
+    let artefact = DeliveryArtefact::from_json(&raw).map_err(|e| {
         error!(error = %e, "refusing: artefact did not parse");
         ExitCode::FAILURE
     })?;
@@ -413,7 +413,17 @@ fn report_fatal(status_file: Option<&Path>, requested: &ExitPreference, reason: 
 /// Connect to the edge over its entrances, print every country it can serve,
 /// and exit — no SOCKS5 listener, no supervisor, no reconnect loop; a single
 /// dial attempt is enough for this one-shot query.
-async fn run_countries(artefact: &EntranceArtefact) -> ExitCode {
+///
+/// An onion artefact has no such list: a chain's exit is where it is, and
+/// there is no edge to ask.
+async fn run_countries(artefact: &DeliveryArtefact) -> ExitCode {
+    let artefact = match artefact {
+        DeliveryArtefact::Vpn(vpn) => vpn,
+        DeliveryArtefact::Onion(_) => {
+            error!("refusing: an onion artefact names a chain, not an edge - there is no country list");
+            return ExitCode::FAILURE;
+        }
+    };
     let exit = match exit_preference_from_mode(&artefact.mode) {
         Ok(exit) => exit,
         Err(e) => {
@@ -661,20 +671,36 @@ async fn wait_for_socks(bind: SocketAddr) -> bool {
 /// Stand up the local proxy the user asked for, over one persistent edge
 /// session. The artefact picks the edge. These flags only pick the local
 /// capture.
-fn relay_hosts(artefact: &EntranceArtefact) -> Vec<String> {
+///
+/// The hosts the local capture must not swallow: the boxes the traffic leaves
+/// through. For the VPN artefact that is the edge's faces; for the onion
+/// artefact it is the chain's hops - the first one above all, since that is
+/// the box the traffic leaves by.
+fn relay_hosts(artefact: &DeliveryArtefact) -> Vec<String> {
     let mut out = Vec::new();
-    for entrance in &artefact.entrances {
-        let host = entrance
-            .addr
+    let addrs: Vec<String> = match artefact {
+        DeliveryArtefact::Vpn(vpn) => vpn.entrances.iter().map(|e| e.addr.clone()).collect(),
+        DeliveryArtefact::Onion(onion) => onion.hops.iter().map(|h| h.addr.clone()).collect(),
+    };
+    for addr in addrs {
+        let host = addr
             .rsplit_once(':')
             .map(|(host, _)| host)
-            .unwrap_or(entrance.addr.as_str());
+            .unwrap_or(addr.as_str());
         let host = host.trim_matches(|ch| ch == '[' || ch == ']');
         if host.parse::<std::net::IpAddr>().is_ok() && !out.iter().any(|have| have == host) {
             out.push(host.to_owned());
         }
     }
     out
+}
+
+/// Which kind of artefact this is — for the log line.
+fn artefact_kind(artefact: &DeliveryArtefact) -> &'static str {
+    match artefact {
+        DeliveryArtefact::Vpn(_) => "vpn",
+        DeliveryArtefact::Onion(_) => "onion",
+    }
 }
 
 fn discover_tun_bin() -> Option<PathBuf> {
@@ -698,10 +724,13 @@ fn discover_tun_bin() -> Option<PathBuf> {
     None
 }
 
-async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
-    // `validate()` already accepted the mode, so the fallback is unreachable;
-    // it only keeps the fatal document well-formed if that ever changes.
-    let requested = exit_preference_from_mode(&artefact.mode).unwrap_or(ExitPreference::Auto);
+async fn run_proxy(artefact: &DeliveryArtefact, args: &Args) -> ExitCode {
+    // The requested exit: the VPN artefact names one, a chain does not - its
+    // exit is where it is.
+    let requested = match artefact {
+        DeliveryArtefact::Vpn(vpn) => exit_preference_from_mode(&vpn.mode).unwrap_or(ExitPreference::Auto),
+        DeliveryArtefact::Onion(_) => ExitPreference::Auto,
+    };
     let fail = |reason: Option<EdgeReason>| {
         report_fatal(args.status_file.as_deref(), &requested, reason);
         ExitCode::FAILURE
@@ -722,8 +751,7 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
             }
         };
         info!(
-            entrances = artefact.entrances.len(),
-            mode = ?artefact.mode,
+            kind = artefact_kind(artefact),
             control = %addr,
             "mirage-subscriber-client: artefact validated, control api"
         );
@@ -734,7 +762,7 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
             start_socks: false,
             ..Default::default()
         };
-        let client = match SubscriberClient::build_with_threshold(
+        let client = match SubscriberClient::build_from_delivery_with_threshold(
             artefact,
             options,
             args.stream_failure_threshold,
@@ -844,8 +872,7 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
     }
 
     info!(
-        entrances = artefact.entrances.len(),
-        mode = ?artefact.mode,
+        kind = artefact_kind(artefact),
         transport = %args.transport,
         services = args.service.len(),
         "mirage-subscriber-client: artefact validated, assembling local proxy"
@@ -859,7 +886,7 @@ async fn run_proxy(artefact: &EntranceArtefact, args: &Args) -> ExitCode {
         ..Default::default()
     };
 
-    let client = match SubscriberClient::build_with_threshold(
+    let client = match SubscriberClient::build_from_delivery_with_threshold(
         artefact,
         options,
         args.stream_failure_threshold,

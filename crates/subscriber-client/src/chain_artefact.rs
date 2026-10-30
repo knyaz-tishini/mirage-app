@@ -17,6 +17,7 @@ use mirage_client_chain::chain::Chain;
 use mirage_core::config::TransportCamouflage;
 use mirage_core::crypto::KeyPair;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::artefact::ArtefactMode;
 use crate::onion_artefact::{role_for_position, OnionArtefact, OnionHop, ONION_KIND, ONION_VERSION};
@@ -54,6 +55,10 @@ pub fn build_onion_artefact(
     let mut built = Vec::with_capacity(count);
     for (index, node) in hops.iter().enumerate() {
         built.push(OnionHop {
+            // The box's own name in the chain is its identity there: the exit
+            // binds the chain leg's credential to it, so the name the chain
+            // was built with is the name the hop answers to.
+            node_id: node.host.clone(),
             addr: node.face.addr.clone(),
             role: role_for_position(index, count),
             server_pubkey_hex: node.face.pubkey_hex.clone(),
@@ -68,16 +73,39 @@ pub fn build_onion_artefact(
         kind: ONION_KIND.to_owned(),
         chain_id: chain.chain_id.clone(),
         private_key_hex: hex::encode(client_keypair.secret.to_bytes()),
+        self_id: client_identity(client_keypair).to_string(),
         mesh_id: chain.keys.mesh_id.clone(),
         hops: built,
         operator_pubkey_hex: chain.keys.operator_pubkey_hex.clone(),
         operator_secret_hex: chain.keys.operator_secret_hex.clone(),
+        identity_not_after_ms: issued_at_ms.saturating_add(DEFAULT_SUBSCRIPTION_MS),
         mode: ArtefactMode::FullAuto,
         label: label.to_owned(),
         issued_at_ms,
     };
     artefact.validate()?;
     Ok(artefact)
+}
+
+/// How long the identity the artefact carries stays valid, when the issuer
+/// says nothing about it.
+///
+/// Thirty days — the subscription's shape. The exit refuses the chain leg
+/// once the bound has passed, so a stale artefact stops working on its own.
+pub const DEFAULT_SUBSCRIPTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The client's own identity in the mesh, derived from its own key.
+///
+/// Derived, not random: rebuilding the same chain from the same client key
+/// must produce the same identity, or the customer's chain leg would be
+/// refused by an exit that has already seen the previous one.
+fn client_identity(keypair: &KeyPair) -> Uuid {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&keypair.public.to_bytes()[..16]);
+    // RFC 4122 shape: version 4, variant 1.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 /// The clock the artefact is stamped with.

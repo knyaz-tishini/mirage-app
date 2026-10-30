@@ -29,7 +29,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
-use crate::artefact::{ArtefactError, EntranceArtefact};
+use crate::artefact::{ArtefactError, DeliveryArtefact, EntranceArtefact};
+use crate::onion_artefact::OnionArtefact;
 use crate::scope::EgressScope;
 use crate::session::{exit_preference_from_mode, EdgeDialError, EdgeSessionSupervisor};
 use crate::status::{EdgeReason, StatusWriter};
@@ -40,6 +41,9 @@ use crate::tun_feed::TunFeed;
 pub enum SubscriberClientError {
     #[error(transparent)]
     Artefact(#[from] ArtefactError),
+
+    #[error(transparent)]
+    OnionArtefact(#[from] crate::onion_artefact::OnionArtefactError),
 
     #[error(transparent)]
     EdgeDial(#[from] EdgeDialError),
@@ -54,7 +58,7 @@ impl SubscriberClientError {
     /// written to is the thing that failed.
     pub fn status_reason(&self) -> Option<EdgeReason> {
         match self {
-            Self::Artefact(_) => Some(EdgeReason::BadArtefact),
+            Self::Artefact(_) | Self::OnionArtefact(_) => Some(EdgeReason::BadArtefact),
             Self::EdgeDial(e) => Some(EdgeReason::from(e)),
             Self::StatusFile { .. } => None,
         }
@@ -123,6 +127,68 @@ impl SubscriberClient {
         .await
     }
 
+    /// Build from a delivery artefact of either kind.
+    ///
+    /// The VPN artefact names one box - the fleet's own shape, unchanged.
+    /// The onion artefact names a chain, and the client walks it itself. The
+    /// artefact's own `kind` field decides which.
+    pub async fn build_from_delivery(
+        artefact: &DeliveryArtefact,
+        options: SubscriberClientOptions,
+    ) -> Result<Self, SubscriberClientError> {
+        Self::build_from_delivery_with_threshold(
+            artefact,
+            options,
+            crate::watchdog::DEFAULT_STREAM_FAILURE_THRESHOLD,
+        )
+        .await
+    }
+
+    /// [`Self::build_from_delivery`] with an explicit stream-failure threshold.
+    pub async fn build_from_delivery_with_threshold(
+        artefact: &DeliveryArtefact,
+        options: SubscriberClientOptions,
+        stream_failure_threshold: u32,
+    ) -> Result<Self, SubscriberClientError> {
+        match artefact {
+            DeliveryArtefact::Vpn(vpn) => {
+                Self::build_with_threshold(vpn, options, stream_failure_threshold).await
+            }
+            DeliveryArtefact::Onion(onion) => {
+                Self::build_onion_with_threshold(onion, options, stream_failure_threshold).await
+            }
+        }
+    }
+
+    /// The onion plane: validate the chain, walk it, and serve the local
+    /// proxy over the exit's mux session.
+    ///
+    /// The stream-failure watchdog uses its default threshold - see
+    /// [`Self::build_onion_with_threshold`].
+    pub async fn build_onion(
+        artefact: &OnionArtefact,
+        options: SubscriberClientOptions,
+    ) -> Result<Self, SubscriberClientError> {
+        Self::build_onion_with_threshold(
+            artefact,
+            options,
+            crate::watchdog::DEFAULT_STREAM_FAILURE_THRESHOLD,
+        )
+        .await
+    }
+
+    /// [`Self::build_onion`] with an explicit stream-failure threshold.
+    pub async fn build_onion_with_threshold(
+        artefact: &OnionArtefact,
+        options: SubscriberClientOptions,
+        stream_failure_threshold: u32,
+    ) -> Result<Self, SubscriberClientError> {
+        artefact.validate()?;
+        let spec = artefact.to_spec()?;
+        let supervisor = crate::onion_session::spawn_onion(spec, stream_failure_threshold);
+        Self::spawn_with_supervisor(supervisor, options).await
+    }
+
     /// [`Self::build`] with an explicit stream-failure threshold: how many
     /// consecutive failed stream opens tear the edge session down and force a
     /// redial — the client-side watchdog ([`crate::watchdog`]). A threshold
@@ -153,6 +219,17 @@ impl SubscriberClient {
             stream_failure_threshold,
         );
 
+        Self::spawn_with_supervisor(supervisor, options).await
+    }
+
+    /// Stand the local proxy up over an already-built supervisor.
+    ///
+    /// Shared by both planes: the VPN one and the onion one differ only in
+    /// which session the supervisor holds.
+    async fn spawn_with_supervisor(
+        supervisor: Arc<EdgeSessionSupervisor>,
+        options: SubscriberClientOptions,
+    ) -> Result<Self, SubscriberClientError> {
         // Started before anything else is bound so an unwritable path refuses
         // the build (dropping `supervisor` aborts its dial loop) instead of
         // leaving a connector running that nobody can observe.

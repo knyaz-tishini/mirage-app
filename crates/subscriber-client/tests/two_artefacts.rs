@@ -22,18 +22,25 @@ const FLEET_ARTEFACT: &str = r#"{
 }"#;
 
 /// The onion artefact: a circuit of two hops.
+///
+/// The hop's `node_id` is not decoration: the exit binds its credential check
+/// to it, and the chain builder refuses a hop without one. `self_id` is the
+/// client's own identity in the mesh, `identity_not_after_ms` the bound after
+/// which the exit stops honouring the chain leg.
 const ONION_ARTEFACT: &str = r#"{
   "v": 1,
   "kind": "onion",
   "chain_id": "stand",
   "private_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "self_id": "6f1a0000-0000-4000-8000-000000000000",
   "mesh_id": "mirage-vpn",
   "hops": [
-    {"addr": "203.0.113.2:41443", "role": "entry", "server_pubkey_hex": "2222222222222222222222222222222222222222222222222222222222222222"},
-    {"addr": "203.0.113.3:41443", "role": "exit", "server_pubkey_hex": "3333333333333333333333333333333333333333333333333333333333333333"}
+    {"node_id": "node-0", "addr": "203.0.113.2:41443", "role": "entry", "server_pubkey_hex": "2222222222222222222222222222222222222222222222222222222222222222"},
+    {"node_id": "node-1", "addr": "203.0.113.3:41443", "role": "exit", "server_pubkey_hex": "3333333333333333333333333333333333333333333333333333333333333333"}
   ],
   "operator_pubkey_hex": "4444444444444444444444444444444444444444444444444444444444444444",
   "operator_secret_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+  "identity_not_after_ms": 1726086400000,
   "mode": "full_auto",
   "label": "onion-1",
   "issued_at_ms": 1726000000000
@@ -75,6 +82,19 @@ fn the_onion_artefact_becomes_a_chain_the_client_can_walk() {
     assert_eq!(chain.hops.len(), 2);
     assert_eq!(chain.hops[0].addr, "203.0.113.2:41443");
     assert_eq!(chain.hops[1].addr, "203.0.113.3:41443");
+    assert_eq!(chain.hops[0].node_id.as_deref(), Some("node-0"));
+    assert_eq!(chain.hops[1].node_id.as_deref(), Some("node-1"));
+    chain.validate().expect("the onion builder accepts it");
+}
+
+#[test]
+fn the_onion_artefact_becomes_the_chain_the_dialer_consumes() {
+    let onion = OnionArtefact::from_json(ONION_ARTEFACT).expect("parse");
+    let spec = onion.to_spec().expect("the dial spec");
+    assert_eq!(spec.chain_id, "stand");
+    assert_eq!(spec.hops.len(), 2);
+    assert_eq!(spec.exit_node_id(), "node-1");
+    assert_eq!(spec.mesh_id, "mirage-vpn");
 }
 
 #[test]

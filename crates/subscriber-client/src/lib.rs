@@ -58,6 +58,7 @@ pub mod control;
 pub mod dial;
 pub mod http_connect;
 pub mod onion_artefact;
+pub(crate) mod onion_session;
 pub mod oss_artefact;
 pub mod oss_setup;
 pub mod peer;

@@ -1,0 +1,31 @@
+[package]
+name    = "mirage-onion-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mirage_onion_client"
+
+[dependencies]
+mirage-core          = { workspace = true }
+mirage-protocol      = { workspace = true }
+mirage-control-plane = { workspace = true }
+tokio                = { workspace = true }
+tracing              = { workspace = true }
+thiserror            = { workspace = true }
+serde                = { workspace = true }
+hex                  = "0.4"
+ed25519-dalek        = { workspace = true }
+uuid                 = { version = "1", features = ["v4"] }
+
+# The live stand runs the PRODUCTION hop code - the node's own relay and exit
+# handlers - so the client's chain walk is checked against what a real node
+# accepts, not against a re-implementation of it.
+[dev-dependencies]
+mirage-node        = { path = "../../../mirage-oss/crates/mirage-node" }
+mirage-client-core = { path = "../client-core" }
+mirage-mux         = { workspace = true, features = ["tokio-compat"] }
+arc-swap           = "1"
+tracing-subscriber = { workspace = true }
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+

@@ -107,7 +107,8 @@ impl From<&EdgeDialError> for EdgeReason {
             | EdgeDialError::BadCountryCode(_)
             | EdgeDialError::NoEntrances
             | EdgeDialError::AssignedFaceMissing { .. }
-            | EdgeDialError::TooManyFaces { .. } => Self::BadArtefact,
+            | EdgeDialError::TooManyFaces { .. }
+            | EdgeDialError::BadOnionChain(_) => Self::BadArtefact,
             EdgeDialError::Mirage(e) => match e {
                 MirageError::Io(_)
                 | MirageError::NodeUnreachable(_)

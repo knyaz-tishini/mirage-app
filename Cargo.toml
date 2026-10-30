@@ -5,6 +5,10 @@ members = [
     # The chain of boxes and its installer. Shared by the GUI and by the
     # headless client: a chain built in one is the chain the other reads.
     "crates/mirage-client-chain",
+    # The onion plane: the client walks the chain itself, holding the
+    # operator secret. A separate crate so the thin customer connector below
+    # stays free of every mesh credential.
+    "crates/mirage-onion-client",
     # "crates/cli",  # cli1 (mirage-client-cli) RETIRED 2026-06-14 → crates/_deprecated/cli
     "crates/cli2/ipc",
     "crates/cli2/ota",
