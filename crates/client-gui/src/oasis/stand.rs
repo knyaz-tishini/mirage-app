@@ -187,6 +187,15 @@ struct Guest {
     body: String,
 }
 
+/// How the traffic leaves this machine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    /// A local SOCKS5 port. The person points their own programs at it.
+    Socks,
+    /// The tunnel adapter: the whole machine goes through the tunnel.
+    Tun,
+}
+
 pub struct Stand {
     pub section: Section,
     pub host: String,
@@ -253,6 +262,11 @@ pub struct Stand {
     /// The box has offered its faces, and the list on screen is the
     /// person's answer to that offer.
     pub faces_from_box: bool,
+    /// How the traffic leaves this machine: a local SOCKS5 port, or the
+    /// tunnel adapter itself.
+    pub carry: Carry,
+    /// The carry changed. The shell pushes it to the engine and clears this.
+    pub carry_dirty: bool,
 }
 
 impl Stand {
@@ -286,6 +300,8 @@ impl Stand {
             dns: String::new(),
             except: String::new(),
             split_bypass: false,
+            carry: Carry::Tun,
+            carry_dirty: false,
             sites: Vec::new(),
             apps: Vec::new(),
             site_draft: String::new(),
@@ -383,6 +399,12 @@ impl Stand {
                     if let Some(bypass) = v.get("split_bypass").and_then(|s| s.as_bool()) {
                         stand.split_bypass = bypass;
                     }
+                    if let Some(carry) = v.get("carry").and_then(|s| s.as_str()) {
+                        stand.carry = match carry {
+                            "socks" => Carry::Socks,
+                            _ => Carry::Tun,
+                        };
+                    }
                     if let Some(sites) = string_list(&v, "sites") {
                         stand.sites = sites;
                     }
@@ -451,6 +473,7 @@ impl Stand {
             "dns": self.dns,
             "except": self.except,
             "split_bypass": self.split_bypass,
+            "carry": carry_key(self.carry),
             "sites": self.sites,
             "apps": self.apps,
         });
@@ -942,6 +965,29 @@ impl Stand {
         self.split_bypass = !self.split_bypass;
         self.scope_dirty = true;
         self.save_profile();
+    }
+
+    /// Switch between the local SOCKS5 port and the tunnel adapter.
+    ///
+    /// The adapter takes the whole machine through the tunnel; the SOCKS5
+    /// port is only what the person's own programs point at. The sheet
+    /// carries the wish, the engine does the work.
+    pub fn cycle_carry(&mut self) {
+        self.carry = match self.carry {
+            Carry::Socks => Carry::Tun,
+            Carry::Tun => Carry::Socks,
+        };
+        self.carry_dirty = true;
+        self.save_profile();
+    }
+
+    /// The carry the person asked for, waiting for the engine.
+    pub fn take_carry(&mut self) -> Option<Carry> {
+        if !self.carry_dirty {
+            return None;
+        }
+        self.carry_dirty = false;
+        Some(self.carry)
     }
 
     pub fn commit_site(&mut self) -> bool {
@@ -1474,6 +1520,13 @@ fn kill_key(kill: Kill) -> &'static str {
     }
 }
 
+fn carry_key(carry: Carry) -> &'static str {
+    match carry {
+        Carry::Socks => "socks",
+        Carry::Tun => "tun",
+    }
+}
+
 fn string_list(v: &serde_json::Value, key: &str) -> Option<Vec<String>> {
     let arr = v.get(key)?.as_array()?;
     Some(
@@ -1613,6 +1666,7 @@ enum Choice {
     Style,
     Build,
     Key,
+    Carry,
 }
 
 enum Row {
@@ -1644,6 +1698,7 @@ enum HitKind {
     MyKey,
     Invite(bool),
     Unlink,
+    Carry,
     Proto(usize),
     ProtoOn(usize),
     Guest(usize),
@@ -1884,6 +1939,7 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
             }
         }
         Section::Link => {
+            lay.choice("st-carry", tr("f.carry"), Choice::Carry, HitKind::Carry);
             lay.choice("st-kill", tr("f.kill"), Choice::Kill, HitKind::Kill);
             lay.field("st-dns", tr("f.dns"), Focus::Dns, tr("f.resolver"), 240, false);
             if stand.kill != Kill::Off {
@@ -1973,6 +2029,7 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Key => stand.cycle_key_source(),
         HitKind::MyKey => stand.show_my_key(),
         HitKind::Unlink => stand.unlink = true,
+        HitKind::Carry => stand.cycle_carry(),
         HitKind::Invite(full) => stand.invite(full),
         HitKind::Proto(index) => stand.select_proto(index),
         HitKind::ProtoOn(index) => stand.toggle_proto(index),
@@ -2248,6 +2305,10 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
                 tr("c.only").into()
             }
         }
+        Choice::Carry => match stand.carry {
+            Carry::Socks => tr("c.socks").into(),
+            Carry::Tun => tr("c.tun").into(),
+        },
         Choice::Lang => crate::text::current_name().into(),
         Choice::Style => {
             if crate::theme::light() {

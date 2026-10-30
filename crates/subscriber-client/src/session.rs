@@ -33,7 +33,7 @@
 //! [`offered_ports_for_transport`] and `mirage_control_plane::edge_session`.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -529,16 +529,6 @@ fn offered_ports_for_transport(
     Ok(filter_offered_faces_by_transport(&faces, transport))
 }
 
-fn probe_origin(len: usize) -> usize {
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let seq = PROBE_DRAW.fetch_add(1, Ordering::Relaxed);
-    let mixed = tick.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(seq);
-    (mixed as usize) % len
-}
-
 /// Hello on one face at `version` (2 or 3). Does not upgrade to mux: the
 /// caller keeps the tunnel only when this face is the session.
 async fn dial_v2_face(
@@ -678,7 +668,16 @@ impl ExitCtrl {
     }
 
     fn set(&self, exit: ExitPreference) {
-        *self.pref.lock().unwrap_or_else(|e| e.into_inner()) = exit;
+        {
+            let mut pref = self.pref.lock().unwrap_or_else(|e| e.into_inner());
+            if *pref == exit {
+                // The same wish again is not a change. Tearing the live
+                // session down for it is how a client that is asked for
+                // "auto" on every frame ends up redialing forever.
+                return;
+            }
+            *pref = exit;
+        }
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -694,6 +693,12 @@ struct EntranceDialer {
     mesh_id: Vec<u8>,
     client_static_priv: [u8; 32],
     exit: Arc<ExitCtrl>,
+    /// The entrance that carried the last live session.
+    ///
+    /// The next dial starts there. A face that worked is the face most
+    /// likely to work again, and a random start lands on a datagram face
+    /// half the time -- a face that cannot carry a mux session at all.
+    last_good: AtomicUsize,
 }
 
 impl EntranceDialer {
@@ -710,11 +715,12 @@ impl EntranceDialer {
         &self,
         version: u8,
         exit: ExitPreference,
+        start: usize,
     ) -> Result<(usize, EdgeSession), EdgeDialError> {
         if self.entrances.is_empty() {
             return Err(EdgeDialError::NoEntrances);
         }
-        let start = probe_origin(self.entrances.len());
+        let start = start % self.entrances.len();
         let mut last_err = EdgeDialError::NoEntrances;
         // A refusal kept for the report: a transport whose face count does
         // not fit in one hello is skipped, not fatal — another transport may
@@ -824,13 +830,22 @@ impl EdgeDialer for EntranceDialer {
             return Err(EdgeDialError::NoEntrances);
         }
         let exit = self.exit.get();
-        match self.dial_at(EDGE_SESSION_WIRE_VERSION_V3, exit).await {
+        // Start where the last live session was. The face that carried it is
+        // the face most likely to carry the next one, and a random start
+        // lands on a datagram face half the time -- a face that cannot
+        // carry a mux session at all.
+        let start = self.last_good.load(Ordering::Relaxed);
+        let result = match self.dial_at(EDGE_SESSION_WIRE_VERSION_V3, exit, start).await {
             Err(EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. }))) => {
                 info!("edge session: edge refused version 3, falling back to version 2");
-                self.dial_at(EDGE_SESSION_WIRE_VERSION_V2, exit).await
+                self.dial_at(EDGE_SESSION_WIRE_VERSION_V2, exit, start).await
             }
             other => other,
+        };
+        if let Ok((idx, _)) = &result {
+            self.last_good.store(*idx, Ordering::Relaxed);
         }
+        result
     }
 
     fn exit_generation(&self) -> u64 {
@@ -897,6 +912,7 @@ impl EdgeSessionSupervisor {
                 mesh_id,
                 client_static_priv,
                 exit: Arc::clone(&exit_ctrl),
+                last_good: AtomicUsize::new(0),
             },
             exit,
             Some(exit_ctrl),

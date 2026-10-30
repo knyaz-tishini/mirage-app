@@ -33,7 +33,7 @@ use crate::shell::menu::{self, MenuTab};
 mod palm_mark;
 pub(crate) mod stand;
 
-use stand::Stand;
+use stand::{Carry, Stand};
 
 const HIT_SCENE: &str = "scene";
 const TRANSITION_S: f64 = 0.55;
@@ -353,7 +353,11 @@ impl App for Oasis {
         };
         let at = |local: Rect| Rect::new(rect.x + local.x, rect.y + local.y, local.width, local.height);
 
-        if self.target >= 1.0 && !self.fell_back && self.engine.status().tun_block.is_some() {
+        if self.target >= 1.0
+            && !self.fell_back
+            && self.stand.carry == Carry::Tun
+            && self.engine.status().tun_block.is_some()
+        {
             self.engine.set_listeners(true, false);
             self.fell_back = true;
         }
@@ -377,6 +381,15 @@ impl App for Oasis {
             } else {
                 self.unlink_armed = true;
             }
+        }
+        // The person chose how the traffic leaves: the local port or the
+        // adapter. The engine does the work.
+        if let Some(carry) = self.stand.take_carry() {
+            match carry {
+                Carry::Socks => self.engine.set_listeners(true, false),
+                Carry::Tun => self.engine.set_tun(true),
+            }
+            self.fell_back = false;
         }
         if !self.take_entrance(now) {
             self.sync_standalone_link();
@@ -732,11 +745,23 @@ impl Oasis {
             }
         }
         self.engine.set_exit("auto");
-        if self.engine.status().tun_block.is_some() {
-            self.engine.set_listeners(true, false);
-            self.fell_back = true;
-        } else {
-            self.engine.set_tun(true);
+        match self.stand.carry {
+            Carry::Socks => {
+                // The person asked for the local port: the machine is not
+                // touched, their own programs point at it.
+                self.engine.set_listeners(true, false);
+                self.fell_back = false;
+            }
+            Carry::Tun => {
+                if self.engine.status().tun_block.is_some() {
+                    // The adapter cannot be taken here. The local port is
+                    // the way out until it can.
+                    self.engine.set_listeners(true, false);
+                    self.fell_back = true;
+                } else {
+                    self.engine.set_tun(true);
+                }
+            }
         }
         self.engine.connect();
         #[cfg(target_os = "ios")]

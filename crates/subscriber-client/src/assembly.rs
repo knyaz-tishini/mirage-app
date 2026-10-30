@@ -204,29 +204,9 @@ impl SubscriberClient {
         let client_static_priv = artefact.client_static_priv()?;
         let mesh_id = artefact.mesh_id.as_bytes().to_vec();
 
-        // EVERY entrance is dialable — the outer camouflage decides the wire
-        // transport, so a datagram-shaped face is dialled over datagrams and
-        // a stream-shaped one over a stream. Dropping the datagram-shaped
-        // faces here would make the subscriber unable to reach a box that
-        // publishes only those.
-        //
-        // But the order matters. The edge session is a mux: a byte stream
-        // with no retransmission of its own, and the transport above it
-        // authenticates every frame with a counter. A carrier that is a
-        // plain datagram pipe loses and reorders packets, and one lost
-        // datagram ends the session.
-        //
-        // Measured on the debug boxes, same artefact, same 20 MiB download:
-        //
-        // - the WireGuard face carried 335 KiB and the session dropped with
-        //   "authentication failed" after ten seconds;
-        // - the QUIC face carried all 20 MiB at 3.2 MB/s without a single
-        //   error.
-        //
-        // So the carriers that can hold a reliable stream are tried first,
-        // and a datagram carrier is only reached when the box publishes
-        // nothing else.
-        let entrances = order_by_carrier_reliability(artefact.entrances.clone());
+        // The configuration says where to go and with what protocol. The
+        // session follows it and decides nothing itself.
+        let entrances = artefact.entrances.clone();
 
         let supervisor = EdgeSessionSupervisor::spawn_with_threshold(
             entrances,
@@ -297,27 +277,14 @@ impl SubscriberClient {
     }
 }
 
-/// Put the entrances that can hold a reliable byte stream first.
+/// The entrances the edge session may use.
 ///
-/// The edge session is a mux, and a mux does not retransmit. The carrier
-/// below it authenticates every frame with a counter, so a datagram
-/// carrier that loses or reorders a packet ends the session rather than
-/// slowing it down. The relative order inside each group is the artefact's
-/// own, so the box's preferred face still wins.
-fn order_by_carrier_reliability(entrances: Vec<ArtefactEntrance>) -> Vec<ArtefactEntrance> {
-    let mut reliable = Vec::with_capacity(entrances.len());
-    let mut datagram = Vec::with_capacity(entrances.len());
-    for entrance in entrances {
-        if entrance.camouflage.carries_reliable_stream() {
-            reliable.push(entrance);
-        } else {
-            datagram.push(entrance);
-        }
-    }
-    reliable.extend(datagram);
-    reliable
+/// The configuration says where to go and with what protocol; this helper
+/// exists only for the tests that pin the contract.
+#[cfg(test)]
+fn entrances_for_session(entrances: Vec<ArtefactEntrance>) -> Vec<ArtefactEntrance> {
+    entrances
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,39 +378,14 @@ mod tests {
         client.shutdown();
     }
 
-    // ── the carrier decides whether the session can live at all ─────────────
+    // ── the session follows the configuration ──────────────────────────────
 
     #[test]
-    fn reliable_carriers_are_tried_before_datagram_carriers() {
-        let mut artefact = sample_artefact(3);
-        // The box publishes the datagram face first, as the debug boxes do.
-        artefact.entrances[0].camouflage =
-            TransportCamouflage::WireGuard { magic_byte: 1, junk_count: 4, junk_min: 10, junk_max: 20, bind_addr: "0.0.0.0:18531".parse().expect("valid addr") };
-        artefact.entrances[1].camouflage =
-            TransportCamouflage::Quic { alpn: vec!["h3".to_owned()], bind_addr: "0.0.0.0:18532".parse().expect("valid addr") };
-        artefact.entrances[2].camouflage = TransportCamouflage::None;
-
-        let ordered = order_by_carrier_reliability(artefact.entrances.clone());
-        let addrs: Vec<&str> = ordered.iter().map(|e| e.addr.as_str()).collect();
-        assert_eq!(
-            addrs,
-            vec![
-                artefact.entrances[1].addr.as_str(),
-                artefact.entrances[2].addr.as_str(),
-                artefact.entrances[0].addr.as_str(),
-            ],
-            "the QUIC and the raw TCP face come first, the datagram face last"
-        );
-    }
-
-    #[test]
-    fn a_datagram_only_artefact_still_builds() {
-        // Nothing is dropped: a box that publishes only datagram faces is
-        // still reachable, the session just cannot live long on it.
-        let mut artefact = sample_artefact(1);
-        artefact.entrances[0].camouflage =
-            TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:18533".parse().expect("valid addr") };
-        let ordered = order_by_carrier_reliability(artefact.entrances.clone());
-        assert_eq!(ordered.len(), 1, "a datagram face must not be dropped");
+    fn the_session_dials_exactly_what_the_configuration_names() {
+        // The configuration says where to go and with what protocol. The
+        // session decides nothing itself: the faces are taken as written.
+        let artefact = sample_artefact(2);
+        let addrs: Vec<&str> = artefact.entrances.iter().map(|e| e.addr.as_str()).collect();
+        assert_eq!(addrs.len(), 2, "the configuration's faces are the session's faces");
     }
 }

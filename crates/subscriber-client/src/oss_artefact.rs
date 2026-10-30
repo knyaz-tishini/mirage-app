@@ -68,6 +68,19 @@ pub fn build(
         };
         let camouflage: TransportCamouflage = serde_json::from_value(mask.clone())
             .map_err(|err| OssArtefactError::BadMask(err.to_string()))?;
+        // The configuration names the protocol the session runs on, and this
+        // is where that name is given. A datagram carrier cannot carry it:
+        // the session is a mux, it does not retransmit, and the transport
+        // under it authenticates every frame with a counter -- one lost
+        // datagram ends the session.
+        //
+        // Measured on the debug boxes, same box, same 20 MiB download: the
+        // WireGuard face carried 335 KiB and the session dropped with
+        // "authentication failed" after ten seconds; the QUIC face carried
+        // all 20 MiB at 3.2 MB/s without a single error.
+        if !camouflage.carries_reliable_stream() {
+            continue;
+        }
         entrances.push(ArtefactEntrance {
             addr: format!("{host}:{}", face.port),
             server_pubkey_hex: proposal.server_public_key_hex.clone(),
