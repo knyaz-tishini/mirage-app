@@ -119,6 +119,7 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "c.key_own" => ("свой ключ", "own key"),
         "c.key_file" => ("ключ из файла", "key from file"),
 
+        "bind.cabinet" => ("кабинет", "cabinet"),
         "bind.unlink" => ("отвязать", "unlink"),
         "bind.confirm" => ("подтвердить", "confirm"),
         "bind.go" => ("привязать", "bind"),

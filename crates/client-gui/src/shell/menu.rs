@@ -867,12 +867,13 @@ fn draw_bind_row(
             let cabinet_x = cabinet_button_x(w);
             let cabinet_w = (unlink_x - 6.0 - cabinet_x).max(0.0);
             ctx.set_fill_color("rgba(255,255,255,0.08)");
-            ctx.fill_rect(cabinet_x, by, cabinet_w, bh);
+            ctx.fill_rounded_rect(cabinet_x, by, cabinet_w, bh, 12.0);
             ctx.set_fill_color(if crate::theme::light() { "#16161a" } else { FG });
+            ctx.set_font("12px PT Root UI");
             ctx.set_text_align(TextAlign::Center);
             fill_clipped(
                 ctx,
-                crate::text::tr("mode.mesh"),
+                crate::text::tr("bind.cabinet"),
                 cabinet_x + cabinet_w / 2.0,
                 crate::theme::label_baseline(by, bh, 14.0),
                 cabinet_x,
