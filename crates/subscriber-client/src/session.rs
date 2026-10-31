@@ -877,10 +877,18 @@ async fn dial_face(
     version: u8,
 ) -> Result<(OpenedEntrance, EdgeWelcome), EdgeDialError> {
     let mut opened = open_entrance(entrance, mesh_id, client_static_priv).await?;
+    // A client that speaks the plane can take the address the box assigns
+    // it: it puts that address on its tunnel adapter. The flag is how the
+    // box knows -- an older client has no such flag and keeps the address
+    // it always had.
+    let mut flags = if commit { EdgeHello::FLAG_COMMIT } else { 0 };
+    if version == EDGE_SESSION_WIRE_VERSION_V4 {
+        flags |= EdgeHello::FLAG_ACCEPTS_ASSIGNMENT;
+    }
     let hello = EdgeHello {
         version,
         exit,
-        flags: if commit { EdgeHello::FLAG_COMMIT } else { 0 },
+        flags,
         offered_ports: offered.to_vec(),
     };
     let bytes = match hello.encode() {
