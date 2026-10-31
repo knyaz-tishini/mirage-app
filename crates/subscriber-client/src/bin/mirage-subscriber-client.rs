@@ -84,6 +84,11 @@ struct Args {
     #[arg(long, default_value = "socks")]
     transport: String,
 
+    /// Physical interface for the entrance socket when another VPN owns the
+    /// default route. Linux and macOS only; no host routes are changed.
+    #[arg(long)]
+    carrier_iface: Option<String>,
+
     /// Local HTTP CONNECT bind. Loopback only. Used when `--transport http`.
     #[arg(long, default_value = "127.0.0.1:8080")]
     http_bind: SocketAddr,
@@ -880,7 +885,14 @@ async fn run_proxy(artefact: &DeliveryArtefact, args: &Args) -> ExitCode {
         None
     };
 
-    if transport == Transport::Tun {
+    if let Some(iface) = args.carrier_iface.as_deref() {
+        if iface.is_empty() {
+            error!("refusing: --carrier-iface must not be empty");
+            return fail(None);
+        }
+        info!(iface = %iface, "pinning the edge carrier to the physical NIC");
+        mirage_protocol::driver::set_carrier_interface(Some(iface.to_owned()));
+    } else if transport == Transport::Tun {
         match default_iface() {
             Ok(iface) => {
                 info!(iface = %iface, "pinning the edge carrier to the physical NIC");
