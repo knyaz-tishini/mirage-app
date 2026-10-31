@@ -13,6 +13,14 @@
 //! parser ([`parse_socks5_udp_request`]) and the ASSOCIATE reply writer
 //! ([`write_udp_associate_reply`]), both `pub(crate)` for that.
 //!
+//! **RAW IP** (command 0x05) is the mono-protocol data path: the device
+//! asks for the whole IP packets of the tunnel, and they ride the QUIC
+//! datagrams of the ONE connection the edge session rides. The wire is the
+//! SOCKS5 request `05 05 00 03 09 "mirage-ip" 00 00` (version 5, command
+//! 5, no auth, domain `mirage-ip`, port 0) and then frames in BOTH
+//! directions: `[2B big-endian length][IP packet]`. The server answers with
+//! the ordinary ten-byte success reply, and the frames follow it.
+//!
 //! Not reused from `mirage_client_core::socks5::Socks5Server` on purpose:
 //! that type is built around a `Router`/`ChainSet`/`TunnelPool` — a fixed
 //! set of pre-built chains — which this crate no longer has. Every flow
@@ -20,9 +28,11 @@
 //! at CONNECT/ASSOCIATE time, never resolved from a pre-built chain table.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mirage_protocol::plane::PacketPlane;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,6 +47,9 @@ const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
+/// The mono-protocol command: the whole IP packets of the tunnel, in and
+/// out. Not a standard SOCKS5 command - it is this client's own.
+const CMD_RAW_IP: u8 = 0x05;
 
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
@@ -53,6 +66,13 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 /// How long a CONNECT waits for a live edge session before giving up and
 /// replying general failure.
 const CONNECT_SESSION_WAIT: Duration = Duration::from_secs(5);
+
+/// One raw-IP consumer at a time.
+///
+/// The tunnel device is the one consumer of the packet plane: a second one
+/// would steal the packets from the first. The device that loses the race
+/// is told "general failure" and closes.
+static RAW_IP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Every way reading a SOCKS5 request off the wire fails.
 #[derive(Debug, Error)]
@@ -131,10 +151,141 @@ async fn handle_connection(
                 debug!(error = %e, "socks5: udp associate ended with an io error");
             }
         }
+        // The whole IP packets of the tunnel. The scope does not apply here:
+        // the box is a plain L3 exit, and the device decides what goes into
+        // the tunnel.
+        CMD_RAW_IP => handle_raw_ip(stream, target, supervisor).await,
         other => {
             debug!(cmd = other, "socks5: unsupported command");
             let _ = write_reply(&mut stream, REP_COMMAND_NOT_SUPPORTED).await;
         }
+    }
+}
+
+/// Serve the raw-IP command: the whole IP packets of the tunnel, in and out.
+///
+/// The device asks with the SOCKS5 request `05 05 00 03 09 "mirage-ip" 00
+/// 00`; the answer is the ordinary success reply, and the frames follow it:
+/// `[2B big-endian length][IP packet]` in both directions.
+///
+/// The packets ride the packet plane of the live edge session - the QUIC
+/// datagrams of the same connection the edge hello rode.
+async fn handle_raw_ip(
+    mut stream: TcpStream,
+    target: String,
+    supervisor: Arc<EdgeSessionSupervisor>,
+) {
+    let session = match supervisor.wait_for_session(CONNECT_SESSION_WAIT).await {
+        Some(session) => session,
+        None => {
+            warn!(target = %target, "socks5: no live edge session - refusing the raw-IP command");
+            let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+            return;
+        }
+    };
+    let Some(plane) = session.packet_plane() else {
+        warn!(
+            target = %target,
+            "socks5: the live session carries no packet plane - refusing the raw-IP command"
+        );
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    };
+    // One device, one consumer: a second raw-IP connection is refused.
+    if RAW_IP_ACTIVE.swap(true, Ordering::SeqCst) {
+        warn!("socks5: a raw-IP consumer is already running - refusing the second one");
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    }
+    if write_reply(&mut stream, REP_SUCCESS).await.is_err() {
+        RAW_IP_ACTIVE.store(false, Ordering::SeqCst);
+        return;
+    }
+    info!(target = %target, "socks5: raw-IP consumer started");
+    let outcome = raw_ip_pump(stream, plane).await;
+    RAW_IP_ACTIVE.store(false, Ordering::SeqCst);
+    match outcome {
+        Ok(()) => info!("socks5: raw-IP consumer ended"),
+        Err(e) => warn!(error = %e, "socks5: raw-IP consumer ended with an error"),
+    }
+}
+
+/// Pump the raw-IP frames in both directions until one side ends.
+async fn raw_ip_pump(stream: TcpStream, plane: Arc<dyn PacketPlane>) -> std::io::Result<()> {
+    let (reader, writer) = tokio::io::split(stream);
+    let upstream = raw_ip_upstream(reader, Arc::clone(&plane));
+    let downstream = raw_ip_downstream(plane, writer);
+    tokio::select! {
+        result = upstream => result,
+        result = downstream => result,
+    }
+}
+
+/// The device -> plane direction: read a frame, split it if it does not fit
+/// the plane, and put every piece on the wire.
+async fn raw_ip_upstream(
+    mut reader: tokio::io::ReadHalf<TcpStream>,
+    plane: Arc<dyn PacketPlane>,
+) -> std::io::Result<()> {
+    let budget = plane.max_packet_size();
+    let mut len_buf = [0u8; 2];
+    loop {
+        if let Err(e) = reader.read_exact(&mut len_buf).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                // The device closed the connection.
+                return Ok(());
+            }
+            return Err(e);
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut packet = vec![0u8; len];
+        if let Err(e) = reader.read_exact(&mut packet).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(());
+            }
+            return Err(e);
+        }
+        for piece in crate::ipv4::fragment(&packet, budget) {
+            if piece.len() > budget {
+                // The packet does not fit and cannot be split: the far side
+                // would never reassemble it, so it is dropped here.
+                debug!(
+                    len = piece.len(),
+                    budget,
+                    "socks5: dropping a packet that does not fit the plane"
+                );
+                continue;
+            }
+            if let Err(e) = plane.send_packet(&piece).await {
+                warn!(error = %e, "socks5: the packet plane refused a packet");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The plane -> device direction: read a packet and write it as a frame.
+async fn raw_ip_downstream(
+    plane: Arc<dyn PacketPlane>,
+    mut writer: tokio::io::WriteHalf<TcpStream>,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; mirage_protocol::plane::MAX_PACKET_SIZE];
+    loop {
+        let read = match plane.recv_packet(&mut buf).await {
+            Ok(read) => read,
+            Err(e) => {
+                warn!(error = %e, "socks5: the packet plane ended");
+                return Ok(());
+            }
+        };
+        if read == 0 {
+            continue;
+        }
+        let mut frame = Vec::with_capacity(2 + read);
+        frame.extend_from_slice(&(read as u16).to_be_bytes());
+        frame.extend_from_slice(&buf[..read]);
+        writer.write_all(&frame).await?;
+        writer.flush().await?;
     }
 }
 
@@ -527,6 +678,37 @@ mod tests {
         let mut req = vec![0x05, 0x01, 0x00, 0x03, 11u8];
         req.extend_from_slice(b"example.com");
         req.extend_from_slice(&443u16.to_be_bytes());
+        client.write_all(&req).await.expect("write request");
+
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.expect("read reply");
+        assert_eq!(reply[0], SOCKS5_VERSION);
+        assert_eq!(reply[1], REP_GENERAL_FAILURE);
+    }
+
+    #[tokio::test]
+    async fn raw_ip_with_no_live_session_replies_general_failure() {
+        let bind = free_local_addr().await;
+        let listener = TcpListener::bind(bind).await.expect("bind");
+        // No entrances at all -> the supervisor never has a live session, and
+        // a live session without a packet plane would not do either.
+        let supervisor =
+            EdgeSessionSupervisor::spawn(Vec::new(), b"MESH2".to_vec(), [0x11u8; 32], ExitPreference::Auto);
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            handle_connection(stream, supervisor, std::sync::Arc::new(EgressScope::all())).await;
+        });
+
+        let mut client = TcpStream::connect(bind).await.expect("connect");
+        client.write_all(&[0x05, 0x01, 0x00]).await.expect("write greeting");
+        let mut greeting_reply = [0u8; 2];
+        client.read_exact(&mut greeting_reply).await.expect("read greeting reply");
+        assert_eq!(greeting_reply, [0x05, 0x00]);
+
+        // CMD=RAW_IP(0x05), ATYP=domain, "mirage-ip:0".
+        let mut req = vec![0x05, CMD_RAW_IP, 0x00, 0x03, 9u8];
+        req.extend_from_slice(b"mirage-ip");
+        req.extend_from_slice(&0u16.to_be_bytes());
         client.write_all(&req).await.expect("write request");
 
         let mut reply = [0u8; 10];

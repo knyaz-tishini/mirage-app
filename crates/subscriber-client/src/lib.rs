@@ -57,6 +57,7 @@ pub mod claim_image;
 pub mod control;
 pub mod dial;
 pub mod http_connect;
+pub mod ipv4;
 pub mod onion_artefact;
 pub(crate) mod onion_session;
 pub mod oss_artefact;
@@ -85,7 +86,7 @@ pub use onion_artefact::{OnionArtefact, OnionArtefactError, OnionHop, ONION_KIND
 pub use oss_artefact::{build as build_oss_artefact, OssArtefactError};
 pub use oss_setup::{OssSetup, OssSetupOutcome};
 pub use scope::EgressScope;
-pub use tun_mode::TunMode;
+pub use tun_mode::{TunMode, WireMode};
 pub use session::{
     exit_preference_from_mode, EdgeDialError, EdgeSession, EdgeSessionSupervisor, EdgeStreamError,
 };

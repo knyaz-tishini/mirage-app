@@ -4,6 +4,12 @@
 //! SOCKS chain. Split: traffic stays direct, and only the user's services
 //! go to that chain. `relay_addrs` stays empty — the carrier socket is
 //! pinned by the dialer, not by a route around the entrance address.
+//!
+//! The datapath is a separate choice, [`WireMode`]: `stack` is the byte
+//! stream path (the device terminates TCP and UDP in userspace), `raw_ip`
+//! is the mono-protocol path (the device hands whole IP packets over the
+//! raw-IP SOCKS5 command, and they ride the QUIC datagrams of the edge
+//! session).
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -11,8 +17,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+use mirage_core::config::TransportCamouflage;
 use serde_json::{json, Value};
 
+use crate::artefact::{ArtefactEntrance, DeliveryArtefact};
 use crate::scope::tun_service_action;
 
 pub const CHAIN_NAME: &str = "edge";
@@ -21,6 +29,66 @@ pub const CHAIN_NAME: &str = "edge";
 pub enum TunMode {
     Full,
     Split,
+}
+
+/// The datapath the tunnel device speaks to this client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireMode {
+    /// The device terminates TCP and UDP in userspace and hands byte streams
+    /// over the SOCKS5 proxy.
+    Stack,
+    /// The device hands whole IP packets over the raw-IP SOCKS5 command, and
+    /// this client tunnels them over the QUIC datagrams of the edge session.
+    RawIp,
+}
+
+impl WireMode {
+    /// The name the device's config carries.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stack => "stack",
+            Self::RawIp => "raw_ip",
+        }
+    }
+
+    /// The adapter MTU this mode needs.
+    ///
+    /// The raw-IP mode carries whole IP packets in QUIC datagrams, and a
+    /// datagram holds at most [`mirage_protocol::plane::MAX_PACKET_SIZE`]
+    /// bytes: an adapter MTU above that has the device drop packets that
+    /// could never fit the plane.
+    pub fn mtu(&self) -> u16 {
+        match self {
+            Self::Stack => 1500,
+            Self::RawIp => mirage_protocol::plane::MAX_PACKET_SIZE as u16,
+        }
+    }
+
+    /// The mode the given faces call for.
+    ///
+    /// A QUIC face is the mono-protocol plane: the whole IP packets ride
+    /// its datagrams. Every other face keeps the byte-stream path.
+    pub fn for_entrances(entrances: &[ArtefactEntrance]) -> Self {
+        let plane = entrances
+            .iter()
+            .any(|entrance| matches!(entrance.camouflage, TransportCamouflage::Quic { .. }));
+        if plane {
+            Self::RawIp
+        } else {
+            Self::Stack
+        }
+    }
+}
+
+/// The mode the given artefact's faces call for.
+///
+/// An onion artefact names a chain, not a box: a chain has no packet plane,
+/// so it keeps the byte-stream path.
+pub fn wire_mode_for(artefact: &DeliveryArtefact) -> WireMode {
+    match artefact {
+        DeliveryArtefact::Vpn(vpn) => WireMode::for_entrances(&vpn.entrances),
+        DeliveryArtefact::Onion(_) => WireMode::Stack,
+    }
 }
 
 fn tun_device_name() -> &'static str {
@@ -99,6 +167,7 @@ pub fn write_config(
     socks_bind: SocketAddr,
     bypass_cidrs: &[String],
     mode: TunMode,
+    wire: WireMode,
     services: &[String],
     apps: &[String],
     bypass_services: &[String],
@@ -106,21 +175,30 @@ pub fn write_config(
     relay_addrs: &[String],
 ) -> Result<(), String> {
     let policy = policy_json(mode, services, apps, bypass_services, bypass_apps)?;
+    let mut chain = json!({
+        "name": CHAIN_NAME,
+        "socks5_addr": socks_bind.to_string(),
+    });
+    if wire == WireMode::RawIp {
+        // The raw-IP chain carries whole IP packets, not byte streams.
+        chain["protocol"] = json!("raw_ip");
+    }
     let doc = json!({
         "tun_name": tun_device_name(),
         "tun_addr": "10.77.0.1/24",
+        // The datapath: `stack` is the byte-stream path, `raw_ip` is the
+        // mono-protocol path.
+        "mode": wire.as_str(),
         // The path MTU, not QUIC's floor. QUIC wants an Initial datagram of
         // at least 1200 bytes (RFC 9000, section 14.1) -- that is a MINIMUM.
         // A real client pads its Initial to the path MTU minus the IP and UDP
         // headers: Chrome sends 1252 bytes, and with an adapter MTU of 1200
         // that datagram did not fit the adapter at all. 1500 is the ordinary
         // Ethernet MTU; the chain carries whole IP packets, so nothing above
-        // it needs to fit.
-        "mtu": 1500,
-        "chains": [{
-            "name": CHAIN_NAME,
-            "socks5_addr": socks_bind.to_string(),
-        }],
+        // it needs to fit. The raw-IP mode carries the packets in QUIC
+        // datagrams, so its MTU is the size of one datagram.
+        "mtu": wire.mtu(),
+        "chains": [chain],
         "bypass": { "cidrs": bypass_cidrs },
         "policy": policy,
         "relay_addrs": relay_addrs,
@@ -182,12 +260,50 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mirage-tun-cfg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("tun.json");
-        write_config(&path, "127.0.0.1:1080".parse().unwrap(), &["192.168.0.0/21".into()], TunMode::Full, &[], &[], &[], &[], &[])
-            .unwrap();
+        write_config(
+            &path,
+            "127.0.0.1:1080".parse().unwrap(),
+            &["192.168.0.0/21".into()],
+            TunMode::Full,
+            WireMode::Stack,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"relay_addrs\": []"));
         assert!(!text.contains("144.172"));
         assert!(text.contains("192.168.0.0/21"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_raw_ip_mode_writes_the_datagram_mtu_and_the_raw_chain() {
+        let dir = std::env::temp_dir().join(format!("mirage-tun-cfg-raw-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("tun.json");
+        write_config(
+            &path,
+            "127.0.0.1:1080".parse().unwrap(),
+            &[],
+            TunMode::Full,
+            WireMode::RawIp,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["mode"], "raw_ip");
+        assert_eq!(doc["mtu"], 1280);
+        assert_eq!(doc["chains"][0]["protocol"], "raw_ip");
+        assert_eq!(doc["chains"][0]["name"], CHAIN_NAME);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

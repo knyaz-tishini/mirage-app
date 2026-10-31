@@ -40,6 +40,7 @@
 //! same `client_static_priv` this adapter holds.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use mirage_core::{
@@ -49,6 +50,7 @@ use mirage_core::{
 use mirage_protocol::{
     client_transport::run_client_v9_transport_aware,
     driver::ClientCredential,
+    plane::{PacketPlane, PlaneConnector},
     traits::{AcceptResult, TcpProtocol, Tunnel},
 };
 use tokio::net::TcpStream;
@@ -149,6 +151,71 @@ impl TcpProtocol for StaticKeyProtocol {
 
     fn probe_resistant(&self) -> bool {
         true
+    }
+}
+
+// -- the mono-protocol QUIC transport --------------------------------------
+
+/// The ALPN list an entrance publishes, when it wears the QUIC camouflage.
+///
+/// The camouflage decides the transport: a QUIC entrance is the
+/// mono-protocol plane - ONE connection carries the control wire AND the
+/// whole IP packets. Every other camouflage keeps the old mux transport.
+pub fn quic_alpn(camouflage: &TransportCamouflage) -> Option<Vec<String>> {
+    match camouflage {
+        TransportCamouflage::Quic { alpn, .. } => Some(alpn.clone()),
+        _ => None,
+    }
+}
+
+/// The mono-protocol QUIC session of one entrance.
+///
+/// ONE QUIC connection carries both halves of the tunnel: the control wire
+/// (the Mirage V9 handshake and the edge hello/welcome) and the packet plane
+/// (whole IP packets in QUIC datagrams, RFC 9221). The packets do not
+/// travel through the control wire - they travel through the same
+/// connection.
+///
+/// The connector owns the QUIC endpoint, and dropping the endpoint closes the
+/// connection: the connector must outlive the session it opened.
+pub struct PlaneDial {
+    connector: PlaneConnector,
+    tunnel: Box<dyn Tunnel>,
+    plane: Arc<dyn PacketPlane>,
+}
+
+impl PlaneDial {
+    /// Open the plane of one entrance.
+    ///
+    /// `alpn` is the ALPN list the face publishes. The server name is empty:
+    /// the face is reached by its address, not by a name.
+    pub async fn open(
+        alpn: &[String],
+        addr: SocketAddr,
+        server_pubkey: &[u8; 32],
+        client_static_priv: &[u8; 32],
+        mesh_id: &[u8],
+    ) -> Result<Self, MirageError> {
+        let connector = PlaneConnector::new(alpn, "")?;
+        let session = connector.connect(addr, server_pubkey, client_static_priv, mesh_id).await?;
+        Ok(Self { connector, tunnel: session.tunnel, plane: session.plane })
+    }
+
+    /// The control wire of the connection - the hello and the welcome ride
+    /// it.
+    pub fn tunnel(&mut self) -> &mut Box<dyn Tunnel> {
+        &mut self.tunnel
+    }
+
+    /// The packet plane of the connection - the whole IP packets.
+    pub fn plane(&self) -> Arc<dyn PacketPlane> {
+        Arc::clone(&self.plane)
+    }
+
+    /// The three pieces of the session: the control wire, the packet plane,
+    /// and the connector that keeps the connection open.
+    pub fn into_parts(self) -> (Box<dyn Tunnel>, Arc<dyn PacketPlane>, PlaneConnector) {
+        (self.tunnel, self.plane, self.connector)
     }
 }
 

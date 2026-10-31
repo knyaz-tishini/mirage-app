@@ -21,7 +21,7 @@ use mirage_control_plane::{CountryCode, ExitPreference};
 use crate::scope::EgressScope;
 use crate::status::EdgeState;
 use crate::supervisor_slot::SupervisorSlot;
-use crate::tun_mode::{self, TunMode};
+use crate::tun_mode::{self, TunMode, WireMode};
 
 const READ_CAP: usize = 16 * 1024;
 
@@ -190,6 +190,7 @@ pub async fn serve(
     scope: Arc<EgressScope>,
     tun_bin: Option<PathBuf>,
     relay_addrs: Vec<String>,
+    wire: WireMode,
 ) -> std::io::Result<()> {
     if !ensure_loopback(bind) {
         return Err(std::io::Error::new(
@@ -208,6 +209,7 @@ pub async fn serve(
         scope,
         tun_bin,
         relay_addrs,
+        wire,
         tun_child: None,
         tun_stamp: String::new(),
         tun_retry_at: None,
@@ -506,6 +508,9 @@ struct Runtime {
     tun_bin: Option<PathBuf>,
     /// Entrance addresses the tun routes around itself. Not a status field.
     relay_addrs: Vec<String>,
+    /// The datapath the device speaks: the raw-IP path carries the whole IP
+    /// packets, the stack path carries byte streams.
+    wire: WireMode,
     tun_child: Option<Child>,
     tun_stamp: String,
     tun_retry_at: Option<Instant>,
@@ -743,6 +748,7 @@ fn sync_tun(rt: &mut Runtime) {
         SocketAddr::from(([127, 0, 0, 1], 1080)),
         &rt.wish.bypass,
         mode,
+        rt.wire,
         &rt.wish.services,
         &rt.wish.apps,
         &rt.wish.bypass_services,

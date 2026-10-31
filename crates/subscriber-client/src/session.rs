@@ -16,13 +16,22 @@
 //!
 //! [`EdgeSessionSupervisor`] holds one session up and reconnects with
 //! exponential backoff whenever it closes. The edge assigns the session
-//! face. This client speaks hello version 3 first, version 2 when the edge
-//! refuses version 3, and version 1 when the edge refuses version 2. It
+//! face. This client speaks hello version 4 first, version 3 when the edge
+//! refuses version 4, version 2 when the edge refuses version 3, and
+//! version 1 when the edge refuses version 2. It
 //! picks a probe from every face the artefact carries — stream-shaped and
 //! datagram-shaped alike — and fails that probe over onto another face of
 //! the SAME transport when the probe itself cannot connect. The version-1
 //! fallback is [`EdgeSession::connect_first_available`] from index 0. A
 //! version-3 refusal does not skip version 2.
+//!
+//! **Version 4 is the plane.** A QUIC face is dialled over the mono-protocol
+//! QUIC transport ([`crate::dial::PlaneDial`]): ONE connection carries the
+//! control wire (this hello and the welcome) AND the whole IP packets, in
+//! QUIC datagrams. When the edge's welcome says the session carries whole
+//! packets, the session is a plane session - there is no mux, and the
+//! packets ride [`EdgeSession::packet_plane`]. Every other camouflage keeps
+//! the mux transport of the older versions, byte for byte.
 //!
 //! **Any face, not only a TCP one.** The subscriber may be handed an
 //! entrance wearing any outer camouflage — a stream one or a datagram one —
@@ -33,7 +42,7 @@
 //! [`offered_ports_for_transport`] and `mirage_control_plane::edge_session`.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,13 +56,14 @@ use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, T
 use mirage_core::error::MirageError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
 use mirage_mux::{MuxError, MuxStream};
+use mirage_protocol::plane::{PacketPlane, PlaneConnector};
 use mirage_protocol::traits::{TcpProtocol, Tunnel};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 use crate::artefact::{ArtefactEntrance, ArtefactError, ArtefactMode};
-use crate::dial::StaticKeyProtocol;
+use crate::dial::{quic_alpn, PlaneDial, StaticKeyProtocol};
 use crate::status::{EdgeReason, EdgeStatusFile};
 use crate::watchdog::{StreamHealth, WatchedStream, DEFAULT_STREAM_FAILURE_THRESHOLD};
 
@@ -63,6 +73,10 @@ use crate::watchdog::{StreamHealth, WatchedStream, DEFAULT_STREAM_FAILURE_THRESH
 const EDGE_SESSION_WIRE_VERSION: u8 = 1;
 const EDGE_SESSION_WIRE_VERSION_V2: u8 = 2;
 const EDGE_SESSION_WIRE_VERSION_V3: u8 = 3;
+/// Version 4 is the plane: the whole IP packets ride the datagrams of the
+/// same QUIC connection the control wire rides - see
+/// [`mirage_protocol::plane`].
+const EDGE_SESSION_WIRE_VERSION_V4: u8 = 4;
 
 /// How long a flow waits before asking for stream credit again.
 ///
@@ -215,6 +229,29 @@ pub fn exit_preference_from_mode(mode: &ArtefactMode) -> Result<ExitPreference, 
     }
 }
 
+/// The mono-protocol transport of one session.
+///
+/// ONE QUIC connection carries both halves of the tunnel: the control wire
+/// (the hello and the welcome) and - when the edge says so - the packet
+/// plane (the whole IP packets, in QUIC datagrams). The packets do not
+/// travel through the control wire, but they travel through the same
+/// connection.
+///
+/// The connector owns the QUIC endpoint, and dropping the endpoint closes the
+/// connection: the connector lives as long as the session does.
+struct PlaneTransport {
+    /// The packet plane - `None` when the edge's welcome does not say the
+    /// session carries whole packets.
+    plane: Option<Arc<dyn PacketPlane>>,
+    /// The connector that owns the QUIC endpoint.
+    _connector: PlaneConnector,
+    /// Set when the control wire ends. The control wire is idle once the
+    /// welcome arrived, so its end IS the end of the connection.
+    control_closed: Arc<AtomicBool>,
+    /// The task that watches the control wire.
+    watcher: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// One live session to the customer's own edge.
 pub struct EdgeSession {
     /// The mux session handle, or `None` once this session has been torn
@@ -232,15 +269,134 @@ pub struct EdgeSession {
     /// Consecutive failed stream opens on THIS session — see
     /// [`crate::watchdog`].
     health: Arc<StreamHealth>,
+    /// The mono-protocol transport of this session, when it rides one. A
+    /// session over the older mux transport has none.
+    plane: Mutex<Option<PlaneTransport>>,
+}
+
+impl Drop for EdgeSession {
+    /// The control-wire watcher must not outlive the session it watches.
+    fn drop(&mut self) {
+        if let Ok(transport) = self.plane.get_mut() {
+            if let Some(transport) = transport.as_mut() {
+                if let Some(watcher) = transport.watcher.as_ref() {
+                    watcher.abort();
+                }
+            }
+        }
+    }
 }
 
 impl EdgeSession {
     /// Dial `entrance`, complete the V9 handshake with the subscriber's
-    /// persistent static key, exchange `EdgeHello`/`EdgeWelcome`, and — on
-    /// [`EdgeOutcome::Accepted`] — upgrade to a mux session. Refuses BY NAME
-    /// (never a bare IO error) when the edge sends
-    /// [`EdgeOutcome::Refused`].
+    /// persistent static key, exchange `EdgeHello`/`EdgeWelcome`, and build
+    /// the session the welcome asks for: a plane session when the edge's
+    /// welcome says the session carries whole IP packets, a mux session
+    /// otherwise. Refuses BY NAME (never a bare IO error) when the edge
+    /// sends [`EdgeOutcome::Refused`].
+    ///
+    /// The hello version is offered newest first: version 4, then version 3,
+    /// then version 2. A version-1 edge is reached through
+    /// [`Self::connect_first_available`].
     pub async fn connect(
+        entrance: &ArtefactEntrance,
+        mesh_id: &[u8],
+        client_static_priv: [u8; 32],
+        exit: ExitPreference,
+    ) -> Result<Self, EdgeDialError> {
+        match Self::connect_at(
+            entrance,
+            mesh_id,
+            client_static_priv,
+            exit,
+            EDGE_SESSION_WIRE_VERSION_V4,
+        )
+        .await
+        {
+            Err(EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. }))) => {
+                info!(
+                    entrance = %entrance.addr,
+                    "edge session: edge refused version 4, falling back to version 3"
+                );
+                match Self::connect_at(
+                    entrance,
+                    mesh_id,
+                    client_static_priv,
+                    exit,
+                    EDGE_SESSION_WIRE_VERSION_V3,
+                )
+                .await
+                {
+                    Err(EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion {
+                        ..
+                    }))) => {
+                        info!(
+                            entrance = %entrance.addr,
+                            "edge session: edge refused version 3, falling back to version 2"
+                        );
+                        Self::connect_at(
+                            entrance,
+                            mesh_id,
+                            client_static_priv,
+                            exit,
+                            EDGE_SESSION_WIRE_VERSION_V2,
+                        )
+                        .await
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// One entrance at one wire version: the hello, the welcome, and the
+    /// session the welcome asks for.
+    async fn connect_at(
+        entrance: &ArtefactEntrance,
+        mesh_id: &[u8],
+        client_static_priv: [u8; 32],
+        exit: ExitPreference,
+        version: u8,
+    ) -> Result<Self, EdgeDialError> {
+        let (opened, welcome) =
+            dial_face(entrance, mesh_id, client_static_priv, exit, false, &[], version).await?;
+        Ok(build_session(opened, welcome, entrance.addr.clone()))
+    }
+
+    /// Version-1 walk across `entrances`, starting at `start_idx`. This is
+    /// the fallback for an edge that does not speak version 2. It is not how
+    /// a version-2 session picks its face — the edge assigns that. Returns
+    /// the first entrance that accepts; on total failure, the LAST
+    /// entrance's refusal/error.
+    pub async fn connect_first_available(
+        entrances: &[ArtefactEntrance],
+        mesh_id: &[u8],
+        client_static_priv: [u8; 32],
+        exit: ExitPreference,
+        start_idx: usize,
+    ) -> Result<(usize, Self), EdgeDialError> {
+        let mut last_err = EdgeDialError::NoEntrances;
+        for offset in 0..entrances.len() {
+            let idx = (start_idx + offset) % entrances.len();
+            match Self::connect_v1(&entrances[idx], mesh_id, client_static_priv, exit).await {
+                Ok(session) => return Ok((idx, session)),
+                Err(e) => {
+                    debug!(
+                        entrance = %entrances[idx].addr,
+                        error = %e,
+                        "edge session: dial failed, trying next entrance"
+                    );
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// The version-1 dial of one entrance: the old wire, the old transport,
+    /// byte for byte. Only an edge that does not speak version 2 needs it.
+    async fn connect_v1(
         entrance: &ArtefactEntrance,
         mesh_id: &[u8],
         client_static_priv: [u8; 32],
@@ -272,36 +428,6 @@ impl EdgeSession {
         Ok(upgrade_session(tunnel, welcome, entrance.addr.clone()))
     }
 
-    /// Version-1 walk across `entrances`, starting at `start_idx`. This is
-    /// the fallback for an edge that does not speak version 2. It is not how
-    /// a version-2 session picks its face — the edge assigns that. Returns
-    /// the first entrance that accepts; on total failure, the LAST
-    /// entrance's refusal/error.
-    pub async fn connect_first_available(
-        entrances: &[ArtefactEntrance],
-        mesh_id: &[u8],
-        client_static_priv: [u8; 32],
-        exit: ExitPreference,
-        start_idx: usize,
-    ) -> Result<(usize, Self), EdgeDialError> {
-        let mut last_err = EdgeDialError::NoEntrances;
-        for offset in 0..entrances.len() {
-            let idx = (start_idx + offset) % entrances.len();
-            match Self::connect(&entrances[idx], mesh_id, client_static_priv, exit).await {
-                Ok(session) => return Ok((idx, session)),
-                Err(e) => {
-                    debug!(
-                        entrance = %entrances[idx].addr,
-                        error = %e,
-                        "edge session: dial failed, trying next entrance"
-                    );
-                    last_err = e;
-                }
-            }
-        }
-        Err(last_err)
-    }
-
     /// Every country this edge can serve — never nodes, never topology.
     pub fn countries(&self) -> &[CountryCode] {
         &self.welcome.countries
@@ -321,14 +447,34 @@ impl EdgeSession {
         &self.entrance_label
     }
 
-    /// `true` once the underlying mux session has closed (peer GoAway, EOF,
+    /// `true` once the underlying session has closed (peer GoAway, EOF,
     /// or a transport error) — the caller (`EdgeSessionSupervisor`) redials.
     /// A session that was torn down by the watchdog counts as closed.
+    ///
+    /// A plane session has no mux: its liveness is the control wire of the
+    /// same QUIC connection, which ends when the connection ends.
     pub fn is_closed(&self) -> bool {
+        let transport = self.plane.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(transport) = transport.as_ref() {
+            if transport.plane.is_some() {
+                return transport.control_closed.load(Ordering::Relaxed);
+            }
+        }
         match self.handle() {
             Some(handle) => handle.is_closed(),
             None => true,
         }
+    }
+
+    /// The packet plane of this session, when it has one.
+    ///
+    /// `None` for the mux sessions of the older wire versions: those carry
+    /// flows, not whole IP packets. The plane is the datagram half of the
+    /// mono-protocol QUIC connection - the same connection the control wire
+    /// rides.
+    pub fn packet_plane(&self) -> Option<Arc<dyn PacketPlane>> {
+        let transport = self.plane.lock().unwrap_or_else(|e| e.into_inner());
+        transport.as_ref().and_then(|t| t.plane.as_ref().map(Arc::clone))
     }
 
     /// The mux session handle, while this session is still live.
@@ -355,9 +501,19 @@ impl EdgeSession {
     /// An in-flight stream open keeps its own reference to the handle, so
     /// the close lands as soon as that open returns — microseconds later in
     /// practice, because the mux driver answers an open immediately.
+    ///
+    /// The mono-protocol transport goes with it: dropping the QUIC endpoint
+    /// closes the connection, so the packet plane stops with the session.
     pub fn abort(&self) {
         let taken = self.session.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(taken);
+        let transport = self.plane.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(transport) = transport {
+            if let Some(watcher) = transport.watcher.as_ref() {
+                watcher.abort();
+            }
+            drop(transport);
+        }
     }
 
     /// Open one mux stream for a TCP flow, writing this session's target
@@ -462,6 +618,7 @@ impl EdgeSession {
             entrance_label,
             framing,
             health: Arc::new(StreamHealth::new()),
+            plane: Mutex::new(None),
         }
     }
 
@@ -473,12 +630,43 @@ impl EdgeSession {
             entrance_label: "test".to_owned(),
             framing: StreamFraming::EdgeHeader,
             health: Arc::new(StreamHealth::new()),
+            plane: Mutex::new(None),
         }
+    }
+}
+
+/// One opened entrance - the transport it rides.
+enum OpenedEntrance {
+    /// The mux transport of the older carriers: one V9 tunnel, upgraded to a
+    /// mux session once the edge accepts.
+    Mux(Box<dyn Tunnel>),
+    /// The mono-protocol QUIC transport: ONE connection carries the control
+    /// wire AND the packet plane.
+    Plane(PlaneDial),
+}
+
+impl OpenedEntrance {
+    /// The control wire of this entrance - the hello and the welcome ride
+    /// it.
+    fn tunnel(&mut self) -> &mut Box<dyn Tunnel> {
+        match self {
+            Self::Mux(tunnel) => tunnel,
+            Self::Plane(dial) => dial.tunnel(),
+        }
+    }
+
+    /// Close the control wire of this entrance.
+    async fn close(&mut self) {
+        let _ = self.tunnel().close().await;
     }
 }
 
 /// Open the V9 tunnel to one entrance. Camouflage stays on this dial; it is
 /// not something the edge-session hello carries.
+///
+/// This is the mux transport of the older carriers. A QUIC entrance does not
+/// come here - it is dialled over the mono-protocol plane, see
+/// [`open_entrance`].
 async fn open_entrance_tunnel(
     entrance: &ArtefactEntrance,
     mesh_id: &[u8],
@@ -506,6 +694,108 @@ async fn open_entrance_tunnel(
         .await?)
 }
 
+/// Open the transport of one entrance.
+///
+/// The camouflage decides: a QUIC entrance is the mono-protocol plane - ONE
+/// connection carries the control wire AND the packet plane. Every other
+/// camouflage keeps the mux transport of the older carriers, byte for byte.
+async fn open_entrance(
+    entrance: &ArtefactEntrance,
+    mesh_id: &[u8],
+    client_static_priv: [u8; 32],
+) -> Result<OpenedEntrance, EdgeDialError> {
+    if let Some(alpn) = quic_alpn(&entrance.camouflage) {
+        let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
+            EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
+        })?;
+        let server_pubkey = entrance.server_pubkey()?;
+        let dial = PlaneDial::open(&alpn, addr, &server_pubkey, &client_static_priv, mesh_id).await?;
+        return Ok(OpenedEntrance::Plane(dial));
+    }
+    Ok(OpenedEntrance::Mux(open_entrance_tunnel(entrance, mesh_id, client_static_priv).await?))
+}
+
+/// Build the session of an accepted hello.
+///
+/// The welcome decides what the session carries: whole IP packets (the
+/// plane) or flows (the mux). The transport decides what it CAN carry: a
+/// session over a transport without a plane is a mux session, whatever the
+/// welcome says.
+fn build_session(
+    opened: OpenedEntrance,
+    welcome: EdgeWelcome,
+    entrance_label: String,
+) -> EdgeSession {
+    match opened {
+        OpenedEntrance::Mux(tunnel) => upgrade_session(tunnel, welcome, entrance_label),
+        OpenedEntrance::Plane(dial) => {
+            let (tunnel, plane, connector) = dial.into_parts();
+            if welcome.carries_datagrams != Some(true) {
+                // The edge did not offer whole packets: this is a mux
+                // session over the same QUIC connection. The connector still
+                // has to outlive it - dropping the QUIC endpoint closes the
+                // connection.
+                let mut session = upgrade_session(tunnel, welcome, entrance_label);
+                session.plane = Mutex::new(Some(PlaneTransport {
+                    plane: None,
+                    _connector: connector,
+                    control_closed: Arc::new(AtomicBool::new(false)),
+                    watcher: None,
+                }));
+                return session;
+            }
+            plane_session(tunnel, plane, connector, welcome, entrance_label)
+        }
+    }
+}
+
+/// Build the plane session: the whole IP packets ride the datagrams of the
+/// same QUIC connection the control wire rides.
+///
+/// The control wire is idle once the welcome arrived - it carried the hello
+/// and the welcome, and nothing else. Its end IS the end of the
+/// connection, so a task watches it and the session's liveness follows it.
+fn plane_session(
+    tunnel: Box<dyn Tunnel>,
+    plane: Arc<dyn PacketPlane>,
+    connector: PlaneConnector,
+    welcome: EdgeWelcome,
+    entrance_label: String,
+) -> EdgeSession {
+    let control_closed = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let closed = Arc::clone(&control_closed);
+        tokio::spawn(async move {
+            let mut tunnel = tunnel;
+            let mut buf = [0u8; 256];
+            loop {
+                match tunnel.recv(&mut buf).await {
+                    // The peer closed the control wire: the connection is
+                    // over, and the datagrams will never come again.
+                    Ok(0) => break,
+                    // Nothing rides the control wire after the welcome.
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            closed.store(true, Ordering::Relaxed);
+        })
+    };
+    EdgeSession {
+        session: Mutex::new(None),
+        welcome,
+        entrance_label,
+        framing: StreamFraming::EdgeHeader,
+        health: Arc::new(StreamHealth::new()),
+        plane: Mutex::new(Some(PlaneTransport {
+            plane: Some(plane),
+            _connector: connector,
+            control_closed,
+            watcher: Some(watcher),
+        })),
+    }
+}
+
 fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label: String) -> EdgeSession {
     let compat = TunnelCompat::wrap(tunnel);
     let session = SessionHandle::client(compat);
@@ -515,6 +805,7 @@ fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label
         entrance_label,
         framing: StreamFraming::EdgeHeader,
         health: Arc::new(StreamHealth::new()),
+        plane: Mutex::new(None),
     }
 }
 
@@ -561,9 +852,9 @@ fn offered_ports_for_transport(
     Ok(filter_offered_faces_by_transport(&faces, transport))
 }
 
-/// Hello on one face at `version` (2 or 3). Does not upgrade to mux: the
-/// caller keeps the tunnel only when this face is the session.
-async fn dial_v2_face(
+/// Hello on one face at `version` (2, 3 or 4). Does not build the session:
+/// the caller keeps the transport only when this face is the session.
+async fn dial_face(
     entrance: &ArtefactEntrance,
     mesh_id: &[u8],
     client_static_priv: [u8; 32],
@@ -571,8 +862,8 @@ async fn dial_v2_face(
     commit: bool,
     offered: &[u16],
     version: u8,
-) -> Result<(Box<dyn Tunnel>, EdgeWelcome), EdgeDialError> {
-    let mut tunnel = open_entrance_tunnel(entrance, mesh_id, client_static_priv).await?;
+) -> Result<(OpenedEntrance, EdgeWelcome), EdgeDialError> {
+    let mut opened = open_entrance(entrance, mesh_id, client_static_priv).await?;
     let hello = EdgeHello {
         version,
         exit,
@@ -582,25 +873,25 @@ async fn dial_v2_face(
     let bytes = match hello.encode() {
         Ok(bytes) => bytes,
         Err(e) => {
-            let _ = tunnel.close().await;
+            opened.close().await;
             return Err(EdgeDialError::MalformedHello(e));
         }
     };
-    if let Err(e) = tunnel.send(&bytes).await {
-        let _ = tunnel.close().await;
+    if let Err(e) = opened.tunnel().send(&bytes).await {
+        opened.close().await;
         return Err(e.into());
     }
-    let welcome = match read_welcome(tunnel.as_mut()).await {
+    let welcome = match read_welcome(opened.tunnel().as_mut()).await {
         Ok(welcome) => welcome,
         Err(e) => {
-            let _ = tunnel.close().await;
+            opened.close().await;
             return Err(e);
         }
     };
     match interpret_welcome(welcome) {
-        Ok(welcome) => Ok((tunnel, welcome)),
+        Ok(welcome) => Ok((opened, welcome)),
         Err(e) => {
-            let _ = tunnel.close().await;
+            opened.close().await;
             Err(e)
         }
     }
@@ -734,9 +1025,10 @@ struct EntranceDialer {
 }
 
 impl EntranceDialer {
-    /// Probe faces at `version` (2 or 3). A version-2 unsupported-version
-    /// refusal falls back to version 1. A version-3 refusal is returned so
-    /// the caller can retry at version 2 — it does not skip to version 1.
+    /// Probe faces at `version` (2, 3 or 4). A version-2 unsupported-version
+    /// refusal falls back to version 1. A version-3 or version-4 refusal is
+    /// returned so the caller can retry at the next version down - it does
+    /// not skip a version.
     ///
     /// The probe face is picked from EVERY entrance — stream- and
     /// datagram-shaped alike — and the faces the hello offers are the ones
@@ -779,7 +1071,7 @@ impl EntranceDialer {
             }
             let ports: Vec<u16> = offered.iter().map(|(_, port)| *port).collect();
             let probe_port = entrance_tcp_port(entrance)?;
-            match dial_v2_face(
+            match dial_face(
                 entrance,
                 &self.mesh_id,
                 self.client_static_priv,
@@ -790,14 +1082,14 @@ impl EntranceDialer {
             )
             .await
             {
-                Ok((mut tunnel, welcome)) => {
+                Ok((mut opened, welcome)) => {
                     if let Some(port) = welcome.assigned_face_port {
                         if port != probe_port {
-                            let _ = tunnel.close().await;
+                            opened.close().await;
                             let Some(target) = offered.iter().copied().find(|(_, face_port)| *face_port == port) else {
                                 return Err(EdgeDialError::AssignedFaceMissing { port });
                             };
-                            let (tunnel, welcome) = dial_v2_face(
+                            let (opened, welcome) = dial_face(
                                 &self.entrances[target.0],
                                 &self.mesh_id,
                                 self.client_static_priv,
@@ -807,12 +1099,16 @@ impl EntranceDialer {
                                 version,
                             )
                             .await?;
-                            let session = upgrade_session(tunnel, welcome, self.entrances[target.0].addr.clone());
+                            let session = build_session(
+                                opened,
+                                welcome,
+                                self.entrances[target.0].addr.clone(),
+                            );
                             log_assigned(&probe_addr, &session);
                             return Ok((target.0, session));
                         }
                     }
-                    let session = upgrade_session(tunnel, welcome, probe_addr.clone());
+                    let session = build_session(opened, welcome, probe_addr.clone());
                     log_assigned(&probe_addr, &session);
                     return Ok((idx, session));
                 }
@@ -867,10 +1163,21 @@ impl EdgeDialer for EntranceDialer {
         // lands on a datagram face half the time -- a face that cannot
         // carry a mux session at all.
         let start = self.last_good.load(Ordering::Relaxed);
-        let result = match self.dial_at(EDGE_SESSION_WIRE_VERSION_V3, exit, start).await {
+        // Newest wire first: version 4 is the plane, version 3 and version 2
+        // are the mux. A step down happens ONLY when the edge refuses the
+        // version by name - a transport error never skips a version.
+        let result = match self.dial_at(EDGE_SESSION_WIRE_VERSION_V4, exit, start).await {
             Err(EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. }))) => {
-                info!("edge session: edge refused version 3, falling back to version 2");
-                self.dial_at(EDGE_SESSION_WIRE_VERSION_V2, exit, start).await
+                info!("edge session: edge refused version 4, falling back to version 3");
+                match self.dial_at(EDGE_SESSION_WIRE_VERSION_V3, exit, start).await {
+                    Err(EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion {
+                        ..
+                    }))) => {
+                        info!("edge session: edge refused version 3, falling back to version 2");
+                        self.dial_at(EDGE_SESSION_WIRE_VERSION_V2, exit, start).await
+                    }
+                    other => other,
+                }
             }
             other => other,
         };

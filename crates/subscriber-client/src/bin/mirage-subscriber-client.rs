@@ -786,6 +786,7 @@ async fn run_proxy(artefact: &DeliveryArtefact, args: &Args) -> ExitCode {
                 std::sync::Arc::new(scope),
                 args.tun_bin.clone().or_else(discover_tun_bin),
                 relay_hosts(artefact),
+                tun_mode::wire_mode_for(artefact),
             ) => {
                 if let Err(e) = result {
                     error!(error = %e, "control listener exited");
@@ -955,6 +956,7 @@ async fn run_proxy(artefact: &DeliveryArtefact, args: &Args) -> ExitCode {
             args.bind,
             &args.bypass_cidr,
             mode,
+            tun_mode::wire_mode_for(artefact),
             &args.service,
             &args.app,
             &[],

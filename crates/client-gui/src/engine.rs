@@ -20,7 +20,7 @@ use mirage_subscriber_client::assembly::{SubscriberClient, SubscriberClientOptio
 use mirage_subscriber_client::scope::EgressScope;
 use mirage_subscriber_client::status::EdgeState;
 use mirage_subscriber_client::supervisor_slot::SupervisorSlot;
-use mirage_subscriber_client::tun_mode::{self, TunMode};
+use mirage_subscriber_client::tun_mode::{self, TunMode, WireMode};
 
 use crate::backend::{EngineLink, EngineStatus};
 
@@ -466,6 +466,19 @@ impl Engine {
         self.publish(|status| status.mode = mode.into());
     }
 
+    /// The datapath the device speaks to the client.
+    ///
+    /// A QUIC face is the mono-protocol plane: the whole IP packets ride the
+    /// QUIC datagrams of the edge session, and the device hands them over
+    /// the raw-IP command. Every other face keeps the byte-stream path.
+    fn wire_mode(&self) -> WireMode {
+        match &self.artefact {
+            Some(artefact) => tun_mode::wire_mode_for(artefact),
+            // No configuration yet: the byte-stream path.
+            None => WireMode::Stack,
+        }
+    }
+
     /// The device goes up. It is a separate process because it needs the
     /// adapter; the window keeps it and brings it back when it dies.
     fn start_tun(&mut self) {
@@ -491,6 +504,7 @@ impl Engine {
             socks5_bind(),
             &[],
             self.tun_mode,
+            self.wire_mode(),
             &self.services,
             &self.apps,
             &[],

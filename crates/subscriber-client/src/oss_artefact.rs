@@ -142,24 +142,23 @@ pub fn client_public_key_b64(keypair: &KeyPair) -> String {
 mod tests {
     use super::*;
 
-    /// The publication a real OSS box printed on the stand — verbatim.
+    /// The publication a real OSS box printed on the stand -- verbatim.
+    ///
+    /// The box serves QUIC only: the MirageKVIC carrier is its one face.
     const FROM_THE_BOX: &str = r#"{
       "v": 1,
       "server_public_key_hex": "f0e1d3d2b6afca2614fee067738ea2b25cf2c9f1b819e3eea3cd64da1f505901",
       "mesh_id": "mirage-vpn",
       "faces": [
         {
-          "port": 41443,
+          "port": 41444,
           "transport": "udp",
           "mask": {
-            "type": "wire_guard",
-            "magic_byte": 1,
-            "junk_count": 4,
-            "junk_min": 10,
-            "junk_max": 20,
-            "bind_addr": "0.0.0.0:41443"
+            "type": "quic",
+            "alpn": [ "h3" ],
+            "bind_addr": "0.0.0.0:41444"
           },
-          "why": "UDP - the MirageVG carrier."
+          "why": "UDP - the MirageKVIC carrier."
         }
       ]
     }"#;
@@ -175,19 +174,16 @@ mod tests {
         artefact.validate().expect("it must validate");
 
         assert_eq!(artefact.entrances.len(), 1);
-        assert_eq!(artefact.entrances[0].addr, "203.0.113.9:41443");
+        assert_eq!(artefact.entrances[0].addr, "203.0.113.9:41444");
         assert_eq!(
             artefact.entrances[0].server_pubkey_hex,
             "f0e1d3d2b6afca2614fee067738ea2b25cf2c9f1b819e3eea3cd64da1f505901"
         );
         assert_eq!(
             artefact.entrances[0].camouflage,
-            TransportCamouflage::WireGuard {
-                magic_byte: 1,
-                junk_count: 4,
-                junk_min: 10,
-                junk_max: 20,
-                bind_addr: "0.0.0.0:41443".parse().expect("addr"),
+            TransportCamouflage::Quic {
+                alpn: vec!["h3".to_owned()],
+                bind_addr: "0.0.0.0:41444".parse().expect("addr"),
             },
             "the mask must decode to the real typed variant, unmodified"
         );
