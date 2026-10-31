@@ -282,6 +282,44 @@ rewrite:
   leaves `state:"fatal"` (with `bad_artefact` where it applies). A reader
   judges liveness by `updated_at_ms`; a killed connector leaves a stale file.
 
+### SOCKS5 over the packet plane (no TUN, no mux)
+
+The mono-protocol transport (edge wire v4) carries whole IP packets in QUIC
+datagrams. A session over it is a whole IP link, not a flow carrier: the
+client opens its own TCP and UDP flows THERE, with **no system TUN, no
+routes, no Wintun, no helper process and no direct fallback**.
+
+- `crate::plane_net` — the userspace TCP/IP stack over the plane. It is OUR
+  OWN fork of smoltcp (`mirage2tun/crates/mirage-tcpip-stack`, already in
+  this workspace and already built for every platform the client runs on) —
+  no new dependency, no supply-chain review. The fork drove TCP as a
+  SERVER (it accepted connections coming IN); `plane_net` adds the OUTBOUND
+  half. `PlaneStack` owns one task; `PlaneTcpStream` is one flow (an
+  ordinary `AsyncRead`+`AsyncWrite`); `PlaneUdpSocket` is one socket.
+- The source address of every packet is the address the box assigned
+  (`EdgeWelcome::assigned_client`) — the IPv6 one is derived by the same
+  rule both ends use (`10.77.0.N` → `fd77::N/64`).
+- `crate::plane_dns` — names resolve THROUGH the tunnel (a UDP datagram to a
+  public resolver); the host resolver is never consulted.
+- `crate::plane_udp` — the RFC 1928 §7 UDP association over the plane.
+- `crate::socks5` picks the path by the session's capability: a plane
+  session goes to the stack, a v1-v3 session keeps the mux path. The
+  SOCKS5 surface itself does not change: same listener, same bind address.
+- **One owner per plane.** The userspace stack (the SOCKS5 flows) and the
+  raw-IP consumer (`mirage2tun`) want the same packets and the same address,
+  so exactly one of them owns them. `session::PlaneConsumer` names the
+  owner; `EdgeSessionSupervisor::set_plane_consumer` switches it, and
+  `socks5::session_for_owner` waits for the session that carries the
+  packets the flow needs (a switch means a new session).
+- `connected` in the status file is written only when the data path can
+  really carry traffic — the control session, the plane AND the userspace
+  stack. A control-only `connected` is a lie.
+- A dead box is noticed in ~20s (QUIC idle timeout) and the client redials
+  by itself: the recovery fits the 35s budget of the acceptance.
+- `crate::multi` + `--config LABEL=ARTEFACT.json` — one process holds
+  several configurations of one customer: each with its own session, its
+  own address in the plane and its own SOCKS5 port.
+
 ### TUN over subscriber-client's SOCKS5 (UDP)
 
 `mirage2tun`'s existing SOCKS5 UDP client

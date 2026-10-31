@@ -38,8 +38,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use crate::session::{EdgeSession, EdgeSessionSupervisor, PlaneConsumer};
+
 use crate::scope::EgressScope;
-use crate::session::EdgeSessionSupervisor;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -66,6 +67,14 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 /// How long a CONNECT waits for a live edge session before giving up and
 /// replying general failure.
 const CONNECT_SESSION_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a flow waits for the session that carries the packets it needs.
+///
+/// Switching the owner of a plane's packets means a new session: the old one
+/// goes away and the next dial brings the new one. That takes the liveness
+/// tick plus the dial - a couple of seconds - so this wait is longer than
+/// the plain "is there a session" wait.
+const PLANE_OWNER_WAIT: Duration = Duration::from_secs(20);
 
 /// How often the counters of the raw-IP path are logged.
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
@@ -224,7 +233,7 @@ async fn handle_connection(
             // A session that carries whole IP packets gives the client its
             // own UDP path inside the tunnel; an older session uses the mux
             // relay instead.
-            let session = supervisor.wait_for_session(CONNECT_SESSION_WAIT).await;
+            let session = session_for_owner(&supervisor, PlaneConsumer::Stack).await;
             let stack = session.as_ref().and_then(|s| s.netstack());
             match stack {
                 Some(stack) => {
@@ -252,6 +261,28 @@ async fn handle_connection(
     }
 }
 
+/// The session that carries the packets this flow needs.
+///
+/// A plane session belongs to ONE owner of its packets: the userspace stack
+/// (the SOCKS5 flows) or the tunnel device (the raw-IP consumer). When the
+/// live session belongs to the other one, the owner is switched and the
+/// wait goes on for the session the switch brings.
+async fn session_for_owner(
+    supervisor: &Arc<EdgeSessionSupervisor>,
+    consumer: PlaneConsumer,
+) -> Option<Arc<EdgeSession>> {
+    let session = supervisor.wait_for_session(CONNECT_SESSION_WAIT).await?;
+    if session.serves_plane_consumer(consumer) {
+        return Some(session);
+    }
+    info!(
+        consumer = ?consumer,
+        "socks5: the live session's packets belong to the other owner - switching"
+    );
+    supervisor.set_plane_consumer(consumer);
+    supervisor.wait_for_session_with(consumer, PLANE_OWNER_WAIT).await
+}
+
 /// Serve the raw-IP command: the whole IP packets of the tunnel, in and out.
 ///
 /// The device asks with the SOCKS5 request `05 05 00 03 09 "mirage-ip" 00
@@ -265,7 +296,7 @@ async fn handle_raw_ip(
     target: String,
     supervisor: Arc<EdgeSessionSupervisor>,
 ) {
-    let session = match supervisor.wait_for_session(CONNECT_SESSION_WAIT).await {
+    let session = match session_for_owner(&supervisor, PlaneConsumer::RawIp).await {
         Some(session) => session,
         None => {
             warn!(target = %target, "socks5: no live edge session - refusing the raw-IP command");
@@ -281,16 +312,6 @@ async fn handle_raw_ip(
         let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
         return;
     };
-    if session.netstack().is_some() {
-        // The userspace stack owns this session's packets: one owner per
-        // plane, or the two would steal the packets from each other.
-        warn!(
-            target = %target,
-            "socks5: the userspace stack owns this session's packets - refusing the raw-IP command"
-        );
-        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
-        return;
-    }
     // One device, one consumer: a second raw-IP connection is refused.
     if RAW_IP_ACTIVE.swap(true, Ordering::SeqCst) {
         warn!("socks5: a raw-IP consumer is already running - refusing the second one");
@@ -476,7 +497,7 @@ async fn handle_connect(
         let _ = write_reply(&mut stream, REP_NOT_ALLOWED).await;
         return;
     }
-    let session = match supervisor.wait_for_session(CONNECT_SESSION_WAIT).await {
+    let session = match session_for_owner(&supervisor, PlaneConsumer::Stack).await {
         Some(session) => session,
         None => {
             warn!(target = %target, "socks5: no live edge session — refusing CONNECT");
@@ -494,11 +515,11 @@ async fn handle_connect(
         return;
     }
     if session.has_plane() {
-        // The tunnel device owns this session's packets: one owner per
-        // plane, or the two would steal the packets from each other.
+        // A plane session without a stack: the box assigned this client no
+        // address, so there is nothing to open a flow from.
         warn!(
             target = %target,
-            "socks5: the tunnel device owns this session's packets - refusing CONNECT"
+            "socks5: the live session carries packets but no address - refusing CONNECT"
         );
         let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
         return;

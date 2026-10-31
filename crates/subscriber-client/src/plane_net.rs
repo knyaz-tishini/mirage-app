@@ -228,7 +228,7 @@ impl PlaneStack {
         let assigned_v6 = derive_client_v6(assigned_v4);
 
         // The reader: the packets that come off the plane.
-        {
+        let reader = {
             let plane = Arc::clone(&plane);
             let stats = Arc::clone(&stats);
             let wake = Arc::clone(&wake);
@@ -255,11 +255,11 @@ impl PlaneStack {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
 
         // The writer: the packets that go onto the plane.
-        {
+        let writer = {
             let plane = Arc::clone(&plane);
             let stats = Arc::clone(&stats);
             tokio::spawn(async move {
@@ -275,8 +275,8 @@ impl PlaneStack {
                         .bytes_to_plane
                         .fetch_add(packet.len() as u64, Ordering::Relaxed);
                 }
-            });
-        }
+            })
+        };
 
         // The stack itself.
         {
@@ -301,6 +301,8 @@ impl PlaneStack {
                 stats: Arc::clone(&stats),
                 ready: Arc::clone(&ready),
                 wake: Arc::clone(&wake),
+                reader: Some(reader),
+                writer: Some(writer),
             };
             tokio::spawn(run_stack(stack, cmd_rx));
         }
@@ -816,6 +818,10 @@ struct Stack {
     ready: Arc<AtomicBool>,
     /// Wakes the task when there is work.
     wake: Arc<Notify>,
+    /// The task that reads the packets off the plane.
+    reader: Option<tokio::task::JoinHandle<()>>,
+    /// The task that puts the packets onto the plane.
+    writer: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// The ephemeral ports this client has opened.
@@ -883,7 +889,24 @@ async fn run_stack(mut stack: Stack, mut cmds: mpsc::Receiver<Cmd>) {
             _ = ticker.tick() => stack.log_stats(),
         }
     }
+    // The reader has to stop NOW: another consumer of the same plane may be
+    // waiting for the packets, and a datagram that is read and dropped is a
+    // datagram nobody gets. Aborting the task cancels the pending receive -
+    // the datagram stays in the plane's queue.
+    stack.stop_helpers();
     info!("plane stack: the stack is gone");
+}
+
+impl Stack {
+    /// Stop the tasks that carry the plane's packets.
+    fn stop_helpers(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
+        }
+    }
 }
 
 impl Stack {

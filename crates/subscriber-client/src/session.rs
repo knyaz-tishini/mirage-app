@@ -517,8 +517,18 @@ impl EdgeSession {
         transport.as_ref().and_then(|t| t.plane.as_ref()).is_some()
     }
 
-    /// Whether this session's data path can carry traffic RIGHT NOW.
+    /// Whether this session's plane is owned by `consumer`.
     ///
+    /// A session of the older wire versions carries no packets, so the owner
+    /// of the plane does not matter and the session serves every consumer.
+    pub fn serves_plane_consumer(&self, consumer: PlaneConsumer) -> bool {
+        if !self.has_plane() {
+            return true;
+        }
+        self.plane_consumer == consumer
+    }
+
+    /// Whether this session's data path can carry traffic RIGHT NOW.    ///
     /// A mux session is its own data path: the control wire and the flows
     /// ride the same connection. A plane session that the userspace stack
     /// owns is only ready once that stack has polled the plane - before
@@ -1602,6 +1612,50 @@ impl EdgeSessionSupervisor {
     /// the older wire versions have no such address.
     pub fn assigned_client(&self) -> Option<ClientAssignment> {
         self.live_session().and_then(|session| session.assigned_client())
+    }
+
+    /// The live session for `consumer`, waiting up to `timeout`.
+    ///
+    /// A plane session belongs to ONE owner of its packets: the userspace
+    /// stack (the SOCKS5 flows) or the tunnel device (the raw-IP consumer).
+    /// When the live session belongs to the other one, the owner is switched
+    /// and the wait goes on: the supervisor tears that session down and dials
+    /// a new one for the new owner.
+    ///
+    /// This is what makes the carry switch work without a race: whoever asks
+    /// for the packets waits for a session that has them.
+    pub async fn wait_for_session_with(
+        &self,
+        consumer: PlaneConsumer,
+        timeout: Duration,
+    ) -> Option<Arc<EdgeSession>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut rx = self.slot.subscribe();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let current = rx.borrow().clone();
+            if let Some(session) = current {
+                if !session.is_closed() {
+                    if session.serves_plane_consumer(consumer) {
+                        return Some(session);
+                    }
+                    // The live session's packets belong to the other owner:
+                    // ask for the switch and wait for the session it brings.
+                    self.set_plane_consumer(consumer);
+                }
+            }
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => return None,
+            }
+        }
     }
 
     /// The current live session, waiting up to `timeout` for one to appear
