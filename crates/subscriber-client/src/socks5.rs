@@ -221,10 +221,24 @@ async fn handle_connection(
     match cmd {
         CMD_CONNECT => handle_connect(stream, target, supervisor, scope).await,
         CMD_UDP_ASSOCIATE => {
-            if let Err(e) =
-                crate::udp_associate::serve_udp_association(stream, supervisor, scope).await
-            {
-                debug!(error = %e, "socks5: udp associate ended with an io error");
+            // A session that carries whole IP packets gives the client its
+            // own UDP path inside the tunnel; an older session uses the mux
+            // relay instead.
+            let session = supervisor.wait_for_session(CONNECT_SESSION_WAIT).await;
+            let stack = session.as_ref().and_then(|s| s.netstack());
+            match stack {
+                Some(stack) => {
+                    if let Err(e) = crate::plane_udp::serve_udp_association(stream, stack).await {
+                        debug!(error = %e, "socks5: udp associate over the plane ended with an io error");
+                    }
+                }
+                None => {
+                    if let Err(e) =
+                        crate::udp_associate::serve_udp_association(stream, supervisor, scope).await
+                    {
+                        debug!(error = %e, "socks5: udp associate ended with an io error");
+                    }
+                }
             }
         }
         // The whole IP packets of the tunnel. The scope does not apply here:
@@ -267,6 +281,16 @@ async fn handle_raw_ip(
         let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
         return;
     };
+    if session.netstack().is_some() {
+        // The userspace stack owns this session's packets: one owner per
+        // plane, or the two would steal the packets from each other.
+        warn!(
+            target = %target,
+            "socks5: the userspace stack owns this session's packets - refusing the raw-IP command"
+        );
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    }
     // One device, one consumer: a second raw-IP connection is refused.
     if RAW_IP_ACTIVE.swap(true, Ordering::SeqCst) {
         warn!("socks5: a raw-IP consumer is already running - refusing the second one");
@@ -461,6 +485,25 @@ async fn handle_connect(
         }
     };
 
+    // A session that carries whole IP packets is a whole IP link: the client
+    // runs its own TCP/IP stack over it and opens the flow THERE. No mux,
+    // no system TUN, no routes, no helper process - and the name is
+    // resolved through the tunnel.
+    if let Some(stack) = session.netstack() {
+        connect_over_plane(stream, target, stack).await;
+        return;
+    }
+    if session.has_plane() {
+        // The tunnel device owns this session's packets: one owner per
+        // plane, or the two would steal the packets from each other.
+        warn!(
+            target = %target,
+            "socks5: the tunnel device owns this session's packets - refusing CONNECT"
+        );
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    }
+
     match session.open_tcp_stream(&target).await {
         Ok(mut edge_stream) => {
             if write_reply(&mut stream, REP_SUCCESS).await.is_err() {
@@ -500,6 +543,89 @@ async fn handle_connect(
             let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
         }
     }
+}
+
+/// Open a CONNECT flow over the packet plane.
+///
+/// The flow is a real TCP connection inside the tunnel: the client's own
+/// userspace stack opens it, the name is resolved through the tunnel, and
+/// the bytes are copied between the local socket and that flow.
+async fn connect_over_plane(
+    mut stream: TcpStream,
+    target: String,
+    stack: Arc<crate::plane_net::PlaneStack>,
+) {
+    let Some((host, port)) = split_target(&target) else {
+        warn!(target = %target, "socks5: the destination is malformed — refusing CONNECT");
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    };
+    // The name is resolved THROUGH the tunnel: the host resolver is never
+    // consulted, so the answer cannot leak outside the tunnel.
+    let addresses = match stack.resolve(&host).await {
+        Ok(addresses) => addresses,
+        Err(e) => {
+            warn!(target = %target, error = %e, "socks5: the name did not resolve");
+            let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+            return;
+        }
+    };
+    let mut opened = None;
+    for ip in addresses {
+        let addr = SocketAddr::new(ip, port);
+        match stack.connect(addr).await {
+            Ok(flow) => {
+                opened = Some(flow);
+                break;
+            }
+            Err(e) => {
+                debug!(target = %target, addr = %addr, error = %e, "socks5: the flow did not open");
+            }
+        }
+    }
+    let Some(mut flow) = opened else {
+        warn!(target = %target, "socks5: no address answered — refusing CONNECT");
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    };
+    if write_reply(&mut stream, REP_SUCCESS).await.is_err() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    info!(target = %target, "socks5: CONNECT flow opened over the plane");
+    match crate::relay::copy_bidirectional_with_flow_idle_timeout(&mut stream, &mut flow).await {
+        Ok((to_remote, from_remote)) => {
+            info!(
+                target = %target,
+                to_remote,
+                from_remote,
+                ms = started.elapsed().as_millis() as u64,
+                "socks5: CONNECT flow over the plane ended"
+            );
+        }
+        Err(e) => {
+            warn!(
+                target = %target,
+                error = %e,
+                kind = ?e.kind(),
+                ms = started.elapsed().as_millis() as u64,
+                "socks5: CONNECT flow over the plane ended with an error"
+            );
+        }
+    }
+}
+
+/// Split a `host:port` target into its host and its port.
+///
+/// The IPv6 form carries the host in brackets: `[::1]:443`.
+pub(crate) fn split_target(target: &str) -> Option<(String, u16)> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?;
+        return Some((host.to_owned(), port.parse().ok()?));
+    }
+    let (host, port) = target.rsplit_once(':')?;
+    Some((host.to_owned(), port.parse().ok()?))
 }
 
 /// Read the SOCKS5 greeting + request, replying to the greeting inline (a

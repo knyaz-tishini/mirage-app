@@ -274,6 +274,14 @@ pub struct EdgeSession {
     /// The mono-protocol transport of this session, when it rides one. A
     /// session over the older mux transport has none.
     plane: Mutex<Option<PlaneTransport>>,
+    /// The userspace TCP/IP stack over this session's packet plane.
+    ///
+    /// `None` for the sessions of the older wire versions: those carry
+    /// flows, not whole IP packets, so there is nothing to stack over. Also
+    /// `None` when the tunnel device owns the plane's packets.
+    netstack: Option<Arc<crate::plane_net::PlaneStack>>,
+    /// Who owns the packets of this session's plane.
+    plane_consumer: PlaneConsumer,
 }
 
 impl Drop for EdgeSession {
@@ -363,7 +371,9 @@ impl EdgeSession {
     ) -> Result<Self, EdgeDialError> {
         let (opened, welcome) =
             dial_face(entrance, mesh_id, client_static_priv, exit, false, &[], version).await?;
-        Ok(build_session(opened, welcome, entrance.addr.clone()))
+        // The direct dial has no carry behind it: the userspace stack is the
+        // consumer of the plane's packets.
+        Ok(build_session(opened, welcome, entrance.addr.clone(), PlaneConsumer::Stack))
     }
 
     /// Version-1 walk across `entrances`, starting at `start_idx`. This is
@@ -488,6 +498,44 @@ impl EdgeSession {
     /// older wire versions, and for a box that assigned nothing.
     pub fn assigned_client(&self) -> Option<ClientAssignment> {
         self.welcome.assigned_client
+    }
+
+    /// The userspace TCP/IP stack over this session's packet plane.
+    ///
+    /// `None` for the sessions of the older wire versions: those carry
+    /// flows, not whole IP packets, so there is nothing to stack over.
+    pub fn netstack(&self) -> Option<Arc<crate::plane_net::PlaneStack>> {
+        self.netstack.clone()
+    }
+
+    /// Whether this session carries whole IP packets.
+    ///
+    /// `true` for the plane sessions of the newer wire version, `false` for
+    /// the mux sessions of the older ones.
+    pub fn has_plane(&self) -> bool {
+        let transport = self.plane.lock().unwrap_or_else(|e| e.into_inner());
+        transport.as_ref().and_then(|t| t.plane.as_ref()).is_some()
+    }
+
+    /// Whether this session's data path can carry traffic RIGHT NOW.
+    ///
+    /// A mux session is its own data path: the control wire and the flows
+    /// ride the same connection. A plane session that the userspace stack
+    /// owns is only ready once that stack has polled the plane - before
+    /// that, the status must not say `connected`. A plane session that the
+    /// tunnel device owns is ready as soon as the plane is up: the device
+    /// brings its own stack.
+    pub fn data_path_ready(&self) -> bool {
+        if !self.has_plane() {
+            return true;
+        }
+        match self.plane_consumer {
+            PlaneConsumer::Stack => match &self.netstack {
+                Some(stack) => stack.is_ready(),
+                None => false,
+            },
+            PlaneConsumer::RawIp => true,
+        }
     }
 
     /// The mux session handle, while this session is still live.
@@ -632,6 +680,8 @@ impl EdgeSession {
             framing,
             health: Arc::new(StreamHealth::new()),
             plane: Mutex::new(None),
+            netstack: None,
+            plane_consumer: PlaneConsumer::Stack,
         }
     }
 
@@ -644,6 +694,8 @@ impl EdgeSession {
             framing: StreamFraming::EdgeHeader,
             health: Arc::new(StreamHealth::new()),
             plane: Mutex::new(None),
+            netstack: None,
+            plane_consumer: PlaneConsumer::Stack,
         }
     }
 }
@@ -738,6 +790,7 @@ fn build_session(
     opened: OpenedEntrance,
     welcome: EdgeWelcome,
     entrance_label: String,
+    consumer: PlaneConsumer,
 ) -> EdgeSession {
     match opened {
         OpenedEntrance::Mux(tunnel) => upgrade_session(tunnel, welcome, entrance_label),
@@ -757,7 +810,7 @@ fn build_session(
                 }));
                 return session;
             }
-            plane_session(tunnel, plane, connector, welcome, entrance_label)
+            plane_session(tunnel, plane, connector, welcome, entrance_label, consumer)
         }
     }
 }
@@ -774,8 +827,21 @@ fn plane_session(
     connector: PlaneConnector,
     welcome: EdgeWelcome,
     entrance_label: String,
+    consumer: PlaneConsumer,
 ) -> EdgeSession {
     let control_closed = Arc::new(AtomicBool::new(false));
+    // The userspace stack over this plane: the client opens its own TCP and
+    // UDP flows THERE - no mux, no TUN, no routes, no helper process.
+    //
+    // Only the consumer that owns the plane's packets gets a stack: the
+    // tunnel device wants the same packets raw, and two consumers would
+    // steal them from each other.
+    let netstack = match consumer {
+        PlaneConsumer::Stack => welcome.assigned_client.map(|assignment| {
+            crate::plane_net::PlaneStack::spawn(Arc::clone(&plane), assignment.addr)
+        }),
+        PlaneConsumer::RawIp => None,
+    };
     let watcher = {
         let closed = Arc::clone(&control_closed);
         tokio::spawn(async move {
@@ -806,6 +872,8 @@ fn plane_session(
             control_closed,
             watcher: Some(watcher),
         })),
+        netstack,
+        plane_consumer: consumer,
     }
 }
 
@@ -819,6 +887,8 @@ fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label
         framing: StreamFraming::EdgeHeader,
         health: Arc::new(StreamHealth::new()),
         plane: Mutex::new(None),
+        netstack: None,
+        plane_consumer: PlaneConsumer::Stack,
     }
 }
 
@@ -973,10 +1043,42 @@ fn interpret_welcome(welcome: EdgeWelcome) -> Result<EdgeWelcome, EdgeDialError>
 // ── Supervisor: reconnect-with-backoff across the artefact's faces ────────
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest the client waits between two dials.
+///
+/// The recovery after the box is back must fit into ONE of these intervals
+/// (the acceptance says 35 seconds), so the ceiling stays well under that:
+/// a dead box is noticed in about twenty seconds, and the next attempt
+/// follows within this one.
+const MAX_BACKOFF: Duration = Duration::from_secs(15);
 /// `SessionHandle` exposes only a synchronous `is_closed()`, no async
 /// "wait until closed" — the driver polls at this interval.
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long the session's data path may take to come up before the session
+/// is given up on.
+///
+/// The control session is up the moment the dial returns, but the userspace
+/// stack over the plane needs a moment to start. Five seconds is far more
+/// than it takes and far less than a user would wait.
+const DATA_PATH_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wait for the session's data path to be ready.
+///
+/// `true` when the data path can carry traffic, `false` when it did not come
+/// up in time - the session is then not a session, and the caller tears it
+/// down rather than publish a `connected` that is not true.
+async fn wait_data_path(session: &Arc<EdgeSession>) -> bool {
+    let deadline = tokio::time::Instant::now() + DATA_PATH_READY_TIMEOUT;
+    loop {
+        if session.data_path_ready() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// One way to obtain a fresh [`EdgeSession`] — the dial the supervisor loop
 /// repeats. The production impl dials the artefact's entrances; the seam
@@ -992,6 +1094,13 @@ pub(crate) trait EdgeDialer: Send + Sync + 'static {
     /// overrides this; a test dialer stays at 0 so a live session is not
     /// torn down.
     fn exit_generation(&self) -> u64 {
+        0
+    }
+
+    /// Bumped when the owner of the plane's packets changes. The production
+    /// dialer overrides this; a test dialer stays at 0 so a live session is
+    /// not torn down.
+    fn plane_generation(&self) -> u64 {
         0
     }
 }
@@ -1030,6 +1139,57 @@ impl ExitCtrl {
     }
 }
 
+/// Who owns the packets of a plane session.
+///
+/// A plane carries whole IP packets, and one address. The userspace stack
+/// (the SOCKS5 flows) and the raw-IP consumer (the tunnel device) both need
+/// every packet of that address - two consumers would steal the packets from
+/// each other. So exactly ONE of them owns the plane, and the client's carry
+/// decides which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaneConsumer {
+    /// The userspace TCP/IP stack: the SOCKS5 flows.
+    #[default]
+    Stack,
+    /// The raw-IP consumer: the tunnel device.
+    RawIp,
+}
+
+/// The plane consumer of the live session, shared by the dialer and
+/// [`EdgeSessionSupervisor::set_plane_consumer`].
+struct PlaneCtrl {
+    consumer: Mutex<PlaneConsumer>,
+    generation: AtomicU64,
+}
+
+impl PlaneCtrl {
+    fn new(consumer: PlaneConsumer) -> Self {
+        Self { consumer: Mutex::new(consumer), generation: AtomicU64::new(0) }
+    }
+
+    fn get(&self) -> PlaneConsumer {
+        *self.consumer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, consumer: PlaneConsumer) {
+        {
+            let mut current = self.consumer.lock().unwrap_or_else(|e| e.into_inner());
+            if *current == consumer {
+                return;
+            }
+            *current = consumer;
+        }
+        // A new consumer means a new owner of the plane's packets: the live
+        // session goes away and the next dial builds the session the new
+        // consumer needs.
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+}
+
 /// [`EdgeDialer`] over the artefact's own entrances — every one of them,
 /// stream-shaped and datagram-shaped alike.
 struct EntranceDialer {
@@ -1037,6 +1197,8 @@ struct EntranceDialer {
     mesh_id: Vec<u8>,
     client_static_priv: [u8; 32],
     exit: Arc<ExitCtrl>,
+    /// Who owns the packets of the plane this dialer builds.
+    plane: Arc<PlaneCtrl>,
     /// The entrance that carried the last live session.
     ///
     /// The next dial starts there. A face that worked is the face most
@@ -1124,12 +1286,14 @@ impl EntranceDialer {
                                 opened,
                                 welcome,
                                 self.entrances[target.0].addr.clone(),
+                                self.plane.get(),
                             );
                             log_assigned(&probe_addr, &session);
                             return Ok((target.0, session));
                         }
                     }
-                    let session = build_session(opened, welcome, probe_addr.clone());
+                    let session =
+                        build_session(opened, welcome, probe_addr.clone(), self.plane.get());
                     log_assigned(&probe_addr, &session);
                     return Ok((idx, session));
                 }
@@ -1211,6 +1375,10 @@ impl EdgeDialer for EntranceDialer {
     fn exit_generation(&self) -> u64 {
         self.exit.generation()
     }
+
+    fn plane_generation(&self) -> u64 {
+        self.plane.generation()
+    }
 }
 
 /// Reconnect-with-backoff wrapper around [`EdgeSession`]. Holds the current
@@ -1224,6 +1392,10 @@ pub struct EdgeSessionSupervisor {
     driver: tokio::task::JoinHandle<()>,
     /// Present on the production supervisor. Test dialers leave this empty.
     exit: Option<Arc<ExitCtrl>>,
+    /// Who owns the packets of the live plane session.
+    ///
+    /// Present on the production supervisor. Test dialers leave this empty.
+    plane: Option<Arc<PlaneCtrl>>,
 }
 
 impl Drop for EdgeSessionSupervisor {
@@ -1265,17 +1437,45 @@ impl EdgeSessionSupervisor {
         exit: ExitPreference,
         stream_failure_threshold: u32,
     ) -> Arc<Self> {
+        Self::spawn_with_threshold_and_consumer(
+            entrances,
+            mesh_id,
+            client_static_priv,
+            exit,
+            stream_failure_threshold,
+            PlaneConsumer::Stack,
+        )
+    }
+
+    /// [`Self::spawn_with_threshold`] with the owner of the plane's packets
+    /// named: the userspace stack (the SOCKS5 flows) or the raw-IP consumer
+    /// (the tunnel device).
+    ///
+    /// The two want the SAME packets, and one address: two consumers would
+    /// steal the packets from each other. So the client says which one it
+    /// is, and the session is built for that one.
+    pub fn spawn_with_threshold_and_consumer(
+        entrances: Vec<ArtefactEntrance>,
+        mesh_id: Vec<u8>,
+        client_static_priv: [u8; 32],
+        exit: ExitPreference,
+        stream_failure_threshold: u32,
+        consumer: PlaneConsumer,
+    ) -> Arc<Self> {
         let exit_ctrl = Arc::new(ExitCtrl::new(exit));
+        let plane_ctrl = Arc::new(PlaneCtrl::new(consumer));
         Self::spawn_with_dialer_exit(
             EntranceDialer {
                 entrances,
                 mesh_id,
                 client_static_priv,
                 exit: Arc::clone(&exit_ctrl),
+                plane: Arc::clone(&plane_ctrl),
                 last_good: AtomicUsize::new(0),
             },
             exit,
             Some(exit_ctrl),
+            Some(plane_ctrl),
             stream_failure_threshold.max(1),
         )
     }
@@ -1284,7 +1484,7 @@ impl EdgeSessionSupervisor {
     /// status file reports as asked-for.
     #[cfg(test)]
     pub(crate) fn spawn_with_dialer(dialer: impl EdgeDialer, requested: ExitPreference) -> Arc<Self> {
-        Self::spawn_with_dialer_exit(dialer, requested, None, DEFAULT_STREAM_FAILURE_THRESHOLD)
+        Self::spawn_with_dialer_exit(dialer, requested, None, None, DEFAULT_STREAM_FAILURE_THRESHOLD)
     }
 
     /// Spawn the supervisor over a dialer of this crate's own making - the
@@ -1298,7 +1498,7 @@ impl EdgeSessionSupervisor {
         requested: ExitPreference,
         stream_failure_threshold: u32,
     ) -> Arc<Self> {
-        Self::spawn_with_dialer_exit(dialer, requested, None, stream_failure_threshold.max(1))
+        Self::spawn_with_dialer_exit(dialer, requested, None, None, stream_failure_threshold.max(1))
     }
 
     /// [`Self::spawn_with_dialer`] with an explicit stream-failure threshold.
@@ -1312,6 +1512,7 @@ impl EdgeSessionSupervisor {
             dialer,
             requested,
             None,
+            None,
             stream_failure_threshold.max(1),
         )
     }
@@ -1320,6 +1521,7 @@ impl EdgeSessionSupervisor {
         dialer: impl EdgeDialer,
         requested: ExitPreference,
         exit: Option<Arc<ExitCtrl>>,
+        plane: Option<Arc<PlaneCtrl>>,
         stream_failure_threshold: u32,
     ) -> Arc<Self> {
         let (slot, _slot_rx) = tokio::sync::watch::channel(None);
@@ -1327,7 +1529,7 @@ impl EdgeSessionSupervisor {
             tokio::sync::watch::channel(EdgeStatusFile::connecting(&requested));
         let driver =
             tokio::spawn(drive(dialer, slot.clone(), status.clone(), stream_failure_threshold));
-        Arc::new(Self { slot, status, driver, exit })
+        Arc::new(Self { slot, status, driver, exit, plane })
     }
 
     /// Next dial uses `exit`. A live session is dropped so the loop redials.
@@ -1352,6 +1554,17 @@ impl EdgeSessionSupervisor {
         };
         self.set_exit(pref);
         true
+    }
+
+    /// Name the owner of the plane's packets.
+    ///
+    /// The userspace stack (the SOCKS5 flows) and the tunnel device (the
+    /// raw-IP consumer) want the same packets, and only one of them may have
+    /// them. A change tears the live session down: the next dial builds the
+    /// session the new owner needs.
+    pub fn set_plane_consumer(&self, consumer: PlaneConsumer) {
+        let Some(ctrl) = &self.plane else { return };
+        ctrl.set(consumer);
     }
 
     /// Stop the dial loop. The live session, if any, is dropped with it and
@@ -1450,8 +1663,27 @@ async fn drive(
                 // receiver is subscribed at that instant, which would lose a
                 // session dialed before the first SOCKS5 client arrived.
                 slot.send_replace(Some(Arc::clone(&session)));
-                status.send_modify(|s| s.set_connected(session.accepted_exit(), session.countries()));
                 let exit_gen = dialer.exit_generation();
+                let plane_gen = dialer.plane_generation();
+                // The status may say `connected` only when the data path can
+                // really carry traffic: the control session, the packet plane
+                // AND the userspace stack. A control-only `connected` is a
+                // lie - the SOCKS5 listener would be up and every flow would
+                // fail.
+                if wait_data_path(&session).await {
+                    status.send_modify(|s| s.set_connected(session.accepted_exit(), session.countries()));
+                } else {
+                    warn!(
+                        entrance = %session.entrance_label(),
+                        "edge session: the data path did not come up - tearing the session down"
+                    );
+                    status.send_modify(EdgeStatusFile::set_reconnecting);
+                    slot.send_replace(None);
+                    session.abort();
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
                 // The watchdog's counter: the loop wakes on every change
                 // instead of waiting for its next liveness tick, so the
                 // teardown starts the moment the threshold is reached.
@@ -1468,6 +1700,10 @@ async fn drive(
                     }
                     if dialer.exit_generation() != exit_gen {
                         info!("edge session: exit changed, redialing");
+                        break;
+                    }
+                    if dialer.plane_generation() != plane_gen {
+                        info!("edge session: the owner of the plane's packets changed, redialing");
                         break;
                     }
                     let failed = session.health().consecutive_failures();
@@ -1524,7 +1760,7 @@ impl EdgeSessionSupervisor {
         let (status, _status_rx) =
             tokio::sync::watch::channel(EdgeStatusFile::connecting(&ExitPreference::Auto));
         let driver = tokio::spawn(std::future::pending());
-        Arc::new(Self { slot, status, driver, exit: None })
+        Arc::new(Self { slot, status, driver, exit: None, plane: None })
     }
 }
 

@@ -58,11 +58,15 @@ pub mod control;
 pub mod dial;
 pub mod http_connect;
 pub mod ipv4;
+pub mod multi;
 pub mod onion_artefact;
 pub(crate) mod onion_session;
 pub mod oss_artefact;
 pub mod oss_setup;
 pub mod peer;
+pub mod plane_dns;
+pub mod plane_net;
+pub mod plane_udp;
 pub mod relay;
 pub mod scope;
 pub mod session;
@@ -89,6 +93,7 @@ pub use scope::EgressScope;
 pub use tun_mode::{TunMode, WireMode};
 pub use session::{
     exit_preference_from_mode, EdgeDialError, EdgeSession, EdgeSessionSupervisor, EdgeStreamError,
+    PlaneConsumer,
 };
 pub use status::{
     exit_label, publish_fatal, EdgeReason, EdgeState, EdgeStatusFile, ExitStatus, StatusWriter,

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use mirage_subscriber_client::artefact::DeliveryArtefact;
 use mirage_subscriber_client::assembly::{SubscriberClient, SubscriberClientOptions};
 use mirage_subscriber_client::scope::EgressScope;
+use mirage_subscriber_client::session::PlaneConsumer;
 use mirage_subscriber_client::status::EdgeState;
 use mirage_subscriber_client::supervisor_slot::SupervisorSlot;
 use mirage_subscriber_client::tun_mode::{self, TunMode, WireMode};
@@ -456,6 +457,16 @@ impl Engine {
 
     /// How the traffic leaves this machine.
     fn apply_carry(&mut self) {
+        // Who owns the plane's packets follows the carry: the tunnel device
+        // wants them raw, the SOCKS5 flows want them in the client's own
+        // userspace stack. One owner per plane - so the switch redials.
+        if let Some(client) = &self.client {
+            client.supervisor.current().set_plane_consumer(if self.carry_tun {
+                PlaneConsumer::RawIp
+            } else {
+                PlaneConsumer::Stack
+            });
+        }
         if self.carry_tun {
             if self.client.is_none() {
                 // The device chains through the local port, so the port has to

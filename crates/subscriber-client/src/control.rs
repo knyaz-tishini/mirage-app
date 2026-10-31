@@ -560,6 +560,14 @@ async fn handle_client(stream: &mut TcpStream, rt: &mut Runtime) -> std::io::Res
                     error!(error = %e, "control: scope rejected");
                 }
             }
+            // The carry decides who owns the plane's packets: the tunnel
+            // device wants them raw, the SOCKS5 and HTTP listeners want them
+            // in the client's own userspace stack. One owner per plane.
+            rt.supervisor.current().set_plane_consumer(if rt.wish.tun {
+                crate::session::PlaneConsumer::RawIp
+            } else {
+                crate::session::PlaneConsumer::Stack
+            });
             sync_listeners(rt);
         }
         if status == 200 {

@@ -84,6 +84,13 @@ pub struct SubscriberClientOptions {
     /// SOCKS5 is the local feed for `--transport socks` and for TUN. HTTP
     /// CONNECT has its own listener and leaves this false.
     pub start_socks: bool,
+    /// Who owns the packets of the plane session.
+    ///
+    /// The userspace stack (the SOCKS5 flows) and the tunnel device (the
+    /// raw-IP consumer) want the same packets, and one address: only one of
+    /// them may have them. The local carry decides - SOCKS5 and HTTP CONNECT
+    /// want the stack, the TUN device wants the packets raw.
+    pub plane_consumer: crate::session::PlaneConsumer,
 }
 
 impl Default for SubscriberClientOptions {
@@ -94,6 +101,7 @@ impl Default for SubscriberClientOptions {
             status_file: None,
             scope: EgressScope::all(),
             start_socks: true,
+            plane_consumer: crate::session::PlaneConsumer::Stack,
         }
     }
 }
@@ -111,6 +119,12 @@ pub struct SubscriberClient {
     /// The destinations the local capture sends through. Shared with the
     /// listeners, so the lists can be replaced while they run.
     pub scope: Arc<EgressScope>,
+    /// Who owns the packets of the plane session.
+    ///
+    /// The carry decides it, and a new configuration inherits it: the
+    /// tunnel device wants the packets raw, the SOCKS5 flows want the
+    /// userspace stack.
+    plane_consumer: crate::session::PlaneConsumer,
     _tun_feed: Option<TunFeed>,
 }
 
@@ -215,12 +229,13 @@ impl SubscriberClient {
         // session follows it and decides nothing itself.
         let entrances = artefact.entrances.clone();
 
-        let supervisor = EdgeSessionSupervisor::spawn_with_threshold(
+        let supervisor = EdgeSessionSupervisor::spawn_with_threshold_and_consumer(
             entrances,
             mesh_id,
             client_static_priv,
             exit,
             stream_failure_threshold,
+            options.plane_consumer,
         );
 
         Self::spawn_with_supervisor(supervisor, options).await
@@ -278,6 +293,7 @@ impl SubscriberClient {
             status_file: options.status_file,
             status_writer: std::sync::Mutex::new(status_writer),
             scope,
+            plane_consumer: options.plane_consumer,
             _tun_feed: tun_feed,
         })
     }
@@ -290,6 +306,7 @@ impl SubscriberClient {
     pub async fn supervisor_for(
         artefact: &DeliveryArtefact,
         stream_failure_threshold: u32,
+        plane_consumer: crate::session::PlaneConsumer,
     ) -> Result<Arc<EdgeSessionSupervisor>, SubscriberClientError> {
         match artefact {
             DeliveryArtefact::Vpn(vpn) => {
@@ -298,12 +315,13 @@ impl SubscriberClient {
                 let client_static_priv = vpn.client_static_priv()?;
                 let mesh_id = vpn.mesh_id.as_bytes().to_vec();
                 let entrances = vpn.entrances.clone();
-                Ok(EdgeSessionSupervisor::spawn_with_threshold(
+                Ok(EdgeSessionSupervisor::spawn_with_threshold_and_consumer(
                     entrances,
                     mesh_id,
                     client_static_priv,
                     exit,
                     stream_failure_threshold,
+                    plane_consumer,
                 ))
             }
             DeliveryArtefact::Onion(onion) => {
@@ -325,7 +343,7 @@ impl SubscriberClient {
         artefact: &DeliveryArtefact,
         stream_failure_threshold: u32,
     ) -> Result<(), SubscriberClientError> {
-        let next = Self::supervisor_for(artefact, stream_failure_threshold).await?;
+        let next = Self::supervisor_for(artefact, stream_failure_threshold, self.plane_consumer).await?;
         // The status file follows the live session.
         if let Some(path) = self.status_file.clone() {
             let writer = StatusWriter::start(path.clone(), next.status())

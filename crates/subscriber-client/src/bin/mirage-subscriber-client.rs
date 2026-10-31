@@ -28,9 +28,10 @@ use mirage_client_chain::chain_install::{self, ChainRequest};
 use mirage_client_chain::oss_install::OssCarrier;
 use mirage_client_chain::provision::InstallBus;
 use mirage_subscriber_client::{
-    chain_artefact, control, exit_preference_from_mode, http_connect, oss_setup, publish_fatal,
-    tun_mode, DeliveryArtefact, EdgeReason, EdgeSession, EdgeState, EgressScope,
-    OssSetup, SubscriberClient, SubscriberClientError, SubscriberClientOptions, TunMode,
+    chain_artefact, control, exit_preference_from_mode, http_connect, multi::ClientSet,
+    oss_setup, publish_fatal, tun_mode, DeliveryArtefact, EdgeReason, EdgeSession, EdgeState,
+    EgressScope, OssSetup, PlaneConsumer, SubscriberClient, SubscriberClientError,
+    SubscriberClientOptions, TunMode,
 };
 use tracing::{error, info, warn};
 
@@ -45,6 +46,20 @@ struct Args {
     /// goes. Required except for `claim`, which writes the file and exits.
     #[arg(long)]
     artefact: Option<PathBuf>,
+
+    /// A configuration to serve: `LABEL=ARTEFACT.json`. Repeat for several.
+    ///
+    /// One customer may hold several configurations against one box: each
+    /// with its own key, its own address inside the plane and its own
+    /// SOCKS5 port. Mutually exclusive with `--artefact`.
+    #[arg(long = "config", value_name = "LABEL=ARTEFACT")]
+    config: Vec<String>,
+
+    /// The SOCKS5 bind of one configuration: `LABEL=ADDR`. Repeat for
+    /// several. A configuration without one gets `--bind` with the port
+    /// counted up from the first configuration that has none.
+    #[arg(long = "config-bind", value_name = "LABEL=ADDR")]
+    config_bind: Vec<String>,
 
     /// Local SOCKS5 bind address. Must be a loopback address — this
     /// listener must never be reachable off this machine. Ignored by the
@@ -374,9 +389,18 @@ async fn main() -> ExitCode {
     }
 
     let Some(artefact_path) = args.artefact.as_ref() else {
+        // Several configurations in one process: each with its own key, its
+        // own address inside the plane and its own local surface.
+        if !args.config.is_empty() {
+            return run_multi(&args).await;
+        }
         error!("refusing: --artefact is required");
         return ExitCode::FAILURE;
     };
+    if !args.config.is_empty() {
+        error!("refusing: --artefact and --config are two ways to say the same thing");
+        return ExitCode::FAILURE;
+    }
     let artefact = match read_and_validate_artefact(artefact_path) {
         Ok(artefact) => artefact,
         Err(code) => {
@@ -884,6 +908,13 @@ async fn run_proxy(artefact: &DeliveryArtefact, args: &Args) -> ExitCode {
         status_file: args.status_file.clone(),
         scope: scope.clone(),
         start_socks: transport != Transport::Http,
+        // The tunnel device wants the plane's packets raw; the SOCKS5 and
+        // HTTP listeners want them in the client's own userspace stack. One
+        // owner per plane.
+        plane_consumer: match transport {
+            Transport::Tun => PlaneConsumer::RawIp,
+            _ => PlaneConsumer::Stack,
+        },
         ..Default::default()
     };
 
@@ -1021,6 +1052,159 @@ async fn run_proxy(artefact: &DeliveryArtefact, args: &Args) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Serve several configurations in one process.
+///
+/// Each configuration is a whole client: its own key, its own session, its
+/// own SOCKS5 port, its own status file. Nothing is shared but the process.
+///
+/// The machine's tunnel device belongs to ONE configuration - it carries
+/// exactly the address the box assigned to that client - so the device is
+/// not started here.
+async fn run_multi(args: &Args) -> ExitCode {
+    let transport = match parse_transport(&args.transport) {
+        Ok(transport) => transport,
+        Err(e) => {
+            error!(error = %e, "refusing");
+            return ExitCode::FAILURE;
+        }
+    };
+    if transport == Transport::Tun {
+        error!("refusing: the tunnel device belongs to one configuration - run it with --artefact");
+        return ExitCode::FAILURE;
+    }
+    let scope = match EgressScope::from_lists(&args.service, &args.app) {
+        Ok(scope) => scope,
+        Err(e) => {
+            error!(error = %e, "refusing");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The binds the operator named.
+    let mut binds: std::collections::BTreeMap<String, SocketAddr> = Default::default();
+    for spec in &args.config_bind {
+        let Some((label, addr)) = spec.split_once('=') else {
+            error!(spec = %spec, "refusing: a bind is LABEL=ADDR");
+            return ExitCode::FAILURE;
+        };
+        let Ok(addr) = addr.parse::<SocketAddr>() else {
+            error!(spec = %spec, "refusing: the bind is not an address");
+            return ExitCode::FAILURE;
+        };
+        if !control::ensure_loopback(addr) {
+            error!(bind = %addr, "refusing: a listener must be loopback");
+            return ExitCode::FAILURE;
+        }
+        binds.insert(label.to_owned(), addr);
+    }
+    // The configurations themselves.
+    let mut specs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for spec in &args.config {
+        let Some((label, path)) = spec.split_once('=') else {
+            error!(spec = %spec, "refusing: a configuration is LABEL=ARTEFACT.json");
+            return ExitCode::FAILURE;
+        };
+        if label.is_empty() {
+            error!(spec = %spec, "refusing: the label is empty");
+            return ExitCode::FAILURE;
+        }
+        specs.push((label.to_owned(), std::path::PathBuf::from(path)));
+    }
+    if specs.is_empty() {
+        error!("refusing: --config wants at least one configuration");
+        return ExitCode::FAILURE;
+    }
+
+    let mut set = ClientSet::new();
+    // The configurations without a bind of their own take `--bind`, with the
+    // port counted up from the first one that has none.
+    let mut next_port = args.bind.port();
+    for (label, path) in &specs {
+        let artefact = match read_and_validate_artefact(path) {
+            Ok(artefact) => artefact,
+            Err(code) => {
+                error!(label = %label, path = %path.display(), "refusing: the artefact is not usable");
+                return code;
+            }
+        };
+        let bind = match binds.get(label) {
+            Some(addr) => *addr,
+            None => {
+                let port = next_port;
+                next_port = next_port.saturating_add(1);
+                SocketAddr::new(args.bind.ip(), port)
+            }
+        };
+        let status_file = args.status_file.as_ref().map(|path| labelled_status_file(path, label));
+        let options = SubscriberClientOptions {
+            socks5_bind: bind,
+            status_file,
+            scope: scope.clone(),
+            start_socks: transport != Transport::Http,
+            plane_consumer: PlaneConsumer::Stack,
+            ..Default::default()
+        };
+        if let Err(e) = set.add(label, &artefact, options).await {
+            error!(label = %label, error = %e, "refusing: failed to assemble the subscriber client");
+            return ExitCode::FAILURE;
+        }
+        info!(
+            label = %label,
+            bind = %bind,
+            "mirage-subscriber-client: configuration ready"
+        );
+    }
+
+    // The HTTP listener belongs to the first configuration.
+    let http_task = if transport == Transport::Http {
+        let first = specs[0].0.clone();
+        let Some(client) = set.get(&first) else {
+            error!("refusing: the first configuration is gone");
+            return ExitCode::FAILURE;
+        };
+        let supervisor = std::sync::Arc::clone(&client.supervisor);
+        let http_scope = std::sync::Arc::new(scope);
+        let bind = args.http_bind;
+        Some(tokio::spawn(async move {
+            if let Err(e) = http_connect::serve(bind, supervisor, http_scope).await {
+                error!(error = %e, "http connect listener exited");
+            }
+        }))
+    } else {
+        None
+    };
+
+    info!(
+        configurations = set.len(),
+        "mirage-subscriber-client: ready - Ctrl-C to stop"
+    );
+    wait_for_stop().await;
+
+    info!("mirage-subscriber-client: shutdown requested");
+    if let Some(task) = http_task {
+        task.abort();
+    }
+    set.shutdown();
+    ExitCode::SUCCESS
+}
+
+/// The status file of one configuration.
+///
+/// The label goes in front of the extension, so the files of several
+/// configurations sit next to each other and none of them overwrites
+/// another: `edge-status.json` + `consumer-1` -> `edge-status.consumer-1.json`.
+fn labelled_status_file(path: &std::path::Path, label: &str) -> std::path::PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "status".to_owned());
+    let extension = path.extension().map(|s| s.to_string_lossy().to_string());
+    let name = match extension {
+        Some(extension) => format!("{stem}.{label}.{extension}"),
+        None => format!("{stem}.{label}"),
+    };
+    path.with_file_name(name)
 }
 
 fn panel_origin(panel: &str) -> &str {
