@@ -743,9 +743,18 @@ fn sync_tun(rt: &mut Runtime) {
         TunMode::Split
     };
     let config = std::env::temp_dir().join("mirage-gui-tun.json");
+    // The address the box assigned to this client: the adapter must carry
+    // exactly it, or the box drops the packets of this peer as a mismatch.
+    let tun_addr = rt
+        .supervisor
+        .current()
+        .assigned_client()
+        .map(|assignment| format!("{}/{}", assignment.addr, assignment.prefix))
+        .unwrap_or_else(|| tun_mode::DEFAULT_TUN_ADDR.to_owned());
     if let Err(e) = tun_mode::write_config(
         &config,
         SocketAddr::from(([127, 0, 0, 1], 1080)),
+        &tun_addr,
         &rt.wish.bypass,
         mode,
         rt.wire,

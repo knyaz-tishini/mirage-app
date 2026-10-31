@@ -28,7 +28,7 @@
 //! at CONNECT/ASSOCIATE time, never resolved from a pre-built chain table.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,12 +67,88 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 /// replying general failure.
 const CONNECT_SESSION_WAIT: Duration = Duration::from_secs(5);
 
+/// How often the counters of the raw-IP path are logged.
+const STATS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The smallest an IPv4 header can be: twenty bytes.
+const IPV4_MIN_HEADER: usize = 20;
+
+/// The smallest an IPv6 header can be: forty bytes.
+const IPV6_MIN_HEADER: usize = 40;
+
 /// One raw-IP consumer at a time.
 ///
 /// The tunnel device is the one consumer of the packet plane: a second one
 /// would steal the packets from the first. The device that loses the race
 /// is told "general failure" and closes.
 static RAW_IP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The counters of the raw-IP path.
+///
+/// A packet that is dropped where nobody looks is a packet the operator
+/// cannot account for: every drop point of this path has a number here.
+#[derive(Debug)]
+struct RawIpStats {
+    /// The packets dropped because they do not fit the plane.
+    dropped_too_large: AtomicU64,
+    /// The packets that could not be sent.
+    send_errors: AtomicU64,
+    /// The frames that were not IP packets at all.
+    malformed_frames: AtomicU64,
+    /// The packets that went onto the plane.
+    packets_to_plane: AtomicU64,
+    /// The packets that came off the plane.
+    packets_from_plane: AtomicU64,
+}
+
+impl RawIpStats {
+    /// A fresh set of counters.
+    const fn new() -> Self {
+        Self {
+            dropped_too_large: AtomicU64::new(0),
+            send_errors: AtomicU64::new(0),
+            malformed_frames: AtomicU64::new(0),
+            packets_to_plane: AtomicU64::new(0),
+            packets_from_plane: AtomicU64::new(0),
+        }
+    }
+
+    /// The counters as plain numbers.
+    fn snapshot(&self) -> RawIpSnapshot {
+        RawIpSnapshot {
+            dropped_too_large: self.dropped_too_large.load(Ordering::Relaxed),
+            send_errors: self.send_errors.load(Ordering::Relaxed),
+            malformed_frames: self.malformed_frames.load(Ordering::Relaxed),
+            packets_to_plane: self.packets_to_plane.load(Ordering::Relaxed),
+            packets_from_plane: self.packets_from_plane.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The counters of the raw-IP path as plain numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RawIpSnapshot {
+    /// The packets dropped because they do not fit the plane.
+    pub(crate) dropped_too_large: u64,
+    /// The packets that could not be sent.
+    pub(crate) send_errors: u64,
+    /// The frames that were not IP packets at all.
+    pub(crate) malformed_frames: u64,
+    /// The packets that went onto the plane.
+    pub(crate) packets_to_plane: u64,
+    /// The packets that came off the plane.
+    pub(crate) packets_from_plane: u64,
+}
+
+/// The counters of the raw-IP path of this process.
+static RAW_IP_STATS: RawIpStats = RawIpStats::new();
+
+/// The counters of the raw-IP path as plain numbers.
+///
+/// The snapshot is what the operator's log line and the tests read.
+pub(crate) fn raw_ip_stats() -> RawIpSnapshot {
+    RAW_IP_STATS.snapshot()
+}
 
 /// Every way reading a SOCKS5 request off the wire fails.
 #[derive(Debug, Error)]
@@ -215,14 +291,39 @@ async fn raw_ip_pump(stream: TcpStream, plane: Arc<dyn PacketPlane>) -> std::io:
     let (reader, writer) = tokio::io::split(stream);
     let upstream = raw_ip_upstream(reader, Arc::clone(&plane));
     let downstream = raw_ip_downstream(plane, writer);
-    tokio::select! {
+    // The counters of the path, one line every ten seconds: a drop that
+    // nobody sees is a drop nobody can account for.
+    let stats = tokio::spawn(log_raw_ip_stats());
+    let outcome = tokio::select! {
         result = upstream => result,
         result = downstream => result,
+    };
+    stats.abort();
+    outcome
+}
+
+/// Log the counters of the raw-IP path, one line every ten seconds.
+async fn log_raw_ip_stats() {
+    let mut ticker = tokio::time::interval(STATS_INTERVAL);
+    // The first tick of an interval fires at once: the line before it would
+    // say nothing but zeroes.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let stats = raw_ip_stats();
+        info!(
+            to_plane = stats.packets_to_plane,
+            from_plane = stats.packets_from_plane,
+            dropped_too_large = stats.dropped_too_large,
+            send_errors = stats.send_errors,
+            malformed_frames = stats.malformed_frames,
+            "socks5: raw-IP stats"
+        );
     }
 }
 
-/// The device -> plane direction: read a frame, split it if it does not fit
-/// the plane, and put every piece on the wire.
+/// The device -> plane direction: read a frame, prepare it for the plane, and
+/// put every piece on the wire.
 async fn raw_ip_upstream(
     mut reader: tokio::io::ReadHalf<TcpStream>,
     plane: Arc<dyn PacketPlane>,
@@ -245,10 +346,31 @@ async fn raw_ip_upstream(
             }
             return Err(e);
         }
-        for piece in crate::ipv4::fragment(&packet, budget) {
+        // The plane's own preparation says what may ride it: the pieces of
+        // the packet, or nothing at all when it cannot ride.
+        let pieces = crate::ipv4::prepare_for_plane(&packet, budget);
+        if pieces.is_empty() {
+            if is_malformed_frame(&packet) {
+                RAW_IP_STATS.malformed_frames.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    len = packet.len(),
+                    "socks5: dropping a frame that is not an IP packet"
+                );
+            } else {
+                RAW_IP_STATS.dropped_too_large.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    len = packet.len(),
+                    budget,
+                    "socks5: dropping a packet that does not fit the plane"
+                );
+            }
+            continue;
+        }
+        for piece in pieces {
             if piece.len() > budget {
                 // The packet does not fit and cannot be split: the far side
                 // would never reassemble it, so it is dropped here.
+                RAW_IP_STATS.dropped_too_large.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     len = piece.len(),
                     budget,
@@ -257,9 +379,11 @@ async fn raw_ip_upstream(
                 continue;
             }
             if let Err(e) = plane.send_packet(&piece).await {
+                RAW_IP_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, "socks5: the packet plane refused a packet");
                 return Ok(());
             }
+            RAW_IP_STATS.packets_to_plane.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -284,8 +408,35 @@ async fn raw_ip_downstream(
         let mut frame = Vec::with_capacity(2 + read);
         frame.extend_from_slice(&(read as u16).to_be_bytes());
         frame.extend_from_slice(&buf[..read]);
-        writer.write_all(&frame).await?;
-        writer.flush().await?;
+        if let Err(e) = writer.write_all(&frame).await {
+            RAW_IP_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(error = %e, "socks5: the device did not take the packet");
+            return Err(e);
+        }
+        if let Err(e) = writer.flush().await {
+            RAW_IP_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(error = %e, "socks5: the device write could not be flushed");
+            return Err(e);
+        }
+        RAW_IP_STATS.packets_from_plane.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether the frame is not an IP packet at all, or is too short to carry
+/// the header of its version.
+///
+/// The plane's own preparation says only "this cannot ride"; this says why:
+/// a frame that is not IP is malformed, a frame that is IP but too big is
+/// too large. The two are different failures, and the operator tells them
+/// apart by the counter.
+fn is_malformed_frame(packet: &[u8]) -> bool {
+    match packet.first() {
+        None => true,
+        Some(&first) => match first >> 4 {
+            4 => packet.len() < IPV4_MIN_HEADER,
+            6 => packet.len() < IPV6_MIN_HEADER,
+            _ => true,
+        },
     }
 }
 
@@ -654,6 +805,63 @@ mod tests {
     async fn free_local_addr() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral");
         listener.local_addr().expect("local addr")
+    }
+
+    // --- the counters of the raw-IP path ---
+
+    #[test]
+    fn the_stats_snapshot_carries_the_counters() {
+        let before = raw_ip_stats();
+        RAW_IP_STATS.dropped_too_large.fetch_add(3, Ordering::Relaxed);
+        RAW_IP_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
+        RAW_IP_STATS.malformed_frames.fetch_add(1, Ordering::Relaxed);
+        RAW_IP_STATS.packets_to_plane.fetch_add(5, Ordering::Relaxed);
+        RAW_IP_STATS.packets_from_plane.fetch_add(7, Ordering::Relaxed);
+        let after = raw_ip_stats();
+
+        assert_eq!(after.dropped_too_large, before.dropped_too_large + 3);
+        assert_eq!(after.send_errors, before.send_errors + 1);
+        assert_eq!(after.malformed_frames, before.malformed_frames + 1);
+        assert_eq!(after.packets_to_plane, before.packets_to_plane + 5);
+        assert_eq!(after.packets_from_plane, before.packets_from_plane + 7);
+    }
+
+    #[test]
+    fn a_frame_that_is_not_ip_is_malformed() {
+        assert!(is_malformed_frame(&[]));
+        // A version nibble that is neither 4 nor 6.
+        let mut not_ip = vec![0u8; 100];
+        not_ip[0] = 0x50;
+        assert!(is_malformed_frame(&not_ip));
+        // Too short to carry the header of its own version.
+        assert!(is_malformed_frame(&[0x45, 0, 0]));
+        assert!(is_malformed_frame(&[0x60; 10]));
+    }
+
+    #[test]
+    fn a_frame_that_is_ip_is_not_malformed() {
+        let mut ipv4 = vec![0u8; IPV4_MIN_HEADER];
+        ipv4[0] = 0x45;
+        assert!(!is_malformed_frame(&ipv4));
+        let mut ipv6 = vec![0u8; IPV6_MIN_HEADER];
+        ipv6[0] = 0x60;
+        assert!(!is_malformed_frame(&ipv6));
+    }
+
+    #[test]
+    fn the_frames_the_plane_refuses_are_told_apart() {
+        // An IPv6 packet that does not fit: the plane refuses it, and it is
+        // too large -- not malformed.
+        let mut ipv6 = vec![0u8; 2000];
+        ipv6[0] = 0x60;
+        assert!(crate::ipv4::prepare_for_plane(&ipv6, 1280).is_empty());
+        assert!(!is_malformed_frame(&ipv6));
+
+        // A frame that is not IP: the plane refuses it, and it is malformed.
+        let mut not_ip = vec![0u8; 100];
+        not_ip[0] = 0x50;
+        assert!(crate::ipv4::prepare_for_plane(&not_ip, 1280).is_empty());
+        assert!(is_malformed_frame(&not_ip));
     }
 
     #[tokio::test]

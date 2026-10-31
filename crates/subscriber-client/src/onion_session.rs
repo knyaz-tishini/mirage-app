@@ -67,6 +67,7 @@ impl EdgeDialer for OnionDialer {
             outcome: EdgeOutcome::Accepted { exit: ExitPreference::Auto },
             assigned_face_port: None,
             carries_datagrams: None,
+            assigned_client: None,
         };
         let label = format!("chain {}", self.spec.chain_id);
         info!(

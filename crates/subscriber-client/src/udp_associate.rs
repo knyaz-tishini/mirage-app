@@ -649,6 +649,7 @@ mod tests {
             outcome: EdgeOutcome::Accepted { exit: ExitPreference::Auto },
             assigned_face_port: Some(1),
             carries_datagrams: Some(true),
+            assigned_client: None,
         }
     }
 

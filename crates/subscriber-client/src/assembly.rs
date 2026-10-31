@@ -343,6 +343,18 @@ impl SubscriberClient {
         Ok(())
     }
 
+    /// The tunnel address the box assigned to this client, in CIDR form.
+    ///
+    /// "10.77.0.7/24" -- the address the box handed to the live session and
+    /// the prefix it sent with it. The tunnel adapter must carry exactly
+    /// this address: the box drops the packets of a peer that sends from
+    /// another one. `None` when no session is up, or when the box assigned
+    /// nothing -- an old box, or a session of the older wire versions.
+    pub fn assigned_client_address(&self) -> Option<String> {
+        let assignment = self.supervisor.current().assigned_client()?;
+        Some(format!("{}/{}", assignment.addr, assignment.prefix))
+    }
+
     /// Abort the SOCKS5 accept loop and, if a status file is kept, stop
     /// rewriting it and remove it. The edge-session supervisor's dial loop
     /// stops when the last `Arc` to it drops; the TUN feed's watcher (if any)

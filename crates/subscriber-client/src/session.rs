@@ -51,7 +51,9 @@ use mirage_control_plane::{
     CountryCode, EdgeHello, EdgeOutcome, EdgeRefusal, EdgeSessionError as WireError, EdgeWelcome,
     ExitPreference, StreamKind, StreamOpen, StreamTarget,
 };
-use mirage_control_plane::edge_session::{face_transport, filter_offered_faces_by_transport};
+use mirage_control_plane::edge_session::{
+    face_transport, filter_offered_faces_by_transport, ClientAssignment,
+};
 use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
 use mirage_core::error::MirageError;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
@@ -475,6 +477,17 @@ impl EdgeSession {
     pub fn packet_plane(&self) -> Option<Arc<dyn PacketPlane>> {
         let transport = self.plane.lock().unwrap_or_else(|e| e.into_inner());
         transport.as_ref().and_then(|t| t.plane.as_ref().map(Arc::clone))
+    }
+
+    /// The address the box assigned to this client, when the welcome carries
+    /// one.
+    ///
+    /// The box is an L3 forwarder and every client behind it needs its own
+    /// address: this is the one the box handed to this session, and the
+    /// tunnel adapter must carry exactly it. `None` for the sessions of the
+    /// older wire versions, and for a box that assigned nothing.
+    pub fn assigned_client(&self) -> Option<ClientAssignment> {
+        self.welcome.assigned_client
     }
 
     /// The mux session handle, while this session is still live.
@@ -1351,7 +1364,23 @@ impl EdgeSessionSupervisor {
 
     /// The current live session, if any — does not wait.
     pub fn current(&self) -> Option<Arc<EdgeSession>> {
+        self.live_session()
+    }
+
+    /// The live session, if any -- does not wait.
+    ///
+    /// The non-blocking twin of [`Self::wait_for_session`]: it answers with
+    /// the session that is up RIGHT NOW, and `None` when there is none.
+    pub fn live_session(&self) -> Option<Arc<EdgeSession>> {
         self.slot.borrow().clone()
+    }
+
+    /// The address the box assigned to the live session, if any.
+    ///
+    /// `None` when no session is up, or when the box assigned nothing --
+    /// the older wire versions have no such address.
+    pub fn assigned_client(&self) -> Option<ClientAssignment> {
+        self.live_session().and_then(|session| session.assigned_client())
     }
 
     /// The current live session, waiting up to `timeout` for one to appear
@@ -1562,6 +1591,7 @@ mod tests {
             outcome,
             assigned_face_port: None,
             carries_datagrams: None,
+            assigned_client: None,
         }
     }
 

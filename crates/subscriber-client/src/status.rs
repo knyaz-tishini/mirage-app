@@ -712,6 +712,7 @@ mod tests {
             outcome: EdgeOutcome::Accepted { exit: granted },
             assigned_face_port: None,
             carries_datagrams: None,
+            assigned_client: None,
         };
         (EdgeSession::for_test(client, welcome), server)
     }

@@ -286,6 +286,9 @@ struct Engine {
     client: Option<SubscriberClient>,
     /// The tunnel device, when it is up. The window owns the process.
     tun: Option<TunDevice>,
+    /// The address the running device was configured with -- the one the
+    /// box assigned to the live session.
+    tun_addr: Option<String>,
     /// The traffic leaves through the device, not through the local port.
     carry_tun: bool,
     /// The destinations the capture sends through.
@@ -314,6 +317,7 @@ impl Engine {
             artefact: None,
             client: None,
             tun: None,
+            tun_addr: None,
             carry_tun: false,
             scope: EgressScope::all(),
             services: Vec::new(),
@@ -479,6 +483,18 @@ impl Engine {
         }
     }
 
+    /// The address the tunnel adapter must carry right now.
+    ///
+    /// The address the box assigned to the live session, in CIDR form. A box
+    /// that assigned nothing -- no session yet, or a box of the older wire
+    /// versions -- gets the address the client always had.
+    fn assigned_tun_addr(&self) -> String {
+        self.client
+            .as_ref()
+            .and_then(|client| client.assigned_client_address())
+            .unwrap_or_else(|| tun_mode::DEFAULT_TUN_ADDR.to_owned())
+    }
+
     /// The device goes up. It is a separate process because it needs the
     /// adapter; the window keeps it and brings it back when it dies.
     fn start_tun(&mut self) {
@@ -499,9 +515,15 @@ impl Engine {
                 return;
             }
         };
+        // The address the box assigned to this client: the adapter must
+        // carry exactly it, or the box drops the packets of this peer as a
+        // mismatch. A box that assigns nothing (an old one) gets the address
+        // the client always had.
+        let tun_addr = self.assigned_tun_addr();
         let write = tun_mode::write_config(
             &config,
             socks5_bind(),
+            &tun_addr,
             &[],
             self.tun_mode,
             self.wire_mode(),
@@ -515,6 +537,7 @@ impl Engine {
             tracing::error!(error = %error, "engine: the device config was refused");
             return;
         }
+        tracing::info!(tun_addr = %tun_addr, "engine: the device config was written");
         let mut child = match tun_mode::spawn(&bin, &config) {
             Ok(child) => child,
             Err(error) => {
@@ -527,6 +550,7 @@ impl Engine {
         let stdin = child.stdin.take();
         tracing::info!(bin = %bin.display(), "engine: the device is up");
         self.tun = Some(TunDevice { child, stdin });
+        self.tun_addr = Some(tun_addr);
         self.publish(|status| {
             status.tun = true;
             status.tun_alive = true;
@@ -541,6 +565,7 @@ impl Engine {
     fn stop_tun(&mut self) {
         if let Some(mut device) = self.tun.take() {
             device.stdin.take();
+            self.tun_addr = None;
             // The device has to take the routes back before it goes. A device
             // whose queue is full takes a while to notice the closed pipe and
             // to drain, and three seconds was not enough: the device was
@@ -576,6 +601,19 @@ impl Engine {
 
     /// Is the device still there?
     fn poll_tun(&mut self) {
+        // The address the box assigned can change under the device: the
+        // session comes up after the device did, and a session that comes
+        // back may get another address. The adapter must carry the address
+        // of the LIVE session, or the box drops the packets as a mismatch.
+        let assigned = self.assigned_tun_addr();
+        if self.tun.is_some() && self.tun_addr.as_deref() != Some(assigned.as_str()) {
+            tracing::info!(
+                tun_addr = %assigned,
+                "engine: the assigned address changed -- the device comes back"
+            );
+            self.restart_tun();
+            return;
+        }
         let Some(device) = self.tun.as_mut() else {
             return;
         };

@@ -9,9 +9,16 @@
 //! rules, and a packet that is already a fragment is never split again -
 //! the far side reassembles it, and a tunnel that re-fragments it would
 //! break the reassembly.
+//!
+//! [`prepare_for_plane`] is the entry point for the packet plane: it takes
+//! a packet of either version and returns the pieces that may ride the
+//! plane. IPv6 rides whole or not at all - the plane does not fragment it.
 
 /// The IPv4 header length in bytes when it carries no options.
 const IPV4_MIN_HEADER: usize = 20;
+/// The IPv6 header length in bytes. IPv6 has no options field, so the header
+/// is always this long.
+const IPV6_MIN_HEADER: usize = 40;
 /// The "more fragments" flag, in the flags/fragment-offset word.
 const FLAG_MORE_FRAGMENTS: u16 = 0x2000;
 /// The mask of the fragment-offset field, in the flags/fragment-offset word.
@@ -72,6 +79,54 @@ pub fn fragment(packet: &[u8], budget: usize) -> Vec<Vec<u8>> {
         return vec![packet.to_vec()];
     }
     out
+}
+
+/// Prepare an IP packet for the packet plane.
+///
+/// The plane carries whole IP packets in QUIC datagrams, and a datagram has a
+/// hard size limit. This function returns the pieces of `packet` that may
+/// ride the plane:
+///
+/// - An IPv4 packet that fits `budget` rides as one piece.
+/// - An IPv4 packet that does not fit is split into fragments (see
+///   [`fragment`]). A packet that cannot be split comes back as one piece
+///   that is still too big: it cannot ride the plane, and the caller drops
+///   it.
+/// - An IPv6 packet that fits `budget` rides as one piece.
+/// - An IPv6 packet that does not fit is dropped: the plane does not
+///   fragment IPv6, and the far side has no fragment header to reassemble.
+///
+/// Returns an empty vector for a packet that cannot ride the plane at all:
+/// one that is not IP, one too short to carry a header of its version.
+pub fn prepare_for_plane(packet: &[u8], budget: usize) -> Vec<Vec<u8>> {
+    // The version is the first four bits of the first byte. Without that
+    // byte there is nothing to tell IPv4 from IPv6 from noise.
+    let Some(&first) = packet.first() else {
+        return Vec::new();
+    };
+    match first >> 4 {
+        4 => {
+            if packet.len() < IPV4_MIN_HEADER {
+                return Vec::new();
+            }
+            if packet.len() <= budget {
+                vec![packet.to_vec()]
+            } else {
+                fragment(packet, budget)
+            }
+        }
+        6 => {
+            if packet.len() < IPV6_MIN_HEADER {
+                return Vec::new();
+            }
+            if packet.len() <= budget {
+                vec![packet.to_vec()]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The length of the IPv4 header of `packet`, or `None` when `packet` is not
@@ -141,6 +196,19 @@ mod tests {
         packet
     }
 
+    /// An IPv6 packet with a 40-byte header and `payload_len` payload bytes.
+    fn ipv6_packet(payload_len: usize) -> Vec<u8> {
+        let mut packet = vec![0u8; IPV6_MIN_HEADER + payload_len];
+        packet[0] = 0x60; // version 6, no traffic class
+        packet[4..6].copy_from_slice(&((payload_len) as u16).to_be_bytes()); // payload length
+        packet[6] = 17; // next header: UDP
+        packet[7] = 64; // hop limit
+        for (i, byte) in packet[IPV6_MIN_HEADER..].iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        packet
+    }
+
     #[test]
     fn a_large_packet_is_split_into_fragments_that_fit() {
         let packet = ipv4_packet(2980);
@@ -205,5 +273,60 @@ mod tests {
         let pieces = fragment(&packet, IPV4_MIN_HEADER);
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0], packet);
+    }
+
+    #[test]
+    fn an_ipv4_packet_that_fits_rides_as_one_piece() {
+        let packet = ipv4_packet(100);
+        let pieces = prepare_for_plane(&packet, 1280);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], packet);
+    }
+
+    #[test]
+    fn an_ipv4_packet_that_does_not_fit_is_fragmented() {
+        let packet = ipv4_packet(2980);
+        let pieces = prepare_for_plane(&packet, 1280);
+
+        assert!(pieces.len() > 1, "the packet must be split");
+        for piece in &pieces {
+            assert!(piece.len() <= 1280, "a fragment must fit the budget");
+            assert!(checksum_is_valid(&piece[..IPV4_MIN_HEADER]), "the header checksum must be right");
+        }
+
+        // The payloads concatenate back into the original payload.
+        let mut payload = Vec::new();
+        for piece in &pieces {
+            payload.extend_from_slice(&piece[IPV4_MIN_HEADER..]);
+        }
+        assert_eq!(payload, packet[IPV4_MIN_HEADER..]);
+    }
+
+    #[test]
+    fn an_ipv6_packet_that_fits_rides_as_one_piece() {
+        let packet = ipv6_packet(100);
+        let pieces = prepare_for_plane(&packet, 1280);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], packet);
+    }
+
+    #[test]
+    fn an_ipv6_packet_that_does_not_fit_is_dropped() {
+        let packet = ipv6_packet(2000);
+        let pieces = prepare_for_plane(&packet, 1280);
+        assert!(pieces.is_empty(), "IPv6 is never fragmented, so it cannot ride");
+    }
+
+    #[test]
+    fn a_packet_that_is_not_ip_is_dropped() {
+        // No version nibble at all.
+        assert!(prepare_for_plane(&[], 1280).is_empty());
+        // A version nibble that is neither 4 nor 6.
+        let mut packet = vec![0u8; 100];
+        packet[0] = 0x50;
+        assert!(prepare_for_plane(&packet, 1280).is_empty());
+        // Too short to carry the header of its version.
+        assert!(prepare_for_plane(&[0x45, 0, 0], 1280).is_empty());
+        assert!(prepare_for_plane(&[0x60; 10], 1280).is_empty());
     }
 }

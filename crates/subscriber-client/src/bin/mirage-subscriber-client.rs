@@ -951,9 +951,16 @@ async fn run_proxy(artefact: &DeliveryArtefact, args: &Args) -> ExitCode {
             .map(|p| p.with_file_name("mirage-tun.json"))
             .unwrap_or_else(|| PathBuf::from("mirage-tun.json"));
         let relays = if cfg!(windows) { relay_hosts(artefact) } else { Vec::new() };
+        // The address the box assigned to this client: the adapter must
+        // carry exactly it, or the box drops the packets of this peer as a
+        // mismatch.
+        let tun_addr = client
+            .assigned_client_address()
+            .unwrap_or_else(|| tun_mode::DEFAULT_TUN_ADDR.to_owned());
         if let Err(e) = tun_mode::write_config(
             &config_path,
             args.bind,
+            &tun_addr,
             &args.bypass_cidr,
             mode,
             tun_mode::wire_mode_for(artefact),

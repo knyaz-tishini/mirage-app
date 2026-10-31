@@ -25,6 +25,13 @@ use crate::scope::tun_service_action;
 
 pub const CHAIN_NAME: &str = "edge";
 
+/// The tunnel address the client falls back to when the box assigns none.
+///
+/// A box of the older wire versions sends no address: the client keeps the
+/// address it always had. The box of the packet plane assigns every client
+/// its own address and sends it in the welcome.
+pub const DEFAULT_TUN_ADDR: &str = "10.77.0.1/24";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TunMode {
     Full,
@@ -162,9 +169,17 @@ fn push_named(rules: &mut Vec<Value>, services: &[String], apps: &[String], acti
     Ok(())
 }
 
+/// Write the device config.
+///
+/// `tun_addr` is the address the tunnel adapter carries, in CIDR form. It is
+/// the address the box assigned to this client ("10.77.0.7/24"), and the
+/// adapter must carry exactly it: the box drops the packets of a peer that
+/// sends from another address. A box that assigns nothing gets
+/// [`DEFAULT_TUN_ADDR`].
 pub fn write_config(
     path: &Path,
     socks_bind: SocketAddr,
+    tun_addr: &str,
     bypass_cidrs: &[String],
     mode: TunMode,
     wire: WireMode,
@@ -185,7 +200,7 @@ pub fn write_config(
     }
     let doc = json!({
         "tun_name": tun_device_name(),
-        "tun_addr": "10.77.0.1/24",
+        "tun_addr": tun_addr,
         // The datapath: `stack` is the byte-stream path, `raw_ip` is the
         // mono-protocol path.
         "mode": wire.as_str(),
@@ -263,6 +278,7 @@ mod tests {
         write_config(
             &path,
             "127.0.0.1:1080".parse().unwrap(),
+            DEFAULT_TUN_ADDR,
             &["192.168.0.0/21".into()],
             TunMode::Full,
             WireMode::Stack,
@@ -288,6 +304,7 @@ mod tests {
         write_config(
             &path,
             "127.0.0.1:1080".parse().unwrap(),
+            "10.77.0.7/24",
             &[],
             TunMode::Full,
             WireMode::RawIp,
@@ -302,6 +319,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["mode"], "raw_ip");
         assert_eq!(doc["mtu"], 1280);
+        // The adapter carries the address the box assigned.
+        assert_eq!(doc["tun_addr"], "10.77.0.7/24");
         assert_eq!(doc["chains"][0]["protocol"], "raw_ip");
         assert_eq!(doc["chains"][0]["name"], CHAIN_NAME);
         let _ = std::fs::remove_dir_all(&dir);
