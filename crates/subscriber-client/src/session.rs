@@ -69,16 +69,19 @@ use crate::dial::{quic_alpn, PlaneDial, StaticKeyProtocol};
 use crate::status::{EdgeReason, EdgeStatusFile};
 use crate::watchdog::{StreamHealth, WatchedStream, DEFAULT_STREAM_FAILURE_THRESHOLD};
 
-/// Version 1 of this client's edge-session wire — see [`EdgeHello::version`].
+/// The wire versions this client speaks. The numbers live in
+/// `mirage_control_plane::peer` -- with every other implementation's -- so
+/// that the client, the commercial box and the fleet box cannot drift apart.
+///
+/// Version 1 of this client's edge-session wire -- see [`EdgeHello::version`].
 /// A version-2 dial is a separate path ([`EntranceDialer`]); this constant
 /// stays the version an old edge still understands.
-const EDGE_SESSION_WIRE_VERSION: u8 = 1;
-const EDGE_SESSION_WIRE_VERSION_V2: u8 = 2;
-const EDGE_SESSION_WIRE_VERSION_V3: u8 = 3;
-/// Version 4 is the plane: the whole IP packets ride the datagrams of the
-/// same QUIC connection the control wire rides - see
-/// [`mirage_protocol::plane`].
-const EDGE_SESSION_WIRE_VERSION_V4: u8 = 4;
+use mirage_control_plane::peer::{
+    MUX_VERSION_V1 as EDGE_SESSION_WIRE_VERSION,
+    MUX_VERSION_V2 as EDGE_SESSION_WIRE_VERSION_V2,
+    MUX_VERSION_V3 as EDGE_SESSION_WIRE_VERSION_V3,
+    PLANE_VERSION as EDGE_SESSION_WIRE_VERSION_V4,
+};
 
 /// How long a flow waits before asking for stream credit again.
 ///
