@@ -1,8 +1,10 @@
 [package]
+license = "MIT"
 name = "mirage-chain-ipc"
 version.workspace = true
 edition.workspace = true
-
+repository = "https://github.com/knyaz-tishini/mirage2app"
+homepage = "https://github.com/knyaz-tishini/mirage2app"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

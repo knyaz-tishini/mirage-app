@@ -1,8 +1,10 @@
 [package]
+license = "MIT"
 name = "mirage-chain-supervisor"
 version.workspace = true
 edition.workspace = true
-
+repository = "https://github.com/knyaz-tishini/mirage2app"
+homepage = "https://github.com/knyaz-tishini/mirage2app"
 [[bin]]
 name = "mirage-chain-supervisor"
 path = "src/main.rs"

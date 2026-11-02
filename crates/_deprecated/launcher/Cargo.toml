@@ -1,8 +1,10 @@
 [package]
+license = "MIT"
 name = "mirage-launcher"
 version = "0.1.0"
 edition = "2021"
-
+repository = "https://github.com/knyaz-tishini/mirage2app"
+homepage = "https://github.com/knyaz-tishini/mirage2app"
 [[bin]]
 name = "mirage-launcher"
 path = "src/main.rs"
