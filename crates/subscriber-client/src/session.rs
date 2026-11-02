@@ -1242,14 +1242,20 @@ impl EntranceDialer {
         }
         let start = start % self.entrances.len();
         let mut last_err = EdgeDialError::NoEntrances;
-        // A refusal kept for the report: a transport whose face count does
-        // not fit in one hello is skipped, not fatal — another transport may
-        // still carry the session.
+        // A refusal kept for the report: it says which version the face does
+        // not speak. Another face of the same box may still serve the
+        // version, so a refusal does not end the walk over the faces.
+        let mut last_refusal: Option<EdgeDialError> = None;
+        // A transport whose face count does not fit in one hello is skipped,
+        // not fatal -- another transport may still carry the session.
         let mut too_many: Option<EdgeDialError> = None;
+        // The face the walk was on when it ended -- the report names it.
+        let mut last_probe = String::new();
         for offset in 0..self.entrances.len() {
             let idx = (start + offset) % self.entrances.len();
             let entrance = &self.entrances[idx];
             let probe_addr = entrance.addr.clone();
+            last_probe = probe_addr.clone();
             let session_transport = face_transport(&entrance.camouflage);
             let offered = offered_ports_for_transport(&self.entrances, session_transport)?;
             if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
@@ -1310,24 +1316,20 @@ impl EntranceDialer {
                     log_assigned(&probe_addr, &session);
                     return Ok((idx, session));
                 }
-                Err(e) => match e {
-                    EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. }))
-                        if version == EDGE_SESSION_WIRE_VERSION_V2 =>
-                    {
-                        info!(probe = %probe_addr, "edge session: edge refused version 2, falling back to version 1");
-                        let (fallback_idx, session) = EdgeSession::connect_first_available(
-                            &self.entrances,
-                            &self.mesh_id,
-                            self.client_static_priv,
-                            exit,
-                            0,
-                        )
-                        .await?;
-                        log_assigned(&probe_addr, &session);
-                        return Ok((fallback_idx, session));
+                Err(e) => match face_verdict(e) {
+                    FaceVerdict::Refused(refused) => {
+                        // A refusal is about THIS face: another face of the
+                        // same box may serve the version. The client must not
+                        // lose the plane because the face it tried first
+                        // speaks an older wire.
+                        debug!(
+                            entrance = %probe_addr,
+                            error = %refused,
+                            "edge session: this face refused the version, trying the next face"
+                        );
+                        last_refusal = Some(refused);
                     }
-                    refused @ EdgeDialError::Refused(_) => return Err(refused),
-                    other => {
+                    FaceVerdict::Failed(other) => {
                         debug!(
                             entrance = %probe_addr,
                             error = %other,
@@ -1338,6 +1340,25 @@ impl EntranceDialer {
                 },
             }
         }
+        // Every face refused this version: the refusal is the answer. It
+        // names the version the peer does not speak, and the caller steps
+        // down to it.
+        if let Some(refused) = last_refusal {
+            if version == EDGE_SESSION_WIRE_VERSION_V2 {
+                info!("edge session: no face speaks version 2, falling back to version 1");
+                let (fallback_idx, session) = EdgeSession::connect_first_available(
+                    &self.entrances,
+                    &self.mesh_id,
+                    self.client_static_priv,
+                    exit,
+                    0,
+                )
+                .await?;
+                log_assigned(&last_probe, &session);
+                return Ok((fallback_idx, session));
+            }
+            return Err(refused);
+        }
         // A face count that did not fit is the more specific refusal than
         // "no entrances" — report it when nothing else was tried.
         if let Some(err) = too_many {
@@ -1346,6 +1367,30 @@ impl EntranceDialer {
             }
         }
         Err(last_err)
+    }
+}
+
+/// What one face answered.
+#[derive(Debug)]
+enum FaceVerdict {
+    /// The face refused the version: it says which version it does not
+    /// speak. Another face of the same box may serve the version, so the walk
+    /// over the faces goes on.
+    Refused(EdgeDialError),
+    /// The face failed to answer at all: a transport error. Another face may
+    /// still serve the version.
+    Failed(EdgeDialError),
+}
+
+/// What the answer of one face means for the walk over the faces.
+///
+/// A refusal does NOT end the walk. It is about the face that gave it: the
+/// box may have another face that speaks the newer wire -- and that face is
+/// the one that carries the plane.
+fn face_verdict(err: EdgeDialError) -> FaceVerdict {
+    match err {
+        refused @ EdgeDialError::Refused(_) => FaceVerdict::Refused(refused),
+        other => FaceVerdict::Failed(other),
     }
 }
 
@@ -1965,6 +2010,36 @@ mod tests {
     }
 
     // ── interpret_welcome: refusal surfaced by name ─────────────────────
+
+    // ── the walk over the faces ─────────────────────────────────────────
+
+    /// A refusal is about the face that gave it. The walk over the faces
+    /// goes on: another face of the same box may speak the newer wire, and
+    /// that face is the one that carries the plane.
+    #[test]
+    fn a_refusal_does_not_end_the_walk_over_the_faces() {
+        let refused = EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion {
+            requested: 4,
+            supported: 3,
+        }));
+        match face_verdict(refused) {
+            FaceVerdict::Refused(EdgeDialError::Refused(RefusalDisplay(
+                EdgeRefusal::UnsupportedVersion { requested, supported },
+            ))) => {
+                assert_eq!(requested, 4);
+                assert_eq!(supported, 3);
+            }
+            other => panic!("a refusal must not end the walk, got {other:?}"),
+        }
+    }
+
+    /// A transport error is not a refusal: the face did not answer, and
+    /// another face may.
+    #[test]
+    fn a_transport_error_is_not_a_refusal() {
+        let failed = EdgeDialError::NoEntrances;
+        assert!(matches!(face_verdict(failed), FaceVerdict::Failed(_)));
+    }
 
     #[test]
     fn accepted_welcome_passes_through() {
