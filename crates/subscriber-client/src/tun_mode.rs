@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use mirage_core::config::TransportCamouflage;
+use mirage_core::mirage::wire::Protocol;
 use serde_json::{json, Value};
 
 use crate::artefact::{ArtefactEntrance, DeliveryArtefact};
@@ -78,7 +78,7 @@ impl WireMode {
     pub fn for_entrances(entrances: &[ArtefactEntrance]) -> Self {
         let plane = entrances
             .iter()
-            .any(|entrance| matches!(entrance.camouflage, TransportCamouflage::Quic { .. }));
+            .any(|entrance| matches!(entrance.protocol, Protocol::Quic { .. }));
         if plane {
             Self::RawIp
         } else {

@@ -56,6 +56,7 @@ pub mod claim;
 pub mod claim_image;
 pub mod control;
 pub mod dial;
+pub(crate) mod door;
 pub mod http_connect;
 pub mod ipv4;
 pub mod multi;

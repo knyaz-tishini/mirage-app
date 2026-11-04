@@ -395,14 +395,17 @@ impl SubscriberClient {
 mod tests {
     use super::*;
     use crate::artefact::{ArtefactEntrance, ArtefactMode, EntranceArtefact};
-    use mirage_core::config::TransportCamouflage;
+    use mirage_core::mirage::wire::{MirageCamouflage, MirageCarrier, Protocol};
 
     fn sample_artefact(n_entrances: usize) -> EntranceArtefact {
         let entrances = (0..n_entrances)
             .map(|i| ArtefactEntrance {
                 addr: format!("127.0.0.1:{}", 20000 + i),
                 server_pubkey_hex: format!("{:02x}", i).repeat(32),
-                camouflage: TransportCamouflage::None,
+                protocol: Protocol::Mirage {
+                    carrier: MirageCarrier::Tcp,
+                    camouflage: MirageCamouflage::None,
+                },
             })
             .collect();
         EntranceArtefact {
@@ -450,8 +453,10 @@ mod tests {
         // A datagram-shaped face is dialled over datagrams — the subscriber
         // must not be refused an artefact that carries nothing else.
         let mut artefact = sample_artefact(1);
-        artefact.entrances[0].camouflage =
-            TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:18530".parse().expect("valid addr") };
+        artefact.entrances[0].protocol = Protocol::Mirage {
+            carrier: MirageCarrier::Udp,
+            camouflage: MirageCamouflage::None,
+        };
         let bind = free_local_addr().await;
         let opts = SubscriberClientOptions { socks5_bind: bind, ..Default::default() };
         let client = SubscriberClient::build(&artefact, opts)

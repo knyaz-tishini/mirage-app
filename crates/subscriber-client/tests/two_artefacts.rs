@@ -14,7 +14,7 @@ const FLEET_ARTEFACT: &str = r#"{
   "entrances": [{
     "addr": "203.0.113.9:443",
     "server_pubkey_hex": "3333333333333333333333333333333333333333333333333333333333333333",
-    "camouflage": {"type": "tls_real", "sni": "entrance.example.com", "alpn": ["h2"]}
+    "protocol": {"type": "tls", "sni": "entrance.example.com", "alpn": ["h2"]}
   }],
   "mode": "full_auto",
   "label": "Ada",

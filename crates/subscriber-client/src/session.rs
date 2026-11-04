@@ -56,6 +56,7 @@ use mirage_control_plane::edge_session::{
 };
 use mirage_core::config::{AuthMode, MirageEndpointConfig, TransportCamouflage, TransportKind};
 use mirage_core::error::MirageError;
+use mirage_core::mirage::wire::Protocol;
 use mirage_mux::tokio_compat::{SessionHandle, TokioMuxStream};
 use mirage_mux::{MuxError, MuxStream};
 use mirage_protocol::plane::{PacketPlane, PlaneConnector};
@@ -150,6 +151,14 @@ pub enum EdgeDialError {
 
     #[error("edge session: the onion chain is unusable: {0}")]
     BadOnionChain(String),
+
+    /// The entrance is a protocol door. The Mirage dial does not speak it.
+    #[error("edge session: {protocol} is a protocol door, not a mirage entrance")]
+    NotMirage { protocol: &'static str },
+
+    /// The protocol door's handshake did not complete.
+    #[error("edge session: protocol door failed: {0}")]
+    Door(String),
 }
 
 /// Every way opening a mux stream on a live [`EdgeSession`] fails.
@@ -172,6 +181,10 @@ pub enum EdgeStreamError {
 
     #[error("edge stream: target is {len} bytes - the length-prefixed frame carries at most 65535")]
     TargetTooLong { len: usize },
+
+    /// The live session cannot carry this flow. The text names the protocol.
+    #[error("edge stream: {0}")]
+    Config(String),
 }
 
 /// How a stream's destination is framed to the far end.
@@ -285,6 +298,14 @@ pub struct EdgeSession {
     netstack: Option<Arc<crate::plane_net::PlaneStack>>,
     /// Who owns the packets of this session's plane.
     plane_consumer: PlaneConsumer,
+    /// The protocol door this session probed, when the entrance is not Mirage.
+    door: Option<ArtefactEntrance>,
+    /// Set when [`Self::abort`] tears a protocol-door session down.
+    ///
+    /// A door session has no mux handle. Without this flag [`Self::is_closed`]
+    /// would read that absence as a closed session and the supervisor would
+    /// redial immediately.
+    door_closed: AtomicBool,
 }
 
 impl Drop for EdgeSession {
@@ -372,6 +393,9 @@ impl EdgeSession {
         exit: ExitPreference,
         version: u8,
     ) -> Result<Self, EdgeDialError> {
+        if !is_mirage(&entrance.protocol) {
+            return open_protocol_door(entrance, exit).await;
+        }
         let (opened, welcome) =
             dial_face(entrance, mesh_id, client_static_priv, exit, false, &[], version).await?;
         // The direct dial has no carry behind it: the userspace stack is the
@@ -417,6 +441,9 @@ impl EdgeSession {
         client_static_priv: [u8; 32],
         exit: ExitPreference,
     ) -> Result<Self, EdgeDialError> {
+        if !is_mirage(&entrance.protocol) {
+            return open_protocol_door(entrance, exit).await;
+        }
         let mut tunnel = open_entrance_tunnel(entrance, mesh_id, client_static_priv).await?;
         let welcome = match send_hello_and_read_welcome(tunnel.as_mut(), exit).await {
             Ok(welcome) => welcome,
@@ -469,6 +496,9 @@ impl EdgeSession {
     /// A plane session has no mux: its liveness is the control wire of the
     /// same QUIC connection, which ends when the connection ends.
     pub fn is_closed(&self) -> bool {
+        if self.door.is_some() {
+            return self.door_closed.load(Ordering::Relaxed);
+        }
         let transport = self.plane.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(transport) = transport.as_ref() {
             if transport.plane.is_some() {
@@ -579,6 +609,7 @@ impl EdgeSession {
     /// The mono-protocol transport goes with it: dropping the QUIC endpoint
     /// closes the connection, so the packet plane stops with the session.
     pub fn abort(&self) {
+        self.door_closed.store(true, Ordering::Relaxed);
         let taken = self.session.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(taken);
         let transport = self.plane.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -598,6 +629,14 @@ impl EdgeSession {
     /// The returned stream reports how the open ended to this session's
     /// watchdog — see [`crate::watchdog`].
     pub async fn open_tcp_stream(&self, target: &str) -> Result<WatchedStream, EdgeStreamError> {
+        if let Some(door) = &self.door {
+            if matches!(door.protocol, Protocol::WireGuard { .. } | Protocol::AmneziaWg { .. }) {
+                return Err(EdgeStreamError::Config(format!(
+                    "{} is not a tcp proxy",
+                    door.protocol.label()
+                )));
+            }
+        }
         let stream = self.open_stream_with_backpressure().await?;
         let mut stream = WatchedStream::new(TokioMuxStream(stream), Arc::clone(&self.health));
         if let Err(e) = self.framing.write_target(&mut stream, target).await {
@@ -695,6 +734,8 @@ impl EdgeSession {
             plane: Mutex::new(None),
             netstack: None,
             plane_consumer: PlaneConsumer::Stack,
+            door: None,
+            door_closed: AtomicBool::new(false),
         }
     }
 
@@ -709,7 +750,42 @@ impl EdgeSession {
             plane: Mutex::new(None),
             netstack: None,
             plane_consumer: PlaneConsumer::Stack,
+            door: None,
+            door_closed: AtomicBool::new(false),
         }
+    }
+
+    /// A session whose handshake was the protocol door's own, not Mirage.
+    ///
+    /// The welcome is synthetic: version 1, no countries, the exit the caller
+    /// asked for. There is no mux. [`Self::is_closed`] stays false until
+    /// [`Self::abort`].
+    pub(crate) fn from_protocol_door(entrance: ArtefactEntrance, exit: ExitPreference) -> Self {
+        let entrance_label = entrance.addr.clone();
+        Self {
+            session: Mutex::new(None),
+            welcome: EdgeWelcome {
+                version: 1,
+                countries: Vec::new(),
+                outcome: EdgeOutcome::Accepted { exit },
+                assigned_face_port: None,
+                carries_datagrams: Some(false),
+                assigned_client: None,
+            },
+            entrance_label,
+            framing: StreamFraming::EdgeHeader,
+            health: Arc::new(StreamHealth::new()),
+            plane: Mutex::new(None),
+            netstack: None,
+            plane_consumer: PlaneConsumer::Stack,
+            door: Some(entrance),
+            door_closed: AtomicBool::new(false),
+        }
+    }
+
+    /// The protocol door behind this session, when the entrance is not Mirage.
+    pub(crate) fn protocol_door(&self) -> Option<&ArtefactEntrance> {
+        self.door.as_ref()
     }
 }
 
@@ -755,20 +831,19 @@ async fn open_entrance_tunnel(
         reason: e.to_string(),
     })?;
     let server_pubkey = entrance.server_pubkey()?;
-    // The camouflage — not this crate — decides the wire transport: a stream
-    // camouflage rides TCP, a datagram one rides datagrams. The config's
-    // `transport` field is therefore DERIVED from the mask, never hardcoded,
-    // so the tunnel this opens is dialled the way the face is published.
+    // The link decides the wire transport. Foreign protocols are not masks
+    // and do not go through the Mirage dial.
+    let mask = entrance_mask(entrance)?;
     let ep_config = MirageEndpointConfig {
-        transport: face_transport(&entrance.camouflage),
+        transport: face_transport(&mask),
         auth: AuthMode::Blake3,
-        camouflage: entrance.camouflage.clone(),
+        camouflage: mask.clone(),
         byte_cipher: None,
         byte_cipher_mode: None,
     };
     let proto = StaticKeyProtocol::new(ep_config, mesh_id.to_vec(), client_static_priv);
     Ok(proto
-        .connect_with_credential(addr, &server_pubkey, "", Some(entrance.camouflage.clone()), None)
+        .connect_with_credential(addr, &server_pubkey, "", Some(mask), None)
         .await?)
 }
 
@@ -782,7 +857,11 @@ async fn open_entrance(
     mesh_id: &[u8],
     client_static_priv: [u8; 32],
 ) -> Result<OpenedEntrance, EdgeDialError> {
-    if let Some(alpn) = quic_alpn(&entrance.camouflage) {
+    if !is_mirage(&entrance.protocol) {
+        return Err(EdgeDialError::NotMirage { protocol: entrance.protocol.label() });
+    }
+    let mask = entrance_mask(entrance)?;
+    if let Some(alpn) = quic_alpn(&mask) {
         let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
             EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
         })?;
@@ -887,6 +966,8 @@ fn plane_session(
         })),
         netstack,
         plane_consumer: consumer,
+        door: None,
+        door_closed: AtomicBool::new(false),
     }
 }
 
@@ -902,7 +983,38 @@ fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label
         plane: Mutex::new(None),
         netstack: None,
         plane_consumer: PlaneConsumer::Stack,
+        door: None,
+        door_closed: AtomicBool::new(false),
     }
+}
+
+/// Mirage is the only protocol the V9 dial speaks.
+fn is_mirage(protocol: &Protocol) -> bool {
+    matches!(protocol, Protocol::Mirage { .. })
+}
+
+/// One real handshake of a protocol door, then a session that stays up.
+async fn open_protocol_door(
+    entrance: &ArtefactEntrance,
+    exit: ExitPreference,
+) -> Result<EdgeSession, EdgeDialError> {
+    crate::door::probe(entrance)
+        .await
+        .map_err(EdgeDialError::Door)?;
+    Ok(EdgeSession::from_protocol_door(entrance.clone(), exit))
+}
+
+/// The old mask for a Mirage door, with the port taken from `addr`.
+fn entrance_mask(entrance: &ArtefactEntrance) -> Result<TransportCamouflage, EdgeDialError> {
+    if !is_mirage(&entrance.protocol) {
+        return Err(EdgeDialError::NotMirage { protocol: entrance.protocol.label() });
+    }
+    let port = entrance_tcp_port(entrance)?;
+    entrance
+        .protocol
+        .to_mask(port)
+        .map_err(MirageError::Config)
+        .map_err(EdgeDialError::from)
 }
 
 fn entrance_tcp_port(entrance: &ArtefactEntrance) -> Result<u16, EdgeDialError> {
@@ -940,11 +1052,22 @@ fn offered_ports_for_transport(
     entrances: &[ArtefactEntrance],
     transport: TransportKind,
 ) -> Result<Vec<(usize, u16)>, EdgeDialError> {
-    let faces: Vec<(usize, &TransportCamouflage, u16)> = entrances
+    let mut owned = Vec::new();
+    for (idx, entrance) in entrances.iter().enumerate() {
+        if !is_mirage(&entrance.protocol) {
+            continue;
+        }
+        let port = entrance_tcp_port(entrance)?;
+        let mask = entrance
+            .protocol
+            .to_mask(port)
+            .map_err(MirageError::Config)?;
+        owned.push((idx, mask, port));
+    }
+    let faces: Vec<(usize, &TransportCamouflage, u16)> = owned
         .iter()
-        .enumerate()
-        .map(|(idx, e)| Ok((idx, &e.camouflage, entrance_tcp_port(e)?)))
-        .collect::<Result<Vec<_>, EdgeDialError>>()?;
+        .map(|(idx, mask, port)| (*idx, mask, *port))
+        .collect();
     Ok(filter_offered_faces_by_transport(&faces, transport))
 }
 
@@ -1254,9 +1377,28 @@ impl EntranceDialer {
         for offset in 0..self.entrances.len() {
             let idx = (start + offset) % self.entrances.len();
             let entrance = &self.entrances[idx];
+            if !is_mirage(&entrance.protocol) {
+                match crate::door::probe(entrance).await {
+                    Ok(()) => {
+                        let session = EdgeSession::from_protocol_door(entrance.clone(), exit);
+                        log_assigned(&entrance.addr, &session);
+                        return Ok((idx, session));
+                    }
+                    Err(reason) => {
+                        debug!(
+                            entrance = %entrance.addr,
+                            error = %reason,
+                            "edge session: protocol door probe failed, trying the next entrance"
+                        );
+                        last_err = EdgeDialError::Door(reason);
+                        continue;
+                    }
+                }
+            }
             let probe_addr = entrance.addr.clone();
             last_probe = probe_addr.clone();
-            let session_transport = face_transport(&entrance.camouflage);
+            let mask = entrance_mask(entrance)?;
+            let session_transport = face_transport(&mask);
             let offered = offered_ports_for_transport(&self.entrances, session_transport)?;
             if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
                 too_many.get_or_insert(EdgeDialError::TooManyFaces {
@@ -2098,20 +2240,23 @@ mod tests {
         let face = |addr: &str, camouflage: TransportCamouflage| ArtefactEntrance {
             addr: addr.to_owned(),
             server_pubkey_hex: "ab".repeat(32),
-            camouflage,
+            protocol: mirage_core::mirage::wire::Protocol::try_from(&camouflage)
+                .expect("the test mask is a protocol"),
         };
         vec![
-            face(
-                "203.0.113.10:80",
-                TransportCamouflage::WebSocket { path: "/".to_owned(), host: "h".to_owned() },
-            ),
+            face("203.0.113.10:80", TransportCamouflage::None),
             face(
                 "203.0.113.10:5060",
                 TransportCamouflage::RawUdp { bind_addr: "0.0.0.0:5060".parse().expect("addr") },
             ),
             face(
                 "203.0.113.10:443",
-                TransportCamouflage::TlsReal { sni: "ex".to_owned(), alpn: Vec::new() },
+                TransportCamouflage::Reality {
+                    short_id: "a".to_owned(),
+                    server_name: "ex".to_owned(),
+                    max_time_diff: 0,
+                    fallback_dest: None,
+                },
             ),
             face(
                 "203.0.113.10:853",
@@ -2209,9 +2354,13 @@ mod tests {
     #[test]
     fn the_transport_of_a_face_comes_from_its_camouflage() {
         let entrances = mixed_face_artefact();
-        assert_eq!(face_transport(&entrances[0].camouflage), TransportKind::Tcp);
-        assert_eq!(face_transport(&entrances[1].camouflage), TransportKind::Udp);
-        assert_eq!(face_transport(&entrances[5].camouflage), TransportKind::Udp);
+        let mask = |entrance: &ArtefactEntrance| {
+            let port = entrance_tcp_port(entrance).expect("port");
+            entrance.protocol.to_mask(port).expect("the test link is a mask")
+        };
+        assert_eq!(face_transport(&mask(&entrances[0])), TransportKind::Tcp);
+        assert_eq!(face_transport(&mask(&entrances[1])), TransportKind::Udp);
+        assert_eq!(face_transport(&mask(&entrances[5])), TransportKind::Udp);
     }
 
     #[test]

@@ -30,6 +30,7 @@
 use mirage_client_chain::oss::OssProposal;
 use mirage_core::config::TransportCamouflage;
 use mirage_core::crypto::KeyPair;
+use mirage_core::mirage::wire::Protocol;
 use thiserror::Error;
 
 use crate::artefact::{ArtefactEntrance, ArtefactError, ArtefactMode, EntranceArtefact};
@@ -81,10 +82,12 @@ pub fn build(
         if !camouflage.carries_reliable_stream() {
             continue;
         }
+        let protocol = Protocol::try_from(&camouflage)
+            .map_err(OssArtefactError::BadMask)?;
         entrances.push(ArtefactEntrance {
             addr: format!("{host}:{}", face.port),
             server_pubkey_hex: proposal.server_public_key_hex.clone(),
-            camouflage,
+            protocol,
         });
     }
     if entrances.is_empty() {
@@ -180,12 +183,9 @@ mod tests {
             "f0e1d3d2b6afca2614fee067738ea2b25cf2c9f1b819e3eea3cd64da1f505901"
         );
         assert_eq!(
-            artefact.entrances[0].camouflage,
-            TransportCamouflage::Quic {
-                alpn: vec!["h3".to_owned()],
-                bind_addr: "0.0.0.0:41444".parse().expect("addr"),
-            },
-            "the mask must decode to the real typed variant, unmodified"
+            artefact.entrances[0].protocol,
+            Protocol::Quic { alpn: vec!["h3".to_owned()] },
+            "the publication's quic mask becomes the quic protocol"
         );
     }
 

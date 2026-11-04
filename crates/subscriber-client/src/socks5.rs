@@ -525,6 +525,53 @@ async fn handle_connect(
         return;
     }
 
+    if let Some(entrance) = session.protocol_door().cloned() {
+            let Some((host, port)) = split_target(&target) else {
+                warn!(target = %target, "socks5: the destination is malformed — refusing CONNECT");
+                let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+                return;
+            };
+            match crate::door::open_carrying(&entrance, &host, port).await {
+                Ok(mut edge_stream) => {
+                    if write_reply(&mut stream, REP_SUCCESS).await.is_err() {
+                        return;
+                    }
+                    let started = std::time::Instant::now();
+                    info!(target = %target, "socks5: CONNECT flow opened");
+                    match crate::relay::copy_bidirectional_with_flow_idle_timeout(
+                        &mut stream,
+                        &mut edge_stream,
+                    )
+                    .await
+                    {
+                        Ok((to_edge, from_edge)) => {
+                            info!(
+                                target = %target,
+                                to_edge,
+                                from_edge,
+                                ms = started.elapsed().as_millis() as u64,
+                                "socks5: CONNECT flow ended"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                target = %target,
+                                error = %e,
+                                kind = ?e.kind(),
+                                ms = started.elapsed().as_millis() as u64,
+                                "socks5: CONNECT flow ended with an error"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(target = %target, error = %e, "socks5: the protocol door did not open");
+                    let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+                }
+            }
+            return;
+    }
+
     match session.open_tcp_stream(&target).await {
         Ok(mut edge_stream) => {
             if write_reply(&mut stream, REP_SUCCESS).await.is_err() {

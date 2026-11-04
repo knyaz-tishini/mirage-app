@@ -47,7 +47,7 @@
 //! published face, never grouped by box — and each entry describes exactly
 //! one dialable face. There is nowhere on this type to put a second hop.
 
-use mirage_core::config::TransportCamouflage;
+use mirage_core::mirage::wire::Protocol;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -92,7 +92,10 @@ pub struct EntranceArtefact {
 }
 
 /// One dialable face — see [`EntranceArtefact::entrances`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` prints the protocol's name, not its body. WireGuard and
+/// Shadowsocks carry key material.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ArtefactEntrance {
     /// `host:port` of this published face.
     pub addr: String,
@@ -100,10 +103,20 @@ pub struct ArtefactEntrance {
     /// `handshake_client_stream_v9`'s `server_static_pub` parameter — see
     /// the module doc for why this field exists on this type today.
     pub server_pubkey_hex: String,
-    /// Reused verbatim from `mirage_core::config::TransportCamouflage` (the
-    /// same type `HopConfig.camouflage` already carries to clients). No new
-    /// descriptor type invented for this.
-    pub camouflage: TransportCamouflage,
+    /// The link this face speaks. The port is [`Self::addr`], not a field
+    /// of the protocol. Dial code that still needs the old mask calls
+    /// [`Protocol::to_mask`].
+    pub protocol: Protocol,
+}
+
+impl std::fmt::Debug for ArtefactEntrance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtefactEntrance")
+            .field("addr", &self.addr)
+            .field("server_pubkey_hex", &self.server_pubkey_hex)
+            .field("protocol", &self.protocol.label())
+            .finish()
+    }
 }
 
 /// The one customer-facing choice the owner's ruling grants: automatic, or a
@@ -326,12 +339,15 @@ mod tests {
                 ArtefactEntrance {
                     addr: "203.0.113.10:8443".to_owned(),
                     server_pubkey_hex: "22".repeat(HEX32_BYTES),
-                    camouflage: TransportCamouflage::None,
+                    protocol: Protocol::Mirage {
+                        carrier: mirage_core::mirage::wire::MirageCarrier::Tcp,
+                        camouflage: mirage_core::mirage::wire::MirageCamouflage::None,
+                    },
                 },
                 ArtefactEntrance {
                     addr: "203.0.113.11:8443".to_owned(),
                     server_pubkey_hex: "33".repeat(HEX32_BYTES),
-                    camouflage: TransportCamouflage::WebSocket {
+                    protocol: Protocol::WebSocket {
                         path: "/ws".to_owned(),
                         host: "cdn.example.com".to_owned(),
                     },
@@ -482,7 +498,7 @@ mod tests {
             "entrances": [{
                 "addr": "203.0.113.9:443",
                 "server_pubkey_hex": "33".repeat(32),
-                "camouflage": {"type": "tls_real", "sni": "entrance.example.com", "alpn": ["h2"]}
+                "protocol": {"type": "tls", "sni": "entrance.example.com", "alpn": ["h2"]}
             }],
             "mode": "full_auto",
             "label": "Ada",
@@ -510,9 +526,9 @@ mod tests {
             "the panel's server_pubkey_hex must decode to the exact bytes it sent"
         );
         assert_eq!(
-            entrance.camouflage,
-            TransportCamouflage::TlsReal { sni: "entrance.example.com".to_owned(), alpn: vec!["h2".to_owned()] },
-            "the panel's opaque camouflage passthrough must decode to the exact typed variant, unmodified"
+            entrance.protocol,
+            Protocol::Tls { sni: "entrance.example.com".to_owned(), alpn: vec!["h2".to_owned()] },
+            "the entrance protocol must decode to the typed link"
         );
 
         assert_eq!(

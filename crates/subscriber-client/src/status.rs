@@ -126,6 +126,7 @@ impl From<&EdgeDialError> for EdgeReason {
             EdgeDialError::Refused(RefusalDisplay(EdgeRefusal::UnsupportedVersion { .. })) => {
                 Self::RefusedUnsupportedVersion
             }
+            EdgeDialError::Door(_) | EdgeDialError::NotMirage { .. } => Self::HandshakeFailed,
         }
     }
 }
