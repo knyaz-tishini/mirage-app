@@ -4,9 +4,10 @@
 //! UI tick and updates both.
 //!
 //! The menu is one action (подключиться / отключиться) and quit.
-//! The icon tip follows the link. A state change posts the system balloon
-//! Amnezia posts from `QSystemTrayIcon::showMessage`: title is the app,
-//! body is the state, and "disconnected" is sent only after a real link.
+//! The hover tip is the app name and version. The palm color is the state.
+//! A state change posts the system balloon Amnezia posts from
+//! `QSystemTrayIcon::showMessage`: title is the app, body is the state,
+//! the picture is the palm, and "disconnected" is sent only after a real link.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -18,6 +19,7 @@ use super::{post, Cmd};
 
 const PALM: &[u8] = include_bytes!("../palm64.rgba");
 const SIDE: u32 = 64;
+const CAPTION: &str = concat!("m1r4g3 ", env!("CARGO_PKG_VERSION"));
 
 struct Live {
     tray: TrayIcon,
@@ -91,7 +93,7 @@ fn open(up: bool) -> Option<Live> {
     }
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(state_tip(up))
+        .with_tooltip(CAPTION)
         .with_menu_on_left_click(false)
         .with_icon(icon)
         .with_icon_as_template(cfg!(target_os = "macos") && up)
@@ -123,7 +125,6 @@ fn refresh(live: &mut Live, up: bool) {
         live.up = up;
         live.link.set_text(action(up));
         live.quit.set_text(crate::text::tr("shelf.quit"));
-        let _ = live.tray.set_tooltip(Some(state_tip(up)));
     }
     announce(live, up);
     let rgb = paint(up);
@@ -202,7 +203,7 @@ fn announce(live: &mut Live, up: bool) {
 fn balloon(up: bool) -> bool {
     let body = state_tip(up);
     #[cfg(windows)]
-    return win_balloon("m1r4g3", body);
+    return win_balloon("m1r4g3", body, up);
     #[cfg(target_os = "linux")]
     {
         linux_balloon("m1r4g3", body);
@@ -326,11 +327,14 @@ fn gsettings(key: &str) -> Option<String> {
 /// (`tray_icon_app`); this finds that window in this process and posts
 /// the balloon on it. Two seconds, same as Amnezia.
 #[cfg(windows)]
-fn win_balloon(title: &str, body: &str) -> bool {
+fn win_balloon(title: &str, body: &str, up: bool) -> bool {
     let Some((hwnd, uid)) = find_tray() else {
         warn_balloon("icon not found");
         return false;
     };
+    // NIIF_INFO is the system "i". NIIF_USER draws hBalloonIcon instead.
+    let palm = balloon_palm(up);
+    let info_flags = if palm == 0 { NIIF_INFO } else { NIIF_USER | NIIF_LARGE_ICON };
     let mut nid = NotifyIcon {
         cb_size: std::mem::size_of::<NotifyIcon>() as u32,
         hwnd,
@@ -344,9 +348,9 @@ fn win_balloon(title: &str, body: &str) -> bool {
         info: [0; 256],
         timeout: 2000,
         title: [0; 64],
-        info_flags: NIIF_INFO,
+        info_flags,
         guid: Guid { data1: 0, data2: 0, data3: 0, data4: [0; 8] },
-        balloon_icon: 0,
+        balloon_icon: palm,
     };
     write_wide(&mut nid.info, body);
     write_wide(&mut nid.title, title);
@@ -443,7 +447,47 @@ const NIF_SHOWTIP: u32 = 0x80;
 #[cfg(windows)]
 const NIIF_INFO: u32 = 0x1;
 #[cfg(windows)]
+const NIIF_USER: u32 = 0x4;
+#[cfg(windows)]
+const NIIF_LARGE_ICON: u32 = 0x20;
+#[cfg(windows)]
 const NIM_MODIFY: u32 = 0x1;
+
+/// One palm per link state. The shell keeps the handle for the balloon,
+/// so these live until the process exits.
+#[cfg(windows)]
+fn balloon_palm(up: bool) -> isize {
+    use std::sync::atomic::AtomicIsize;
+    static PALMS: [AtomicIsize; 2] = [AtomicIsize::new(0), AtomicIsize::new(0)];
+    let slot = &PALMS[usize::from(up)];
+    let existing = slot.load(Ordering::SeqCst);
+    if existing != 0 {
+        return existing;
+    }
+    let handle = palm_icon(&palm(paint(up)));
+    if handle == 0 {
+        warn_balloon("palm icon failed");
+        return 0;
+    }
+    slot.store(handle, Ordering::SeqCst);
+    handle
+}
+
+#[cfg(windows)]
+fn palm_icon(rgba: &[u8]) -> isize {
+    let pixels = rgba.len() / 4;
+    let mut bgra = vec![0u8; rgba.len()];
+    let mut mask = vec![0u8; pixels];
+    for i in 0..pixels {
+        let o = i * 4;
+        bgra[o] = rgba[o + 2];
+        bgra[o + 1] = rgba[o + 1];
+        bgra[o + 2] = rgba[o];
+        bgra[o + 3] = rgba[o + 3];
+        mask[i] = rgba[o + 3].wrapping_sub(u8::MAX);
+    }
+    unsafe { CreateIcon(0, SIDE as i32, SIDE as i32, 1, 32, mask.as_ptr(), bgra.as_ptr()) }
+}
 
 #[cfg(windows)]
 #[repr(C)]
@@ -512,6 +556,15 @@ extern "system" {
     fn EnumWindows(cb: unsafe extern "system" fn(isize, isize) -> i32, param: isize) -> i32;
     fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
     fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+    fn CreateIcon(
+        instance: isize,
+        width: i32,
+        height: i32,
+        planes: u32,
+        bits_per_pixel: u32,
+        and_bits: *const u8,
+        xor_bits: *const u8,
+    ) -> isize;
 }
 
 #[cfg(windows)]
