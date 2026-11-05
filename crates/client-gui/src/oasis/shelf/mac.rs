@@ -44,6 +44,7 @@ unsafe fn install() {
         return;
     }
     HANDLER.store(handler, Ordering::SeqCst);
+    set_dock_icon();
     let class = objc_getClass(b"WinitApplicationDelegate\0".as_ptr());
     if class.is_null() {
         tracing::warn!("dock shelf: no application delegate");
@@ -170,6 +171,53 @@ unsafe fn msg3(
         *mut std::ffi::c_void,
     ) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel_registerName(sel.as_ptr()), a, b, c)
+}
+
+/// The Dock reads the application icon. winit drops `set_window_icon`
+/// on macOS, so the palm is set here. The menu-bar palm is the tray.
+unsafe fn set_dock_icon() {
+    const PALM: &[u8] = include_bytes!("../palm64.rgba");
+    let Some(image) = image::RgbaImage::from_raw(64, 64, PALM.to_vec()) else {
+        return;
+    };
+    let image = image::DynamicImage::ImageRgba8(image);
+    let mut png = std::io::Cursor::new(Vec::new());
+    if image.write_to(&mut png, image::ImageFormat::Png).is_err() {
+        return;
+    }
+    let bytes = png.into_inner();
+    let data = msg_bytes(
+        objc_getClass(b"NSData\0".as_ptr()),
+        b"dataWithBytes:length:\0",
+        bytes.as_ptr() as *mut std::ffi::c_void,
+        bytes.len(),
+    );
+    let icon = msg1(
+        msg0(objc_getClass(b"NSImage\0".as_ptr()), b"alloc\0"),
+        b"initWithData:\0",
+        data,
+    );
+    let app = msg0(objc_getClass(b"NSApplication\0".as_ptr()), b"sharedApplication\0");
+    msg1(app, b"setApplicationIconImage:\0", icon);
+    tracing::info!("dock palm");
+}
+
+unsafe fn msg_bytes(
+    obj: *mut std::ffi::c_void,
+    sel: &[u8],
+    bytes: *mut std::ffi::c_void,
+    len: usize,
+) -> *mut std::ffi::c_void {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    let f: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        usize,
+    ) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel_registerName(sel.as_ptr()), bytes, len)
 }
 
 unsafe fn msg_bool(obj: *mut std::ffi::c_void, sel: &[u8], value: i8) {

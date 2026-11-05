@@ -1879,6 +1879,12 @@ fn app_window(key: &str, w: u32, h: u32, x: i32, y: i32) -> WindowSpec {
     window.tick = Some(TickRate::Capped(60));
     window.decorations = false;
     window.corner_style = uzor::CornerStyle::Rounded;
+    // macOS keeps the system rounded frame only when the undecorated
+    // window is also transparent. A borderless window is square.
+    #[cfg(target_os = "macos")]
+    {
+        window.transparent = true;
+    }
     window.position = Some((x, y));
     window.min_inner_size = Some(SizePx::new(320, 320));
     window
@@ -1897,7 +1903,43 @@ fn local_clock() -> (f64, f64, f64) {
     }
     #[cfg(not(windows))]
     {
-        (12.0, 172.0, 0.0)
+        unix_clock()
+    }
+}
+
+/// Local hour, day of year (1-based), and whether daylight time is in effect.
+#[cfg(not(windows))]
+fn unix_clock() -> (f64, f64, f64) {
+    #[repr(C)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: i64,
+        zone: *const i8,
+    }
+    extern "C" {
+        fn time(tloc: *mut i64) -> i64;
+        fn localtime_r(clock: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+    unsafe {
+        let mut secs = 0i64;
+        if time(&mut secs) < 0 {
+            return (0.0, 1.0, 0.0);
+        }
+        let mut tm = std::mem::zeroed::<Tm>();
+        if localtime_r(&secs, &mut tm).is_null() {
+            return (0.0, 1.0, 0.0);
+        }
+        let hour = tm.hour as f64 + tm.min as f64 / 60.0 + tm.sec as f64 / 3600.0;
+        let dst = if tm.isdst > 0 { 1.0 } else { 0.0 };
+        (hour, tm.yday as f64 + 1.0, dst)
     }
 }
 
