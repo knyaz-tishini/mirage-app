@@ -1,6 +1,6 @@
 # mirage2app
 
-Mirage VPN client: CLI + client-core library. Extracted from mirage2web.
+m1r4g3 client: CLI + client-core library. Extracted from mirage2web.
 
 ## L0 stack (client side)
 

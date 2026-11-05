@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-client-gui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arboard",
  "async-trait",

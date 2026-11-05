@@ -148,10 +148,10 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "c.key_own" => ("свой ключ", "own key"),
         "c.key_file" => ("ключ из файла", "key from file"),
 
-        "kit.qm" => ("quic + mirage", "quic + mirage"),
+        "kit.qm" => ("quic + m1r4g3", "quic + m1r4g3"),
         "kit.qm.d" => (
-            "quic UDP 443, мираж TCP 443 80 8080 8443",
-            "quic UDP 443, mirage TCP 443 80 8080 8443",
+            "quic UDP 443, m1r4g3 TCP 443 80 8080 8443",
+            "quic UDP 443, m1r4g3 TCP 443 80 8080 8443",
         ),
         "kit.quic" => ("quic", "quic"),
         "kit.quic.d" => ("UDP 443", "UDP 443"),
