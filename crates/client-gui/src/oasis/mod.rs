@@ -1205,8 +1205,6 @@ impl Oasis {
                 match spec.focus {
                     stand::Focus::Host
                     | stand::Focus::User
-                    | stand::Focus::Port
-                    | stand::Focus::Mtu
                     | stand::Focus::Dns
                     | stand::Focus::Except
                     | stand::Focus::Binary

@@ -25,6 +25,12 @@
 //! The first press of "install" does step 1 and stops there; the second one
 //! does step 2. The image, the compose file, the volume and the
 //! `m1r4g3-link <LINK>` line are the same in both.
+//!
+//! A job with [`Job::profile`] set skips that question. The uploaded file is
+//! three lines (`STACK`, `PROFILE`, `PROFILE_HOST`). The install script
+//! expands it, before the container stays up, by running the image's
+//! `m1r4g3-server env`. The expanded file has no `PROFILE=` line, so a later
+//! start does not mint a new key.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,7 +111,15 @@ pub struct Job {
     ///
     /// The first press of "install" asks; the second one installs with the
     /// faces the person chose.
+    ///
+    /// Ignored when [`Self::profile`] is set: a profile does not ask.
     pub ask_faces: bool,
+    /// `all`, `quic`, or `quic-mirage`.
+    ///
+    /// When set, the uploaded `server.env` is the three-line stub from
+    /// [`profile_env`], and the box expands it. Anything else is refused
+    /// before SSH. `None` keeps the face list in [`Self::env`].
+    pub profile: Option<String>,
     /// This box's own state directory.
     ///
     /// `None` means the default one, next to the executable. A chain gives
@@ -113,6 +127,22 @@ pub struct Job {
     /// the host-key pin of that box belong to THAT box, and two boxes must
     /// not overwrite each other's.
     pub state: Option<PathBuf>,
+}
+
+/// The `server.env` a profile install uploads.
+///
+/// Three lines, and nothing else. The box expands them. `profile` must be
+/// `all`, `quic`, or `quic-mirage`. Any other name is the error, and the
+/// caller refuses it before SSH.
+pub fn profile_env(profile: &str, host: &str) -> Result<String, String> {
+    if !matches!(profile, "all" | "quic" | "quic-mirage") {
+        return Err(format!(
+            "unknown profile '{profile}': use all, quic, or quic-mirage"
+        ));
+    }
+    Ok(format!(
+        "STACK=auto\nPROFILE={profile}\nPROFILE_HOST={host}\n"
+    ))
 }
 
 /// What one install step ended with.
@@ -190,6 +220,68 @@ pub fn remove(host: String, port: u16, user: String, bus: Arc<InstallBus>) {
     });
 }
 
+/// Read `/data/client.link` off a box that is already up.
+///
+/// Key only, same door as [`remove`]. No password, no `server.env`, no
+/// `m1r4g3-server env`, no `docker compose up`. The line that comes back is
+/// the one the container already wrote. This does not mint a key.
+pub fn fetch_link(host: String, port: u16, user: String, bus: Arc<InstallBus>) {
+    use std::sync::atomic::Ordering;
+    if bus.running.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt.block_on(read_client_link(&host, port, &user)),
+            Err(err) => Err(format!("runtime: {err}")),
+        };
+        match outcome {
+            Ok(link) => {
+                *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(link);
+                set_text(&bus, crate::i18n::tr("p.config_ok"));
+            }
+            Err(err) => set_text(&bus, &err),
+        }
+        bus.running.store(false, Ordering::Relaxed);
+    });
+}
+
+/// The remote command that prints the existing client link and nothing else.
+pub(crate) fn fetch_link_sh() -> &'static str {
+    r#"if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+if $SUDO docker compose version >/dev/null 2>&1; then
+  $SUDO docker compose -f /opt/m1r4g3/docker-compose.yml exec -T mirage cat /data/client.link
+else
+  $SUDO docker-compose -f /opt/m1r4g3/docker-compose.yml exec -T mirage cat /data/client.link
+fi
+"#
+}
+
+async fn read_client_link(host: &str, port: u16, user: &str) -> Result<String, String> {
+    let dir = state_dir()?;
+    let key_path = dir.join("server.key");
+    if !key_path.is_file() {
+        return Err(crate::i18n::tr("p.no_key").into());
+    }
+    let pem = fs::read(&key_path).map_err(|e| format!("key: {e}"))?;
+    let pins = dir.join("host-keys.json");
+    let addr = format!("{host}:{port}");
+    let session = connect_key(&addr, user, &pem, &pins).await?;
+    let out = exec(&session, fetch_link_sh()).await?;
+    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+    if out.exit.unwrap_or(1) != 0 {
+        let err = out.stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
+        if err.is_empty() {
+            return Err(format!("{}: exit {:?}", crate::i18n::tr("p.container"), out.exit));
+        }
+        return Err(format!("{}: {err}", crate::i18n::tr("p.container")));
+    }
+    match out.stdout.lines().map(str::trim).find(|line| !line.is_empty()) {
+        Some(line) => Ok(line.to_owned()),
+        None => Err(crate::i18n::tr("p.no_config").into()),
+    }
+}
+
 async fn take_down(host: &str, port: u16, user: &str) -> Result<(), String> {
     let dir = state_dir()?;
     let key_path = dir.join("server.key");
@@ -217,6 +309,11 @@ pub(crate) fn set_text(bus: &InstallBus, line: &str) {
 }
 
 pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
+    // A profile the box does not know is refused by name, before any SSH.
+    let profile_body = match job.profile.as_deref() {
+        Some(name) => Some(profile_env(name, &job.host)?),
+        None => None,
+    };
     let dir = job_state_dir(&job)?;
     let key_path = dir.join("server.key");
     let pub_path = dir.join("server.pub");
@@ -265,7 +362,9 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
     let remote = "/opt/m1r4g3";
     exec(&session, &format!("mkdir -p {remote}")).await?;
     upload(&session, COMPOSE.as_bytes(), &format!("{remote}/docker-compose.yml")).await?;
-    let env = if job.env.is_empty() {
+    let env = if let Some(body) = profile_body.as_deref() {
+        body.to_owned()
+    } else if job.env.is_empty() {
         format!("STACK={}\n", job.stack)
     } else {
         job.env
@@ -283,7 +382,7 @@ pub async fn install(job: Job, bus: &InstallBus) -> Result<Outcome, String> {
         }
     }
 
-    if job.ask_faces {
+    if profile_body.is_none() && job.ask_faces {
         // Step one: the box is asked what it could publish. Nothing is
         // published yet — the person chooses, and the second press carries
         // the choice out.
@@ -1037,6 +1136,35 @@ set -eu
 if [ -f image.tar ]; then
   $SUDO docker load -i image.tar
 fi
+# PROFILE= is a request, not a server. Expand it once, here, and replace
+# server.env with that stdout. The image entrypoint is not used: it prints
+# a banner, and the banner would land in the file. Compose v1 also writes
+# "Creating" and "Attaching" on stdout, so only blanks, comments, and
+# KEY=VALUE are kept. The expanded file has no PROFILE= line, so a later
+# start does not mint new keys.
+if grep -q '^PROFILE=' server.env; then
+  PROFILE_NAME=$(grep '^PROFILE=' server.env | tail -n 1 | cut -d= -f2- | tr -d '\r')
+  PROFILE_HOST=$(grep '^PROFILE_HOST=' server.env | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)
+  if [ -z "$PROFILE_HOST" ]; then
+    PROFILE_HOST=localhost
+  fi
+  if $SUDO docker compose version >/dev/null 2>&1; then
+    $SUDO docker compose run --rm -T --no-deps --entrypoint m1r4g3-server mirage env "$PROFILE_NAME" --host "$PROFILE_HOST" > server.env.expanded
+  else
+    $SUDO docker-compose run --rm -T --no-deps --entrypoint m1r4g3-server mirage env "$PROFILE_NAME" --host "$PROFILE_HOST" > server.env.expanded
+  fi
+  grep -E '^(#|[[:space:]]*$|[A-Za-z_][A-Za-z0-9_]*=)' server.env.expanded > server.env.clean || true
+  mv server.env.clean server.env.expanded
+  if ! grep -q '^PROTOCOLS=' server.env.expanded; then
+    echo "m1r4g3-server env did not print a PROTOCOLS= line" >&2
+    exit 22
+  fi
+  if grep -q '^PROFILE=' server.env.expanded; then
+    echo "expanded server.env still contains PROFILE=" >&2
+    exit 23
+  fi
+  mv server.env.expanded server.env
+fi
 if $SUDO docker compose version >/dev/null 2>&1; then
   $SUDO docker compose up -d
   LINK="$($SUDO docker compose exec -T mirage cat /data/client.link 2>/dev/null | head -n 1 | tr -d '\r' || true)"
@@ -1114,6 +1242,71 @@ mod tests {
         assert!(
             faces_sh().contains("apt-get install -y docker.io"),
             "the proposal must install docker too — it asks the box to speak"
+        );
+    }
+
+    /// Fetch prints the link the container already wrote. It does not install.
+    #[test]
+    fn the_fetch_shell_only_reads_client_link() {
+        let script = fetch_link_sh();
+        assert!(script.contains("cat /data/client.link"), "{script}");
+        assert!(script.contains("docker compose"), "{script}");
+        assert!(script.contains("docker-compose"), "{script}");
+        assert!(!script.contains("PROFILE="), "{script}");
+        assert!(!script.contains("server.env"), "{script}");
+    }
+
+    /// A profile job does not upload a face list. The box expands the stub.
+    #[test]
+    fn a_profile_job_uploads_the_three_line_stub() {
+        let stub = profile_env("quic-mirage", "box.example").expect("profile");
+        assert_eq!(
+            stub,
+            "STACK=auto\nPROFILE=quic-mirage\nPROFILE_HOST=box.example\n"
+        );
+        assert_eq!(
+            profile_env("all", "localhost").expect("all"),
+            "STACK=auto\nPROFILE=all\nPROFILE_HOST=localhost\n"
+        );
+        assert_eq!(
+            profile_env("quic", "h").expect("quic"),
+            "STACK=auto\nPROFILE=quic\nPROFILE_HOST=h\n"
+        );
+        let err = profile_env("mask", "box.example").expect_err("refused");
+        assert!(err.contains("mask"), "{err}");
+        assert!(err.contains("all"), "{err}");
+        assert!(err.contains("quic-mirage"), "{err}");
+    }
+
+    /// The image expands PROFILE after it is loaded and before it stays up.
+    /// Both compose commands do it, and a banner from the entrypoint is not
+    /// part of the file.
+    #[test]
+    fn the_install_expands_a_profile_before_the_container_starts() {
+        let script = install_sh();
+        let load = script.find("docker load -i image.tar").expect("the image is loaded");
+        let expand = script
+            .find("m1r4g3-server env")
+            .expect("the image prints the env");
+        let up = script.find("docker compose up -d").expect("compose up");
+        assert!(load < expand, "expand after the image is loaded");
+        assert!(expand < up, "expand before the container stays up");
+        assert!(
+            script.contains("docker compose run --rm -T --no-deps --entrypoint m1r4g3-server"),
+            "compose v2 skips the entrypoint"
+        );
+        assert!(
+            script.contains("docker-compose run --rm -T --no-deps --entrypoint m1r4g3-server"),
+            "compose v1 skips the entrypoint"
+        );
+        assert!(script.contains("^PROTOCOLS="), "a body without PROTOCOLS= fails");
+        assert!(
+            script.contains("^PROFILE="),
+            "an expanded file that still says PROFILE= fails"
+        );
+        assert!(
+            script.contains("server.env.clean"),
+            "compose chatter on stdout must not become server.env"
         );
     }
 

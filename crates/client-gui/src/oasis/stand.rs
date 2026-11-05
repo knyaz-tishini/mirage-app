@@ -1,10 +1,19 @@
 //! Standalone sheet. Four sections under the chrome divider: server, protocols,
 //! access (link, guests, camera / file / clipboard), connection (kill switch,
-//! dns, split). The install itself is [`super::provision`]. Password is never
-//! written. Kill switch and the split lists live in the profile; ports, MTU,
-//! stack, and dns go out in `server.env` on install. Guest shares are local
-//! files, not a server call. A raw link or config is stored as text. A JSON
-//! object is what the shell hands to the subscriber.
+//! dns, split). Password is never written.
+//!
+//! The ready stack is three kits (`quic-mirage`, `quic`, `all`), not a list of
+//! look-alike masks. Install sends the kit name. A box that already has the
+//! container is read with the existing `client.link`; that does not reinstall
+//! and does not mint keys. Access is the share page: the link, the QR, export,
+//! and copy.
+//!
+//! The own-binary mode still names its two carrier ports. Kill switch and the
+//! split lists live in the profile. The catalogue, `server.env`, and the
+//! ask-faces path stay for the headless chain; the ready-stack window does not
+//! show them. Guest shares are local files, not a server call. A raw link or
+//! config is stored as text. A JSON object is what the shell hands to the
+//! subscriber.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -35,9 +44,11 @@ fn accent() -> &'static str {
 }
 const ROW: f64 = 40.0;
 const ROW_H: f64 = 32.0;
+/// A kit card is taller than a field row. The step leaves a 4px gap.
+const KIT_H: f64 = 52.0;
+const KIT_STEP: f64 = 56.0;
 const NAV_H: f64 = 44.0;
 const LABEL_W: f64 = 108.0;
-const TOGGLE_W: f64 = 64.0;
 const REVOKE_W: f64 = 72.0;
 
 /// The ports the box's own carriers open by default.
@@ -47,6 +58,12 @@ const REVOKE_W: f64 = 72.0;
 const DEFAULT_MWG_PORT: &str = "41443";
 const DEFAULT_KVIK_PORT: &str = "41444";
 
+/// Catalogue of face ids for the headless chain and the ask-faces path.
+///
+/// The ready-stack window does not show these rows and does not write
+/// `{ID}_MASK`. It offers three kits — `quic-mirage`, `quic`, `all` — and
+/// installs the one that is selected.
+///
 /// The server-side protocols the standalone image publishes, as
 /// `(id, port, mtu, on_by_default)`.
 ///
@@ -124,8 +141,6 @@ pub enum Focus {
     Except,
     Site,
     App,
-    Port,
-    Mtu,
     /// The binary that goes on the box, in the own-binary mode.
     Binary,
     /// The ssh key the client uses for the box's door.
@@ -145,6 +160,17 @@ pub enum Build {
     Ready,
     /// The client's own binary, put up on the box by the client itself.
     Own,
+}
+
+/// One ready-stack kit. The profile name is what the installer receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kit {
+    /// QUIC on UDP 443 plus the Mirage TCP perimeter. The recommended kit.
+    QuicMirage,
+    /// QUIC only, on UDP 443.
+    Quic,
+    /// Every protocol on its default port, camouflage none.
+    All,
 }
 
 /// Which key the client comes into the box with.
@@ -178,6 +204,8 @@ pub struct Proto {
     /// Why this face is offered, in the operator's language.
     ///
     /// The box's own proposal says it; the catalogue's own rows have none.
+    /// The ready-stack window does not show it. The dev ask-faces view does.
+    #[cfg(feature = "dev-tools")]
     pub why: String,
 }
 
@@ -209,6 +237,8 @@ pub struct Stand {
     /// Where the box's stack comes from: the ready-made one, or the client's
     /// own binary put up by the client itself.
     pub build: Build,
+    /// The kit the ready stack installs. The own-binary mode does not send it.
+    pub kit: Kit,
     /// The binary that goes on the box — the own-binary mode only.
     pub binary: String,
     /// The ssh key the client uses for the box's door. Empty means "make one
@@ -285,6 +315,7 @@ impl Stand {
             focus: Focus::None,
             link: String::new(),
             build: Build::Ready,
+            kit: Kit::QuicMirage,
             binary: String::new(),
             ssh_key: String::new(),
             key_source: KeySource::Own,
@@ -347,6 +378,11 @@ impl Stand {
                         Some("own") => Build::Own,
                         _ => Build::Ready,
                     };
+                    // A missing or unknown kit stays the recommended one.
+                    // Old catalogue rows are not a kit.
+                    if let Some(raw) = v.get("kit").and_then(|s| s.as_str()) {
+                        stand.kit = kit_from_key(raw);
+                    }
                     if let Some(bin) = v.get("binary").and_then(|s| s.as_str()) {
                         stand.binary = bin.to_owned();
                     }
@@ -470,6 +506,7 @@ impl Stand {
             "stack_auto": self.stack_auto,
             "stack": self.stack,
             "build": build_key(self.build),
+            "kit": kit_key(self.kit),
             "binary": self.binary,
             "ssh_key": self.ssh_key,
             "key_source": key_source_key(self.key_source),
@@ -514,14 +551,18 @@ impl Stand {
         let Some(link) = published else {
             return;
         };
-        if self.link == link {
-            return;
+        if self.link != link {
+            self.link = link;
+            self.bump_link_epoch();
+            self.save_link();
+            // A box was just installed, or its link changed: it is a configuration now.
+            self.refresh_configs();
         }
-        self.link = link;
-        self.bump_link_epoch();
-        self.save_link();
-        // A box was just installed: it is a configuration now.
-        self.refresh_configs();
+        // The link that arrived is the share page. The QR is that link, not a guest.
+        self.qr_guest = None;
+        self.section = Section::Access;
+        self.focus = Focus::None;
+        self.save_profile();
     }
 
     /// Read the list of configurations again.
@@ -581,6 +622,7 @@ impl Stand {
                 port: face.port.to_string(),
                 mtu: String::new(),
                 mask: face.mask.clone(),
+                #[cfg(feature = "dev-tools")]
                 why: face.why.clone(),
             });
         }
@@ -602,6 +644,7 @@ impl Stand {
                 port: proto.port.clone(),
                 mtu: proto.mtu.clone(),
                 mask: String::new(),
+                #[cfg(feature = "dev-tools")]
                 why: String::new(),
             });
         }
@@ -646,6 +689,7 @@ impl Stand {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
     pub fn server_env(&self) -> String {
         let stack = if self.stack_auto || self.stack.trim().is_empty() {
             "auto"
@@ -688,6 +732,9 @@ impl Stand {
 
     /// Install with an explicit mode: `ask_faces = true` asks the box what it
     /// could publish, `false` brings it up with the faces the person chose.
+    ///
+    /// The ready-stack window does not call this. The dev ask-faces path does.
+    #[cfg(feature = "dev-tools")]
     pub fn install_with(&mut self, ask_faces: bool) {
         if self.bus.running.load(Ordering::Relaxed) {
             return;
@@ -720,18 +767,70 @@ impl Stand {
                 stack,
                 env,
                 ask_faces,
+                profile: None,
                 state: None,
             },
             Arc::clone(&self.bus),
         );
     }
 
-    /// Install in the mode the stand is in: the first press asks the box what
-    /// it could publish, the second one installs with the faces the person
-    /// chose.
+    /// The profile name the ready stack installs. The own binary sends none.
+    pub fn ready_profile(&self) -> Option<&'static str> {
+        match self.build {
+            Build::Own => None,
+            Build::Ready => Some(kit_key(self.kit)),
+        }
+    }
+
+    /// Install the ready stack as the selected kit.
+    ///
+    /// Same host and login checks as [`Self::install_with`], and the password
+    /// leaves the field the same way. The job carries the kit name and an
+    /// empty env: the window does not upload the face catalogue.
+    pub fn install_kit(&mut self) {
+        if self.bus.running.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((host, port)) = split_host(&self.host) else {
+            self.say(tr("say.need_host"));
+            return;
+        };
+        if self.user.trim().is_empty() {
+            self.say(tr("say.need_login"));
+            return;
+        }
+        let Some(profile) = self.ready_profile() else {
+            return;
+        };
+        self.save_profile();
+        self.pass_epoch = self.pass_epoch.wrapping_add(1);
+        if self.pass_epoch == 0 {
+            self.pass_epoch = 1;
+        }
+        provision::start(
+            Job {
+                host,
+                port,
+                user: self.user.trim().to_owned(),
+                password: std::mem::take(&mut self.pass),
+                stack: "auto".to_owned(),
+                env: String::new(),
+                ask_faces: false,
+                profile: Some(profile.to_owned()),
+                state: None,
+            },
+            Arc::clone(&self.bus),
+        );
+    }
+
+    /// Install in the mode the stand is in.
+    ///
+    /// The ready stack sends the selected kit. The own binary is put up by
+    /// the client itself. Asking the box for faces stays on `install_with`,
+    /// which the ready-stack window does not call.
     pub fn install(&mut self) {
         match self.build {
-            Build::Ready => self.install_with(!self.faces_from_box),
+            Build::Ready => self.install_kit(),
             Build::Own => self.install_own(),
         }
     }
@@ -897,6 +996,30 @@ impl Stand {
         provision::remove(host, port, self.user.trim().to_owned(), Arc::clone(&self.bus));
     }
 
+    /// Read the link a box that is already up already has.
+    ///
+    /// Host and login, same as install. The password stays in the field:
+    /// this door is the key only, and it does not reinstall.
+    pub fn fetch_config(&mut self) {
+        if self.bus.running.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((host, port)) = split_host(&self.host) else {
+            self.say(tr("say.need_host"));
+            return;
+        };
+        if self.user.trim().is_empty() {
+            self.say(tr("say.need_login"));
+            return;
+        }
+        provision::fetch_link(host, port, self.user.trim().to_owned(), Arc::clone(&self.bus));
+    }
+
+    fn select_kit(&mut self, kit: Kit) {
+        self.kit = kit;
+        self.save_profile();
+    }
+
     pub fn export(&self) {
         if self.link.is_empty() {
             self.say(tr("say.no_link"));
@@ -922,42 +1045,6 @@ impl Stand {
             return;
         }
         self.copy_text(&self.link);
-    }
-
-    pub fn toggle_stack(&mut self) {
-        self.stack_auto = !self.stack_auto;
-        let fallback = self.protocols.first().map(|p| p.id.to_owned()).unwrap_or_default();
-        if !self.stack_auto && !self.protocols.iter().any(|p| p.id == self.stack) {
-            self.stack = self
-                .protocols
-                .iter()
-                .find(|p| p.on)
-                .map(|p| p.id.to_owned())
-                .unwrap_or(fallback);
-        }
-        self.focus = Focus::None;
-        self.save_profile();
-    }
-
-    pub fn select_proto(&mut self, index: usize) {
-        let Some(id) = self.protocols.get(index).map(|p| p.id) else {
-            return;
-        };
-        self.stack_auto = false;
-        self.stack = id.to_owned();
-        if let Some(proto) = self.protocols.get_mut(index) {
-            proto.on = true;
-        }
-        self.focus = Focus::None;
-        self.save_profile();
-    }
-
-    pub fn toggle_proto(&mut self, index: usize) {
-        let Some(proto) = self.protocols.get_mut(index) else {
-            return;
-        };
-        proto.on = !proto.on;
-        self.save_profile();
     }
 
     pub fn cycle_kill(&mut self) {
@@ -1234,14 +1321,6 @@ impl Stand {
             Focus::Except => Some(&mut self.except),
             Focus::Site => Some(&mut self.site_draft),
             Focus::App => Some(&mut self.app_draft),
-            Focus::Port => {
-                let i = self.active_index()?;
-                Some(&mut self.protocols[i].port)
-            }
-            Focus::Mtu => {
-                let i = self.active_index()?;
-                Some(&mut self.protocols[i].mtu)
-            }
             Focus::Binary => Some(&mut self.binary),
             Focus::SshKey => Some(&mut self.ssh_key),
             Focus::MwgPort => Some(&mut self.mwg_port),
@@ -1255,8 +1334,6 @@ impl Stand {
         let focus = self.focus;
         let limit = match focus {
             Focus::Link => 256 * 1024,
-            Focus::Port => 8,
-            Focus::Mtu => 5,
             Focus::Guest => 64,
             Focus::MwgPort | Focus::KvikPort => 5,
             Focus::Bind => 512,
@@ -1277,42 +1354,8 @@ impl Stand {
         }
     }
 
-    pub fn backspace(&mut self) {
-        if let Some(buf) = self.buf_mut() {
-            buf.pop();
-        }
-    }
-
     fn buf_mut(&mut self) -> Option<&mut String> {
         self.field_mut(self.focus)
-    }
-
-    fn active_index(&self) -> Option<usize> {
-        if self.stack_auto {
-            return None;
-        }
-        self.protocols.iter().position(|p| p.id == self.stack)
-    }
-
-    /// Why the box offered the face the person is looking at.
-    ///
-    /// The face the person is on, if there is one; otherwise the first
-    /// proposed face that is switched on. Only proposed faces carry a
-    /// reason — the catalogue's own rows do not, and there is nothing to
-    /// say about them.
-    fn active_why(&self) -> Option<String> {
-        let proto = match self.active_index() {
-            Some(index) => self.protocols.get(index),
-            None => self
-                .protocols
-                .iter()
-                .find(|p| p.on && !p.why.trim().is_empty()),
-        }?;
-        let why = proto.why.trim();
-        if why.is_empty() {
-            return None;
-        }
-        Some(why.to_owned())
     }
 
     fn bump_clear(&mut self, which: Focus) {
@@ -1351,6 +1394,7 @@ fn default_protocols() -> Vec<Proto> {
             port: (*port).to_owned(),
             mtu: (*mtu).to_owned(),
             mask: String::new(),
+            #[cfg(feature = "dev-tools")]
             why: String::new(),
         })
         .collect()
@@ -1392,6 +1436,40 @@ fn build_key(build: Build) -> &'static str {
     match build {
         Build::Ready => "ready",
         Build::Own => "own",
+    }
+}
+
+fn kit_key(kit: Kit) -> &'static str {
+    match kit {
+        Kit::QuicMirage => "quic-mirage",
+        Kit::Quic => "quic",
+        Kit::All => "all",
+    }
+}
+
+/// Missing and unknown names stay on the recommended kit.
+fn kit_from_key(raw: &str) -> Kit {
+    match raw {
+        "quic" => Kit::Quic,
+        "all" => Kit::All,
+        "quic-mirage" => Kit::QuicMirage,
+        _ => Kit::QuicMirage,
+    }
+}
+
+fn kit_title(kit: Kit) -> &'static str {
+    match kit {
+        Kit::QuicMirage => tr("kit.qm"),
+        Kit::Quic => tr("kit.quic"),
+        Kit::All => tr("kit.all"),
+    }
+}
+
+fn kit_desc(kit: Kit) -> &'static str {
+    match kit {
+        Kit::QuicMirage => tr("kit.qm.d"),
+        Kit::Quic => tr("kit.quic.d"),
+        Kit::All => tr("kit.all.d"),
     }
 }
 
@@ -1517,6 +1595,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_ready_kit_is_the_profile() {
+        let mut stand = Stand::load();
+        stand.build = Build::Ready;
+        stand.kit = Kit::QuicMirage;
+        assert_eq!(stand.ready_profile(), Some("quic-mirage"));
+        stand.kit = Kit::Quic;
+        assert_eq!(stand.ready_profile(), Some("quic"));
+        stand.kit = Kit::All;
+        assert_eq!(stand.ready_profile(), Some("all"));
+        stand.build = Build::Own;
+        assert_eq!(stand.ready_profile(), None);
+    }
+
+    #[test]
+    fn the_ready_protocol_sheet_is_three_kit_cards() {
+        let mut stand = Stand::load();
+        stand.kit = Kit::QuicMirage;
+        stand.build = Build::Ready;
+        stand.section = Section::Protocols;
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        let kinds: Vec<HitKind> = lay.hits.iter().map(|hit| hit.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                HitKind::Kit(Kit::QuicMirage),
+                HitKind::Kit(Kit::Quic),
+                HitKind::Kit(Kit::All),
+                HitKind::Fetch,
+            ]
+        );
+        assert_eq!(kinds.iter().filter(|kind| matches!(kind, HitKind::Kit(_))).count(), 3);
+        assert_eq!(kinds.iter().filter(|kind| matches!(kind, HitKind::Fetch)).count(), 1);
+        assert!(kinds.iter().all(|kind| !matches!(kind, HitKind::Proto(_) | HitKind::ProtoOn(_))));
+        // The kinds exist; this sheet must not be what builds them.
+        let _toggle = (HitKind::Proto(0), HitKind::ProtoOn(0));
+        let cards: Vec<_> = lay.hits.iter().filter(|hit| matches!(hit.kind, HitKind::Kit(_))).collect();
+        assert_eq!(cards.len(), 3);
+        for card in &cards {
+            assert_eq!(card.rect.height, 52.0);
+        }
+        assert_eq!(cards[1].rect.y - cards[0].rect.y, 56.0);
+        assert_eq!(cards[2].rect.y - cards[1].rect.y, 56.0);
+        let fetch = lay.hits.iter().find(|hit| hit.kind == HitKind::Fetch).expect("fetch");
+        assert_eq!(fetch.rect.width, cards[0].rect.width);
+        assert_eq!(fetch.rect.x, cards[0].rect.x);
+    }
+
+    #[test]
+    fn the_own_protocol_sheet_has_no_kit_fetch() {
+        let mut stand = Stand::load();
+        stand.kit = Kit::QuicMirage;
+        stand.build = Build::Own;
+        stand.section = Section::Protocols;
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        assert!(lay.hits.iter().all(|hit| !matches!(hit.kind, HitKind::Fetch | HitKind::Kit(_))));
+        assert!(lay.fields.iter().any(|field| field.focus == Focus::MwgPort));
+        assert!(lay.fields.iter().any(|field| field.focus == Focus::KvikPort));
     }
 }
 
@@ -1655,6 +1793,7 @@ struct NavBtn {
 enum ButtonText {
     Install,
     Remove,
+    Config,
     Export,
     Copy,
     Scan,
@@ -1667,7 +1806,6 @@ enum ButtonText {
 }
 
 enum Choice {
-    Stack,
     Kill,
     Split,
     Lang,
@@ -1675,28 +1813,29 @@ enum Choice {
     Build,
     Key,
     Carry,
+    Kit,
 }
 
 enum Row {
     Field { rect: Rect, label: &'static str, focus: Focus },
     Button { rect: Rect, text: ButtonText },
     Choice { rect: Rect, label: &'static str, which: Choice },
-    Proto { rect: Rect, index: usize, toggle: Rect },
-    Note { rect: Rect, text: String },
+    Kit { rect: Rect, kit: Kit },
     Guest { rect: Rect, index: usize, revoke: Rect },
     Entry { rect: Rect, index: usize, site: bool },
     Line { x: f64, y: f64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HitKind {
     Install,
     Remove,
+    Fetch,
     Export,
     Copy,
     Scan,
     File,
     Clip,
-    Stack,
     Kill,
     Split,
     Lang,
@@ -1707,6 +1846,8 @@ enum HitKind {
     Invite(bool),
     Unlink,
     Carry,
+    Kits,
+    Kit(Kit),
     Proto(usize),
     ProtoOn(usize),
     Guest(usize),
@@ -1820,21 +1961,16 @@ impl Lay {
         self.hit(id.to_owned(), rect, kind);
     }
 
-    fn proto(&mut self, index: usize) {
-        let rect = self.row_rect();
-        let toggle_w = TOGGLE_W.min(rect.width);
-        let toggle = Rect::new(rect.x + rect.width - toggle_w, rect.y, toggle_w, rect.height);
-        let body = Rect::new(rect.x, rect.y, (rect.width - toggle_w).max(0.0), rect.height);
-        self.rows.push(Row::Proto { rect, index, toggle });
-        self.hit(format!("st-p{index}"), body, HitKind::Proto(index));
-        self.hit(format!("st-p{index}-on"), toggle, HitKind::ProtoOn(index));
-    }
-
-    /// A line of explanation under the list — the box's own reason for the
-    /// face the person is looking at.
-    fn note(&mut self, text: String) {
-        let rect = self.row_rect();
-        self.rows.push(Row::Note { rect, text });
+    fn kit_card(&mut self, kit: Kit) {
+        let rect = Rect::new(self.x, self.y, self.w, KIT_H);
+        self.y += KIT_STEP;
+        self.rows.push(Row::Kit { rect, kit });
+        let id = match kit {
+            Kit::QuicMirage => "st-kit-quic-mirage",
+            Kit::Quic => "st-kit-quic",
+            Kit::All => "st-kit-all",
+        };
+        self.hit(id.to_owned(), rect, HitKind::Kit(kit));
     }
 
     fn guest(&mut self, index: usize) {
@@ -1880,6 +2016,9 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
             lay.field("st-host", tr("f.host"), Focus::Host, tr("f.host"), 240, false);
             lay.field("st-user", tr("f.user"), Focus::User, tr("f.user"), 240, false);
             lay.field("st-pass", tr("f.pass"), Focus::Pass, tr("f.pass"), 240, true);
+            if stand.build == Build::Ready {
+                lay.choice("st-kit", tr("f.kit"), Choice::Kit, HitKind::Kits);
+            }
             lay.choice("st-build", tr("f.build"), Choice::Build, HitKind::Build);
             if stand.build == Build::Own {
                 lay.field("st-bin", tr("f.binary"), Focus::Binary, tr("f.binary"), 240, false);
@@ -1909,21 +2048,12 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
                 lay.field("st-mwg", tr("f.mwg"), Focus::MwgPort, tr("f.port"), 5, false);
                 lay.field("st-kvik", tr("f.kvik"), Focus::KvikPort, tr("f.port"), 5, false);
             } else {
-                lay.choice("st-stack", tr("f.stack"), Choice::Stack, HitKind::Stack);
-                for index in 0..stand.protocols.len() {
-                    lay.proto(index);
+                // Three kits, then the button that reads a box already up.
+                // The catalogue, the ports, and the mask note stay off this sheet.
+                for kit in [Kit::QuicMirage, Kit::Quic, Kit::All] {
+                    lay.kit_card(kit);
                 }
-                if stand.active_index().is_some() {
-                    lay.field("st-port", tr("f.port"), Focus::Port, tr("f.port"), 8, false);
-                    lay.field("st-mtu", "mtu", Focus::Mtu, "mtu", 5, false);
-                    // The box's own reason for the face the person is on. It is
-                    // the sentence that says what this port looks like from
-                    // outside — and, when the port was not the one first in
-                    // mind, what happened to it.
-                    if let Some(why) = stand.active_why() {
-                        lay.note(why);
-                    }
-                }
+                lay.solo(("st-config", ButtonText::Config, HitKind::Fetch));
             }
         }
         Section::Access => {
@@ -2023,12 +2153,12 @@ fn apply(stand: &mut Stand, kind: HitKind) {
     match kind {
         HitKind::Install => stand.install(),
         HitKind::Remove => stand.remove_remote(),
+        HitKind::Fetch => stand.fetch_config(),
         HitKind::Export => stand.export(),
         HitKind::Copy => stand.copy_link(),
         HitKind::Scan => stand.request_scan(),
         HitKind::File => stand.import_file(),
         HitKind::Clip => stand.import_clipboard(),
-        HitKind::Stack => stand.toggle_stack(),
         HitKind::Kill => stand.cycle_kill(),
         HitKind::Split => stand.toggle_split(),
         HitKind::Lang => crate::text::cycle(),
@@ -2038,9 +2168,12 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::MyKey => stand.show_my_key(),
         HitKind::Unlink => stand.unlink = true,
         HitKind::Carry => stand.cycle_carry(),
+        HitKind::Kits => stand.set_section(Section::Protocols),
+        HitKind::Kit(kit) => stand.select_kit(kit),
+        // The ready sheet does not build these. The arms stay so a hit of
+        // that kind is still a defined action if one is ever delivered.
+        HitKind::Proto(_) | HitKind::ProtoOn(_) => {}
         HitKind::Invite(full) => stand.invite(full),
-        HitKind::Proto(index) => stand.select_proto(index),
-        HitKind::ProtoOn(index) => stand.toggle_proto(index),
         HitKind::Guest(index) => stand.select_guest(index),
         HitKind::Revoke(index) => stand.revoke(index),
         HitKind::DropSite(index) => stand.drop_site(index),
@@ -2166,34 +2299,23 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             let space = (rect.width - LABEL_W).max(0.0);
             ctx.fill_text(&value, rect.x + LABEL_W + space / 2.0, y);
         }
-        Row::Proto { rect, index, toggle } => {
-            let Some(proto) = stand.protocols.get(*index) else {
-                return;
-            };
-            let active = !stand.stack_auto && stand.stack == proto.id;
-            plate(ctx, *rect, active);
+        Row::Kit { rect, kit } => {
+            let selected = stand.kit == *kit;
+            plate(ctx, *rect, selected);
             ctx.set_text_align(TextAlign::Left);
-            let y = crate::theme::label_baseline(rect.y, rect.height, 14.0);
-            ctx.set_fill_color(if active { accent() } else { fg() });
-            ctx.fill_text(proto.id, rect.x + 8.0, y);
-            // The port this face is on — the thing the person is choosing.
-            if !proto.port.trim().is_empty() {
-                ctx.set_fill_color(dim());
-                let port = format!(":{}", proto.port.trim());
-                ctx.fill_text(&port, rect.x + LABEL_W, y);
-            }
-            ctx.set_text_align(TextAlign::Center);
-            ctx.set_fill_color(if proto.on { accent() } else { dim() });
-            let word = if proto.on { tr("b.on") } else { tr("b.off") };
-            ctx.fill_text(word, toggle.x + toggle.width / 2.0, crate::theme::label_baseline(toggle.y, toggle.height, 14.0));
-        }
-        Row::Note { rect, text } => {
-            ctx.set_text_align(TextAlign::Left);
+            ctx.set_font("14px PT Root UI");
+            ctx.set_fill_color(if selected { accent() } else { fg() });
+            ctx.fill_text(
+                kit_title(*kit),
+                rect.x + 8.0,
+                crate::theme::label_baseline(rect.y + 4.0, 22.0, 14.0),
+            );
+            ctx.set_font("12px PT Root UI");
             ctx.set_fill_color(dim());
             ctx.fill_text(
-                &short(text, 96),
+                kit_desc(*kit),
                 rect.x + 8.0,
-                crate::theme::label_baseline(rect.y, rect.height, 14.0),
+                crate::theme::label_baseline(rect.y + 26.0, 22.0, 12.0),
             );
         }
         Row::Guest { rect, index, revoke } => {
@@ -2274,6 +2396,13 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
                 tr("b.remove")
             }
         }
+        ButtonText::Config => {
+            if running {
+                tr("b.fetching")
+            } else {
+                tr("b.config")
+            }
+        }
         ButtonText::Export => tr("b.export"),
         ButtonText::Copy => tr("b.copy"),
         ButtonText::Scan => tr("b.scan"),
@@ -2288,19 +2417,6 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
 
 fn choice_value(stand: &Stand, which: &Choice) -> String {
     match which {
-        Choice::Stack => {
-            if stand.stack_auto {
-                tr("c.auto").into()
-            } else if stand.stack.is_empty() {
-                stand
-                    .protocols
-                    .first()
-                    .map(|p| p.id.to_owned())
-                    .unwrap_or_default()
-            } else {
-                stand.stack.clone()
-            }
-        }
         Choice::Kill => match stand.kill {
             Kill::Off => tr("b.off").into(),
             Kill::Soft => tr("c.soft").into(),
@@ -2333,6 +2449,7 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
             KeySource::Own => tr("c.key_own").into(),
             KeySource::File => tr("c.key_file").into(),
         },
+        Choice::Kit => kit_title(stand.kit).into(),
     }
 }
 

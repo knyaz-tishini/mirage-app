@@ -78,6 +78,7 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "f.user" => ("логин", "user"),
         "f.pass" => ("пароль", "password"),
         "f.build" => ("режим", "mode"),
+        "f.kit" => ("комплект", "kit"),
         "f.binary" => ("бинарь", "binary"),
         "f.sshkey" => ("ключ", "key"),
         "f.keysrc" => ("ключ бокса", "box key"),
@@ -107,6 +108,8 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
 
         "b.install" => ("установить", "install"),
         "b.installing" => ("ставится…", "installing…"),
+        "b.config" => ("конфиг", "config"),
+        "b.fetching" => ("забираю…", "fetching…"),
         "b.remove" => ("снять", "remove"),
         "b.removing" => ("снимается…", "removing…"),
         "b.export" => ("экспорт", "export"),
@@ -134,6 +137,16 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "c.build_own" => ("свой бинарь", "own binary"),
         "c.key_own" => ("свой ключ", "own key"),
         "c.key_file" => ("ключ из файла", "key from file"),
+
+        "kit.qm" => ("quic + mirage", "quic + mirage"),
+        "kit.qm.d" => (
+            "quic UDP 443, мираж TCP 443 80 8080 8443",
+            "quic UDP 443, mirage TCP 443 80 8080 8443",
+        ),
+        "kit.quic" => ("quic", "quic"),
+        "kit.quic.d" => ("UDP 443", "UDP 443"),
+        "kit.all" => ("все протоколы", "all protocols"),
+        "kit.all.d" => ("дефолтные порты, камуфляж none", "default ports, camouflage none"),
 
         "bind.cabinet" => ("кабинет", "cabinet"),
         "bind.unlink" => ("отвязать", "unlink"),
