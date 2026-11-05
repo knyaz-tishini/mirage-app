@@ -49,12 +49,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One real handshake. The stream may be closed afterwards.
 pub(crate) async fn probe(entrance: &ArtefactEntrance) -> Result<(), String> {
+    let entrance = crate::envelope::front(entrance).await?;
     match &entrance.protocol {
         Protocol::Mirage { .. } => Err("mirage is not a protocol door".to_owned()),
-        Protocol::WireGuard { .. } => prove_wireguard(entrance).await,
-        Protocol::AmneziaWg { .. } => prove_amneziawg(entrance).await,
+        Protocol::WireGuard { .. } => prove_wireguard(&entrance).await,
+        Protocol::AmneziaWg { .. } => prove_amneziawg(&entrance).await,
         Protocol::Shadowsocks { .. } => {
-            let mut stream = open_shadowsocks(entrance, "127.0.0.1", 1).await?;
+            let mut stream = open_shadowsocks(&entrance, "127.0.0.1", 1).await?;
             tokio::time::timeout(PROBE_TIMEOUT, async {
                 stream.write_all(b"x").await.map_err(|e| e.to_string())?;
                 stream.flush().await.map_err(|e| e.to_string())?;
@@ -65,20 +66,20 @@ pub(crate) async fn probe(entrance: &ArtefactEntrance) -> Result<(), String> {
             prove_read(&mut stream).await
         }
         Protocol::Dns { .. } => {
-            let _stream = tokio::time::timeout(PROBE_TIMEOUT, open_stream(entrance))
+            let _stream = tokio::time::timeout(PROBE_TIMEOUT, open_stream(&entrance))
                 .await
                 .map_err(|_| "dns handshake timed out".to_owned())??;
             Ok(())
         }
         Protocol::Icmp { .. } => {
-            let mut stream = open_stream(entrance).await?;
+            let mut stream = open_stream(&entrance).await?;
             write_preamble(&mut stream, "127.0.0.1", 1)
                 .await
                 .map_err(|_| "preamble was refused".to_owned())?;
             prove_read(&mut stream).await
         }
         _ => {
-            let _stream = tokio::time::timeout(PROBE_TIMEOUT, open_stream(entrance))
+            let _stream = tokio::time::timeout(PROBE_TIMEOUT, open_stream(&entrance))
                 .await
                 .map_err(|_| format!("{} handshake timed out", entrance.protocol.label()))??;
             Ok(())
@@ -92,13 +93,14 @@ pub(crate) async fn open_carrying(
     host: &str,
     port: u16,
 ) -> Result<DoorIo, String> {
+    let entrance = crate::envelope::front(entrance).await?;
     match &entrance.protocol {
         Protocol::Mirage { .. } => Err("mirage is not a protocol door".to_owned()),
-        Protocol::WireGuard { .. } => open_wireguard(entrance, host, port).await,
-        Protocol::AmneziaWg { .. } => open_amneziawg(entrance, host, port).await,
-        Protocol::Shadowsocks { .. } => open_shadowsocks(entrance, host, port).await,
+        Protocol::WireGuard { .. } => open_wireguard(&entrance, host, port).await,
+        Protocol::AmneziaWg { .. } => open_amneziawg(&entrance, host, port).await,
+        Protocol::Shadowsocks { .. } => open_shadowsocks(&entrance, host, port).await,
         _ => {
-            let mut stream = open_stream(entrance).await?;
+            let mut stream = open_stream(&entrance).await?;
             write_preamble(&mut stream, host, port)
                 .await
                 .map_err(|_| "preamble was refused".to_owned())?;
@@ -233,12 +235,26 @@ async fn open_stream(entrance: &ArtefactEntrance) -> Result<DoorIo, String> {
             identifier,
             mtu,
         } => {
-            let layer = IcmpCamouflage::new(*peer_addr, *identifier, *mtu);
+            // Not a TCP/UDP proxy. The echo goes to the relay IP, and the
+            // first payload is the terminator envelope. Later writes,
+            // including write_preamble, stay one payload each.
+            let peer = match entrance.relay.as_deref() {
+                Some(relay) => resolve(relay).await?.ip(),
+                None => *peer_addr,
+            };
+            let layer = IcmpCamouflage::new(peer, *identifier, *mtu);
             let addr = resolve(&entrance.addr).await?;
-            let stream = layer
+            let mut stream = layer
                 .connect_client(addr, "")
                 .await
                 .map_err(|_| format!("{label} handshake failed"))?;
+            if entrance.relay.is_some() {
+                let envelope = crate::envelope::target_envelope(&entrance.addr)?;
+                stream
+                    .write_all(&envelope)
+                    .await
+                    .map_err(|_| format!("{label} envelope failed"))?;
+            }
             Ok(Box::pin(stream))
         }
         Protocol::Shadowsocks { .. }

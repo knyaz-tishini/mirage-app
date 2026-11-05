@@ -826,6 +826,7 @@ async fn open_entrance_tunnel(
     mesh_id: &[u8],
     client_static_priv: [u8; 32],
 ) -> Result<Box<dyn Tunnel>, EdgeDialError> {
+    let entrance = crate::envelope::front(entrance).await.map_err(EdgeDialError::Door)?;
     let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| EdgeDialError::BadAddr {
         addr: entrance.addr.clone(),
         reason: e.to_string(),
@@ -833,7 +834,7 @@ async fn open_entrance_tunnel(
     let server_pubkey = entrance.server_pubkey()?;
     // The link decides the wire transport. Foreign protocols are not masks
     // and do not go through the Mirage dial.
-    let mask = entrance_mask(entrance)?;
+    let mask = entrance_mask(&entrance)?;
     let ep_config = MirageEndpointConfig {
         transport: face_transport(&mask),
         auth: AuthMode::Blake3,
@@ -860,7 +861,8 @@ async fn open_entrance(
     if !is_mirage(&entrance.protocol) {
         return Err(EdgeDialError::NotMirage { protocol: entrance.protocol.label() });
     }
-    let mask = entrance_mask(entrance)?;
+    let entrance = crate::envelope::front(entrance).await.map_err(EdgeDialError::Door)?;
+    let mask = entrance_mask(&entrance)?;
     if let Some(alpn) = quic_alpn(&mask) {
         let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
             EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
@@ -869,7 +871,7 @@ async fn open_entrance(
         let dial = PlaneDial::open(&alpn, addr, &server_pubkey, &client_static_priv, mesh_id).await?;
         return Ok(OpenedEntrance::Plane(dial));
     }
-    Ok(OpenedEntrance::Mux(open_entrance_tunnel(entrance, mesh_id, client_static_priv).await?))
+    Ok(OpenedEntrance::Mux(open_entrance_tunnel(&entrance, mesh_id, client_static_priv).await?))
 }
 
 /// Build the session of an accepted hello.
@@ -2239,6 +2241,7 @@ mod tests {
         use mirage_core::config::TransportCamouflage;
         let face = |addr: &str, camouflage: TransportCamouflage| ArtefactEntrance {
             addr: addr.to_owned(),
+            relay: None,
             server_pubkey_hex: "ab".repeat(32),
             protocol: mirage_core::mirage::wire::Protocol::try_from(&camouflage)
                 .expect("the test mask is a protocol"),

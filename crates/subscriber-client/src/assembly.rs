@@ -401,6 +401,7 @@ mod tests {
         let entrances = (0..n_entrances)
             .map(|i| ArtefactEntrance {
                 addr: format!("127.0.0.1:{}", 20000 + i),
+                relay: None,
                 server_pubkey_hex: format!("{:02x}", i).repeat(32),
                 protocol: Protocol::Mirage {
                     carrier: MirageCarrier::Tcp,

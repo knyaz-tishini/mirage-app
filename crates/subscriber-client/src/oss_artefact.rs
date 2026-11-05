@@ -86,6 +86,7 @@ pub fn build(
             .map_err(OssArtefactError::BadMask)?;
         entrances.push(ArtefactEntrance {
             addr: format!("{host}:{}", face.port),
+            relay: None,
             server_pubkey_hex: proposal.server_public_key_hex.clone(),
             protocol,
         });

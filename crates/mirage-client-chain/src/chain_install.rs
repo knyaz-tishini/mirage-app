@@ -162,6 +162,7 @@ pub async fn install_chain(
             stack: String::new(),
             env: base_env.to_owned(),
             ask_faces: false,
+            profile: None,
             state: Some(state.clone()),
         };
         let outcome = provision::install(job, bus).await?;

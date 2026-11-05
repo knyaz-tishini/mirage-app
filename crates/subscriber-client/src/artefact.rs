@@ -47,7 +47,8 @@
 //! published face, never grouped by box — and each entry describes exactly
 //! one dialable face. There is nowhere on this type to put a second hop.
 
-use mirage_core::mirage::wire::Protocol;
+use mirage_core::mirage::wire::{Protocol, TransportCamouflage};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -95,10 +96,14 @@ pub struct EntranceArtefact {
 ///
 /// `Debug` prints the protocol's name, not its body. WireGuard and
 /// Shadowsocks carry key material.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 pub struct ArtefactEntrance {
-    /// `host:port` of this published face.
+    /// `host:port` where the protocol ends (the terminator).
     pub addr: String,
+    /// Optional `host:port` relay. Absent dials [`Self::addr`] directly.
+    /// The protocol still ends at `addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
     /// The box's static X25519 public key for THIS face, 64-char hex.
     /// `handshake_client_stream_v9`'s `server_static_pub` parameter — see
     /// the module doc for why this field exists on this type today.
@@ -106,13 +111,56 @@ pub struct ArtefactEntrance {
     /// The link this face speaks. The port is [`Self::addr`], not a field
     /// of the protocol. Dial code that still needs the old mask calls
     /// [`Protocol::to_mask`].
+    ///
+    /// Files written before this field existed name the same value
+    /// `camouflage`. Both shapes are read. New files write `protocol`.
     pub protocol: Protocol,
+}
+
+impl<'de> Deserialize<'de> for ArtefactEntrance {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let addr = value
+            .get("addr")
+            .and_then(|item| item.as_str())
+            .ok_or_else(|| de::Error::missing_field("addr"))?
+            .to_owned();
+        let relay = match value.get("relay") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(item) => Some(
+                item.as_str()
+                    .ok_or_else(|| de::Error::custom("relay is not a string"))?
+                    .to_owned(),
+            ),
+        };
+        let server_pubkey_hex = value
+            .get("server_pubkey_hex")
+            .and_then(|item| item.as_str())
+            .ok_or_else(|| de::Error::missing_field("server_pubkey_hex"))?
+            .to_owned();
+        let protocol = if let Some(item) = value.get("protocol") {
+            serde_json::from_value(item.clone()).map_err(de::Error::custom)?
+        } else if let Some(item) = value.get("camouflage") {
+            let mask: TransportCamouflage =
+                serde_json::from_value(item.clone()).map_err(de::Error::custom)?;
+            Protocol::try_from(&mask).map_err(de::Error::custom)?
+        } else {
+            return Err(de::Error::missing_field("protocol"));
+        };
+        Ok(Self {
+            addr,
+            relay,
+            server_pubkey_hex,
+            protocol,
+        })
+    }
 }
 
 impl std::fmt::Debug for ArtefactEntrance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArtefactEntrance")
             .field("addr", &self.addr)
+            .field("relay", &self.relay)
             .field("server_pubkey_hex", &self.server_pubkey_hex)
             .field("protocol", &self.protocol.label())
             .finish()
@@ -152,6 +200,9 @@ pub enum ArtefactError {
 
     #[error("entrance artefact: entrances[{index}].addr {addr:?} is not host:port")]
     BadEntranceAddr { index: usize, addr: String },
+
+    #[error("entrance artefact: entrances[{index}].relay {relay:?} is not host:port")]
+    BadEntranceRelay { index: usize, relay: String },
 
     #[error(
         "entrance artefact: mode country code {code:?} is not a 2-letter uppercase ISO-3166 alpha-2 code"
@@ -227,6 +278,11 @@ impl EntranceArtefact {
         for (i, e) in self.entrances.iter().enumerate() {
             if !looks_like_host_port(&e.addr) {
                 return Err(ArtefactError::BadEntranceAddr { index: i, addr: e.addr.clone() });
+            }
+            if let Some(relay) = &e.relay {
+                if !looks_like_host_port(relay) {
+                    return Err(ArtefactError::BadEntranceRelay { index: i, relay: relay.clone() });
+                }
             }
             check_hex_field(
                 &format!("entrances[{i}].server_pubkey_hex"),
@@ -338,6 +394,7 @@ mod tests {
             entrances: vec![
                 ArtefactEntrance {
                     addr: "203.0.113.10:8443".to_owned(),
+                    relay: None,
                     server_pubkey_hex: "22".repeat(HEX32_BYTES),
                     protocol: Protocol::Mirage {
                         carrier: mirage_core::mirage::wire::MirageCarrier::Tcp,
@@ -346,6 +403,7 @@ mod tests {
                 },
                 ArtefactEntrance {
                     addr: "203.0.113.11:8443".to_owned(),
+                    relay: None,
                     server_pubkey_hex: "33".repeat(HEX32_BYTES),
                     protocol: Protocol::WebSocket {
                         path: "/ws".to_owned(),
@@ -407,6 +465,41 @@ mod tests {
         let mut a = sample_artefact();
         a.entrances[0].addr = "not-an-addr".to_owned();
         assert!(matches!(a.validate(), Err(ArtefactError::BadEntranceAddr { index: 0, .. })));
+    }
+
+    #[test]
+    fn validate_refuses_bad_relay() {
+        let mut a = sample_artefact();
+        a.entrances[0].relay = Some("not-an-addr".to_owned());
+        assert!(matches!(a.validate(), Err(ArtefactError::BadEntranceRelay { index: 0, .. })));
+    }
+
+    #[test]
+    fn validate_accepts_a_relay_and_round_trips_it() {
+        let mut a = sample_artefact();
+        a.entrances[0].relay = Some("198.51.100.8:443".to_owned());
+        assert!(a.validate().is_ok());
+        let back = EntranceArtefact::from_json(&a.to_json().unwrap()).unwrap();
+        assert_eq!(back.entrances[0].relay.as_deref(), Some("198.51.100.8:443"));
+        assert!(back.entrances[1].relay.is_none());
+    }
+
+    #[test]
+    fn debug_prints_relay_like_addr_and_not_the_protocol_body() {
+        let entrance = ArtefactEntrance {
+            addr: "203.0.113.10:8443".to_owned(),
+            relay: Some("198.51.100.8:443".to_owned()),
+            server_pubkey_hex: "22".repeat(HEX32_BYTES),
+            protocol: Protocol::Shadowsocks {
+                method: "aes-256-gcm".to_owned(),
+                password: "super-secret-password".to_owned(),
+            },
+        };
+        let rendered = format!("{entrance:?}");
+        assert!(rendered.contains("203.0.113.10:8443"), "{rendered}");
+        assert!(rendered.contains("198.51.100.8:443"), "{rendered}");
+        assert!(rendered.contains("shadowsocks"), "{rendered}");
+        assert!(!rendered.contains("super-secret-password"), "{rendered}");
     }
 
     #[test]
@@ -519,6 +612,7 @@ mod tests {
         assert_eq!(artefact.entrances.len(), 1);
         let entrance = &artefact.entrances[0];
         assert_eq!(entrance.addr, "203.0.113.9:443");
+        assert!(entrance.relay.is_none(), "an artefact with no relay field still deserializes");
         assert_eq!(entrance.server_pubkey_hex, "33".repeat(32));
         assert_eq!(
             entrance.server_pubkey().expect("decode server pubkey"),
@@ -530,6 +624,23 @@ mod tests {
             Protocol::Tls { sni: "entrance.example.com".to_owned(), alpn: vec!["h2".to_owned()] },
             "the entrance protocol must decode to the typed link"
         );
+
+        let legacy = serde_json::json!({
+            "v": 1,
+            "private_key_hex": "11".repeat(32),
+            "mesh_id": "22".repeat(32),
+            "entrances": [{
+                "addr": "203.0.113.9:443",
+                "server_pubkey_hex": "33".repeat(32),
+                "camouflage": {"type": "quic", "alpn": ["h3"], "bind_addr": "0.0.0.0:443"}
+            }],
+            "mode": "full_auto",
+            "label": "Ada",
+            "issued_at_ms": 1_726_000_000_000u64
+        })
+        .to_string();
+        let old = EntranceArtefact::from_json(&legacy).expect("a camouflage entrance still parses");
+        assert!(matches!(old.entrances[0].protocol, Protocol::Quic { .. }));
 
         assert_eq!(
             artefact.client_static_priv().expect("decode client private key"),
