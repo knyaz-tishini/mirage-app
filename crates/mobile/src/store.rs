@@ -8,7 +8,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use mirage_subscriber_client::{
-    redeem_artefact_json, EgressScope, EntranceArtefact, SubscriberClient, SubscriberClientOptions,
+    redeem_artefact_json, EgressScope, EntranceArtefact, PlaneConsumer, SubscriberClient,
+    SubscriberClientOptions,
 };
 use mirage_tun_core::policy::{PolicyConfigRequest, PolicyDecision};
 use mirage_tun_core::stack_config::{ChainEntry, StackConfig};
@@ -189,6 +190,9 @@ async fn bind_subscriber(artefact: &EntranceArtefact) -> Result<(SubscriberClien
             status_file: None,
             scope: EgressScope::all(),
             start_socks: true,
+            // The packet tunnel reads this SOCKS listener. The session
+            // feeds the userspace stack, not a raw-IP device.
+            plane_consumer: PlaneConsumer::Stack,
         };
         if let Ok(client) = SubscriberClient::build(artefact, options).await {
             return Ok((client, socks));

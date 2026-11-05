@@ -28,5 +28,7 @@
   <false/>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Камера нужна, чтобы считать QR-код подключения.</string>
 </dict>
 </plist>

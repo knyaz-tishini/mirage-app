@@ -58,7 +58,10 @@ enum TunnelBridge {
     }
 
     static let startTunnel: @convention(c) (UnsafePointer<CChar>?) -> Void = { raw in
-        let passed = raw.map { String(cString: $0) }.filter { !$0.isEmpty }
+        let passed = raw.flatMap { pointer -> String? in
+            let text = String(cString: pointer)
+            return text.isEmpty ? nil : text
+        }
         phase = 1
         NETunnelProviderManager.loadAllFromPreferences { managers, error in
             if error != nil {
