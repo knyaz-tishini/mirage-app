@@ -68,10 +68,9 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "t.none" => ("ничего не выбрано", "nothing picked"),
         "t.empty" => ("пока пусто", "nothing yet"),
 
-        "nav.server" => ("сервер", "server"),
-        "nav.proto" => ("протоколы", "protocols"),
-        "nav.access" => ("доступ", "access"),
-        "nav.link" => ("связь", "link"),
+        "nav.servers" => ("серверы", "servers"),
+        "nav.device" => ("устройство", "device"),
+        "nav.cabinet" => ("кабинет", "cabinet"),
 
         "f.host" => ("хост", "host"),
         "f.cabinet" => ("кабинет", "cabinet"),
@@ -107,6 +106,10 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "theme.dark" => ("тёмная", "dark"),
 
         "b.install" => ("установить", "install"),
+        "b.roll" => ("накатить", "roll"),
+        "b.forget" => ("забыть", "forget"),
+        "b.page_new" => ("новый сервер", "new server"),
+        "b.page_known" => ("имеющиеся", "existing"),
         "b.installing" => ("ставится…", "installing…"),
         "b.config" => ("конфиг", "config"),
         "b.fetching" => ("забираю…", "fetching…"),
@@ -121,6 +124,13 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "b.invite_full" => ("полный", "full"),
         "b.my_key" => ("мой ключ", "my key"),
         "b.unlink" => ("отвязать", "unlink"),
+        "shelf.connect" => ("подключиться", "connect"),
+        "shelf.disconnect" => ("отключиться", "disconnect"),
+        "shelf.quit" => ("выйти", "quit"),
+        // State, not the action. The tray balloon and the icon tip use these.
+        "shelf.state.on" => ("подключено", "connected"),
+        "shelf.state.off" => ("отключено", "disconnected"),
+
         "b.on" => ("вкл", "on"),
         "b.off" => ("выкл", "off"),
         "b.revoke" => ("отозвать", "revoke"),
@@ -177,6 +187,7 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "say.need_name" => ("нужно имя", "name required"),
         "say.nothing" => ("нечего отдать", "nothing to share"),
         "say.saved" => ("записано", "saved"),
+        "say.forgot" => ("сервер забыт в клиенте", "server forgotten on this client"),
         "say.copied" => ("скопировано", "copied"),
         "say.empty" => ("пусто", "empty"),
         "say.long" => ("слишком длинно", "too long"),

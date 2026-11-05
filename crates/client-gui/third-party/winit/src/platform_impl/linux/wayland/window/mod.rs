@@ -124,8 +124,17 @@ impl Window {
         // Set the decorations hint.
         window_state.set_decorate(attributes.decorations);
 
-        // Set the app_id.
-        if let Some(name) = attributes.platform_specific.name.map(|name| name.general) {
+        // Set the app_id. Without an explicit name the binary name is the
+        // id, same as the X11 WM_CLASS, so a desktop entry can find the window.
+        let app_id = attributes.platform_specific.name.map(|name| name.general).or_else(|| {
+            std::env::args_os()
+                .next()
+                .as_ref()
+                .and_then(|path| std::path::Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_owned())
+        });
+        if let Some(name) = app_id {
             window.set_app_id(name);
         }
 

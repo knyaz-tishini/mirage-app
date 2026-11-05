@@ -10,7 +10,10 @@
 //!   GET  /health        → {"ok":true}
 //!   GET  /stand         → the stand as it stands
 //!   POST /stand/ask     → step one: ask the box what it could publish
-//!   POST /stand/install → step two: bring it up with the faces that were chosen
+//!   POST /stand/install → step two: bring it up with the faces that were chosen.
+//!                         A JSON string `profile` of `all`, `quic`, or
+//!                         `quic-mirage` skips the question and installs that
+//!                         profile. Any other profile is 400.
 //!   POST /stand/remove  → take the container down
 //!   GET  /stand/status  → what the running job is doing
 //!   POST /stand/chain   → build a chain of boxes: install them, then wire them
@@ -29,7 +32,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use mirage_client_chain::chain_install;
-use mirage_client_chain::provision::ProposedFace;
+use mirage_client_chain::provision::{self, profile_env, Job, ProposedFace};
 use crate::oasis::stand::{split_host, Proto, Stand};
 
 /// Port the control API listens on when nothing else is asked for.
@@ -229,10 +232,17 @@ fn handle(api: &Api, stream: &mut TcpStream) {
             Err(err) => respond(stream, 400, &error_body(&err)),
         },
         Route::Install => match credentials(&request.body, true) {
-            Ok(creds) => {
-                let (code, body) = install(api, &creds, false);
-                respond(stream, code, &body);
-            }
+            Ok(creds) => match read_profile(&request.body) {
+                Ok(Some(profile)) => {
+                    let (code, body) = install_profile(api, &creds, &profile);
+                    respond(stream, code, &body);
+                }
+                Ok(None) => {
+                    let (code, body) = install(api, &creds, false);
+                    respond(stream, code, &body);
+                }
+                Err(err) => respond(stream, 400, &error_body(&err)),
+            },
             Err(err) => respond(stream, 400, &error_body(&err)),
         },
         Route::Remove => match credentials(&request.body, false) {
@@ -411,6 +421,72 @@ fn check_host(host: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `profile` from a POST body, when the caller set one.
+///
+/// Absent keeps today's install. A value that is not `all`, `quic`, or
+/// `quic-mirage` names those three and is refused. The password is not read
+/// here and is not logged.
+fn read_profile(body: &[u8]) -> Result<Option<String>, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "body is not text".to_owned())?;
+    let value: Value = serde_json::from_str(text).map_err(|err| format!("bad json: {err}"))?;
+    match value.get("profile") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let profile = raw.trim();
+            profile_env(profile, "localhost")?;
+            Ok(Some(profile.to_owned()))
+        }
+        Some(_) => Err("unknown profile: use all, quic, or quic-mirage".to_owned()),
+    }
+}
+
+/// Install one named profile. The face question is not asked.
+fn install_profile(api: &Api, creds: &Credentials, profile: &str) -> (u16, String) {
+    let mut stand = api.lock_stand();
+    api.sync_bus(&mut stand);
+    if stand.bus.running.load(Ordering::Relaxed) {
+        return (409, error_body("busy"));
+    }
+    let Some((host, port)) = split_host(&creds.host) else {
+        return (400, error_body("host is required"));
+    };
+    if let Err(err) = profile_env(profile, &host) {
+        return (400, error_body(&err));
+    }
+    stand.host = creds.host.clone();
+    stand.user = creds.user.clone();
+    let bus = Arc::clone(&stand.bus);
+    // The password goes into the worker. It is not kept on the stand and
+    // it is not logged.
+    provision::start(
+        Job {
+            host,
+            port,
+            user: creds.user.clone(),
+            password: creds.password.clone(),
+            stack: "auto".to_owned(),
+            env: String::new(),
+            ask_faces: false,
+            profile: Some(profile.to_owned()),
+            state: None,
+        },
+        bus,
+    );
+    if !stand.bus.running.load(Ordering::Relaxed) {
+        let why = stand.status();
+        let error = if why.is_empty() {
+            "the install did not start".to_owned()
+        } else {
+            why
+        };
+        return (400, error_body(&error));
+    }
+    (
+        200,
+        json!({"ok": true, "started": true, "mode": "install"}).to_string(),
+    )
 }
 
 /// Run one install step and answer with what happened.

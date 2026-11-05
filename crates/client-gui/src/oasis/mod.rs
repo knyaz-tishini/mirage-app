@@ -19,7 +19,7 @@ use uzor::render::{AnimParams, AnimScript, ImagePainter, RenderContext, TextAlig
 use uzor::tokens::{BuiltinSet, Tokens};
 use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
-use uzor_framework::host::native::{NativeOptions, TraySpec, run_native};
+use uzor_framework::host::native::{NativeOptions, run_native};
 use uzor_framework::{
     App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
     KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig,
@@ -33,6 +33,7 @@ use crate::engine::LocalEngine;
 use crate::shell::menu::{self, MenuTab};
 
 mod palm_mark;
+mod shelf;
 pub(crate) mod stand;
 
 use stand::{Carry, Stand};
@@ -192,6 +193,8 @@ struct Oasis {
     restored: bool,
     /// Time of the last raise or stop. See [`LINK_RETRY_S`].
     link_sent_at: f64,
+    /// Last frame time, so a tray click (which has no clock of its own) can stamp the link.
+    clock: f64,
     /// Last standalone link handed to the subscriber. Stops a re-spawn every frame.
     adopted: String,
     pending_submit: Option<String>,
@@ -376,6 +379,7 @@ impl App for Oasis {
         let win = cx.window;
         let now = cx.time.now.0;
         let dt = cx.time.dt;
+        self.pump_shelf(cx, now);
         let w = rect.width;
         let h = rect.height;
         let scene_h = (h - CHROME_H).max(1.0);
@@ -576,7 +580,6 @@ impl App for Oasis {
             let (sheet_targets, sheet_settings) = sheet_pair(w);
             paint_sheets(render, sheet_targets, sheet_settings, self.sheet);
         }
-        paint_target_chip(render, w, &self.target_name());
         paint_menu(render);
         paint_controls(render, w, pointer);
         if let Some(scan) = self.scan.as_ref() {
@@ -633,6 +636,13 @@ impl App for Oasis {
                     cx.command(AppCommand::Shutdown);
                 }
             }
+            Intent::Tray(id) => {
+                if let Some(cmd) = shelf::from_id(id.0) {
+                    if self.apply_shelf(cmd, self.clock) {
+                        cx.command(AppCommand::Shutdown);
+                    }
+                }
+            }
             Intent::Unhandled(UnhandledInput::Paste { text, .. }) => self.on_paste(&text),
             Intent::Text(TextIntent::Submitted { field, .. }) => {
                 self.pending_submit = Some(field.as_str().to_string());
@@ -643,6 +653,84 @@ impl App for Oasis {
 }
 
 impl Oasis {
+    /// Tray, taskbar preview, dock menu, and the Linux launcher all use this.
+    /// Quit returns true so the caller can stop the process.
+    fn pump_shelf(&mut self, cx: &mut PanelCx<'_, Vocab>, now: f64) {
+        self.clock = now;
+        shelf::tick(self.shelf_up());
+        if let Some(cmd) = shelf::take() {
+            if self.apply_shelf(cmd, now) {
+                cx.out.command(AppCommand::Shutdown);
+            }
+        }
+    }
+
+    fn apply_shelf(&mut self, cmd: shelf::Cmd, now: f64) -> bool {
+        match cmd {
+            shelf::Cmd::Connect => {
+                self.shelf_on(now);
+                false
+            }
+            shelf::Cmd::Disconnect => {
+                self.shelf_off(now);
+                false
+            }
+            shelf::Cmd::Toggle => {
+                if self.shelf_up() {
+                    self.shelf_off(now);
+                } else {
+                    self.shelf_on(now);
+                }
+                false
+            }
+            shelf::Cmd::Quit => {
+                self.mark_link(now, false);
+                self.stop_link();
+                true
+            }
+        }
+    }
+
+    /// The button shows the link the picture is on: the click that started
+    /// it, or an adapter that is already up.
+    fn shelf_up(&self) -> bool {
+        if self.linked {
+            return true;
+        }
+        let st = self.engine.status();
+        st.online && st.tun
+    }
+
+    fn shelf_on(&mut self, now: f64) {
+        if self.shelf_up() {
+            tracing::info!("shelf idle up");
+            return;
+        }
+        if !self.connection_ready() || !self.raise_link() {
+            tracing::info!("shelf idle not-ready");
+            return;
+        }
+        self.mark_link(now, true);
+        tracing::info!("shelf on");
+    }
+
+    fn shelf_off(&mut self, now: f64) {
+        if !self.shelf_up() {
+            tracing::info!("shelf idle down");
+            return;
+        }
+        self.mark_link(now, false);
+        self.stop_link();
+        tracing::info!("shelf off");
+    }
+
+    fn mark_link(&mut self, now: f64, on: bool) {
+        self.linked = on;
+        self.link_sent_at = now;
+        self.style = (self.toggles % 4) as f64;
+        self.toggles = self.toggles.wrapping_add(1);
+    }
+
     /// The cabinet is a redeemed device. A configuration is a JSON entrance
     /// artefact. Anything else is not a connection, and the scene button does
     /// not start one.
@@ -758,20 +846,6 @@ impl Oasis {
         let config = crate::configs::take_artefact(artefact, "")?;
         self.stand.refresh_configs();
         self.stand.configs.iter().position(|item| item.dir == config.dir)
-    }
-
-    /// What the chrome says the picked target is.
-    fn target_name(&self) -> String {
-        match self.picked {
-            Target::None => crate::text::tr("t.none").to_owned(),
-            Target::Cabinet => crate::text::tr("t.cabinet").to_owned(),
-            Target::Config(index) => self
-                .stand
-                .configs
-                .get(index)
-                .map(|config| config.name.clone())
-                .unwrap_or_else(|| crate::text::tr("t.none").to_owned()),
-        }
     }
 
     fn cabinet_ready(&self) -> bool {
@@ -1128,11 +1202,16 @@ impl Oasis {
         let quiet = if light { "#5c5c64" } else { "#9a9aa2" };
         render.set_font("14px PT Root UI");
         render.set_text_baseline(TextBaseline::Middle);
+        // Rows and the empty line stay inside the curtain. A short list used
+        // to paint past the lip, and the entrance then sat off the cabinet.
+        render.save();
+        render.clip_rect(g.content.x, g.content.y, g.content.width, g.content.height);
         if rows.is_empty() {
             render.set_text_align(TextAlign::Center);
             render.set_fill_color(quiet);
-            let y = g.content.y + 24.0;
+            let y = g.content.y + g.content.height / 2.0;
             render.fill_text(crate::text::tr("t.empty"), g.content.x + g.content.width / 2.0, y);
+            render.restore();
             return;
         }
         for row in rows {
@@ -1144,6 +1223,7 @@ impl Oasis {
             render.set_fill_color(quiet);
             render.fill_text(&row.subtitle, row.rect.x + 10.0, row.rect.y + 30.0);
         }
+        render.restore();
     }
 
     fn mount_stand(
@@ -1361,17 +1441,6 @@ fn sheet_pair(width: f64) -> (Rect, Rect) {
     (Rect::new(x, y, half, SEG_H), Rect::new(x + half, y, avail - half, SEG_H))
 }
 
-/// The chip in the chrome: what is picked right now.
-///
-/// It is always there, sheet or no sheet: the scene connects to this, so the
-/// person must see what it will connect to.
-fn chip_rect(width: f64) -> Rect {
-    let y = (CHROME_H - SEG_H) / 2.0;
-    let right = glyph_rect(width, 1).x - 10.0;
-    let w = 160.0_f64.min((right - 8.0).max(0.0));
-    Rect::new(right - w, y, w, SEG_H)
-}
-
 fn paint_sheets(render: &mut dyn RenderContext, targets: Rect, settings: Rect, sheet: Sheet) {
     let light = crate::theme::light();
     let x = targets.x;
@@ -1394,25 +1463,6 @@ fn paint_sheets(render: &mut dyn RenderContext, targets: Rect, settings: Rect, s
     };
     word(render, targets, crate::text::tr("h.connections"), sheet == Sheet::Targets);
     word(render, settings, crate::text::tr("h.settings"), sheet == Sheet::Settings);
-}
-
-/// The name of the picked target, in the chrome.
-fn paint_target_chip(render: &mut dyn RenderContext, width: f64, name: &str) {
-    let light = crate::theme::light();
-    let rect = chip_rect(width);
-    if rect.width <= 8.0 {
-        return;
-    }
-    render.set_font("12px PT Root UI");
-    render.set_text_align(TextAlign::Right);
-    render.set_text_baseline(TextBaseline::Alphabetic);
-    render.set_fill_color(if light { "#5c5c64" } else { "#b4b4bc" });
-    let y = crate::theme::label_baseline(rect.y, rect.height, 12.0);
-    let mut shown = name.to_owned();
-    while shown.chars().count() > 22 {
-        shown.pop();
-    }
-    render.fill_text(&shown, rect.x + rect.width, y);
 }
 
 /// One row of the list of what one can connect to.
@@ -1469,8 +1519,14 @@ fn target_rows(content: Rect, stand: &Stand, bound: bool) -> Vec<TargetRow> {
 }
 
 /// How tall the list of targets is.
+///
+/// An empty list is still a row. Eight pixels is shorter than the glyphs, so
+/// the empty line was painted under the lip and the entrance left the cabinet.
 fn targets_height(stand: &Stand, bound: bool) -> f64 {
     let rows = if bound { 1.0 } else { 0.0 } + stand.configs.len() as f64;
+    if rows == 0.0 {
+        return 8.0 + TARGET_ROW_H + 8.0;
+    }
     8.0 + rows * (TARGET_ROW_H + 8.0)
 }
 
@@ -1711,6 +1767,10 @@ fn stroke_x(render: &mut dyn RenderContext, cx: f64, cy: f64, s: f64, color: &st
 }
 
 pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
+    // A launcher action on Linux is this exe again. It only delivers the word.
+    if shelf::deliver_and_exit() {
+        return Ok(());
+    }
     let host = JsAnimHost::new()?;
     host.load(include_str!("veg.js"))?;
     host.load(include_str!("figures.js"))?;
@@ -1759,6 +1819,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             linked: false,
             restored: false,
             link_sent_at: f64::NEG_INFINITY,
+            clock: 0.0,
             adopted: String::new(),
             pending_submit: None,
             pass_reset_seen: HashMap::new(),
@@ -1771,11 +1832,8 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         NativeOptions {
             // backend stays unset: the host walks UZOR_RENDER_FAMILY, then
             // RenderFamily::default (URX), then the adapter probe.
-            tray: Some(TraySpec {
-                tooltip: Some("m1r4g3".into()),
-                icon: Some(palm_icon(PALM_W, PALM)),
-                items: Vec::new(),
-            }),
+            // The shelf owns the tray. uzor's spec freezes the icon and the labels.
+            tray: None,
             ..NativeOptions::default()
         },
     )?;

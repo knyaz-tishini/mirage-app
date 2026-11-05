@@ -1,12 +1,14 @@
-//! Standalone sheet. Four sections under the chrome divider: server, protocols,
-//! access (link, guests, camera / file / clipboard), connection (kill switch,
-//! dns, split). Password is never written.
+//! Standalone sheet. Three sections under the chrome divider: servers (a new
+//! box, or the boxes this client already has), device (how this machine
+//! leaves, and the share page of the picked entrance), cabinet (bind and
+//! unlink only). Password is never written.
 //!
-//! The ready stack is three kits (`quic-mirage`, `quic`, `all`), not a list of
-//! look-alike masks. Install sends the kit name. A box that already has the
-//! container is read with the existing `client.link`; that does not reinstall
-//! and does not mint keys. Access is the share page: the link, the QR, export,
-//! and copy.
+//! The ready stack is three one-line kits (`quic`, `quic-mirage`, `all`), not
+//! a list of look-alike masks. Install sends the kit name. The link, the
+//! re-roll, the remote remove, and the local forget open only for the box
+//! that was pressed. A box that already has the container is read with the
+//! existing `client.link`; that does not reinstall and does not mint keys.
+//! Device is the share page: the link, the QR, export, and copy.
 //!
 //! The own-binary mode still names its two carrier ports. Kill switch and the
 //! split lists live in the profile. The catalogue, `server.env`, and the
@@ -44,9 +46,6 @@ fn accent() -> &'static str {
 }
 const ROW: f64 = 40.0;
 const ROW_H: f64 = 32.0;
-/// A kit card is taller than a field row. The step leaves a 4px gap.
-const KIT_H: f64 = 52.0;
-const KIT_STEP: f64 = 56.0;
 const NAV_H: f64 = 44.0;
 const LABEL_W: f64 = 108.0;
 const REVOKE_W: f64 = 72.0;
@@ -123,10 +122,12 @@ const ID_POOLS: &[(&str, &[&str])] = &[
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    Server,
-    Protocols,
-    Access,
-    Link,
+    /// A box the client can reach: host, kit, install, the fetched entrance.
+    Servers,
+    /// This machine: language, how traffic leaves, and the share page.
+    Device,
+    /// The fleet cabinet. Bind and unlink, and nothing else.
+    Cabinet,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -227,6 +228,12 @@ pub enum Carry {
 pub struct Stand {
     pub section: Section,
     pub host: String,
+    /// The known box whose detail is open. Empty means the list is shut.
+    /// Not written down: it is which row is open, not a credential.
+    pub open_host: String,
+    /// The servers section is showing the new-box form. False is the list of
+    /// boxes this client already has. Not written down.
+    pub server_new: bool,
     pub user: String,
     pub pass: String,
     pub stack_auto: bool,
@@ -305,8 +312,10 @@ pub struct Stand {
 impl Stand {
     pub fn load() -> Self {
         let mut stand = Self {
-            section: Section::Server,
+            section: Section::Servers,
             host: String::new(),
+            open_host: String::new(),
+            server_new: false,
             user: "root".into(),
             pass: String::new(),
             stack_auto: true,
@@ -354,11 +363,12 @@ impl Stand {
         if let Some(dir) = dir() {
             if let Ok(text) = std::fs::read_to_string(dir.join("host.json")) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // Old names stay readable. Protocols lived on the server,
+                    // access and the link page live on the device.
                     stand.section = match v.get("section").and_then(|s| s.as_str()) {
-                        Some("protocols") => Section::Protocols,
-                        Some("access") => Section::Access,
-                        Some("link") => Section::Link,
-                        _ => Section::Server,
+                        Some("device") | Some("access") | Some("link") => Section::Device,
+                        Some("cabinet") => Section::Cabinet,
+                        _ => Section::Servers,
                     };
                     if let Some(h) = v.get("host").and_then(|s| s.as_str()) {
                         stand.host = h.to_owned();
@@ -560,7 +570,7 @@ impl Stand {
         }
         // The link that arrived is the share page. The QR is that link, not a guest.
         self.qr_guest = None;
-        self.section = Section::Access;
+        self.section = Section::Device;
         self.focus = Focus::None;
         self.save_profile();
     }
@@ -1020,6 +1030,51 @@ impl Stand {
         self.save_profile();
     }
 
+    /// Open the detail of one known box, or close it when it is already open.
+    ///
+    /// The host field becomes that box, so install, fetch, and remove talk to
+    /// it. Closing the row leaves the draft host as it is.
+    fn open_server(&mut self, host: &str) {
+        if self.open_host == host {
+            self.open_host.clear();
+            return;
+        }
+        self.open_host = host.to_owned();
+        self.host = host.to_owned();
+        self.focus = Focus::None;
+        self.save_profile();
+    }
+
+    /// Drop this box from the client's list. The files stay. The box is not
+    /// contacted: that is the remote remove, and it is a different button.
+    fn forget_server(&mut self) {
+        let host = self.open_host.trim().to_owned();
+        if host.is_empty() {
+            self.say(tr("say.need_host"));
+            return;
+        }
+        let doomed: Vec<crate::configs::Config> = self
+            .configs
+            .iter()
+            .filter(|config| server_host(config) == host)
+            .cloned()
+            .collect();
+        if doomed.is_empty() {
+            self.say(tr("say.empty"));
+            return;
+        }
+        for config in &doomed {
+            crate::configs::forget(config);
+        }
+        if self.host.trim() == host {
+            self.host.clear();
+        }
+        self.open_host.clear();
+        self.refresh_configs();
+        self.save_profile();
+        self.say(tr("say.forgot"));
+    }
+
     pub fn export(&self) {
         if self.link.is_empty() {
             self.say(tr("say.no_link"));
@@ -1241,8 +1296,8 @@ impl Stand {
             self.say(tr("say.long"));
             return;
         }
-        if self.section != Section::Access {
-            self.section = Section::Access;
+        if self.section != Section::Device {
+            self.section = Section::Device;
             self.save_profile();
         }
         self.set_link(raw);
@@ -1424,10 +1479,9 @@ fn id_for_face(face: &provision::ProposedFace, taken: &[&'static str]) -> Option
 
 fn section_key(section: Section) -> &'static str {
     match section {
-        Section::Server => "server",
-        Section::Protocols => "protocols",
-        Section::Access => "access",
-        Section::Link => "link",
+        Section::Servers => "servers",
+        Section::Device => "device",
+        Section::Cabinet => "cabinet",
     }
 }
 
@@ -1465,12 +1519,32 @@ fn kit_title(kit: Kit) -> &'static str {
     }
 }
 
-fn kit_desc(kit: Kit) -> &'static str {
-    match kit {
-        Kit::QuicMirage => tr("kit.qm.d"),
-        Kit::Quic => tr("kit.quic.d"),
-        Kit::All => tr("kit.all.d"),
+/// The box an entrance belongs to.
+///
+/// The artefact's address is the box. Several entrances of one box — the
+/// install itself and the later consumers — are one row. A name is only the
+/// fallback when the artefact does not say.
+fn server_host(config: &crate::configs::Config) -> String {
+    if let Some(text) = config.read() {
+        let (host, _) = crate::configs::read_name(&text);
+        if !host.is_empty() {
+            return host;
+        }
     }
+    config.name.trim().to_owned()
+}
+
+/// Boxes this client already has an entrance for, in list order, once each.
+fn known_servers(stand: &Stand) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for config in &stand.configs {
+        let host = server_host(config);
+        if host.is_empty() || hosts.iter().any(|item| item == &host) {
+            continue;
+        }
+        hosts.push(host);
+    }
+    hosts
 }
 
 /// Which key the client comes in by, as the profile writes it down.
@@ -1616,33 +1690,114 @@ mod tests {
         let mut stand = Stand::load();
         stand.kit = Kit::QuicMirage;
         stand.build = Build::Ready;
-        stand.section = Section::Protocols;
+        stand.section = Section::Servers;
+        stand.server_new = true;
         let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
         let kinds: Vec<HitKind> = lay.hits.iter().map(|hit| hit.kind).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                HitKind::Kit(Kit::QuicMirage),
-                HitKind::Kit(Kit::Quic),
-                HitKind::Kit(Kit::All),
-                HitKind::Fetch,
-            ]
-        );
+        assert!(kinds.contains(&HitKind::Kit(Kit::QuicMirage)));
+        assert!(kinds.contains(&HitKind::Kit(Kit::Quic)));
+        assert!(kinds.contains(&HitKind::Kit(Kit::All)));
+        // Nothing is selected, so the link actions stay shut. A new box can
+        // still be typed and installed.
+        assert!(!kinds.contains(&HitKind::Fetch));
+        assert!(!kinds.contains(&HitKind::Remove));
+        assert!(!kinds.contains(&HitKind::Forget));
+        assert!(kinds.contains(&HitKind::Install));
+        assert!(kinds.contains(&HitKind::ServerPage(true)));
+        assert!(kinds.contains(&HitKind::ServerPage(false)));
+        assert!(kinds.iter().all(|kind| !matches!(kind, HitKind::Unlink | HitKind::Server(_))));
+        assert!(lay.fields.iter().any(|field| field.focus == Focus::Host));
+        assert!(lay.fields.iter().all(|field| field.focus != Focus::Bind));
         assert_eq!(kinds.iter().filter(|kind| matches!(kind, HitKind::Kit(_))).count(), 3);
-        assert_eq!(kinds.iter().filter(|kind| matches!(kind, HitKind::Fetch)).count(), 1);
         assert!(kinds.iter().all(|kind| !matches!(kind, HitKind::Proto(_) | HitKind::ProtoOn(_))));
-        // The kinds exist; this sheet must not be what builds them.
         let _toggle = (HitKind::Proto(0), HitKind::ProtoOn(0));
         let cards: Vec<_> = lay.hits.iter().filter(|hit| matches!(hit.kind, HitKind::Kit(_))).collect();
         assert_eq!(cards.len(), 3);
+        assert_eq!(cards[0].kind, HitKind::Kit(Kit::Quic));
+        assert_eq!(cards[1].kind, HitKind::Kit(Kit::QuicMirage));
+        assert_eq!(cards[2].kind, HitKind::Kit(Kit::All));
         for card in &cards {
-            assert_eq!(card.rect.height, 52.0);
+            assert_eq!(card.rect.height, ROW_H);
         }
-        assert_eq!(cards[1].rect.y - cards[0].rect.y, 56.0);
-        assert_eq!(cards[2].rect.y - cards[1].rect.y, 56.0);
-        let fetch = lay.hits.iter().find(|hit| hit.kind == HitKind::Fetch).expect("fetch");
-        assert_eq!(fetch.rect.width, cards[0].rect.width);
-        assert_eq!(fetch.rect.x, cards[0].rect.x);
+        assert_eq!(cards[1].rect.y - cards[0].rect.y, ROW);
+        assert_eq!(cards[2].rect.y - cards[1].rect.y, ROW);
+    }
+
+    /// Several entrances of one box are one server. Its config actions exist
+    /// only while that row is open.
+    #[test]
+    fn the_server_sheet_opens_one_box() {
+        let dir = std::env::temp_dir().join(format!("m1r4g3-srv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::create_dir_all(dir.join("c")).unwrap();
+        std::fs::write(
+            dir.join("a").join("artefact.json"),
+            r#"{"v":1,"entrances":[{"addr":"edge.example:443"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b").join("artefact.json"),
+            r#"{"v":1,"entrances":[{"addr":"edge.example:443"}],"label":"consumer"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("c").join("artefact.json"),
+            r#"{"v":1,"entrances":[{"addr":"other.example:443"}]}"#,
+        )
+        .unwrap();
+        let mut stand = Stand::load();
+        stand.section = Section::Servers;
+        stand.build = Build::Ready;
+        stand.server_new = false;
+        stand.configs = vec![
+            crate::configs::Config {
+                name: "edge.example".into(),
+                kind: "vpn".into(),
+                dir: dir.join("a"),
+            },
+            crate::configs::Config {
+                name: "consumer".into(),
+                kind: "vpn".into(),
+                dir: dir.join("b"),
+            },
+            crate::configs::Config {
+                name: "other.example".into(),
+                kind: "vpn".into(),
+                dir: dir.join("c"),
+            },
+        ];
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        let servers: Vec<_> = lay
+            .hits
+            .iter()
+            .filter(|hit| matches!(hit.kind, HitKind::Server(_)))
+            .collect();
+        assert_eq!(servers.len(), 2);
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::ServerPage(true)));
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::ServerPage(false)));
+        assert!(lay.hits.iter().all(|hit| {
+            hit.kind != HitKind::Fetch && hit.kind != HitKind::Forget && !matches!(hit.kind, HitKind::Kit(_))
+        }));
+        assert!(lay.fields.iter().all(|field| field.focus != Focus::Host));
+        stand.open_host = "edge.example".into();
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        let kinds: Vec<HitKind> = lay.hits.iter().map(|hit| hit.kind).collect();
+        assert!(kinds.contains(&HitKind::Fetch));
+        assert!(kinds.contains(&HitKind::Install));
+        assert!(kinds.contains(&HitKind::Remove));
+        assert!(kinds.contains(&HitKind::Forget));
+        assert!(kinds.contains(&HitKind::Kit(Kit::Quic)));
+        assert!(lay.fields.iter().all(|field| field.focus != Focus::Host));
+        assert!(lay.fields.iter().any(|field| field.focus == Focus::User));
+        stand.server_new = true;
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        assert!(lay.hits.iter().all(|hit| !matches!(hit.kind, HitKind::Server(_))));
+        assert!(lay.fields.iter().any(|field| field.focus == Focus::Host));
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::Install));
+        assert!(lay.hits.iter().all(|hit| hit.kind != HitKind::Fetch && hit.kind != HitKind::Forget));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1650,11 +1805,32 @@ mod tests {
         let mut stand = Stand::load();
         stand.kit = Kit::QuicMirage;
         stand.build = Build::Own;
-        stand.section = Section::Protocols;
+        stand.section = Section::Servers;
+        stand.server_new = true;
         let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
         assert!(lay.hits.iter().all(|hit| !matches!(hit.kind, HitKind::Fetch | HitKind::Kit(_))));
         assert!(lay.fields.iter().any(|field| field.focus == Focus::MwgPort));
         assert!(lay.fields.iter().any(|field| field.focus == Focus::KvikPort));
+    }
+
+    #[test]
+    fn the_cabinet_sheet_is_only_the_claim() {
+        let mut stand = Stand::load();
+        stand.section = Section::Cabinet;
+        stand.cabinet_bound = false;
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        assert!(lay.fields.iter().any(|field| field.focus == Focus::Bind));
+        assert!(lay.hits.iter().all(|hit| hit.kind != HitKind::Install));
+        stand.cabinet_bound = true;
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::Unlink));
+        assert!(lay.fields.iter().all(|field| field.focus != Focus::Bind));
+        stand.section = Section::Device;
+        let lay = layout(&stand, Rect::new(0.0, 0.0, 320.0, 1.0), false);
+        assert!(lay.fields.iter().any(|field| field.focus == Focus::Link));
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::Carry));
+        assert!(lay.hits.iter().all(|hit| hit.kind != HitKind::Unlink && hit.kind != HitKind::Install));
+        assert_eq!(nav_buttons(Rect::new(0.0, 0.0, 320.0, 1.0)).len(), 3);
     }
 }
 
@@ -1803,6 +1979,9 @@ enum ButtonText {
     InviteFull,
     MyKey,
     Unlink,
+    Forget,
+    PageNew,
+    PageKnown,
 }
 
 enum Choice {
@@ -1813,7 +1992,6 @@ enum Choice {
     Build,
     Key,
     Carry,
-    Kit,
 }
 
 enum Row {
@@ -1821,6 +1999,7 @@ enum Row {
     Button { rect: Rect, text: ButtonText },
     Choice { rect: Rect, label: &'static str, which: Choice },
     Kit { rect: Rect, kit: Kit },
+    Server { rect: Rect, index: usize },
     Guest { rect: Rect, index: usize, revoke: Rect },
     Entry { rect: Rect, index: usize, site: bool },
     Line { x: f64, y: f64 },
@@ -1831,6 +2010,10 @@ enum HitKind {
     Install,
     Remove,
     Fetch,
+    Forget,
+    Server(usize),
+    /// `true` opens the new-box form. `false` opens the boxes already known.
+    ServerPage(bool),
     Export,
     Copy,
     Scan,
@@ -1846,7 +2029,6 @@ enum HitKind {
     Invite(bool),
     Unlink,
     Carry,
-    Kits,
     Kit(Kit),
     Proto(usize),
     ProtoOn(usize),
@@ -1962,8 +2144,7 @@ impl Lay {
     }
 
     fn kit_card(&mut self, kit: Kit) {
-        let rect = Rect::new(self.x, self.y, self.w, KIT_H);
-        self.y += KIT_STEP;
+        let rect = self.row_rect();
         self.rows.push(Row::Kit { rect, kit });
         let id = match kit {
             Kit::QuicMirage => "st-kit-quic-mirage",
@@ -1971,6 +2152,12 @@ impl Lay {
             Kit::All => "st-kit-all",
         };
         self.hit(id.to_owned(), rect, HitKind::Kit(kit));
+    }
+
+    fn server(&mut self, index: usize) {
+        let rect = self.row_rect();
+        self.rows.push(Row::Server { rect, index });
+        self.hit(format!("st-srv-{index}"), rect, HitKind::Server(index));
     }
 
     fn guest(&mut self, index: usize) {
@@ -2004,59 +2191,75 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
         hits: Vec::new(),
     };
     match stand.section {
-        Section::Server => {
-            // The cabinet is one of the ways out, so its claim code sits at
-            // the top of the server sheet: the person looks for it first,
-            // next to the boxes of their own.
-            if stand.cabinet_bound {
-                lay.solo(("st-unlink", ButtonText::Unlink, HitKind::Unlink));
-            } else {
-                lay.field("st-bind", tr("f.cabinet"), Focus::Bind, tr("bind.ph"), 512, false);
-            }
-            lay.field("st-host", tr("f.host"), Focus::Host, tr("f.host"), 240, false);
-            lay.field("st-user", tr("f.user"), Focus::User, tr("f.user"), 240, false);
-            lay.field("st-pass", tr("f.pass"), Focus::Pass, tr("f.pass"), 240, true);
-            if stand.build == Build::Ready {
-                lay.choice("st-kit", tr("f.kit"), Choice::Kit, HitKind::Kits);
-            }
-            lay.choice("st-build", tr("f.build"), Choice::Build, HitKind::Build);
-            if stand.build == Build::Own {
-                lay.field("st-bin", tr("f.binary"), Focus::Binary, tr("f.binary"), 240, false);
-                lay.choice("st-keysrc", tr("f.keysrc"), Choice::Key, HitKind::Key);
-                if stand.key_source == KeySource::File {
-                    lay.field("st-key", tr("f.sshkey"), Focus::SshKey, tr("f.sshkey"), 240, false);
+        Section::Servers => {
+            lay.pair(
+                ("st-page-new", ButtonText::PageNew, HitKind::ServerPage(true)),
+                ("st-page-known", ButtonText::PageKnown, HitKind::ServerPage(false)),
+            );
+            if stand.server_new {
+                lay.field("st-host", tr("f.host"), Focus::Host, tr("f.host"), 240, false);
+                lay.field("st-user", tr("f.user"), Focus::User, tr("f.user"), 240, false);
+                lay.field("st-pass", tr("f.pass"), Focus::Pass, tr("f.pass"), 240, true);
+                lay.choice("st-build", tr("f.build"), Choice::Build, HitKind::Build);
+                if stand.build == Build::Own {
+                    lay.field("st-bin", tr("f.binary"), Focus::Binary, tr("f.binary"), 240, false);
+                    lay.choice("st-keysrc", tr("f.keysrc"), Choice::Key, HitKind::Key);
+                    if stand.key_source == KeySource::File {
+                        lay.field("st-key", tr("f.sshkey"), Focus::SshKey, tr("f.sshkey"), 240, false);
+                    }
+                    lay.field("st-mwg", tr("f.mwg"), Focus::MwgPort, tr("f.port"), 5, false);
+                    lay.field("st-kvik", tr("f.kvik"), Focus::KvikPort, tr("f.port"), 5, false);
+                    lay.pair(
+                        ("st-go", ButtonText::Install, HitKind::Install),
+                        ("st-mykey", ButtonText::MyKey, HitKind::MyKey),
+                    );
+                } else {
+                    for kit in [Kit::Quic, Kit::QuicMirage, Kit::All] {
+                        lay.kit_card(kit);
+                    }
+                    lay.solo(("st-go", ButtonText::Install, HitKind::Install));
                 }
-                // The ready-made stack is taken down by a button of its own;
-                // the own binary is not, so the install takes the whole row.
-                lay.pair(
-                    ("st-go", ButtonText::Install, HitKind::Install),
-                    ("st-mykey", ButtonText::MyKey, HitKind::MyKey),
-                );
             } else {
-                lay.pair(
-                    ("st-go", ButtonText::Install, HitKind::Install),
-                    ("st-down", ButtonText::Remove, HitKind::Remove),
-                );
+                let servers = known_servers(stand);
+                for index in 0..servers.len() {
+                    lay.server(index);
+                }
+                let open = servers.iter().any(|host| host == &stand.open_host);
+                if open {
+                    for kit in [Kit::Quic, Kit::QuicMirage, Kit::All] {
+                        lay.kit_card(kit);
+                    }
+                    lay.field("st-user", tr("f.user"), Focus::User, tr("f.user"), 240, false);
+                    lay.field("st-pass", tr("f.pass"), Focus::Pass, tr("f.pass"), 240, true);
+                    lay.pair(
+                        ("st-go", ButtonText::Install, HitKind::Install),
+                        ("st-config", ButtonText::Config, HitKind::Fetch),
+                    );
+                    lay.pair(
+                        ("st-down", ButtonText::Remove, HitKind::Remove),
+                        ("st-forget", ButtonText::Forget, HitKind::Forget),
+                    );
+                }
             }
+        }
+        Section::Device => {
             lay.choice("st-lang", tr("f.lang"), Choice::Lang, HitKind::Lang);
             lay.choice("st-style", tr("f.style"), Choice::Style, HitKind::Style);
-        }
-        Section::Protocols => {
-            if stand.build == Build::Own {
-                // The own binary opens two doors: the two carriers. The masks
-                // of the ready-made stack mean nothing here.
-                lay.field("st-mwg", tr("f.mwg"), Focus::MwgPort, tr("f.port"), 5, false);
-                lay.field("st-kvik", tr("f.kvik"), Focus::KvikPort, tr("f.port"), 5, false);
-            } else {
-                // Three kits, then the button that reads a box already up.
-                // The catalogue, the ports, and the mask note stay off this sheet.
-                for kit in [Kit::QuicMirage, Kit::Quic, Kit::All] {
-                    lay.kit_card(kit);
-                }
-                lay.solo(("st-config", ButtonText::Config, HitKind::Fetch));
+            lay.choice("st-carry", tr("f.carry"), Choice::Carry, HitKind::Carry);
+            lay.choice("st-kill", tr("f.kill"), Choice::Kill, HitKind::Kill);
+            lay.field("st-dns", tr("f.dns"), Focus::Dns, tr("f.resolver"), 240, false);
+            if stand.kill != Kill::Off {
+                lay.field("st-except", tr("f.except"), Focus::Except, tr("f.dns_list"), 240, false);
             }
-        }
-        Section::Access => {
+            lay.choice("st-split", tr("f.routes"), Choice::Split, HitKind::Split);
+            lay.field("st-site", tr("f.site"), Focus::Site, tr("f.domain"), 240, false);
+            for index in 0..stand.sites.len() {
+                lay.entry(index, true);
+            }
+            lay.field("st-app", tr("f.app"), Focus::App, tr("f.process"), 240, false);
+            for index in 0..stand.apps.len() {
+                lay.entry(index, false);
+            }
             lay.field("st-link", tr("f.link"), Focus::Link, tr("f.paste"), 256 * 1024, false);
             lay.pair(
                 ("st-export", ButtonText::Export, HitKind::Export),
@@ -2076,21 +2279,11 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
                 lay.guest(index);
             }
         }
-        Section::Link => {
-            lay.choice("st-carry", tr("f.carry"), Choice::Carry, HitKind::Carry);
-            lay.choice("st-kill", tr("f.kill"), Choice::Kill, HitKind::Kill);
-            lay.field("st-dns", tr("f.dns"), Focus::Dns, tr("f.resolver"), 240, false);
-            if stand.kill != Kill::Off {
-                lay.field("st-except", tr("f.except"), Focus::Except, tr("f.dns_list"), 240, false);
-            }
-            lay.choice("st-split", tr("f.routes"), Choice::Split, HitKind::Split);
-            lay.field("st-site", tr("f.site"), Focus::Site, tr("f.domain"), 240, false);
-            for index in 0..stand.sites.len() {
-                lay.entry(index, true);
-            }
-            lay.field("st-app", tr("f.app"), Focus::App, tr("f.process"), 240, false);
-            for index in 0..stand.apps.len() {
-                lay.entry(index, false);
+        Section::Cabinet => {
+            if stand.cabinet_bound {
+                lay.solo(("st-unlink", ButtonText::Unlink, HitKind::Unlink));
+            } else {
+                lay.field("st-bind", tr("f.cabinet"), Focus::Bind, tr("bind.ph"), 512, false);
             }
         }
     }
@@ -2106,21 +2299,21 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
     }
 }
 
-fn nav_buttons(content: Rect) -> [NavBtn; 4] {
-    const IDS: [&str; 4] = ["st-nav-server", "st-nav-proto", "st-nav-access", "st-nav-link"];
-    let labels = [tr("nav.server"), tr("nav.proto"), tr("nav.access"), tr("nav.link")];
-    const SECS: [Section; 4] = [Section::Server, Section::Protocols, Section::Access, Section::Link];
+fn nav_buttons(content: Rect) -> [NavBtn; 3] {
+    const IDS: [&str; 3] = ["st-nav-servers", "st-nav-device", "st-nav-cabinet"];
+    let labels = [tr("nav.servers"), tr("nav.device"), tr("nav.cabinet")];
+    const SECS: [Section; 3] = [Section::Servers, Section::Device, Section::Cabinet];
     let y = content.y + 6.0;
     let x0 = content.x + 16.0;
     let inner = (content.width - 32.0).max(0.0);
-    let w = inner / 4.0;
+    let w = inner / 3.0;
     let mut out = [NavBtn {
         id: IDS[0],
         label: labels[0],
-        section: Section::Server,
+        section: Section::Servers,
         rect: Rect::new(0.0, 0.0, 0.0, 0.0),
-    }; 4];
-    for i in 0..4 {
+    }; 3];
+    for i in 0..3 {
         out[i] = NavBtn {
             id: IDS[i],
             label: labels[i],
@@ -2132,7 +2325,7 @@ fn nav_buttons(content: Rect) -> [NavBtn; 4] {
 }
 
 fn qr_payload(stand: &Stand) -> Option<&str> {
-    if stand.section != Section::Access {
+    if stand.section != Section::Device {
         return None;
     }
     if let Some(index) = stand.qr_guest {
@@ -2154,6 +2347,20 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Install => stand.install(),
         HitKind::Remove => stand.remove_remote(),
         HitKind::Fetch => stand.fetch_config(),
+        HitKind::Forget => stand.forget_server(),
+        HitKind::ServerPage(fresh) => {
+            stand.server_new = fresh;
+            if fresh {
+                stand.open_host.clear();
+            }
+        }
+        HitKind::Server(index) => {
+            let hosts = known_servers(stand);
+            if let Some(host) = hosts.get(index) {
+                let host = host.clone();
+                stand.open_server(&host);
+            }
+        }
         HitKind::Export => stand.export(),
         HitKind::Copy => stand.copy_link(),
         HitKind::Scan => stand.request_scan(),
@@ -2168,7 +2375,6 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::MyKey => stand.show_my_key(),
         HitKind::Unlink => stand.unlink = true,
         HitKind::Carry => stand.cycle_carry(),
-        HitKind::Kits => stand.set_section(Section::Protocols),
         HitKind::Kit(kit) => stand.select_kit(kit),
         // The ready sheet does not build these. The arms stay so a hit of
         // that kind is still a defined action if one is ever delivered.
@@ -2245,7 +2451,7 @@ fn paint_nav(ctx: &mut dyn RenderContext, content: Rect, section: Section) {
     let track = Rect::new(
         nav[0].rect.x,
         nav[0].rect.y,
-        nav[3].rect.x + nav[3].rect.width - nav[0].rect.x,
+        nav[2].rect.x + nav[2].rect.width - nav[0].rect.x,
         nav[0].rect.height,
     );
     let active = nav.iter().find(|n| n.section == section).map(|n| n.rect).unwrap_or(nav[0].rect);
@@ -2275,13 +2481,18 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
         }
         Row::Button { rect, text } => {
             let primary = matches!(text, ButtonText::Install);
+            let page = match text {
+                ButtonText::PageNew => Some(stand.server_new),
+                ButtonText::PageKnown => Some(!stand.server_new),
+                _ => None,
+            };
             if primary {
                 ctx.set_fill_color(if crate::theme::light() { "#1c1c1f" } else { AMBER });
                 ctx.fill_rounded_rect(rect.x, rect.y, rect.width, rect.height, 12.0);
                 ctx.set_fill_color(if crate::theme::light() { "#ffffff" } else { "#1a1208" });
             } else {
-                plate(ctx, *rect, false);
-                ctx.set_fill_color(fg());
+                plate(ctx, *rect, page.unwrap_or(false));
+                ctx.set_fill_color(if page == Some(true) { accent() } else { fg() });
             }
             ctx.set_text_align(TextAlign::Center);
             let label = button_label(stand, text);
@@ -2308,15 +2519,20 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             ctx.fill_text(
                 kit_title(*kit),
                 rect.x + 8.0,
-                crate::theme::label_baseline(rect.y + 4.0, 22.0, 14.0),
+                crate::theme::label_baseline(rect.y, rect.height, 14.0),
             );
-            ctx.set_font("12px PT Root UI");
-            ctx.set_fill_color(dim());
-            ctx.fill_text(
-                kit_desc(*kit),
-                rect.x + 8.0,
-                crate::theme::label_baseline(rect.y + 26.0, 22.0, 12.0),
-            );
+        }
+        Row::Server { rect, index } => {
+            let hosts = known_servers(stand);
+            let Some(host) = hosts.get(*index) else {
+                return;
+            };
+            let open = stand.open_host == *host;
+            plate(ctx, *rect, open);
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_font("14px PT Root UI");
+            ctx.set_fill_color(if open { accent() } else { fg() });
+            ctx.fill_text(host, rect.x + 8.0, crate::theme::label_baseline(rect.y, rect.height, 14.0));
         }
         Row::Guest { rect, index, revoke } => {
             let Some(guest) = stand.guests.get(*index) else {
@@ -2385,10 +2601,15 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
         ButtonText::Install => {
             if running {
                 tr("b.installing")
-            } else {
+            } else if stand.open_host.is_empty() {
                 tr("b.install")
+            } else {
+                tr("b.roll")
             }
         }
+        ButtonText::Forget => tr("b.forget"),
+        ButtonText::PageNew => tr("b.page_new"),
+        ButtonText::PageKnown => tr("b.page_known"),
         ButtonText::Remove => {
             if running {
                 tr("b.removing")
@@ -2449,7 +2670,6 @@ fn choice_value(stand: &Stand, which: &Choice) -> String {
             KeySource::Own => tr("c.key_own").into(),
             KeySource::File => tr("c.key_file").into(),
         },
-        Choice::Kit => kit_title(stand.kit).into(),
     }
 }
 

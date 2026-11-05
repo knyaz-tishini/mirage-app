@@ -97,6 +97,12 @@ rand                    = "0.8"
 hex                     = "0.4"
 # Paint the issued link. No image backend.
 qrcode                  = { version = "0.14", default-features = false }
+# Own tray menu. uzor's TraySpec freezes the icon and the labels, so a
+# language change never reaches it. tray-icon 0.20.1 is already in this
+# lock through uzor-framework. No extra features, so that crate is not rebuilt.
+
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
+tray-icon = { version = "0.20.1", default-features = false }
 
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 uzor-framework = { version = "1.5.19", features = ["native"] }
