@@ -127,9 +127,9 @@ fn row(id: &'static str) -> (&'static str, &'static str) {
         "shelf.connect" => ("подключиться", "connect"),
         "shelf.disconnect" => ("отключиться", "disconnect"),
         "shelf.quit" => ("выйти", "quit"),
-        // State, not the action. The tray balloon and the icon tip use these.
-        "shelf.state.on" => ("подключено", "connected"),
-        "shelf.state.off" => ("отключено", "disconnected"),
+        // One line on the tray balloon. No separate title above it.
+        "shelf.state.on" => ("m1r4g3 подключен", "m1r4g3 connected"),
+        "shelf.state.off" => ("m1r4g3 отключен", "m1r4g3 disconnected"),
 
         "b.on" => ("вкл", "on"),
         "b.off" => ("выкл", "off"),

@@ -6,8 +6,9 @@
 //! The menu is one action (подключиться / отключиться) and quit.
 //! The hover tip is the app name and version. The palm color is the state.
 //! A state change posts the system balloon Amnezia posts from
-//! `QSystemTrayIcon::showMessage`: title is the app, body is the state,
-//! the picture is the palm, and "disconnected" is sent only after a real link.
+//! `QSystemTrayIcon::showMessage`: one line, the colored palm when the
+//! link comes up and the same palm in gray when it goes down.
+//! "Disconnected" is sent only after a real link.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -201,38 +202,35 @@ fn announce(live: &mut Live, up: bool) {
 }
 
 fn balloon(up: bool) -> bool {
-    let body = state_tip(up);
+    let line = state_tip(up);
     #[cfg(windows)]
-    return win_balloon("m1r4g3", body, up);
+    return win_balloon(line, up);
     #[cfg(target_os = "linux")]
     {
-        linux_balloon("m1r4g3", body);
+        linux_balloon(line);
         return true;
     }
     #[cfg(target_os = "macos")]
     {
-        mac_balloon("m1r4g3", body);
+        mac_balloon(line);
         return true;
     }
 }
 
 #[cfg(target_os = "linux")]
-fn linux_balloon(title: &str, body: &str) {
-    // The desktop notification, the same role as QSystemTrayIcon::showMessage.
+fn linux_balloon(line: &str) {
+    // One line. The desktop notification, same role as showMessage.
     let _ = std::process::Command::new("notify-send")
-        .args(["-a", "m1r4g3", "-t", "2000", title, body])
+        .args(["-a", "m1r4g3", "-t", "2000", line])
         .spawn();
 }
 
 #[cfg(target_os = "macos")]
-fn mac_balloon(title: &str, body: &str) {
+fn mac_balloon(line: &str) {
     // Amnezia posts a UserNotifications request. This is the system
-    // notification without linking that framework.
-    let script = format!(
-        "display notification \"{}\" with title \"{}\"",
-        apple(body),
-        apple(title)
-    );
+    // notification without linking that framework. The line is the title
+    // so Notification Center does not add a second name above it.
+    let script = format!("display notification \"\" with title \"{}\"", apple(line));
     let _ = std::process::Command::new("osascript").args(["-e", &script]).spawn();
 }
 
@@ -327,7 +325,7 @@ fn gsettings(key: &str) -> Option<String> {
 /// (`tray_icon_app`); this finds that window in this process and posts
 /// the balloon on it. Two seconds, same as Amnezia.
 #[cfg(windows)]
-fn win_balloon(title: &str, body: &str, up: bool) -> bool {
+fn win_balloon(line: &str, up: bool) -> bool {
     let Some((hwnd, uid)) = find_tray() else {
         warn_balloon("icon not found");
         return false;
@@ -352,8 +350,7 @@ fn win_balloon(title: &str, body: &str, up: bool) -> bool {
         guid: Guid { data1: 0, data2: 0, data3: 0, data4: [0; 8] },
         balloon_icon: palm,
     };
-    write_wide(&mut nid.info, body);
-    write_wide(&mut nid.title, title);
+    write_wide(&mut nid.info, line);
     let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &mut nid) };
     if ok == 0 {
         warn_balloon("notify failed");
@@ -464,13 +461,32 @@ fn balloon_palm(up: bool) -> isize {
     if existing != 0 {
         return existing;
     }
-    let handle = palm_icon(&palm(paint(up)));
+    let handle = palm_icon(&balloon_rgba(up));
     if handle == 0 {
         warn_balloon("palm icon failed");
         return 0;
     }
     slot.store(handle, Ordering::SeqCst);
     handle
+}
+
+/// The baked palm keeps its greens and trunk when the link comes up.
+/// Down, the same pixels with the color taken out.
+#[cfg(windows)]
+fn balloon_rgba(up: bool) -> Vec<u8> {
+    if up {
+        return PALM.to_vec();
+    }
+    let mut out = vec![0u8; PALM.len()];
+    for (dst, src) in out.chunks_exact_mut(4).zip(PALM.chunks_exact(4)) {
+        let y = (u32::from(src[0]) * 54 + u32::from(src[1]) * 183 + u32::from(src[2]) * 19) / 256;
+        let y = y as u8;
+        dst[0] = y;
+        dst[1] = y;
+        dst[2] = y;
+        dst[3] = src[3];
+    }
+    out
 }
 
 #[cfg(windows)]
