@@ -4,14 +4,16 @@
 //! UI tick and updates both.
 //!
 //! The menu is one action (подключиться / отключиться) and quit.
-//! The hover tip is the app name and version. The palm color is the state.
+//! The hover tip is the app name and version. The palm is gray when the
+//! link is down and the colored palm when it is up. The system toast
+//! header copies this tray icon, so the header matches it.
 //! A state change posts the system balloon Amnezia posts from
 //! `QSystemTrayIcon::showMessage`: one line, the colored palm when the
 //! link comes up and the same palm in gray when it goes down.
 //! "Disconnected" is sent only after a real link.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -77,8 +79,7 @@ pub fn tick(up: bool) {
 fn open(up: bool) -> Option<Live> {
     #[cfg(windows)]
     super::wincolor::allow_dark_menus();
-    let rgb = paint(up);
-    let icon = match Icon::from_rgba(palm(rgb), SIDE, SIDE) {
+    let icon = match Icon::from_rgba(tray_rgba(up), SIDE, SIDE) {
         Ok(icon) => icon,
         Err(err) => {
             tracing::warn!("tray shelf: icon: {err}");
@@ -97,7 +98,7 @@ fn open(up: bool) -> Option<Live> {
         .with_tooltip(CAPTION)
         .with_menu_on_left_click(false)
         .with_icon(icon)
-        .with_icon_as_template(cfg!(target_os = "macos") && up)
+        .with_icon_as_template(false)
         .build();
     let tray = match tray {
         Ok(tray) => tray,
@@ -112,7 +113,7 @@ fn open(up: bool) -> Option<Live> {
         link,
         quit,
         lang: crate::text::current() as u8,
-        ink: pack(rgb),
+        ink: tray_ink(up),
         up,
         told: None,
         balloon_wait: 0,
@@ -127,22 +128,16 @@ fn refresh(live: &mut Live, up: bool) {
         live.link.set_text(action(up));
         live.quit.set_text(crate::text::tr("shelf.quit"));
     }
-    announce(live, up);
-    let rgb = paint(up);
-    let ink = pack(rgb);
+    // The toast header copies the tray icon, so the picture changes
+    // before the balloon is posted.
+    let ink = tray_ink(up);
     if live.ink != ink {
         live.ink = ink;
-        if let Ok(icon) = Icon::from_rgba(palm(rgb), SIDE, SIDE) {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = live.tray.set_icon_with_as_template(Some(icon), up);
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = live.tray.set_icon(Some(icon));
-            }
+        if let Ok(icon) = Icon::from_rgba(tray_rgba(up), SIDE, SIDE) {
+            let _ = live.tray.set_icon(Some(icon));
         }
     }
+    announce(live, up);
 }
 
 fn pump() {
@@ -250,74 +245,19 @@ fn palm(rgb: [u8; 3]) -> Vec<u8> {
     out
 }
 
-fn pack(rgb: [u8; 3]) -> u32 {
-    (rgb[0] as u32) << 16 | (rgb[1] as u32) << 8 | rgb[2] as u32
-}
-
-/// Off is gray. On is the taskbar's own foreground, not the accent:
-/// on this machine the accent is red.
-fn paint(up: bool) -> [u8; 3] {
-    if !up {
-        return [0x8E, 0x8E, 0x8E];
+/// Tray picture. Off is one gray. On is the baked palm, greens and trunk.
+/// The accent is not used. A template image would throw the color away,
+/// so the connected palm is a normal icon on every platform.
+fn tray_rgba(up: bool) -> Vec<u8> {
+    if up {
+        PALM.to_vec()
+    } else {
+        palm([0x8E, 0x8E, 0x8E])
     }
-    glyph_rgb()
 }
 
-#[cfg(windows)]
-fn glyph_rgb() -> [u8; 3] {
-    super::wincolor::neutral()
-}
-
-#[cfg(target_os = "macos")]
-fn glyph_rgb() -> [u8; 3] {
-    // A template image. AppKit tints the black silhouette.
-    [0, 0, 0]
-}
-
-#[cfg(target_os = "linux")]
-fn glyph_rgb() -> [u8; 3] {
-    linux_rgb()
-}
-
-#[cfg(target_os = "linux")]
-fn linux_rgb() -> [u8; 3] {
-    static TICKS: AtomicU32 = AtomicU32::new(0);
-    static CACHED: AtomicU32 = AtomicU32::new(u32::MAX);
-    let n = TICKS.fetch_add(1, Ordering::Relaxed);
-    let cached = CACHED.load(Ordering::Relaxed);
-    if cached != u32::MAX && n % 120 != 0 {
-        return [(cached >> 16) as u8, (cached >> 8) as u8, cached as u8];
-    }
-    // Unknown scheme: a light palm, so a dark panel does not hide it.
-    let dark = panel_dark().unwrap_or(true);
-    let rgb = if dark { [0xE6, 0xE6, 0xE6] } else { [0x20, 0x20, 0x20] };
-    CACHED.store(pack(rgb), Ordering::Relaxed);
-    rgb
-}
-
-#[cfg(target_os = "linux")]
-fn panel_dark() -> Option<bool> {
-    if let Some(text) = gsettings("color-scheme") {
-        if text.contains("prefer-dark") {
-            return Some(true);
-        }
-        if text.contains("prefer-light") {
-            return Some(false);
-        }
-    }
-    gsettings("gtk-theme").map(|text| text.to_ascii_lowercase().contains("dark"))
-}
-
-#[cfg(target_os = "linux")]
-fn gsettings(key: &str) -> Option<String> {
-    let out = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.interface", key])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+fn tray_ink(up: bool) -> u32 {
+    u32::from(up)
 }
 
 /// `QSystemTrayIcon::showMessage` on Windows is `Shell_NotifyIconW` with
