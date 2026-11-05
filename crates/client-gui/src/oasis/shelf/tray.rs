@@ -5,13 +5,16 @@
 //!
 //! The menu is one action (подключиться / отключиться) and quit.
 //! The hover tip is the app name and version. The palm color is the state.
-//! A state change posts the system balloon Amnezia posts from
-//! `QSystemTrayIcon::showMessage`: one line, the colored palm when the
-//! link comes up and the same palm in gray when it goes down.
-//! "Disconnected" is sent only after a real link.
+//! A state change opens a small window beside the tray icon: the palm and
+//! one line, for two seconds. The colored palm means the link came up, the
+//! gray palm means it went down. The Windows toast is not used: its header
+//! (the exe icon, the product name, and the system buttons) cannot be
+//! removed. "Disconnected" is sent only after a real link.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -69,6 +72,8 @@ pub fn tick(up: bool) {
     });
     if ready {
         pump();
+        #[cfg(windows)]
+        expire_tip();
     } else {
         FAILED.store(true, Ordering::SeqCst);
     }
@@ -320,43 +325,25 @@ fn gsettings(key: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// `QSystemTrayIcon::showMessage` on Windows is `Shell_NotifyIconW` with
-/// `NIF_INFO`. The icon already belongs to tray-icon's hidden window
-/// (`tray_icon_app`); this finds that window in this process and posts
-/// the balloon on it. Two seconds, same as Amnezia.
+/// The icon belongs to tray-icon's hidden window (`tray_icon_app`).
+/// `Shell_NotifyIconW` + `NIF_INFO` is what Windows 10/11 draws as a toast,
+/// and that toast always keeps its header. This posts nothing to the shell.
+/// The notice is a borderless topmost tool window anchored to the icon.
 #[cfg(windows)]
 fn win_balloon(line: &str, up: bool) -> bool {
     let Some((hwnd, uid)) = find_tray() else {
         warn_balloon("icon not found");
         return false;
     };
-    // NIIF_INFO is the system "i". NIIF_USER draws hBalloonIcon instead.
     let palm = balloon_palm(up);
-    let info_flags = if palm == 0 { NIIF_INFO } else { NIIF_USER | NIIF_LARGE_ICON };
-    let mut nid = NotifyIcon {
-        cb_size: std::mem::size_of::<NotifyIcon>() as u32,
-        hwnd,
-        uid,
-        flags: NIF_INFO | NIF_SHOWTIP,
-        callback: 0,
-        icon: 0,
-        tip: [0; 128],
-        state: 0,
-        state_mask: 0,
-        info: [0; 256],
-        timeout: 2000,
-        title: [0; 64],
-        info_flags,
-        guid: Guid { data1: 0, data2: 0, data3: 0, data4: [0; 8] },
-        balloon_icon: palm,
-    };
-    write_wide(&mut nid.info, line);
-    let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &mut nid) };
-    if ok == 0 {
-        warn_balloon("notify failed");
+    if palm == 0 {
         return false;
     }
-    true
+    let Some(anchor) = icon_rect(hwnd, uid) else {
+        warn_balloon("icon rect failed");
+        return false;
+    };
+    show_tip(hwnd, line, palm, anchor)
 }
 
 #[cfg(windows)]
@@ -428,30 +415,23 @@ fn probe_uid(hwnd: isize) -> Option<u32> {
 }
 
 #[cfg(windows)]
-fn write_wide(dst: &mut [u16], text: &str) {
-    for (i, unit) in text.encode_utf16().enumerate() {
-        if i + 1 >= dst.len() {
-            break;
-        }
-        dst[i] = unit;
+fn icon_rect(hwnd: isize, uid: u32) -> Option<WinRect> {
+    let id = NotifyId {
+        cb_size: std::mem::size_of::<NotifyId>() as u32,
+        hwnd,
+        uid,
+        guid: Guid { data1: 0, data2: 0, data3: 0, data4: [0; 8] },
+    };
+    let mut rect = WinRect { left: 0, top: 0, right: 0, bottom: 0 };
+    if unsafe { Shell_NotifyIconGetRect(&id, &mut rect) } == 0 {
+        Some(rect)
+    } else {
+        None
     }
 }
 
-#[cfg(windows)]
-const NIF_INFO: u32 = 0x10;
-#[cfg(windows)]
-const NIF_SHOWTIP: u32 = 0x80;
-#[cfg(windows)]
-const NIIF_INFO: u32 = 0x1;
-#[cfg(windows)]
-const NIIF_USER: u32 = 0x4;
-#[cfg(windows)]
-const NIIF_LARGE_ICON: u32 = 0x20;
-#[cfg(windows)]
-const NIM_MODIFY: u32 = 0x1;
-
-/// One palm per link state. The shell keeps the handle for the balloon,
-/// so these live until the process exits.
+/// One palm per link state. The tip window draws this handle.
+/// It lives until the process exits: the window must not destroy it.
 #[cfg(windows)]
 fn balloon_palm(up: bool) -> isize {
     use std::sync::atomic::AtomicIsize;
@@ -514,28 +494,6 @@ struct Guid {
     data4: [u8; 8],
 }
 
-/// x64 `NOTIFYICONDATAW`. `cbSize` is `size_of` this struct, which is the
-/// Vista layout tray-icon already registers the icon with.
-#[cfg(windows)]
-#[repr(C)]
-struct NotifyIcon {
-    cb_size: u32,
-    hwnd: isize,
-    uid: u32,
-    flags: u32,
-    callback: u32,
-    icon: isize,
-    tip: [u16; 128],
-    state: u32,
-    state_mask: u32,
-    info: [u16; 256],
-    timeout: u32,
-    title: [u16; 64],
-    info_flags: u32,
-    guid: Guid,
-    balloon_icon: isize,
-}
-
 #[cfg(windows)]
 #[repr(C)]
 struct NotifyId {
@@ -545,8 +503,6 @@ struct NotifyId {
     guid: Guid,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
-const _: () = assert!(std::mem::size_of::<NotifyIcon>() == 976);
 #[cfg(all(windows, target_arch = "x86_64"))]
 const _: () = assert!(std::mem::size_of::<NotifyId>() == 40);
 
@@ -562,7 +518,6 @@ struct WinRect {
 #[cfg(windows)]
 #[link(name = "shell32")]
 extern "system" {
-    fn Shell_NotifyIconW(message: u32, data: *mut NotifyIcon) -> i32;
     fn Shell_NotifyIconGetRect(id: *const NotifyId, rect: *mut WinRect) -> i32;
 }
 
@@ -581,10 +536,656 @@ extern "system" {
         and_bits: *const u8,
         xor_bits: *const u8,
     ) -> isize;
+    fn RegisterClassExW(class: *const WndClass) -> u16;
+    fn CreateWindowExW(
+        ex_style: u32,
+        class: *const u16,
+        window: *const u16,
+        style: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        parent: isize,
+        menu: isize,
+        instance: isize,
+        param: *mut core::ffi::c_void,
+    ) -> isize;
+    fn DestroyWindow(hwnd: isize) -> i32;
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
+    fn SetWindowRgn(hwnd: isize, region: isize, redraw: i32) -> i32;
+    fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn BeginPaint(hwnd: isize, paint: *mut Paint) -> isize;
+    fn EndPaint(hwnd: isize, paint: *const Paint) -> i32;
+    fn FillRect(hdc: isize, rect: *const WinRect, brush: isize) -> i32;
+    fn DrawTextW(hdc: isize, text: *const u16, n: i32, rect: *mut WinRect, format: u32) -> i32;
+    fn DrawIconEx(
+        hdc: isize,
+        x: i32,
+        y: i32,
+        icon: isize,
+        w: i32,
+        h: i32,
+        step: u32,
+        brush: isize,
+        flags: u32,
+    ) -> i32;
+    fn GetClientRect(hwnd: isize, rect: *mut WinRect) -> i32;
+    fn LoadCursorW(instance: isize, name: *const u16) -> isize;
+    fn SetTimer(hwnd: isize, id: usize, elapse: u32, proc: *const core::ffi::c_void) -> usize;
+    fn GetDC(hwnd: isize) -> isize;
+    fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+    fn MonitorFromRect(rect: *const WinRect, flags: u32) -> isize;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
+    fn GetDpiForWindow(hwnd: isize) -> u32;
+}
+
+#[cfg(windows)]
+#[link(name = "gdi32")]
+extern "system" {
+    fn CreateFontW(
+        height: i32,
+        width: i32,
+        escapement: i32,
+        orientation: i32,
+        weight: i32,
+        italic: u32,
+        underline: u32,
+        strike: u32,
+        charset: u32,
+        out_precision: u32,
+        clip_precision: u32,
+        quality: u32,
+        pitch: u32,
+        face: *const u16,
+    ) -> isize;
+    fn CreateSolidBrush(color: u32) -> isize;
+    fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, w: i32, h: i32) -> isize;
+    fn SelectObject(hdc: isize, object: isize) -> isize;
+    fn DeleteObject(object: isize) -> i32;
+    fn GetStockObject(index: i32) -> isize;
+    fn SetBkMode(hdc: isize, mode: i32) -> i32;
+    fn SetTextColor(hdc: isize, color: u32) -> u32;
+    fn GetTextExtentPoint32W(hdc: isize, text: *const u16, n: i32, size: *mut WinSize) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "shcore")]
+extern "system" {
+    fn GetDpiForMonitor(monitor: isize, kind: i32, x: *mut u32, y: *mut u32) -> i32;
 }
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn GetCurrentProcessId() -> u32;
+    fn GetModuleHandleW(name: *const u16) -> isize;
+    fn GetLastError() -> u32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WndClass {
+    cb_size: u32,
+    style: u32,
+    wnd_proc: unsafe extern "system" fn(isize, u32, usize, isize) -> isize,
+    cb_cls_extra: i32,
+    cb_wnd_extra: i32,
+    instance: isize,
+    icon: isize,
+    cursor: isize,
+    brush: isize,
+    menu_name: *const u16,
+    class_name: *const u16,
+    icon_sm: isize,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Paint {
+    hdc: isize,
+    erase: i32,
+    paint: WinRect,
+    restore: i32,
+    inc_update: i32,
+    reserved: [u8; 32],
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct MonitorInfo {
+    cb_size: u32,
+    monitor: WinRect,
+    work: WinRect,
+    flags: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WinSize {
+    cx: i32,
+    cy: i32,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+const _: () = assert!(std::mem::size_of::<WndClass>() == 80);
+#[cfg(all(windows, target_arch = "x86_64"))]
+const _: () = assert!(std::mem::size_of::<Paint>() == 72);
+#[cfg(all(windows, target_arch = "x86_64"))]
+const _: () = assert!(std::mem::size_of::<MonitorInfo>() == 40);
+
+#[cfg(windows)]
+const WS_POPUP: u32 = 0x8000_0000;
+#[cfg(windows)]
+const WS_EX_TOPMOST: u32 = 0x0000_0008;
+#[cfg(windows)]
+const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+#[cfg(windows)]
+const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+#[cfg(windows)]
+const SW_SHOWNOACTIVATE: i32 = 4;
+#[cfg(windows)]
+const SWP_NOSIZE: u32 = 0x0001;
+#[cfg(windows)]
+const SWP_NOMOVE: u32 = 0x0002;
+#[cfg(windows)]
+const SWP_NOACTIVATE: u32 = 0x0010;
+#[cfg(windows)]
+const SWP_SHOWWINDOW: u32 = 0x0040;
+#[cfg(windows)]
+const HWND_TOPMOST: isize = -1;
+#[cfg(windows)]
+const CS_VREDRAW: u32 = 0x0001;
+#[cfg(windows)]
+const CS_HREDRAW: u32 = 0x0002;
+#[cfg(windows)]
+const CS_DROPSHADOW: u32 = 0x0002_0000;
+#[cfg(windows)]
+const WM_DESTROY: u32 = 0x0002;
+#[cfg(windows)]
+const WM_ERASEBKGND: u32 = 0x0014;
+#[cfg(windows)]
+const WM_MOUSEACTIVATE: u32 = 0x0021;
+#[cfg(windows)]
+const WM_PAINT: u32 = 0x000F;
+#[cfg(windows)]
+const WM_TIMER: u32 = 0x0113;
+#[cfg(windows)]
+const WM_LBUTTONDOWN: u32 = 0x0201;
+#[cfg(windows)]
+const WM_RBUTTONDOWN: u32 = 0x0204;
+#[cfg(windows)]
+const WM_MBUTTONDOWN: u32 = 0x0207;
+#[cfg(windows)]
+const MA_NOACTIVATE: isize = 3;
+#[cfg(windows)]
+const IDC_ARROW: isize = 32512;
+#[cfg(windows)]
+const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+#[cfg(windows)]
+const DT_VCENTER: u32 = 0x0004;
+#[cfg(windows)]
+const DT_SINGLELINE: u32 = 0x0020;
+#[cfg(windows)]
+const DT_NOPREFIX: u32 = 0x0800;
+#[cfg(windows)]
+const DT_END_ELLIPSIS: u32 = 0x8000;
+#[cfg(windows)]
+const BK_TRANSPARENT: i32 = 1;
+#[cfg(windows)]
+const DI_NORMAL: u32 = 0x0003;
+#[cfg(windows)]
+const MONITOR_DEFAULTTONEAREST: u32 = 2;
+#[cfg(windows)]
+const DEFAULT_GUI_FONT: i32 = 17;
+#[cfg(windows)]
+const CLEARTYPE_QUALITY: u32 = 5;
+
+#[cfg(windows)]
+struct Tip {
+    hwnd: isize,
+    born: Instant,
+    paint: TipPaint,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct TipPaint {
+    line: Vec<u16>,
+    palm: isize,
+    bg: u32,
+    fg: u32,
+    edge: u32,
+    pad: i32,
+    icon: i32,
+    gap: i32,
+    dpi: u32,
+}
+
+#[cfg(windows)]
+thread_local! {
+    static TIP: RefCell<Option<Tip>> = RefCell::new(None);
+}
+
+#[cfg(windows)]
+fn show_tip(tray: isize, line: &str, palm: isize, anchor: WinRect) -> bool {
+    if !ensure_class() {
+        return false;
+    }
+    close_tip();
+    let dpi = tip_dpi(tray, &anchor);
+    let (bg, fg, edge) = card_colors();
+    let pad = px(12, dpi);
+    let icon = px(32, dpi);
+    let gap = px(10, dpi);
+    let wide = utf16(line);
+    let (text_w, text_h) = text_px(&wide, dpi);
+    let text_w = text_w.min(px(480, dpi)).max(px(40, dpi));
+    let width = pad + icon + gap + text_w + pad;
+    let height = pad + icon.max(text_h) + pad;
+    if width < 8 || height < 8 {
+        warn_balloon("tip size failed");
+        return false;
+    }
+    let (x, y) = place(&anchor, width, height, dpi);
+    let paint = TipPaint {
+        line: wide,
+        palm,
+        bg: cref(bg),
+        fg: cref(fg),
+        edge: cref(edge),
+        pad,
+        icon,
+        gap,
+        dpi,
+    };
+    TIP.with(|slot| {
+        *slot.borrow_mut() = Some(Tip { hwnd: 0, born: Instant::now(), paint });
+    });
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_name().as_ptr(),
+            std::ptr::null(),
+            WS_POPUP,
+            x,
+            y,
+            width,
+            height,
+            0,
+            0,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null_mut(),
+        )
+    };
+    if hwnd == 0 {
+        TIP.with(|slot| *slot.borrow_mut() = None);
+        warn_balloon("window failed");
+        return false;
+    }
+    TIP.with(|slot| {
+        if let Some(tip) = slot.borrow_mut().as_mut() {
+            tip.hwnd = hwnd;
+            tip.born = Instant::now();
+        }
+    });
+    let rad = px(8, dpi).max(4);
+    unsafe {
+        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, rad, rad);
+        if region != 0 {
+            SetWindowRgn(hwnd, region, 0);
+        }
+        SetTimer(hwnd, 1, 2000, std::ptr::null());
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+    true
+}
+
+#[cfg(windows)]
+fn expire_tip() {
+    let due = TIP.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|tip| tip.hwnd != 0 && tip.born.elapsed() >= Duration::from_millis(2000))
+            .unwrap_or(false)
+    });
+    if due {
+        close_tip();
+    }
+}
+
+#[cfg(windows)]
+fn close_tip() {
+    let hwnd = TIP.with(|slot| slot.borrow().as_ref().map(|tip| tip.hwnd).unwrap_or(0));
+    if hwnd != 0 {
+        unsafe { DestroyWindow(hwnd) };
+    }
+}
+
+#[cfg(windows)]
+fn forget_tip(hwnd: isize) {
+    TIP.with(|slot| {
+        let matches = slot.borrow().as_ref().map(|tip| tip.hwnd == hwnd).unwrap_or(false);
+        if matches {
+            *slot.borrow_mut() = None;
+        }
+    });
+}
+
+#[cfg(windows)]
+fn ensure_class() -> bool {
+    static READY: AtomicBool = AtomicBool::new(false);
+    if READY.load(Ordering::SeqCst) {
+        return true;
+    }
+    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let class = WndClass {
+        cb_size: std::mem::size_of::<WndClass>() as u32,
+        style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+        wnd_proc: tip_proc,
+        cb_cls_extra: 0,
+        cb_wnd_extra: 0,
+        instance,
+        icon: 0,
+        cursor: unsafe { LoadCursorW(0, IDC_ARROW as *const u16) },
+        brush: 0,
+        menu_name: std::ptr::null(),
+        class_name: class_name().as_ptr(),
+        icon_sm: 0,
+    };
+    let atom = unsafe { RegisterClassExW(&class) };
+    if atom == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
+        warn_balloon("class failed");
+        return false;
+    }
+    READY.store(true, Ordering::SeqCst);
+    true
+}
+
+#[cfg(windows)]
+fn class_name() -> &'static [u16] {
+    use std::sync::OnceLock;
+    static NAME: OnceLock<Vec<u16>> = OnceLock::new();
+    NAME.get_or_init(|| utf16("m1r4g3_tray_tip")).as_slice()
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn tip_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_MOUSEACTIVATE => MA_NOACTIVATE,
+        WM_TIMER | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_PAINT => {
+            paint_tip(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            forget_tip(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(windows)]
+fn paint_tip(hwnd: isize) {
+    let paint = TIP.with(|slot| slot.borrow().as_ref().map(|tip| tip.paint.clone()));
+    let Some(paint) = paint else {
+        return;
+    };
+    let mut info = Paint {
+        hdc: 0,
+        erase: 0,
+        paint: WinRect { left: 0, top: 0, right: 0, bottom: 0 },
+        restore: 0,
+        inc_update: 0,
+        reserved: [0; 32],
+    };
+    let hdc = unsafe { BeginPaint(hwnd, &mut info) };
+    if hdc == 0 {
+        return;
+    }
+    let mut client = WinRect { left: 0, top: 0, right: 0, bottom: 0 };
+    unsafe { GetClientRect(hwnd, &mut client) };
+    let edge = Brush(unsafe { CreateSolidBrush(paint.edge) });
+    let bg = Brush(unsafe { CreateSolidBrush(paint.bg) });
+    unsafe { FillRect(hdc, &client, edge.0) };
+    let inner = WinRect {
+        left: client.left + 1,
+        top: client.top + 1,
+        right: client.right - 1,
+        bottom: client.bottom - 1,
+    };
+    if inner.right > inner.left && inner.bottom > inner.top {
+        unsafe { FillRect(hdc, &inner, bg.0) };
+    }
+    let icon_y = client.top + (client.bottom - client.top - paint.icon) / 2;
+    if paint.palm != 0 {
+        unsafe {
+            DrawIconEx(
+                hdc,
+                client.left + paint.pad,
+                icon_y,
+                paint.palm,
+                paint.icon,
+                paint.icon,
+                0,
+                0,
+                DI_NORMAL,
+            );
+        }
+    }
+    let font = font_for(paint.dpi);
+    let old = unsafe { SelectObject(hdc, font.handle) };
+    unsafe {
+        SetBkMode(hdc, BK_TRANSPARENT);
+        SetTextColor(hdc, paint.fg);
+    }
+    let mut text = WinRect {
+        left: client.left + paint.pad + paint.icon + paint.gap,
+        top: client.top,
+        right: client.right - paint.pad,
+        bottom: client.bottom,
+    };
+    unsafe {
+        DrawTextW(
+            hdc,
+            paint.line.as_ptr(),
+            -1,
+            &mut text,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        SelectObject(hdc, old);
+        EndPaint(hwnd, &info);
+    }
+}
+
+#[cfg(windows)]
+fn place(anchor: &WinRect, width: i32, height: i32, dpi: u32) -> (i32, i32) {
+    let gap = px(8, dpi);
+    let work = work_area(anchor);
+    let mid_x = work.left + (work.right - work.left) / 2;
+    let mut x = if anchor.left >= mid_x { anchor.right - width } else { anchor.left };
+    let mut y = anchor.top - gap - height;
+    let below = anchor.bottom + gap;
+    if y < work.top && below + height <= work.bottom {
+        y = below;
+    } else if y < work.top {
+        y = anchor.top + (anchor.bottom - anchor.top - height) / 2;
+        x = if anchor.left >= mid_x {
+            anchor.left - gap - width
+        } else {
+            anchor.right + gap
+        };
+    }
+    if x + width > work.right {
+        x = work.right - width;
+    }
+    if x < work.left {
+        x = work.left;
+    }
+    if y + height > work.bottom {
+        y = work.bottom - height;
+    }
+    if y < work.top {
+        y = work.top;
+    }
+    (x, y)
+}
+
+#[cfg(windows)]
+fn work_area(anchor: &WinRect) -> WinRect {
+    unsafe {
+        let monitor = MonitorFromRect(anchor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MonitorInfo {
+            cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+            monitor: WinRect { left: 0, top: 0, right: 0, bottom: 0 },
+            work: WinRect { left: 0, top: 0, right: 0, bottom: 0 },
+            flags: 0,
+        };
+        if monitor != 0 && GetMonitorInfoW(monitor, &mut info) != 0 {
+            return info.work;
+        }
+        let left = GetSystemMetrics(76);
+        let top = GetSystemMetrics(77);
+        WinRect {
+            left,
+            top,
+            right: left + GetSystemMetrics(78),
+            bottom: top + GetSystemMetrics(79),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn tip_dpi(tray: isize, anchor: &WinRect) -> u32 {
+    unsafe {
+        let monitor = MonitorFromRect(anchor, MONITOR_DEFAULTTONEAREST);
+        if monitor != 0 {
+            let mut x = 0u32;
+            let mut y = 0u32;
+            if GetDpiForMonitor(monitor, 0, &mut x, &mut y) == 0 && x >= 96 {
+                return x;
+            }
+        }
+        let dpi = GetDpiForWindow(tray);
+        if dpi >= 96 { dpi } else { 96 }
+    }
+}
+
+#[cfg(windows)]
+fn text_px(line: &[u16], dpi: u32) -> (i32, i32) {
+    let fallback = (px(180, dpi), px(20, dpi));
+    unsafe {
+        let dc = GetDC(0);
+        if dc == 0 {
+            return fallback;
+        }
+        let font = font_for(dpi);
+        let old = SelectObject(dc, font.handle);
+        let mut size = WinSize { cx: 0, cy: 0 };
+        let n = line.iter().take_while(|unit| **unit != 0).count() as i32;
+        if n > 0 {
+            GetTextExtentPoint32W(dc, line.as_ptr(), n, &mut size);
+        }
+        SelectObject(dc, old);
+        drop(font);
+        ReleaseDC(0, dc);
+        if size.cx <= 0 || size.cy <= 0 { fallback } else { (size.cx, size.cy) }
+    }
+}
+
+#[cfg(windows)]
+fn font_for(dpi: u32) -> GdiFont {
+    let face = utf16("Segoe UI");
+    let handle = unsafe {
+        CreateFontW(
+            -px(15, dpi),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            CLEARTYPE_QUALITY,
+            0,
+            face.as_ptr(),
+        )
+    };
+    if handle != 0 {
+        GdiFont { handle, owned: true }
+    } else {
+        GdiFont { handle: unsafe { GetStockObject(DEFAULT_GUI_FONT) }, owned: false }
+    }
+}
+
+#[cfg(windows)]
+struct GdiFont {
+    handle: isize,
+    owned: bool,
+}
+
+#[cfg(windows)]
+impl Drop for GdiFont {
+    fn drop(&mut self) {
+        if self.owned && self.handle != 0 {
+            unsafe { DeleteObject(self.handle) };
+            self.handle = 0;
+        }
+    }
+}
+
+#[cfg(windows)]
+struct Brush(isize);
+
+#[cfg(windows)]
+impl Drop for Brush {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { DeleteObject(self.0) };
+            self.0 = 0;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn card_colors() -> ([u8; 3], [u8; 3], [u8; 3]) {
+    if super::wincolor::system_dark() {
+        ([0x2C, 0x2C, 0x2C], [0xF3, 0xF3, 0xF3], [0x3F, 0x3F, 0x3F])
+    } else {
+        ([0xF7, 0xF7, 0xF7], [0x1A, 0x1A, 0x1A], [0xD6, 0xD6, 0xD6])
+    }
+}
+
+#[cfg(windows)]
+fn cref(rgb: [u8; 3]) -> u32 {
+    u32::from(rgb[0]) | u32::from(rgb[1]) << 8 | u32::from(rgb[2]) << 16
+}
+
+#[cfg(windows)]
+fn px(n: i32, dpi: u32) -> i32 {
+    n * dpi as i32 / 96
+}
+
+#[cfg(windows)]
+fn utf16(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }

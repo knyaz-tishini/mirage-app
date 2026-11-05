@@ -63,7 +63,7 @@ pub fn allow_dark_menus() {
     }
 }
 
-fn system_dark() -> bool {
+pub(super) fn system_dark() -> bool {
     // 0 means the taskbar is dark. A missing value is the old light bar.
     dword(
         "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
