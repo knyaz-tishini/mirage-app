@@ -13,16 +13,13 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::SystemTime};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use mirage_chain_ipc::{
-    MonitorTransportSpec, Socks5ListenSpec, SupervisorMsg, WorkerMsg, WorkerState,
+    Socks5ListenSpec, SupervisorMsg, WorkerMsg, WorkerState,
     pid_file_path, pipe_path,
     pipe::{PipePair, PipeListener},
 };
 use mirage_runtime_guard::{MemoryGuard, MemoryGuardConfig};
 use mirage_client_core::{
-    ChainHandle, ChainId, ChainMetrics, ChainSet, ChainState, HealthProbeConfig, PrewarmStrategy,
-    monitor_link::{MonitorLink, MonitorLinkOptions, MonitorTransport, WsServerFrame},
     mux_pool::MuxPool,
     pool::TunnelPool,
     socks5::{Socks5Server, SocksFailurePolicy},
@@ -59,14 +56,6 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::from_env("MIRAGE_LOG")
                 .add_directive(
                     "mirage_chain_worker=debug".parse().expect("valid directive"),
-                )
-                // MonitorLink + OverChainChannel state transitions only — same
-                // as supervisor. Worker hosts MonitorLink when monitor_link_host=true.
-                .add_directive(
-                    "mirage_client_core::monitor_link=info".parse().expect("valid directive"),
-                )
-                .add_directive(
-                    "mirage_client_core::monitor_channel=info".parse().expect("valid directive"),
                 )
                 // Pool slot lifecycle (init / reconnect / lease) — visible to
                 // diagnose pool-exhausted errors during chain dial issues.
@@ -829,24 +818,24 @@ fn spawn_socks5_accept_loop(
 async fn handle_session(
     ipc: &mut PipePair,
     chain_id: &str,
-    chain_cfg: &mirage_core::config::ChainConfig,
-    mesh_id: &str,
-    node_client_id: &str,
+    _chain_cfg: &mirage_core::config::ChainConfig,
+    _mesh_id: &str,
+    _node_client_id: &str,
     pool: Arc<TunnelPool>,
     mux_pool_opt: Option<Arc<MuxPool>>,
     state: Arc<tokio::sync::Mutex<WorkerState>>,
     peer_table: Arc<ArcSwap<PeerTable>>,
     credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
-    token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>>,
-    ring_credential: mirage_client_core::token_pool::RingCredentialCell,
-    outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
+    _token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>>,
+    _ring_credential: mirage_client_core::token_pool::RingCredentialCell,
+    _outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
     outgoing_rx: &mut mpsc::Receiver<WorkerMsg>,
     stop_tx: &watch::Sender<bool>,
-    wire_addr: Option<String>,
-    wire_pubkey: Option<String>,
-    operator_pub_hex: Option<String>,
-    enrol_token: Option<String>,
-    nf_counter_dir: std::path::PathBuf,
+    _wire_addr: Option<String>,
+    _wire_pubkey: Option<String>,
+    _operator_pub_hex: Option<String>,
+    _enrol_token: Option<String>,
+    _nf_counter_dir: std::path::PathBuf,
 ) -> SessionEnd {
     loop {
         tokio::select! {
@@ -916,33 +905,10 @@ async fn handle_session(
                     }
                 }
             }
-            Ok(Some(SupervisorMsg::SetupMonitorLink {
-                monitor_api_key,
-                transports_json,
-                tun_api_url,
-            })) => {
-                info!(chain_id, "worker: SetupMonitorLink received — spawning MonitorLink");
-                spawn_monitor_link_in_worker(
-                    chain_id,
-                    monitor_api_key,
-                    transports_json,
-                    tun_api_url,
-                    mesh_id.to_string(),
-                    node_client_id.to_string(),
-                    Arc::clone(&peer_table),
-                    Arc::clone(&credential_params),
-                    Arc::clone(&token_pool),
-                    Arc::clone(&ring_credential),
-                    Arc::clone(&pool),
-                    mux_pool_opt.as_ref().map(Arc::clone),
-                    chain_cfg.clone(),
-                    Arc::clone(&outgoing_tx),
-                    wire_addr.clone(),
-                    wire_pubkey.clone(),
-                    operator_pub_hex.clone(),
-                    enrol_token.clone(),
-                    nf_counter_dir.clone(),
-                );
+            Ok(Some(SupervisorMsg::SetupMonitorLink { .. })) => {
+                // The monitor host lives in mirage-client-link. This OSS
+                // worker runs the chain and does not open a monitor channel.
+                info!(chain_id, "worker: SetupMonitorLink ignored — OSS build has no monitor host");
             }
             Ok(Some(SupervisorMsg::Drain { timeout_secs })) => {
                 info!(chain_id, timeout_secs, "received Drain");
@@ -1022,277 +988,6 @@ async fn handle_session(
     } // end loop
 } // end handle_session
 
-/// Build a single-entry `ChainSet` for this worker's chain, construct
-/// `MonitorLink`, spawn it, then watch for peer_table snapshots and forward
-/// them to the supervisor via `outgoing_tx` as `WorkerMsg::PeerTableSnapshot`.
-///
-/// The worker's `TunnelPool` / `MuxPool` and the `MonitorLink` share the SAME
-/// `Arc<ArcSwap<PeerTable>>` so the chain self-resolves from MonitorLink's
-/// own snapshots (no chicken-and-egg: OverChain only activates when direct WS
-/// fails; by then the first DirectWs snapshot has already populated the table).
-fn spawn_monitor_link_in_worker(
-    chain_id: &str,
-    monitor_api_key: Option<String>,
-    transports_json: String,
-    tun_api_url: Option<String>,
-    mesh_id: String,
-    node_client_id: String,
-    peer_table: Arc<ArcSwap<PeerTable>>,
-    credential_params: Arc<ArcSwap<Option<mirage_core::crypto::credential::CredentialParams>>>,
-    token_pool: Arc<ArcSwap<mirage_client_core::token_pool::TokenPool>>,
-    ring_credential: mirage_client_core::token_pool::RingCredentialCell,
-    pool: Arc<TunnelPool>,
-    mux_pool_opt: Option<Arc<MuxPool>>,
-    chain_cfg: mirage_core::config::ChainConfig,
-    outgoing_tx: Arc<mpsc::Sender<WorkerMsg>>,
-    wire_addr: Option<String>,
-    wire_pubkey: Option<String>,
-    operator_pub_hex: Option<String>,
-    enrol_token: Option<String>,
-    nf_counter_dir: std::path::PathBuf,
-) {
-    // Parse transport specs from JSON.
-    let transport_specs: Vec<MonitorTransportSpec> = match serde_json::from_str(&transports_json) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(chain_id, "SetupMonitorLink: failed to parse transports_json: {e} — MonitorLink not spawned");
-            return;
-        }
-    };
-
-    // Build a ChainHandle that wraps the worker's existing pools.
-    // ChainConfig on the handle is needed for OverChain routing — we build a
-    // minimal placeholder since MonitorLink only uses the ChainSet for dial,
-    // and the actual dial config lives in TunnelPool / MuxPool already.
-    let handle_id = ChainId(chain_id.to_string());
-    // Clone mux_pool_opt before moving it into ChainHandle so the watcher task
-    // can also hold a reference for peer_table notifications.
-    let mux_for_handle = mux_pool_opt.as_ref().map(Arc::clone);
-    let handle = Arc::new(ChainHandle {
-        id: handle_id.clone(),
-        config: Arc::new(ArcSwap::from_pointee(chain_cfg)),
-        pool: Arc::clone(&pool),
-        mux: mux_for_handle,
-        metrics: ChainMetrics::new(),
-        state: Arc::new(ArcSwap::from_pointee(ChainState::Active)),
-    });
-
-    // Build ChainSet with this single handle.
-    let chain_map: Arc<DashMap<ChainId, Arc<ChainHandle>>> = Arc::new(DashMap::new());
-    chain_map.insert(handle_id, handle);
-    let chain_set = Arc::new(ChainSet {
-        chains: chain_map,
-        prewarm: PrewarmStrategy::default(),
-        peer_table: Arc::clone(&peer_table),
-        peer_table_notify: Arc::new(tokio::sync::Notify::new()),
-        mesh_id: Vec::new(),  // MonitorLink doesn't use mesh_id directly
-        probe_config: HealthProbeConfig::default(),
-    });
-
-    // Convert MonitorTransportSpec → MonitorTransport.
-    // Wire transport from ClientConfig fields is prepended first (preferred).
-    let mut transports: Vec<MonitorTransport> = Vec::new();
-
-    // Prepend Wire from ClientConfig.monitor_wire_addr / monitor_wire_pubkey_hex
-    // when both are present. This is the primary Wire source for the cli2 worker
-    // path (mirrors the l0-sentinel construction in SentinelConfig).
-    if let (Some(ref wa), Some(ref wp)) = (&wire_addr, &wire_pubkey) {
-        info!(
-            chain_id,
-            addr = %wa,
-            "worker: Wire transport configured from ClientConfig — prepending to MonitorLink transports"
-        );
-        transports.push(MonitorTransport::Wire {
-            monitor_addr: wa.clone(),
-            monitor_pubkey_hex: wp.clone(),
-            mesh_id: mesh_id.clone(),
-            host_hint: None,
-        });
-    }
-
-    for spec in transport_specs {
-        match spec {
-            MonitorTransportSpec::DirectWs { .. } => {
-                // DirectWs has been removed from MonitorTransport — skip.
-                debug!(chain_id, "worker: DirectWs transport spec ignored (removed)");
-            }
-            MonitorTransportSpec::OverChain { worker_socks5, monitor_addr, chain_id: cid } => {
-                transports.push(MonitorTransport::OverChain {
-                    worker_socks5,
-                    monitor_addr,
-                    chain_id: ChainId(cid),
-                });
-            }
-            MonitorTransportSpec::Wire { monitor_addr, monitor_pubkey_hex, mesh_id: mid } => {
-                // Wire from supervisor transports_json — only add if not already
-                // covered by the ClientConfig flat fields (avoid duplicate).
-                let already_prepended = wire_addr.is_some() && wire_pubkey.is_some();
-                if !already_prepended {
-                    transports.push(MonitorTransport::Wire {
-                        monitor_addr,
-                        monitor_pubkey_hex,
-                        mesh_id: mid,
-                        host_hint: None,
-                    });
-                }
-            }
-        }
-    }
-
-    // Blind-token credential wiring (mirrors cli + l0-sentinel): verify pushed
-    // CredentialParams against the operator key when configured, arm blind-RSA
-    // batch requests with the enrol token. Bad operator_pub_hex → log + unverified.
-    let operator_pub = operator_pub_hex.as_deref().and_then(|hex_str| {
-        match MonitorLink::parse_operator_pub_hex(hex_str) {
-            Ok(k) => {
-                info!(chain_id, "worker: operator_pub_hex decoded — CredentialParams will be verified");
-                Some(k)
-            }
-            Err(e) => {
-                warn!(chain_id, "worker: invalid operator_pub_hex ({e}); CredentialParams applied unverified");
-                None
-            }
-        }
-    });
-
-    let (monitor_link, mut config_rx) = MonitorLink::new_with_credential_arc(
-        monitor_api_key,
-        Arc::clone(&peer_table),
-        Arc::clone(&credential_params),
-        Arc::clone(&token_pool),
-        Arc::clone(&ring_credential),
-        chain_set,
-        transports,
-        mesh_id,
-        node_client_id,
-        MonitorLinkOptions {
-            operator_pub,
-            // The worker never spawns a debug shell (only l0-sentinel does) —
-            // it has no business honouring this frame either way.
-            allow_operator_debug_shell: false,
-        },
-    );
-    monitor_link.set_enrol_token(enrol_token);
-    monitor_link.set_nf_counter_dir(nf_counter_dir);
-    monitor_link.spawn();
-
-    // Policy-push task: forward monitor-pushed SplitPolicyConfig to the local
-    // TUN daemon on every config version bump.  Only spawned when tun_api_url
-    // is set (SOCKS-only mode has no TUN to push to).
-    if let Some(u) = tun_api_url {
-        tokio::spawn(mirage_client_core::policy_push::run_policy_pusher(config_rx.clone(), u));
-    } else {
-        info!(chain_id, "worker: no tun_api_url — policy-push task not started (SOCKS-only mode)");
-    }
-
-    // Watcher task: on each pushed `CredentialParams` frame, forward the
-    // current authority set to the supervisor via `outgoing_tx` as
-    // `WorkerMsg::CredentialParamsSnapshot`.
-    //
-    // WHY a separate watcher (not the peer_table `config_rx` one below):
-    // `apply_credential_params` (monitor_link.rs) only pushes through
-    // `frame_tx`, never `config_tx`, so `config_rx.changed()` never fires
-    // for a credential-only push. Multi-wire clients run N sibling workers
-    // but only ONE ever hosts a MonitorLink (`monitor_link_host=true`);
-    // without this relay, sibling workers never see CredentialParams and
-    // dial with credential_scheme=0x00 forever. Mirrors the peer_table
-    // broadcast path (`WorkerMsg::PeerTableSnapshot` /
-    // `SupervisorMsg::PeerTableUpdate`) 1:1, applied to the credential
-    // authority set instead of the mesh peer table.
-    {
-        let mut cred_frame_rx = monitor_link.subscribe_frames();
-        let credential_params_for_watch = Arc::clone(&credential_params);
-        let outgoing_tx_cred = Arc::clone(&outgoing_tx);
-        let chain_id_owned_cred = chain_id.to_string();
-        tokio::spawn(async move {
-            let mut last_generation: u64 = 0;
-            loop {
-                if cred_frame_rx.changed().await.is_err() {
-                    // MonitorLink dropped — watcher exits.
-                    break;
-                }
-                let frame = cred_frame_rx.borrow().clone();
-                if !matches!(frame, Some(WsServerFrame::CredentialParams(_))) {
-                    continue;
-                }
-                // Read the current params directly from the ArcSwap (already
-                // updated by MonitorLink::apply_credential_params before the
-                // watch fires) — same pattern as the peer_table watcher below.
-                let snapshot = credential_params_for_watch.load();
-                let Some(ref params) = **snapshot else { continue };
-                let generation = params.generation;
-                if generation <= last_generation && last_generation != 0 {
-                    continue;
-                }
-                last_generation = generation;
-                match serde_json::to_string(params) {
-                    Ok(json) => {
-                        debug!(
-                            chain_id = %chain_id_owned_cred,
-                            generation,
-                            "worker: sending CredentialParamsSnapshot to supervisor"
-                        );
-                        let msg = WorkerMsg::CredentialParamsSnapshot {
-                            generation,
-                            credential_params_json: json,
-                        };
-                        if outgoing_tx_cred.send(msg).await.is_err() {
-                            break; // supervisor disconnected — stop
-                        }
-                    }
-                    Err(e) => {
-                        warn!(chain_id = %chain_id_owned_cred, "worker: credential_params serialize error: {e}");
-                    }
-                }
-            }
-        });
-    }
-
-    let chain_id_owned = chain_id.to_string();
-    // Watcher task: on each new MonitorLink config with a new peer_table
-    // generation, send WorkerMsg::PeerTableSnapshot to supervisor via outgoing_tx.
-    tokio::spawn(async move {
-        let mut last_generation: u64 = 0;
-        loop {
-            if config_rx.changed().await.is_err() {
-                // MonitorLink dropped — watcher exits.
-                break;
-            }
-            // Read the current peer_table directly from the ArcSwap (already
-            // updated by MonitorLink::apply_config before the watch fires).
-            let snapshot = peer_table.load();
-            let generation = snapshot.generation;
-            if generation <= last_generation && last_generation != 0 {
-                continue;
-            }
-            last_generation = generation;
-            match serde_json::to_string(&**snapshot) {
-                Ok(json) => {
-                    debug!(
-                        chain_id = %chain_id_owned,
-                        generation,
-                        "worker: sending PeerTableSnapshot to supervisor"
-                    );
-                    let msg = WorkerMsg::PeerTableSnapshot {
-                        generation,
-                        peer_table_json: json,
-                    };
-                    if outgoing_tx.send(msg).await.is_err() {
-                        break; // supervisor disconnected — stop
-                    }
-                    // Notify pools so they can re-dial with fresh keys.
-                    pool.notify_peer_table_change();
-                    if let Some(ref mp) = mux_pool_opt {
-                        mp.notify_peer_table_change();
-                    }
-                }
-                Err(e) => {
-                    warn!(chain_id = %chain_id_owned, "worker: peer_table serialize error: {e}");
-                }
-            }
-        }
-    });
-}
 
 /// Wait for the first supervisor connection and the `Start` message.
 ///

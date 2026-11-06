@@ -30,7 +30,6 @@ bytes                = { workspace = true }
 tokio-tungstenite    = { workspace = true }
 dashmap              = "5"
 ipnet                = "2"
-mirage-mesh-client   = { workspace = true }
 mirage-ringmember    = { workspace = true }
 hex                  = "0.4"
 ed25519-dalek        = { workspace = true }

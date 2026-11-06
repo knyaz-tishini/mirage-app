@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
                 // peer_table dumps, no frame bytes. Safe to keep on by default;
                 // operator can drop further via MIRAGE_LOG=warn for ZT lockdown.
                 .add_directive(
-                    "mirage_client_core::monitor_link=info".parse().expect("valid directive"),
+                    "mirage_client_link::monitor_link=info".parse().expect("valid directive"),
                 ),
         )
         .init();

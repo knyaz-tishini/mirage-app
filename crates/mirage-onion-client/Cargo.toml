@@ -24,7 +24,7 @@ uuid                 = { version = "1", features = ["v4"] }
 # handlers - so the client's chain walk is checked against what a real node
 # accepts, not against a re-implementation of it.
 [dev-dependencies]
-mirage-node        = { path = "../../../mirage-oss/crates/mirage-node" }
+mirage-node        = { path = "../../../mirage-node/crates/mirage-node" }
 mirage-client-core = { path = "../client-core" }
 mirage-mux         = { workspace = true, features = ["tokio-compat"] }
 arc-swap           = "1"

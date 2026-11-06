@@ -1,13 +1,8 @@
 pub mod chain_set;
-pub mod health_watcher;
-pub mod policy_push;
 pub mod token_pool;
 pub mod capability_pool;
 pub mod log_capture;
-pub mod monitor_channel;
-pub mod monitor_link;
 pub mod tun;
-pub mod tun_bridge;
 pub mod discovery;
 pub mod dns_forwarder;
 pub mod endpoint_protocol;

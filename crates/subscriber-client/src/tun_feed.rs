@@ -16,29 +16,24 @@
 //! listener set per face. Easy to replace with a one-chain-per-entrance feed
 //! once that product question is settled; nothing here forecloses it.
 //!
-//! Only the two plain data structs `MonitorConfig`/`MonitorChain` are
-//! imported from `mirage_client_core::monitor_link` — never `MonitorLink`
-//! itself. No monitor WS dial, no debug-tunnel listener, anywhere in this
-//! module.
+//! The post is the same `/chains/update` body the fleet monitor bridge
+//! sends for one healthy chain with no kill-switch. This crate does not
+//! link the monitor channel.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::time::Duration;
 
-use mirage_client_core::monitor_link::{MonitorChain, MonitorConfig};
-use mirage_client_core::tun_bridge::TunBridge;
-use mirage_core::config::{ChainConfig, HandshakeStrategy, ProtocolId, ReplyMode, TcpProtocolId};
-use mirage_core::crypto::AeadSuite;
 use tokio::sync::watch;
+use tracing::warn;
 
 /// Chain name reported to TUN for the shared, router-backed local listener.
 pub const TUN_FEED_CHAIN_ID: &str = "subscriber-entrances";
 
-/// Owns the background watcher task that pushes chain-registry updates to
-/// TUN's `/chains/update`. Dropping this stops future pushes (the watcher
-/// task exits once the `watch::Sender` half is gone); it does not reach out
-/// and unregister the chain TUN already has.
+/// Owns the background task that pushes the chain registry to TUN.
+/// Dropping this stops further pushes. It does not unregister a chain TUN
+/// already has.
 pub struct TunFeed {
-    _tx: watch::Sender<Option<MonitorConfig>>,
+    _tx: watch::Sender<bool>,
     _watcher: tokio::task::JoinHandle<()>,
 }
 
@@ -47,44 +42,37 @@ impl TunFeed {
     /// `socks5_bind` — see the module doc for why one shared chain, not one
     /// per entrance.
     pub fn start(tun_api_url: String, socks5_bind: SocketAddr) -> Self {
-        let (tx, rx) = watch::channel(None);
-        let bridge = Arc::new(TunBridge::new(tun_api_url));
-        let watcher = bridge.spawn_watcher(rx);
-
-        // Never dialed directly — `chain_to_json` only reads `chain_id`,
-        // `socks5_bind`, `protocol`, `kill_switch`, `group`. `hops` is left
-        // empty on purpose: this `ChainConfig` describes a registry entry,
-        // not a dial target.
-        let chain = ChainConfig {
-            chain_id: TUN_FEED_CHAIN_ID.to_owned(),
-            hops: Vec::new(),
-            handshake: HandshakeStrategy::Telescopic,
-            reply: ReplyMode::Raw,
-            protocol: ProtocolId::Tcp(TcpProtocolId::Mirage),
-            priority: 0,
-            shaping: Default::default(),
-            camouflage: Default::default(),
-            cover_traffic: Default::default(),
-            socks5_bind: Some(socks5_bind.to_string()),
-            aead_suite: AeadSuite::ChaCha20Poly1305,
-            kill_switch: None,
-            group: None,
-            nature: None,
-        };
-        let config = MonitorConfig {
-            version: 1,
-            chains: vec![MonitorChain { chain, healthy: true, latency_ms: None }],
-            policy: None,
-            camouflage: None,
-            shaping: None,
-            metadata_policy: None,
-        };
-        // `watch::channel` never fails on send while a receiver is held —
-        // `rx` was just moved into `spawn_watcher` and the resulting task
-        // owns it for the task's lifetime, so this send always has a live
-        // receiver.
-        let _ = tx.send(Some(config));
-
+        let (tx, mut rx) = watch::channel(false);
+        let socks5_addr = socks5_bind.to_string();
+        let watcher = tokio::spawn(async move {
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            let url = format!("{}/chains/update", tun_api_url.trim_end_matches('/'));
+            let body = serde_json::json!({
+                "chains": [{
+                    "name": TUN_FEED_CHAIN_ID,
+                    "socks5_addr": socks5_addr,
+                    "protocol": "Tcp(Mirage)",
+                    "failure_policy": { "mode": "fail_closed" },
+                }]
+            });
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                if !*rx.borrow() {
+                    continue;
+                }
+                match http.post(&url).json(&body).send().await {
+                    Ok(resp) if resp.status().is_success() => {}
+                    Ok(resp) => warn!(status = %resp.status(), "TUN chains update rejected"),
+                    Err(e) => warn!(error = %e, "TUN API unreachable, chains not updated"),
+                }
+            }
+        });
+        let _ = tx.send(true);
         Self { _tx: tx, _watcher: watcher }
     }
 }

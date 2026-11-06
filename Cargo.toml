@@ -15,8 +15,6 @@ members = [
     "crates/cli2/worker",
     "crates/cli2/supervisor",
     # "crates/desktop/windows/v2",  # legacy — uses path-deps to uzor; conflicts with crates.io uzor used by launcher
-    "crates/l0-sentinel",
-    "crates/l0-orchestrator",
     "crates/subscriber-client",
     # "crates/desktop-cli",  # legacy pre-orchestrator launcher (spawned cli1) — RETIRED 2026-06-14 → crates/_deprecated/desktop-cli
     "crates/runtime-guard",
@@ -59,6 +57,5 @@ mirage-control-plane = { path = "../mirage-oss/crates/mirage-dial-core" }
 mirage-client-core  = { path = "crates/client-core" }
 tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roots"] }
 mirage-runtime-guard    = { path = "crates/runtime-guard" }
-mirage-mesh-client  = { path = "../../fleet/mirage-mesh/crates/mirage-mesh-client" }
 mirage-ringmember   = { path = "../mirage-oss/crates/mirage-ringmember" }
 ed25519-dalek       = { version = "2", features = ["rand_core"] }
