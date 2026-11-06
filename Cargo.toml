@@ -59,6 +59,6 @@ mirage-control-plane = { path = "../mirage-oss/crates/mirage-dial-core" }
 mirage-client-core  = { path = "crates/client-core" }
 tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roots"] }
 mirage-runtime-guard    = { path = "crates/runtime-guard" }
-mirage-mesh-client  = { path = "../mirage2web/crates/mirage-mesh-client" }
+mirage-mesh-client  = { path = "../../fleet/mirage-mesh/crates/mirage-mesh-client" }
 mirage-ringmember   = { path = "../mirage-oss/crates/mirage-ringmember" }
 ed25519-dalek       = { version = "2", features = ["rand_core"] }

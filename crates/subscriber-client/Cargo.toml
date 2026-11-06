@@ -25,7 +25,7 @@ mirage-onion-client   = { path = "../mirage-onion-client" }
 # headless client runs it over the packet plane, so a SOCKS5 flow opens real
 # TCP/UDP without a system TUN, without routes and without Wintun.
 # Same cross-repo path dependency pattern as `mirage-client-chain` above.
-mirage-tcpip-stack    = { path = "../../../mirage2tun/crates/mirage-tcpip-stack" }
+mirage-tcpip-stack    = { path = "../../../mirage-tun/crates/mirage-tcpip-stack" }
 uuid                 = { version = "1", features = ["v4"] }
 tokio                = { workspace = true }
 tracing              = { workspace = true }

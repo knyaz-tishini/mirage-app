@@ -10,10 +10,10 @@ name = "mirage2app"
 path = "src/main.rs"
 
 [dependencies]
-mirage-core            = { path = "../../../../../mirage-oss/crates/mirage-core" }
-uzor                   = { path = "../../../../../uzor/uzor" }
-uzor-desktop           = { path = "../../../../../uzor/uzor-desktop" }
-uzor-backend-tiny-skia = { path = "../../../../../uzor/uzor-backend-tiny-skia" }
+mirage-core            = { path = "../../../../../../mirage-oss/crates/mirage-core" }
+uzor                   = { path = "../../../../../../../../uzor/uzor" }
+uzor-desktop           = { path = "../../../../../../../../uzor/uzor-desktop" }
+uzor-backend-tiny-skia = { path = "../../../../../../../../uzor/uzor-backend-tiny-skia" }
 softbuffer             = "0.4"
 tokio                  = { workspace = true }
 serde                  = { workspace = true }

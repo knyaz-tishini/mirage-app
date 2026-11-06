@@ -561,7 +561,7 @@ fn find_tun_bin(subscriber: &std::path::Path) -> Option<PathBuf> {
     if sibling.is_file() {
         return Some(sibling);
     }
-    let nested = dir.join("../../../mirage2tun/target/release").join(&name);
+    let nested = dir.join("../../../mirage-tun/target/release").join(&name);
     if nested.is_file() {
         return Some(nested);
     }
