@@ -1,0 +1,48 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<title>Spacing · Radii · Shadows</title>
+<style>
+.section { display: grid; grid-template-columns: 90px 1fr; gap: 8px 16px; align-items: center; }
+.label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #555860; text-transform: uppercase; letter-spacing: 0.1em; }
+.row5 { display: flex; gap: 8px; align-items: flex-end; }
+.bar { height: 10px; background: #FBB26A; border-radius: 1px; }
+.rad { width: 32px; height: 32px; background: #14151A; border: 1px solid #FBB26A; }
+.sh { width: 56px; height: 32px; background: #14151A; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; }
+.sh.c { box-shadow: 0 2px 12px rgba(0,0,0,0.3); }
+.sh.g { box-shadow: 0 0 24px rgba(251,178,106,0.25); }
+.sh.o { box-shadow: 0 8px 40px rgba(0,0,0,0.55); }
+.cap { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #878B91; margin-top: 4px; }
+</style></head>
+<body>
+<div class="card stack" style="gap: 16px;">
+  <div class="eyebrow">Spacing · Radii · Shadows</div>
+  <div class="section">
+    <span class="label">Space</span>
+    <div class="row5">
+      <div><div class="bar" style="width:4px"></div><div class="cap">4</div></div>
+      <div><div class="bar" style="width:8px"></div><div class="cap">8</div></div>
+      <div><div class="bar" style="width:16px"></div><div class="cap">16</div></div>
+      <div><div class="bar" style="width:24px"></div><div class="cap">24</div></div>
+      <div><div class="bar" style="width:40px"></div><div class="cap">40</div></div>
+      <div><div class="bar" style="width:64px"></div><div class="cap">64</div></div>
+      <div><div class="bar" style="width:96px"></div><div class="cap">96</div></div>
+    </div>
+    <span class="label">Radius</span>
+    <div class="row5">
+      <div><div class="rad" style="border-radius:4px"></div><div class="cap">4 xs</div></div>
+      <div><div class="rad" style="border-radius:6px"></div><div class="cap">6 sm</div></div>
+      <div><div class="rad" style="border-radius:8px"></div><div class="cap">8 md</div></div>
+      <div><div class="rad" style="border-radius:12px"></div><div class="cap">12 lg</div></div>
+      <div><div class="rad" style="border-radius:999px"></div><div class="cap">pill</div></div>
+    </div>
+    <span class="label">Shadow</span>
+    <div class="row5" style="gap: 16px;">
+      <div><div class="sh c"></div><div class="cap">card</div></div>
+      <div><div class="sh g"></div><div class="cap">glow</div></div>
+      <div><div class="sh o"></div><div class="cap">overlay</div></div>
+    </div>
+  </div>
+</div>
+</body></html>

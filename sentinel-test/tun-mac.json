@@ -1,0 +1,15 @@
+{
+  "tun_addr": "10.7.0.2",
+  "mtu": 1500,
+  "chains": [
+    { "name": "byte-cipher-classic", "socks5_addr": "127.0.0.1:19482" }
+  ],
+  "kill_switch": false,
+  "relay_addrs": ["203.0.113.16", "203.0.113.17"],
+  "dns_upstream": "1.1.1.1:53",
+  "dns_cache_ttl_secs": 300,
+  "dns_cache_max": 4096,
+  "dns_concurrency": 64,
+  "socks5_concurrency": 64,
+  "per_chain_tun": false
+}

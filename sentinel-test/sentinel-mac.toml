@@ -1,0 +1,14 @@
+monitor_urls = [
+    "https://lm.example.invalid:19443",
+    "https://lm-nl.example.invalid:19443",
+]
+monitor_api_key      = "00000000-0000-4000-8000-000000000000"
+client_id            = "tester2"
+client_config_path   = "client-config-managed.json"
+client_binary        = "mirage-client-cli"
+client_args          = ["--config", "{client_config_path}"]
+client_template      = "client-template.json"
+poll_interval_secs   = 30
+respect_user_config  = true
+install_panic_hook   = true
+exit_on_memory_fatal = false

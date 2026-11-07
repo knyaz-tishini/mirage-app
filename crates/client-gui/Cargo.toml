@@ -1,0 +1,121 @@
+# mirage-client-gui — own workspace root.
+#
+# Lives inside mirage2app/crates/ but is NOT a member of the mirage2app
+# workspace (commented out in mirage2app/Cargo.toml).  The isolation is
+# necessary because:
+#   1. The launcher resolves uzor via crates.io (1.2.0, softbuffer path);
+#      uzor-fonts carries `links = "uzor_fonts_assets"` — two copies conflict.
+#   2. vello 0.9 / wgpu 29 requires windows-core 0.62; existing workspace
+#      deps resolve 0.57 — co-resolution fails.
+#
+# Same isolation pattern as crates/desktop/windows/v2/ (see the comment in
+# mirage2app/Cargo.toml).
+[workspace]
+members = ["."]
+
+[package]
+license = "MIT"
+name = "mirage-client-gui"
+version = "0.1.9"
+edition = "2021"
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[[bin]]
+name = "mirage-client-gui"
+path = "src/main.rs"
+
+[[bin]]
+name = "mirage-ota-publish"
+path = "src/bin/mirage-ota-publish.rs"
+
+[lib]
+name = "mirage_client_gui"
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = []
+# Developer-only surface under `src/dev/`: the uzor agent API (:17471), the
+# profiling control server (:17472), the fps HUD and the mock engine that lets
+# the UI run without the L0 stack. OFF by default — a customer build has none
+# of it (gate: tests/customer_sources.rs).
+dev-tools = []
+
+# Win-only: embeds an application manifest that asks UAC for admin elevation
+# on launch. Required so the orchestrator → sentinel → cli2 → tun tree the
+# GUI spawns inherits the elevated token (Wintun needs admin). Without it the
+# client connects + registers but the data-plane never comes up — no internet.
+# No-op on non-Windows targets. Mirrors mirage2mshd/crates/mshd/build.rs.
+[build-dependencies]
+embed-manifest = "1"
+winresource = "0.1"
+
+# ── uzor 1.5.19 from crates.io: framework window + QuickJS scene ──────────────
+[dependencies]
+uzor          = { version = "1.5.19" }
+uzor-text     = { version = "1.5.19" }
+# Offscreen bake of the still desert. The window follows uzor autodetect;
+# these two crates rasterise a plate once, then the window blits it.
+uzor-render-urx = { version = "1.5.19" }
+uzor-urx-cpu    = { version = "1.5.19" }
+
+tokio                   = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "io-util"] }
+tracing                 = "0.1"
+tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
+
+# The chain of boxes, its installer and the installer's copy — one crate,
+# shared with the headless client. The GUI is a consumer of it, never a
+# second copy of it.
+mirage-client-chain     = { path = "../mirage-client-chain" }
+# The engine itself: edge session, SOCKS5, mux. The GUI runs it in-process —
+# one application, one process. The tun carrier stays a separate daemon.
+mirage-subscriber-client = { path = "../subscriber-client" }
+
+# Config import: parse/validate, file picker, clipboard (text + image).
+serde_json              = "1"
+# QR decode (pure Rust, no platform deps — safe for the isolated workspace).
+rqrr                    = "0.7"
+# Live backend link (loopback HTTP to sentinel :19420). rustls (no OpenSSL),
+# same as mirage-launcher; co-resolves fine with vello's windows-core 0.62.
+reqwest                 = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+serde                   = { version = "1", features = ["derive"] }
+semver                  = "1"
+sha2                    = "0.10"
+base64                  = "0.22"
+ed25519-dalek           = "2"
+# Read the face proposal the box writes (faces.proposed.toml). Already in
+# this workspace's lock file as a transitive dependency, so it costs no
+# new crate download.
+toml                    = "0.8"
+# Same russh 0.49 line as mirage2operator and d-watchdog. The desktop
+# standalone mode SSHs to the user's server, plants a key, and starts Docker.
+russh                   = "0.49"
+russh-keys              = "0.49"
+russh-sftp              = "2"
+async-trait             = "0.1"
+ssh-key                 = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "std"] }
+rand                    = "0.8"
+hex                     = "0.4"
+# Paint the issued link. No image backend.
+qrcode                  = { version = "0.14", default-features = false }
+# Own tray menu. uzor's TraySpec freezes the icon and the labels, so a
+# language change never reaches it. tray-icon 0.20.1 is already in this
+# lock through uzor-framework. No extra features, so that crate is not rebuilt.
+
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
+tray-icon = { version = "0.20.1", default-features = false }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+uzor-framework = { version = "1.5.19", features = ["native"] }
+uzor-anim-js = { version = "1.5.19", features = ["quickjs"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.14"
+arboard = "3"
+nokhwa = { version = "0.10.11", features = ["input-native"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+uzor-framework = { version = "1.5.19", features = ["native"] }
+uzor-anim-js = { version = "1.5.19", features = ["quickjs"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[patch.crates-io]
+winit = { path = "third-party/winit" }

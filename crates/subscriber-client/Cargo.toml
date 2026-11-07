@@ -1,0 +1,47 @@
+[package]
+license = "MIT"
+name    = "mirage-subscriber-client"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[lib]
+name = "mirage_subscriber_client"
+
+[dependencies]
+mirage-core          = { workspace = true }
+mirage-protocol      = { workspace = true, features = ["ssh", "grpc"] }
+mirage-client-core   = { workspace = true }
+mirage-control-plane = { workspace = true }
+mirage-mux           = { workspace = true }
+# The chain of boxes and its installer — the same crate the desktop client
+# builds its chains with, so a chain built here is the chain it reads.
+mirage-client-chain   = { path = "../mirage-client-chain" }
+# The onion plane: the client walks the chain itself. A separate crate so this
+# one keeps holding no mesh credential - see the crate doc's own boundary.
+mirage-onion-client   = { path = "../mirage-onion-client" }
+# The userspace TCP/IP stack: OUR OWN fork of smoltcp, vendored in the
+# workspace and already built for every platform the client runs on. The
+# headless client runs it over the packet plane, so a SOCKS5 flow opens real
+# TCP/UDP without a system TUN, without routes and without Wintun.
+# Same cross-repo path dependency pattern as `mirage-client-chain` above.
+mirage-tcpip-stack    = { path = "../../../mirage-tun/crates/mirage-tcpip-stack" }
+uuid                 = { version = "1", features = ["v4"] }
+tokio                = { workspace = true }
+tracing              = { workspace = true }
+tracing-subscriber   = { workspace = true }
+clap                 = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+async-trait          = "0.1"
+hex                  = "0.4"
+reqwest              = { workspace = true }
+# Same QR decoder the desktop GUI already ships (client-gui, rqrr 0.7.1).
+# `image` 0.25 reads the PNG or JPEG. Neither crate is new to this repo.
+rqrr                 = "=0.7.1"
+image                = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+qrcode = { version = "=0.14.1", default-features = false, features = ["image"] }

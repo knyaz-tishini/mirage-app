@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirage centerpiece — bloom variant</title>
+<style>
+  body{margin:0;background:#0b0b0e;color:#f4f4f5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:18px}
+  h1{font-size:13px;letter-spacing:.16em;font-weight:500;color:#fbb26a;margin:0 0 6px}
+  .sub{font-size:11px;color:#878b91;margin-bottom:12px}
+  .clk{color:#fbb26a}
+  .card{background:#14151a;border:1px solid #ffffff14;border-radius:12px;padding:10px;max-width:460px}
+  canvas{display:block;width:100%;border-radius:6px;background:#060507;cursor:pointer}
+  .mctl{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+  .mbtn{font:11px ui-monospace,monospace;background:#0b0b0e;color:#c9ccd1;border:1px solid #ffffff24;border-radius:6px;padding:4px 9px;cursor:pointer;letter-spacing:.04em}
+  .mbtn:hover{border-color:#fbb26a;color:#fbb26a}
+</style>
+</head>
+<body>
+<h1>MIRAGE · CENTERPIECE — BLOOM VARIANT</h1>
+<div class="sub">peony · off ascii → bud ascii(stem) → ready halftone → connected pixel+halo · petal length constant (≥70%), only the angle folds into an upward cone at night · time ×1 = 1 hour/sec (real clock) &nbsp; <span class="clk" id="clk"></span> <span id="ph"></span></div>
+<div class="mctl"><button class="mbtn" data-st="0">off</button><button class="mbtn" data-st="1">bud</button><button class="mbtn" data-st="2">ready</button><button class="mbtn" data-st="3">connected</button><button class="mbtn" id="b-auto">auto: on</button><button class="mbtn" id="b-time">time ×1</button></div>
+<div class="card"><canvas id="cstage" width="420" height="315"></canvas></div>
+<script>
+(function(){
+const BG="#060507",TAU=Math.PI*2,clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const q=id=>document.getElementById(id);
+function ihash(i,j,s){let h=(Math.imul(i,374761393)+Math.imul(j,668265263)+s)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296;}
+const lerpC=(a,b,t)=>[a[0]+(b[0]-a[0])*t|0,a[1]+(b[1]-a[1])*t|0,a[2]+(b[2]-a[2])*t|0];
+const css=c=>"rgb("+c[0]+","+c[1]+","+c[2]+")";
+const BW=240,BH=180,RAMP=" .,:;ox%#@";
+function makeBuf(){const c=document.createElement("canvas");c.width=BW;c.height=BH;return{c,x:c.getContext("2d")};}
+
+function rasterize(ctx,W,H,id,mode,step){ctx.fillStyle=BG;ctx.fillRect(0,0,W,H);
+ const sx=W/BW,sy=H/BH;
+ if(mode===3){ctx.textBaseline="top";ctx.font=Math.ceil(step*sy)+"px ui-monospace,monospace";}
+ for(let y=0;y<BH;y+=step)for(let x2=0;x2<BW;x2+=step){const j=(y*BW+x2)*4,r=id[j],g=id[j+1],b=id[j+2],lum=(r*0.299+g*0.587+b*0.114)/255;
+  if(lum<0.03)continue;
+  if(mode===1){ctx.fillStyle="rgb("+r+","+g+","+b+")";ctx.fillRect(x2*sx,y*sy,step*sx-0.6,step*sy-0.6);}
+  else if(mode===2){ctx.fillStyle="rgb("+r+","+g+","+b+")";ctx.beginPath();ctx.arc((x2+step/2)*sx,(y+step/2)*sy,lum*step*sx*0.62,0,TAU);ctx.fill();}
+  else{ctx.fillStyle="rgb("+Math.min(r+45,255)+","+Math.min(g+45,255)+","+Math.min(b+45,255)+")";ctx.fillText(RAMP[clamp(lum*RAMP.length|0,0,RAMP.length-1)],x2*sx,y*sy);}}
+}
+
+function petal(x,cx,cy,a,rb,L,w,col,h){const bx2=cx+Math.cos(a)*rb,by2=cy+Math.sin(a)*rb,tx=cx+Math.cos(a)*(rb+L),ty=cy+Math.sin(a)*(rb+L);
+ const c1x=cx+Math.cos(a-w)*(rb+L*0.62),c1y=cy+Math.sin(a-w)*(rb+L*0.62),c2x=cx+Math.cos(a+w)*(rb+L*0.62),c2y=cy+Math.sin(a+w)*(rb+L*0.62);
+ const v=0.88+h*0.24;x.fillStyle="rgb("+(col[0]*v|0)+","+(col[1]*v|0)+","+(col[2]*v|0)+")";
+ x.beginPath();x.moveTo(bx2,by2);x.quadraticCurveTo(c1x,c1y,tx,ty);x.quadraticCurveTo(c2x,c2y,bx2,by2);x.closePath();x.fill();}
+
+const buf=makeBuf(),bx=buf.x,seedi=987654;
+const outer=[255,226,190],inner=[251,168,96],deep=[206,116,52],coreC=[120,66,30];
+let state=0,auto=true,T=0,last=null,autoClk=0;
+let glowI=0,stemT=0,spd=360,eNorm=1,trem=0,simT=10,dayMul=1;
+const TIMES=[1,2,4,8];
+function smooth(u){return u*u*(3-2*u);}
+function spreadDeg(h){if(h>=8&&h<=16)return 360;if(h>=23||h<=1)return 60;
+ if(h>16&&h<23)return 360+(60-360)*smooth((h-16)/7);
+ return 60+(360-60)*smooth((h-1)/7);}
+const oc=q("cstage"),octx=oc.getContext("2d");
+function setState(s){state=s;auto=false;q("b-auto").textContent="auto: off";}
+document.querySelectorAll("[data-st]").forEach(b=>b.addEventListener("click",()=>setState(+b.dataset.st)));
+q("b-auto").addEventListener("click",()=>{auto=!auto;autoClk=0;q("b-auto").textContent="auto: "+(auto?"on":"off");});
+q("b-time").addEventListener("click",()=>{dayMul=TIMES[(TIMES.indexOf(dayMul)+1)%TIMES.length];q("b-time").textContent="time ×"+dayMul;});
+oc.addEventListener("pointerdown",()=>{setState((state+1)%4);});
+
+function drawScene(){const hx=BW/2+2.5*trem*Math.sin(T*3),hy=108-24*stemT;bx.fillStyle=BG;bx.fillRect(0,0,BW,BH);
+ const headR=46,O=eNorm,spreadR=spd*Math.PI/180,lenF=1.1-0.1*O;
+ if(glowI>0.02){const gr=headR*1.28,pulse=1+0.08*Math.sin(T*2.5),g=bx.createRadialGradient(hx,hy,headR*0.3,hx,hy,gr*pulse);
+  g.addColorStop(0,"rgba(255,216,152,"+(0.6*glowI).toFixed(2)+")");g.addColorStop(0.55,"rgba(251,168,96,"+(0.24*glowI).toFixed(2)+")");g.addColorStop(1,"rgba(251,168,96,0)");
+  bx.fillStyle=g;bx.beginPath();bx.arc(hx,hy,gr*pulse,0,TAU);bx.fill();}
+ if(stemT>0.05){bx.strokeStyle="rgb(70,90,46)";bx.lineWidth=2.8;bx.globalAlpha=Math.min(1,stemT*1.6);bx.beginPath();bx.moveTo(hx,178);bx.quadraticCurveTo(hx+3,(178+hy)/2,hx,hy+10);bx.stroke();bx.globalAlpha=1;}
+ const rings=6;
+ for(let k=0;k<rings;k++){const kt=k/(rings-1),count=10-k,col=lerpC(outer,k<rings-2?inner:deep,kt),
+   L=headR*(1-kt*0.45)*lenF,rb=2+headR*0.08*(1-kt),w=clamp((spreadR/count)*0.62,0.16,0.7),
+   sway=0.08*Math.sin(T*1.1+k*1.3)*(k%2?1:-1);
+  for(let i=0;i<count;i++){const h=ihash(k,i,seedi),
+    a=-Math.PI/2+((i+0.5)/count-0.5)*spreadR+sway+(h-0.5)*0.10+0.03*Math.sin(T*1.6+i+k),
+    Lb=L*(0.85+h*0.3)*(1+0.05*Math.sin(T*1.4+i*0.6+k));
+   petal(bx,hx,hy,a,rb,Lb,w,col,h);}}
+ bx.fillStyle=css(coreC);bx.beginPath();bx.arc(hx,hy,5+0.6*Math.sin(T*2.2),0,TAU);bx.fill();
+ if(glowI>0.05){const nsp=Math.floor(5+10*glowI),gr2=headR*1.2;for(let i=0;i<nsp;i++){const a=Math.random()*TAU,rr=gr2*0.45+Math.random()*gr2*0.7,px=hx+Math.cos(a)*rr,py=hy+Math.sin(a)*rr,al=Math.random()*glowI*0.85;bx.fillStyle="rgba(255,236,200,"+al.toFixed(2)+")";bx.fillRect(px,py,1.3,1.3);}}
+}
+
+function pad(n){return(n<10?"0":"")+n;}
+function ez(x,t,r,dt){return x+(t-x)*Math.min(1,r*dt);}
+(function loop(){const now=(typeof performance!=="undefined"?performance.now():Date.now());if(last===null)last=now;let dt=(now-last)/1000;last=now;if(dt>0.1)dt=0.1;T+=dt;
+ if(auto){autoClk+=dt;const seq=[1.5,1.5,1.8,16],tot=20.8;if(autoClk>=tot)autoClk=0;let acc=0,st=0;for(let k=0;k<seq.length;k++){acc+=seq[k];if(autoClk<acc){st=k;break;}}state=st;}
+ glowI=ez(glowI,state>=3?1:0,3,dt);stemT=ez(stemT,state>=1?1:0,1.8,dt);trem=ez(trem,state===1?1:0,3,dt);
+ simT=(simT+dt*dayMul)%24;const tgt=state>=3?spreadDeg(simT):360;spd=ez(spd,tgt,2.5,dt);eNorm=clamp((spd-60)/300,0,1);
+ drawScene();
+ const id=bx.getImageData(0,0,BW,BH).data,mode=state<=1?3:state===2?2:1;
+ rasterize(octx,oc.width,oc.height,id,mode,mode===1?4:5);
+ q("clk").textContent=state>=3?("sim "+pad(simT|0)+":"+pad((simT%1*60)|0)):"";
+ q("ph").textContent=["· off · ascii","· bud · ascii · stem","· ready · halftone","· connected · pixel · "+(spd|0)+"° len "+(110-10*eNorm|0)+"%"][state];
+ requestAnimationFrame(loop);})();
+})();
+</script>
+</body>
+</html>

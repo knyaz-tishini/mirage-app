@@ -1,0 +1,49 @@
+[package]
+license = "MIT"
+name = "mirage-client-cli"
+version.workspace = true
+edition.workspace = true
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[lib]
+name = "mirage_client_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mirage-client-cli"
+path = "src/main.rs"
+
+# Native UDP smoke test — dial a server's `udp_*`-mode endpoint via
+# `run_client_udp`, send a SOCKS-style target frame, print the bytes that
+# come back. Verifies the udp_aggregator NodeConfig path on the server
+# end-to-end without the full SOCKS5/TunnelPool wiring.
+[[bin]]
+name = "mirage-udp-smoke"
+path = "src/bin/udp_smoke.rs"
+
+[dependencies]
+mirage-core          = { workspace = true }
+mirage-protocol      = { workspace = true }
+mirage-client-core   = { workspace = true }
+mirage-ringmember    = { workspace = true }
+mirage-runtime-guard = { workspace = true }
+arc-swap             = { workspace = true }
+tokio              = { workspace = true }
+tokio-util         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap               = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+async-trait        = "0.1"
+hex                = "0.4"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+libloading  = "0.8"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

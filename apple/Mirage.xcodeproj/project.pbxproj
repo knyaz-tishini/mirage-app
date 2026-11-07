@@ -1,0 +1,405 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000013 /* MirageApp.swift in iOS */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001E; };
+		A00000000000000000000061 /* main.swift in iOS */ = {isa = PBXBuildFile; fileRef = A00000000000000000000060; };
+		A00000000000000000000046 /* DeviceStore.swift in iOS */ = {isa = PBXBuildFile; fileRef = A00000000000000000000045; };
+		A00000000000000000000047 /* DeviceStore.swift in Mac */ = {isa = PBXBuildFile; fileRef = A00000000000000000000045; };
+		A00000000000000000000048 /* DeviceStore.swift in iOS tunnel */ = {isa = PBXBuildFile; fileRef = A00000000000000000000045; };
+		A00000000000000000000049 /* DeviceStore.swift in Mac tunnel */ = {isa = PBXBuildFile; fileRef = A00000000000000000000045; };
+		A00000000000000000000051 /* MirageClientView.swift in iOS */ = {isa = PBXBuildFile; fileRef = A00000000000000000000050; };
+		A00000000000000000000036 /* PacketTunnelProvider.swift in iOS tunnel */ = {isa = PBXBuildFile; fileRef = A00000000000000000000022; };
+		A00000000000000000000037 /* m1r4g3Tunnel.appex in iOS */ = {isa = PBXBuildFile; fileRef = A00000000000000000000001; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A00000000000000000000008 /* MirageApp.swift in Mac */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001E; };
+		A00000000000000000000053 /* main.swift in Mac */ = {isa = PBXBuildFile; fileRef = A00000000000000000000052; };
+		A00000000000000000000027 /* PacketTunnelProvider.swift in Mac tunnel */ = {isa = PBXBuildFile; fileRef = A00000000000000000000022; };
+		A0000000000000000000000A /* m1r4g3Tunnel.appex in Mac */ = {isa = PBXBuildFile; fileRef = A00000000000000000000032; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A00000000000000000000041 /* Assets.xcassets in iOS */ = {isa = PBXBuildFile; fileRef = A00000000000000000000040; };
+		A00000000000000000000042 /* Assets.xcassets in Mac */ = {isa = PBXBuildFile; fileRef = A00000000000000000000040; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A00000000000000000000024 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A0000000000000000000000B /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A0000000000000000000003A;
+			remoteInfo = "MirageTunnel iOS";
+		};
+		A0000000000000000000003E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A0000000000000000000000B /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A00000000000000000000020;
+			remoteInfo = "MirageTunnel macOS";
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A00000000000000000000026 /* Embed iOS extension */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A00000000000000000000037 /* m1r4g3Tunnel.appex in iOS */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A0000000000000000000000D /* Embed Mac extension */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A0000000000000000000000A /* m1r4g3Tunnel.appex in Mac */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A0000000000000000000001E /* MirageApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MirageApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000045 /* DeviceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceStore.swift; sourceTree = "<group>"; };
+		A0000000000000000000002C /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
+		A00000000000000000000050 /* MirageClientView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MirageClientView.swift; sourceTree = "<group>"; };
+		A00000000000000000000052 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		A00000000000000000000060 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		A00000000000000000000022 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+		A00000000000000000000003 /* AppInfo.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AppInfo.plist; sourceTree = "<group>"; };
+		A00000000000000000000015 /* TunnelInfo.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = TunnelInfo.plist; sourceTree = "<group>"; };
+		A0000000000000000000002E /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
+		A00000000000000000000004 /* Tunnel.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Tunnel.entitlements; sourceTree = "<group>"; };
+		A00000000000000000000025 /* AppInfo.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AppInfo.plist; sourceTree = "<group>"; };
+		A0000000000000000000001B /* TunnelInfo.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = TunnelInfo.plist; sourceTree = "<group>"; };
+		A00000000000000000000033 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
+		A0000000000000000000003C /* Tunnel.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Tunnel.entitlements; sourceTree = "<group>"; };
+		A0000000000000000000001C /* m1r4g3.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = m1r4g3.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000001 /* m1r4g3Tunnel.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = m1r4g3Tunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A0000000000000000000001D /* m1r4g3.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = m1r4g3.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000032 /* m1r4g3Tunnel.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = m1r4g3Tunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000040 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A00000000000000000000021 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A0000000000000000000001F /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000029 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000028 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A0000000000000000000000F = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000034 /* Shared */,
+				A0000000000000000000002A /* ios */,
+				A0000000000000000000002F /* mac */,
+				A00000000000000000000040 /* Assets.xcassets */,
+				A00000000000000000000023 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000034 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000001E /* MirageApp.swift */,
+				A00000000000000000000050 /* MirageClientView.swift */,
+				A00000000000000000000045 /* DeviceStore.swift */,
+				A0000000000000000000002C /* ConnectView.swift */,
+				A00000000000000000000022 /* PacketTunnelProvider.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000002A /* ios */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000060 /* main.swift */,
+				A00000000000000000000003 /* AppInfo.plist */,
+				A00000000000000000000015 /* TunnelInfo.plist */,
+				A0000000000000000000002E /* App.entitlements */,
+				A00000000000000000000004 /* Tunnel.entitlements */,
+			);
+			path = ios;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000002F /* mac */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000052 /* main.swift */,
+				A00000000000000000000025 /* AppInfo.plist */,
+				A0000000000000000000001B /* TunnelInfo.plist */,
+				A00000000000000000000033 /* App.entitlements */,
+				A0000000000000000000003C /* Tunnel.entitlements */,
+			);
+			path = mac;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000023 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000001C /* m1r4g3.app */,
+				A00000000000000000000001 /* m1r4g3Tunnel.appex */,
+				A0000000000000000000001D /* m1r4g3.app */,
+				A00000000000000000000032 /* m1r4g3Tunnel.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A00000000000000000000018 /* Mirage iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000014;
+			buildPhases = (
+				A00000000000000000000038 /* Sources */,
+				A00000000000000000000021 /* Frameworks */,
+				A00000000000000000000043 /* Resources */,
+				A00000000000000000000026 /* Embed iOS extension */,
+			);
+			buildRules = ();
+			dependencies = (
+				A0000000000000000000000C /* PBXTargetDependency */,
+			);
+			name = "Mirage iOS";
+			productName = m1r4g3;
+			productReference = A0000000000000000000001C /* m1r4g3.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A0000000000000000000003A /* MirageTunnel iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000011;
+			buildPhases = (
+				A0000000000000000000003B /* Sources */,
+				A0000000000000000000001F /* Frameworks */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = "MirageTunnel iOS";
+			productName = m1r4g3Tunnel;
+			productReference = A00000000000000000000001 /* m1r4g3Tunnel.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		A0000000000000000000003D /* Mirage macOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A0000000000000000000002B;
+			buildPhases = (
+				A00000000000000000000012 /* Sources */,
+				A00000000000000000000029 /* Frameworks */,
+				A00000000000000000000044 /* Resources */,
+				A0000000000000000000000D /* Embed Mac extension */,
+			);
+			buildRules = ();
+			dependencies = (
+				A00000000000000000000005 /* PBXTargetDependency */,
+			);
+			name = "Mirage macOS";
+			productName = m1r4g3;
+			productReference = A0000000000000000000001D /* m1r4g3.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A00000000000000000000020 /* MirageTunnel macOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000017;
+			buildPhases = (
+				A0000000000000000000000E /* Sources */,
+				A00000000000000000000028 /* Frameworks */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = "MirageTunnel macOS";
+			productName = m1r4g3Tunnel;
+			productReference = A00000000000000000000032 /* m1r4g3Tunnel.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A0000000000000000000000B /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					A00000000000000000000018 = {DevelopmentTeam = QG96QRRQBQ; };
+					A0000000000000000000003A = {DevelopmentTeam = QG96QRRQBQ; };
+					A0000000000000000000003D = {DevelopmentTeam = QG96QRRQBQ; };
+					A00000000000000000000020 = {DevelopmentTeam = QG96QRRQBQ; };
+				};
+			};
+			buildConfigurationList = A0000000000000000000002D;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = ru;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, ru, Base);
+			mainGroup = A0000000000000000000000F;
+			productRefGroup = A00000000000000000000023;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A00000000000000000000018 /* Mirage iOS */,
+				A0000000000000000000003A /* MirageTunnel iOS */,
+				A0000000000000000000003D /* Mirage macOS */,
+				A00000000000000000000020 /* MirageTunnel macOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A00000000000000000000043 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000041 /* Assets.xcassets in iOS */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000044 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000042 /* Assets.xcassets in Mac */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A00000000000000000000038 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000061 /* main.swift in iOS */,
+				A00000000000000000000013 /* MirageApp.swift in iOS */,
+				A00000000000000000000051 /* MirageClientView.swift in iOS */,
+				A00000000000000000000046 /* DeviceStore.swift in iOS */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A0000000000000000000003B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000036 /* PacketTunnelProvider.swift in iOS tunnel */,
+				A00000000000000000000048 /* DeviceStore.swift in iOS tunnel */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000012 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000053 /* main.swift in Mac */,
+				A00000000000000000000047 /* DeviceStore.swift in Mac */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A0000000000000000000000E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000027 /* PacketTunnelProvider.swift in Mac tunnel */,
+				A00000000000000000000049 /* DeviceStore.swift in Mac tunnel */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A0000000000000000000000C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A0000000000000000000003A /* MirageTunnel iOS */;
+			targetProxy = A00000000000000000000024 /* PBXContainerItemProxy */;
+		};
+		A00000000000000000000005 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A00000000000000000000020 /* MirageTunnel macOS */;
+			targetProxy = A0000000000000000000003E /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A00000000000000000000007 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A00000000000000000000019 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A00000000000000000000030 /* Debug iOS app */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = ios/App.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ios/AppInfo.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks"); MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = ios; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_gui.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3; PRODUCT_NAME = m1r4g3; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = iphoneos; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		A00000000000000000000016 /* Release iOS app */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = ios/App.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution: Bergman Konstantin (QG96QRRQBQ)"; CODE_SIGN_STYLE = Manual; PROVISIONING_PROFILE_SPECIFIER = "m1r4g3-ios-appstore"; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ios/AppInfo.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks"); MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = ios; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_gui.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3; PRODUCT_NAME = m1r4g3; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = iphoneos; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		A0000000000000000000001A /* Debug iOS tunnel */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = ios/Tunnel.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ios/TunnelInfo.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"); MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = ios; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_mobile.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3.tunnel; PRODUCT_NAME = m1r4g3Tunnel; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphoneos; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; }; name = Debug; };
+		A00000000000000000000039 /* Release iOS tunnel */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = ios/Tunnel.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution: Bergman Konstantin (QG96QRRQBQ)"; CODE_SIGN_STYLE = Manual; PROVISIONING_PROFILE_SPECIFIER = "m1r4g3-ios-tunnel-appstore"; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ios/TunnelInfo.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"); MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = ios; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_mobile.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3.tunnel; PRODUCT_NAME = m1r4g3Tunnel; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphoneos; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; }; name = Release; };
+		A00000000000000000000010 /* Debug Mac app */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = mac/App.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = mac/AppInfo.plist; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks"); MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = mac; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_gui.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension, "-framework", Metal, "-framework", QuartzCore, "-framework", CoreVideo, "-framework", AVFoundation, "-framework", IOKit, "-framework", AppKit, "-framework", Cocoa, "-framework", Carbon); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3; PRODUCT_NAME = m1r4g3; ARCHS = arm64; EXCLUDED_ARCHS = x86_64; SDKROOT = macosx; SUPPORTED_PLATFORMS = macosx; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; }; name = Debug; };
+		A00000000000000000000009 /* Release Mac app */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = mac/App.entitlements; CODE_SIGN_IDENTITY = "3rd Party Mac Developer Application: Bergman Konstantin (QG96QRRQBQ)"; CODE_SIGN_STYLE = Manual; PROVISIONING_PROFILE_SPECIFIER = "m1r4g3-mac-appstore"; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = mac/AppInfo.plist; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks"); MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = mac; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_gui.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension, "-framework", Metal, "-framework", QuartzCore, "-framework", CoreVideo, "-framework", AVFoundation, "-framework", IOKit, "-framework", AppKit, "-framework", Cocoa, "-framework", Carbon); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3; PRODUCT_NAME = m1r4g3; ARCHS = arm64; EXCLUDED_ARCHS = x86_64; SDKROOT = macosx; SUPPORTED_PLATFORMS = macosx; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; }; name = Release; };
+		A00000000000000000000031 /* Debug Mac tunnel */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = mac/Tunnel.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = mac/TunnelInfo.plist; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks", "@executable_path/../../../../Frameworks"); MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = mac; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_mobile.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3.tunnel; PRODUCT_NAME = m1r4g3Tunnel; ARCHS = arm64; EXCLUDED_ARCHS = x86_64; SDKROOT = macosx; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = macosx; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; }; name = Debug; };
+		A00000000000000000000035 /* Release Mac tunnel */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = mac/Tunnel.entitlements; CODE_SIGN_IDENTITY = "3rd Party Mac Developer Application: Bergman Konstantin (QG96QRRQBQ)"; CODE_SIGN_STYLE = Manual; PROVISIONING_PROFILE_SPECIFIER = "m1r4g3-mac-tunnel-appstore"; CURRENT_PROJECT_VERSION = 7; DEVELOPMENT_TEAM = QG96QRRQBQ; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = mac/TunnelInfo.plist; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks", "@executable_path/../../../../Frameworks"); MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 0.1.9; MIRAGE_RUST_DIR = mac; OTHER_LDFLAGS = ("$(inherited)", "-force_load", "$(SRCROOT)/Rust/$(MIRAGE_RUST_DIR)/libmirage_client_mobile.a", "-lc++", "-framework", Security, "-framework", Foundation, "-framework", SystemConfiguration, "-framework", CoreFoundation, "-framework", NetworkExtension); PRODUCT_BUNDLE_IDENTIFIER = bid.m1r4g3.tunnel; PRODUCT_NAME = m1r4g3Tunnel; ARCHS = arm64; EXCLUDED_ARCHS = x86_64; SDKROOT = macosx; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = macosx; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Support"; SWIFT_VERSION = 5.0; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A0000000000000000000002D /* Build configuration list for PBXProject */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (A00000000000000000000007 /* Debug */, A00000000000000000000019 /* Release */);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000014 /* Build configuration list for Mirage iOS */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (A00000000000000000000030 /* Debug */, A00000000000000000000016 /* Release */);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000011 /* Build configuration list for MirageTunnel iOS */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (A0000000000000000000001A /* Debug */, A00000000000000000000039 /* Release */);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A0000000000000000000002B /* Build configuration list for Mirage macOS */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (A00000000000000000000010 /* Debug */, A00000000000000000000009 /* Release */);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000017 /* Build configuration list for MirageTunnel macOS */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (A00000000000000000000031 /* Debug */, A00000000000000000000035 /* Release */);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A0000000000000000000000B /* Project object */;
+}

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirage centerpiece — morph scene (grid → real planet + node panel WIP)</title>
+<style>
+  body{margin:0;background:#0b0b0e;color:#f4f4f5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:18px}
+  h1{font-size:13px;letter-spacing:.16em;font-weight:500;color:#fbb26a;margin:0 0 14px}
+  .lbl{font-size:11px;color:#878b91;margin-bottom:6px;letter-spacing:.05em}
+  .hint{color:#555860}
+  .card{background:#14151a;border:1px solid #ffffff14;border-radius:12px;padding:10px;margin-bottom:14px}
+  .gwrap{position:relative}
+  .gwrap canvas{display:block;width:100%;border-radius:6px;touch-action:none;cursor:grab}
+  #npop{position:absolute;display:none;pointer-events:none;z-index:3;background:#14151af2;border:1px solid #ffffff26;border-radius:8px;padding:8px 10px;font:11px ui-monospace,monospace;color:#c9ccd1;width:188px;box-shadow:0 6px 22px #00000066}
+  .mctl{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .mbtn{font:11px ui-monospace,monospace;background:#0b0b0e;color:#c9ccd1;border:1px solid #ffffff24;border-radius:6px;padding:4px 9px;cursor:pointer;letter-spacing:.04em}
+  .mbtn:hover{border-color:#fbb26a;color:#fbb26a}
+</style>
+</head>
+<body>
+<h1>MIRAGE · CENTERPIECE — MORPH SCENE</h1>
+<!-- Gestures: single click = connect, dbl-click = disconnect, single click a node
+     (connected) = info popup, drag = rotate, wheel = zoom. Node hit-test runs in CSS
+     px (scaled from the 600x360 buffer) so clicks land on the rendered node. The info
+     popup (#npop floating) is the WIP panel — for the uzor port redo it docked, not
+     floating-follow. See nemo/docs/mirage/handoffs/handoff-2026-06-15-morph-centerpiece.md. -->
+<div class="card">
+  <div class="lbl">RELIEF → REAL PLANET → MESH <span class="hint">— drag = rotate · click = connect · dbl-click = disconnect · click a node = info · wheel = zoom</span></div>
+  <div class="gwrap"><canvas id="gmorph" width="600" height="360" style="background:#0b0b0e"></canvas><div id="npop"></div></div>
+  <div class="mctl">
+    <button class="mbtn" data-ms="0">boot</button>
+    <button class="mbtn" data-ms="1">services up</button>
+    <button class="mbtn" data-ms="2">collapse</button>
+    <button class="mbtn" data-ms="3">connected</button>
+    <button class="mbtn" id="m-auto">auto: on</button>
+  </div>
+</div>
+<!-- d3 + topojson load the real Natural-Earth land mask (world-atlas) at runtime.
+     For the uzor/Rust port: bake the mask to a static array, and feed real fleet
+     nodes (id/ip/region/geo) from inventory.toml / opbox /mesh/inventory. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
+<script>
+(function(){
+const BG="#0b0b0e",FG0="#f4f4f5",FG1="#878b91",FG3="#555860",AMBER="#fbb26a",AMBER_HI="#ffd9b0",TAU=Math.PI*2,DEG=180/Math.PI;
+const q=id=>document.getElementById(id),clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+function ihash(i,j,s){let h=(Math.imul(i,374761393)+Math.imul(j,668265263)+s)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296;}
+function vnoise(x,y,s){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+ const a=ihash(xi,yi,s),b=ihash(xi+1,yi,s),c=ihash(xi,yi+1,s),d=ihash(xi+1,yi+1,s);return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;}
+
+function MORPH(){const c=q("gmorph"),x=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2,pop=q("npop");
+ const Ng=50,ns=4242,N=Ng*Ng,GA=Math.PI*(3-Math.sqrt(5)),PTS=[];
+ for(let i=0;i<Ng;i++)for(let j=0;j<Ng;j++){const u=i/(Ng-1),v=j/(Ng-1),k=i*Ng+j;
+  const fy=1-(k/(N-1))*2,fr=Math.sqrt(Math.max(0,1-fy*fy)),fth=GA*k,fib=[Math.cos(fth)*fr,fy,Math.sin(fth)*fr];
+  PTS[k]={px:(u-0.5)*2.0,pz:(v-0.5)*2.0,fib,i,j,latd:Math.asin(clamp(fy,-1,1))*DEG,lond:-Math.atan2(fib[2],fib[0])*DEG,land:false};}
+ const MW=360,MH=180;let mask=null;
+ function isLand(latd,lond){if(!mask)return false;const px=((Math.floor((lond+180)/360*MW))%MW+MW)%MW,py=clamp(Math.floor((90-latd)/180*MH),0,MH-1);return mask[(py*MW+px)*4]>128;}
+ (async function(){try{
+  const topo=await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json").then(r=>r.json());
+  const off=document.createElement("canvas");off.width=MW;off.height=MH;const o=off.getContext("2d");
+  const proj=d3.geoEquirectangular().scale(MW/TAU).translate([MW/2,MH/2]),path=d3.geoPath(proj,o);
+  o.fillStyle="#fff";o.beginPath();path(topojson.merge(topo,topo.objects.countries.geometries));o.fill();
+  mask=o.getImageData(0,0,MW,MH).data;for(let k=0;k<N;k++)PTS[k].land=isLand(PTS[k].latd,PTS[k].lond);
+ }catch(e){}})();
+ function geo(lat,lon){const la=lat/DEG,lo=lon/DEG;return[Math.cos(la)*Math.cos(lo),Math.sin(la),-Math.cos(la)*Math.sin(lo)];}
+ const ROLES="monitor · node · sentry · mshd · db-worker";
+ const NODES=[
+  {id:"ru-hostkey-203.0.113.10",ip:"203.0.113.15",reg:"RU",prov:"HostKey",city:"Moscow",roles:ROLES,lat:55.75,lon:37.62},
+  {id:"ru-example-203.0.113.50",ip:"203.0.113.16",reg:"RU",prov:"HostKey",city:"St Petersburg",roles:ROLES,lat:59.93,lon:30.34},
+  {id:"tr-hostkey-203.0.113.20",ip:"203.0.113.14",reg:"TR",prov:"HostKey",city:"Istanbul",roles:ROLES,lat:41.01,lon:28.98},
+  {id:"nl-example-203.0.113.31",ip:"203.0.113.10",reg:"NL",prov:"Omro",city:"Amsterdam",roles:ROLES+" · standalone",lat:52.37,lon:4.90},
+  {id:"nl-example-203.0.113.30",ip:"203.0.113.11",reg:"NL",prov:"HostKey",city:"Rotterdam",roles:ROLES,lat:51.92,lon:4.48},
+  {id:"ch-example-203.0.113.41",ip:"203.0.113.17",reg:"CH",prov:"Cloudzy",city:"Zurich",roles:ROLES+" · standalone",lat:47.37,lon:8.54}];
+ NODES.forEach(n=>{n.p=geo(n.lat,n.lon);n.sx=0;n.sy=0;n.front=false;});
+ const LINKS=[[0,2],[2,5],[1,3],[3,5],[0,1],[4,2]];
+ function row(k,v,c2){return '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#878b91">'+k+'</span><span style="color:'+(c2||"#c9ccd1")+'">'+v+'</span></div>';}
+ function fillPop(n){pop.innerHTML='<div style="color:#fbb26a;font-weight:500;letter-spacing:.05em">'+n.reg+' · '+n.city+'</div><div style="height:1px;background:#ffffff1f;margin:6px 0"></div>'+row("IP",n.ip,"#ffd9b0")+row("ID",n.id)+row("PROVIDER",n.prov)+'<div style="color:#878b91;margin-top:5px">ROLES</div><div style="color:#c9ccd1;font-size:10px;line-height:1.5">'+n.roles+'</div>';}
+ let yaw=0.5,pitch=0.4,vyaw=0.015,vpitch=0,zoom=1,drag=null,t=0,selNode=-1,connectTimer=null;
+ let state=0,auto=true,autoT=0,fold=0,colT=0,amp=0.16,mesh=0;
+ function rot(p){const cyw=Math.cos(yaw),syw=Math.sin(yaw),x1=p[0]*cyw+p[2]*syw,z1=-p[0]*syw+p[2]*cyw,y1=p[1];
+  const cp=Math.cos(pitch),sp=Math.sin(pitch),y2=y1*cp-z1*sp,z2=y1*sp+z1*cp;return[x1,y2,z2];}
+ const Rr=()=>150*zoom;
+ function lbl(){const b=q("m-auto");if(b)b.textContent="auto: "+(auto?"on":"off");}
+ c.addEventListener("pointerdown",e=>{drag={x:e.offsetX,y:e.offsetY,m:0};vyaw=vpitch=0;c.style.cursor="grabbing";});
+ c.addEventListener("pointermove",e=>{if(drag){const dx=e.offsetX-drag.x,dy=e.offsetY-drag.y;drag.m+=Math.abs(dx)+Math.abs(dy);yaw+=dx*0.008;pitch=clamp(pitch+dy*0.008,-1.35,1.35);vyaw=dx*0.008;vpitch=dy*0.008;drag.x=e.offsetX;drag.y=e.offsetY;}});
+ window.addEventListener("pointerup",()=>{
+   if(drag&&drag.m<7){
+     const scx=(c.clientWidth/W)||1,scy=(c.clientHeight/H)||1,tx=drag.x,ty=drag.y;
+     if(state>=3){
+       let best=-1,bd=20*20;
+       for(let ni=0;ni<NODES.length;ni++){const n=NODES[ni];if(!n.front)continue;const dx=n.sx*scx-tx,dy=n.sy*scy-ty,dd=dx*dx+dy*dy;if(dd<bd){bd=dd;best=ni;}}
+       selNode=(best>=0)?(selNode===best?-1:best):-1;if(selNode>=0)fillPop(NODES[selNode]);
+     }else{
+       if(connectTimer)clearTimeout(connectTimer);
+       connectTimer=setTimeout(()=>{auto=false;state=3;selNode=-1;lbl();connectTimer=null;},200);
+     }
+   }
+   drag=null;c.style.cursor="grab";
+ });
+ c.addEventListener("dblclick",()=>{
+   if(connectTimer){clearTimeout(connectTimer);connectTimer=null;}
+   if(state>=3){auto=false;state=0;selNode=-1;lbl();}
+ });
+ c.addEventListener("wheel",e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:0.926;zoom=clamp(zoom,0.6,3.2);},{passive:false});
+ document.querySelectorAll("[data-ms]").forEach(b=>b.addEventListener("click",()=>{auto=false;state=+b.dataset.ms;lbl();}));
+ const ab=q("m-auto");if(ab)ab.addEventListener("click",()=>{auto=!auto;autoT=0;lbl();});
+ const dwell=[150,150,300,320],total=dwell.reduce((a,b)=>a+b,0);
+ function hgt(i,j){return (vnoise(i*0.22,j*0.22+t*0.4,ns)-0.5)+0.25*Math.sin((i+j)*0.42+t*1.8);}
+ function lerpCa(cc){const r=Math.round(244+(251-244)*cc),g=Math.round(244+(178-244)*cc),b=Math.round(245+(106-245)*cc);return r+","+g+","+b;}
+ (function d(){t+=0.016;
+  if(auto){autoT++;if(autoT>=total)autoT=0;let acc=0,st=0;for(let k=0;k<dwell.length;k++){acc+=dwell[k];if(autoT<acc){st=k;break;}}state=st;}
+  const tf=state>=2?1:0,ta=state===0?0.16:0.26,tc=state>=1?1:0,tm=state===3?1:0;
+  fold+=(tf-fold)*0.011;amp+=(ta-amp)*0.04;colT+=(tc-colT)*0.05;mesh+=(tm-mesh)*0.06;
+  const fe=fold*fold*(3-2*fold),meshA=mesh*clamp((fold-0.9)/0.08,0,1),R=Rr();
+  const lineFade=clamp(1-fe/0.12,0,1),dotFade=clamp((fe-0.03)/0.16,0,1);
+  if(!drag){yaw+=vyaw+(selNode<0?0.0012:0);pitch+=vpitch;vyaw*=0.95;vpitch*=0.95;pitch=clamp(pitch,-1.35,1.35);}
+  x.fillStyle=BG;x.fillRect(0,0,W,H);
+  const PR=new Array(N);
+  for(let k=0;k<N;k++){const P=PTS[k],flatY=amp*1.5*hgt(P.i,P.j),wx=P.px+(P.fib[0]-P.px)*fe,wy=flatY+(P.fib[1]-flatY)*fe,wz=P.pz+(P.fib[2]-P.pz)*fe,r=rot([wx,wy,wz]);PR[k]=[cx+r[0]*R,cy-r[1]*R,r[2]];}
+  if(fe>0.55){x.strokeStyle="rgba(255,255,255,"+(0.06*clamp((fe-0.55)/0.3,0,1)).toFixed(2)+")";x.lineWidth=1;x.beginPath();x.arc(cx,cy,R,0,TAU);x.stroke();}
+  if(lineFade>0.01){const cr=Math.round(244+(251-244)*colT),cg=Math.round(244+(178-244)*colT),cb=Math.round(245+(106-245)*colT);
+   x.lineWidth=1;x.strokeStyle="rgba("+cr+","+cg+","+cb+","+(0.45*lineFade).toFixed(2)+")";
+   for(let i=0;i<Ng;i++){x.beginPath();for(let j=0;j<Ng;j++){const s=PR[i*Ng+j];if(j)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}
+   for(let j=0;j<Ng;j++){x.beginPath();for(let i=0;i<Ng;i++){const s=PR[i*Ng+j];if(i)x.lineTo(s[0],s[1]);else x.moveTo(s[0],s[1]);}x.stroke();}}
+  if(dotFade>0.01){for(let k=0;k<N;k++){const P=PTS[k];if(!P.land)continue;const s=PR[k],d2=s[2];if(d2<-0.04)continue;const sB=0.32+0.68*clamp(d2,0,1);
+    const tw=0.85+0.15*Math.sin(t*2.4+k*0.7),al=sB*tw*dotFade;
+    x.fillStyle="rgba("+lerpCa(colT)+","+al.toFixed(2)+")";x.fillRect(s[0]-1,s[1]-1,2.2,2.2);}}
+  if(meshA>0.01){
+   for(let li=0;li<LINKS.length;li++){const a=LINKS[li][0],bb=LINKS[li][1],ra=rot(NODES[a].p),rb=rot(NODES[bb].p),path=[];
+    for(let k=0;k<=20;k++){const tt=k/20;let mx=ra[0]+(rb[0]-ra[0])*tt,my=ra[1]+(rb[1]-ra[1])*tt,mz=ra[2]+(rb[2]-ra[2])*tt,L=Math.hypot(mx,my,mz)||1;mx/=L;my/=L;mz/=L;const lift=1+0.16*Math.sin(tt*Math.PI);path.push([cx+(mx*lift)*R,cy-(my*lift)*R,mz]);}
+    x.strokeStyle="rgba(255,217,176,"+(0.8*meshA).toFixed(2)+")";x.lineWidth=1.4;let started=false;x.beginPath();for(let k=0;k<path.length;k++){const P=path[k];if(P[2]>=-0.02){if(started)x.lineTo(P[0],P[1]);else{x.moveTo(P[0],P[1]);started=true;}}else started=false;}x.stroke();}
+   for(let ni=0;ni<NODES.length;ni++){const n=NODES[ni],r=rot(n.p),s=[cx+r[0]*R,cy-r[1]*R],front=r[2]>=-0.02;n.sx=s[0];n.sy=s[1];n.front=front;if(!front)continue;
+    const sel=selNode===ni;x.globalAlpha=meshA;
+    if(sel){x.strokeStyle="rgba(251,178,106,"+(0.8*meshA).toFixed(2)+")";x.lineWidth=1.3;x.beginPath();x.arc(s[0],s[1],9,0,TAU);x.stroke();}
+    x.fillStyle=FG0;x.beginPath();x.arc(s[0],s[1],4.6,0,TAU);x.fill();x.fillStyle=AMBER;x.beginPath();x.arc(s[0],s[1],2.8,0,TAU);x.fill();
+    x.fillStyle=AMBER;x.font="9px ui-monospace,monospace";x.textAlign="left";x.fillText(n.reg,s[0]+9,s[1]-3);x.globalAlpha=1;}}
+  if(selNode>=0&&NODES[selNode].front&&meshA>0.5){const n=NODES[selNode],scx=c.clientWidth/W,scy=c.clientHeight/H,px=clamp(n.sx*scx+14,4,c.clientWidth-200),py=clamp(n.sy*scy-12,4,c.clientHeight-104);pop.style.left=px+"px";pop.style.top=py+"px";pop.style.display="block";}else pop.style.display="none";
+  const names=["BOOT — grid relief","READY — services up","COLLAPSING -> planet","MESH — connected"];
+  x.fillStyle=state>=1?AMBER:FG0;x.font="10px ui-monospace,monospace";x.textAlign="left";x.fillText(names[state],12,20);
+  x.fillStyle=FG3;x.fillText((auto?"auto":"manual")+"  zoom "+zoom.toFixed(2)+"x  ·  click connect · dbl-click disconnect"+(mask?"":"  loading atlas…"),12,H-10);
+  requestAnimationFrame(d);})();}
+
+MORPH();
+})();
+</script>
+</body>
+</html>

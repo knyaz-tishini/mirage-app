@@ -1,0 +1,14 @@
+[service]
+name = "mirage2landing"
+kind = "static_site"
+display_name = "Mirage2 Landing"
+description = "Static landing page served by mirage2server behind m1r4g3.bid"
+
+[links]
+public_url = "https://m1r4g3.bid"
+
+[dependencies]
+# mirage2server serves this via tower_http ServeDir fallback_service (STATIC_DIR env).
+# cloudflared-zengeld → mirage2server → mirage2landing.
+upstream = []
+downstream = ["mirage2server"]

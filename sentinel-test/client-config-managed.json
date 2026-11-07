@@ -1,0 +1,211 @@
+{
+  "_managed_by": "mirage-l0-sentinel",
+  "chains": [
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "classic-direct",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [],
+      "l1": {
+        "addr": "203.0.113.16:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l1_transparent": true,
+      "l2": {
+        "addr": "203.0.113.17:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "priority": 10,
+      "protocol": "Mirage",
+      "reply": "raw",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19482"
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "byte-cipher-classic",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [],
+      "l1": {
+        "addr": "203.0.113.16:4702",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "l2": {
+        "addr": "203.0.113.17:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "priority": 10,
+      "protocol": "MirageTls",
+      "reply": "raw",
+      "shaping": "none",
+      "socks5_bind": null
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "crypto-relay-classic",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [],
+      "l1": {
+        "addr": "203.0.113.16:4703",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "l2": {
+        "addr": "203.0.113.17:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "priority": 10,
+      "protocol": "Mirage",
+      "reply": "raw",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19483"
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "three-hop-onion",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "ephemeral",
+      "hops": [
+        {
+          "addr": "203.0.113.16:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "entry",
+          "sni": null
+        },
+        {
+          "addr": "203.0.113.16:4710",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "middle",
+          "sni": null
+        },
+        {
+          "addr": "203.0.113.17:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "exit",
+          "sni": null
+        }
+      ],
+      "l1": null,
+      "l1_transparent": false,
+      "l2": {
+        "addr": "203.0.113.17:4701",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "priority": 0,
+      "protocol": "Mirage",
+      "reply": "onion",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19484"
+    },
+    {
+      "byte_cipher": null,
+      "camouflage": "raw",
+      "chain_id": "three-hop-telescopic",
+      "cover_traffic": {
+        "enabled": false,
+        "idle_threshold_ms": 2000,
+        "max_interval_ms": 5000,
+        "max_size": 1024,
+        "min_interval_ms": 500,
+        "min_size": 64
+      },
+      "handshake": "telescopic",
+      "hops": [
+        {
+          "addr": "203.0.113.16:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "entry",
+          "sni": null
+        },
+        {
+          "addr": "203.0.113.16:4710",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "middle",
+          "sni": null
+        },
+        {
+          "addr": "203.0.113.17:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "exit",
+          "sni": null
+        }
+      ],
+      "l1": null,
+      "l1_transparent": false,
+      "l2": {
+        "addr": "203.0.113.17:4701",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "priority": 0,
+      "protocol": "Mirage",
+      "reply": "onion",
+      "shaping": "none",
+      "socks5_bind": "127.0.0.1:19486"
+    }
+  ],
+  "client_id": "stend-client",
+  "http_proxy": {
+    "bind_addr": "127.0.0.1:19481",
+    "enabled": true
+  },
+  "management_addr": "0.0.0.0:4498",
+  "management_key": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "monitor_url": "http://127.0.0.1:19410",
+  "pool": {
+    "pool_size": 200
+  },
+  "private_key": "0000000000000000000000000000000000000000000000000000000000000000",
+  "psk": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "routing": {
+    "blocked_domains": [],
+    "default_chain": "byte-cipher-classic",
+    "direct_cidrs": [],
+    "direct_domains": [],
+    "rules": []
+  },
+  "use_mux": true
+}

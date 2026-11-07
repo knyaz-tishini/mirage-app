@@ -1,0 +1,2 @@
+[build]
+target-dir = "../mirage2app/target"

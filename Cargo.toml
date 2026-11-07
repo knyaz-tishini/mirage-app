@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/client-core",
+    # The chain of boxes and its installer. Shared by the GUI and by the
+    # headless client: a chain built in one is the chain the other reads.
+    "crates/mirage-client-chain",
+    # The onion plane: the client walks the chain itself, holding the
+    # operator secret. A separate crate so the thin customer connector below
+    # stays free of every mesh credential.
+    "crates/mirage-onion-client",
+    # "crates/cli",  # cli1 (mirage-client-cli) RETIRED 2026-06-14 → crates/_deprecated/cli
+    "crates/cli2/ipc",
+    "crates/cli2/ota",
+    "crates/cli2/worker",
+    "crates/cli2/supervisor",
+    # "crates/desktop/windows/v2",  # legacy — uses path-deps to uzor; conflicts with crates.io uzor used by launcher
+    "crates/subscriber-client",
+    # "crates/desktop-cli",  # legacy pre-orchestrator launcher (spawned cli1) — RETIRED 2026-06-14 → crates/_deprecated/desktop-cli
+    "crates/runtime-guard",
+    "crates/debug-shell",
+    # "crates/launcher",  # mirage GUI launcher RETIRED 2026-09-30 → crates/_deprecated/launcher (product GUI = crates/client-gui)
+    # "crates/client-gui",  # uses vello-gpu + wgpu 29; windows-core version conflicts with launcher workspace — own workspace root
+    # "crates/mobile",  # cdylib — skip on Windows build
+    # "crates/mirage-pt-adapter",  # arc3 Phase-0 Tor PT+bridge spike — DELETED 2026-07-31.
+    # Superseded by transparent-forward per the 2026-07-24 canon: one commit
+    # (2f8e7ba), never touched again, absent from every live-proof commit. It
+    # had also stopped compiling (E0106), and because it is a workspace member
+    # that broke `cargo test` for this whole repo — zero client tests ran.
+]
+
+[workspace.package]
+license = "MIT"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[workspace.dependencies]
+tokio               = { version = "1", features = ["full"] }
+tokio-util          = { version = "0.7", features = ["codec", "rt"] }
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+serde               = { version = "1", features = ["derive"] }
+serde_json          = "1"
+clap                = { version = "4", features = ["derive"] }
+thiserror           = "2"
+futures             = "0.3"
+rand                = "0.8"
+bytes               = "1"
+arc-swap            = "1"
+axum                = "0.8"
+reqwest             = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
+mirage-core         = { path = "../mirage-oss/crates/mirage-core" }
+mirage-protocol     = { path = "../mirage-oss/crates/mirage-protocol" }
+mirage-mux          = { path = "../mirage-oss/crates/mirage-mux" }
+mirage-control-plane = { path = "../mirage-oss/crates/mirage-dial-core" }
+mirage-client-core  = { path = "crates/client-core" }
+tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roots"] }
+mirage-runtime-guard    = { path = "crates/runtime-guard" }
+mirage-ringmember   = { path = "../mirage-oss/crates/mirage-ringmember" }
+ed25519-dalek       = { version = "2", features = ["rand_core"] }

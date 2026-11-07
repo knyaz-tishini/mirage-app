@@ -1,0 +1,42 @@
+[package]
+license = "MIT"
+name = "mirage-client-core"
+version.workspace = true
+edition.workspace = true
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[lib]
+name = "mirage_client_core"
+
+[dependencies]
+mirage-core      = { workspace = true }
+mirage-mux       = { workspace = true, features = ["tokio-compat"] }
+mirage-control-plane = { workspace = true }
+futures          = { workspace = true }
+mirage-protocol  = { workspace = true }
+tokio           = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror       = { workspace = true }
+async-trait     = "0.1"
+serde           = { workspace = true, features = ["derive"] }
+serde_json      = { workspace = true }
+reqwest         = { workspace = true }
+rand            = { workspace = true }
+axum            = { workspace = true }
+arc-swap             = { workspace = true }
+tokio-util           = { workspace = true }
+bytes                = { workspace = true }
+tokio-tungstenite    = { workspace = true }
+dashmap              = "5"
+ipnet                = "2"
+mirage-ringmember    = { workspace = true }
+hex                  = "0.4"
+ed25519-dalek        = { workspace = true }
+blake3 = "1"
+
+# Linux-only: transparent.rs uses libc::getsockopt for SO_ORIGINAL_DST.
+# Windows/macOS builds compile this module out via cfg(target_os="linux").
+[target.'cfg(target_os = "linux")'.dependencies]
+libc                 = "0.2"
+

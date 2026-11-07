@@ -1,0 +1,23 @@
+[package]
+license = "MIT"
+name    = "mirage-debug-shell"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[[bin]]
+name = "mirage-debug-shell"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap               = { workspace = true }
+anyhow             = "1"
+mirage-runtime-guard = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

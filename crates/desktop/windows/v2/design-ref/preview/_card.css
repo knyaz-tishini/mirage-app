@@ -1,0 +1,35 @@
+/* Shared preview-card chrome. 700×~180 by default. */
+html, body { margin: 0; padding: 0; background: var(--bg, #0E0E11); color: var(--fg-1, #D7D8DB); }
+body { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+.card {
+  box-sizing: border-box;
+  width: 700px;
+  padding: 20px 24px;
+  background:
+    var(--grid-dot),
+    radial-gradient(ellipse at 100% 0%, rgba(251,178,106,0.04), transparent 60%),
+    var(--bg);
+  background-size: var(--grid-size), auto, auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg-1);
+  overflow: hidden;
+  position: relative;
+}
+.card::before {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, transparent 90%, rgba(0,0,0,0.3));
+  pointer-events: none;
+}
+.card > * { position: relative; z-index: 1; }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.stack { display: flex; flex-direction: column; gap: 12px; }
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--fg-2);
+}

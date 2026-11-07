@@ -1,0 +1,25 @@
+[package]
+license = "MIT"
+name = "mirage2app"
+version.workspace = true
+edition.workspace = true
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[[bin]]
+name = "mirage2app"
+path = "src/main.rs"
+
+[dependencies]
+mirage-core            = { path = "../../../../../../mirage-oss/crates/mirage-core" }
+uzor                   = { path = "../../../../../../../../uzor/uzor" }
+uzor-desktop           = { path = "../../../../../../../../uzor/uzor-desktop" }
+uzor-backend-tiny-skia = { path = "../../../../../../../../uzor/uzor-backend-tiny-skia" }
+softbuffer             = "0.4"
+tokio                  = { workspace = true }
+serde                  = { workspace = true }
+serde_json             = { workspace = true }
+tracing                = { workspace = true }
+tracing-subscriber     = { workspace = true }
+open                   = "5"
+arboard                = "3"
+reqwest                = { version = "0.12", features = ["json"] }

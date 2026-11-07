@@ -1,0 +1,31 @@
+[package]
+license = "MIT"
+name = "mirage-client-mobile"
+version = "0.1.0"
+edition.workspace = true
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+mirage-core        = { workspace = true }
+mirage-protocol    = { workspace = true }
+mirage-client-core = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+serde_json         = { workspace = true }
+async-trait        = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni              = "0.21"
+android_logger   = "0.14"
+libc             = "0.2"
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+libc = "0.2"
+mirage-tun-ios = { path = "../../../mirage-tun/crates/mirage-tun-ios", default-features = false }
+mirage-tun-core = { path = "../../../mirage-tun/crates/mirage-tun-core" }
+mirage-subscriber-client = { path = "../subscriber-client" }
+tokio-util = { workspace = true }
+tracing-subscriber = { workspace = true }

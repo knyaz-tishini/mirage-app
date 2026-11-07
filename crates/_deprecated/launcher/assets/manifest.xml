@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="com.mirage.launcher"
+      version="0.1.0.0"
+      processorArchitecture="*"/>
+
+  <!-- TEMP (visual-sandbox debugging): run as the invoking user, NOT elevated.
+       wintun.dll (real TUN) needs Administrator, but the mock sandbox never
+       touches the TUN, and elevation just blocks the iterate/kill loop. RESTORE
+       requireAdministrator (or elevate only the TUN child) before shipping a
+       build that actually creates the adapter. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Declare Win10/11 compatibility so APIs and DPI behave correctly. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <!-- Per-monitor DPI awareness for sharp rendering on HiDPI screens. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

@@ -1,0 +1,40 @@
+[package]
+license = "MIT"
+name = "mirage-chain-supervisor"
+version.workspace = true
+edition.workspace = true
+repository = "https://github.com/knyaz-tishini/mirage-app"
+homepage = "https://github.com/knyaz-tishini/mirage-app"
+[[bin]]
+name = "mirage-chain-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+# The workspace dep, which is rustls-only. Spelling it out here with bare
+# `features = ["json"]` took reqwest's DEFAULT features, i.e. native-tls, i.e.
+# openssl-sys — the one OpenSSL edge in a client that is rustls everywhere
+# else, and the thing that failed the musl build of the shipping client.
+reqwest = { workspace = true }
+dashmap = "5"
+mirage-chain-ipc     = { path = "../ipc" }
+mirage-chain-ota     = { path = "../ota" }
+mirage-runtime-guard = { workspace = true }
+mirage-core          = { workspace = true }
+mirage-client-core   = { workspace = true }
+arc-swap             = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
