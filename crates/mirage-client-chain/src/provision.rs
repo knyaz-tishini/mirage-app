@@ -507,6 +507,87 @@ pub async fn reconfigure(
     Ok(())
 }
 
+/// The directory the ready-stack window keeps its one key in.
+///
+/// A box the window already installed answers to that key. A chain built
+/// from those boxes uses the same door, not a new key per box.
+pub(crate) fn client_state_dir() -> Result<PathBuf, String> {
+    state_dir()
+}
+
+/// The link a box that is already up already published.
+pub(crate) async fn published_link(host: &str, port: u16, user: &str) -> Result<String, String> {
+    read_client_link(host, port, user).await
+}
+
+/// The `server.env` already on an installed box.
+///
+/// The chain is appended to it. Replacing the file with only the chain
+/// would drop the kit the box is already running.
+pub(crate) async fn read_remote_env(host: &str, port: u16, user: &str) -> Result<String, String> {
+    let dir = state_dir()?;
+    let key_path = dir.join("server.key");
+    if !key_path.is_file() {
+        return Err(crate::i18n::tr("p.no_key").into());
+    }
+    let pem = fs::read(&key_path).map_err(|e| format!("key: {e}"))?;
+    let pins = dir.join("host-keys.json");
+    let addr = format!("{host}:{port}");
+    let session = connect_key(&addr, user, &pem, &pins).await?;
+    let out = exec(&session, read_env_sh()).await?;
+    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+    if out.exit.unwrap_or(1) != 0 {
+        let err = out
+            .stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        return Err(if err.is_empty() {
+            format!("server.env: exit {:?}", out.exit)
+        } else {
+            format!("server.env: {err}")
+        });
+    }
+    Ok(out.stdout)
+}
+
+fn read_env_sh() -> &'static str {
+    r#"if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+$SUDO cat /opt/m1r4g3/server.env
+"#
+}
+
+/// The box's own env, with a previous chain taken out and this chain put in.
+///
+/// Lines that are not the chain stay, in the order the box had them. The
+/// kit, the ports and the masks are those lines. The chain is the tail.
+pub fn merge_chain_env(existing: &str, chain_body: &str) -> String {
+    let mut out = String::new();
+    for line in existing.lines() {
+        let key = line.split('=').next().unwrap_or("").trim();
+        if key.starts_with("MIRAGE_CHAIN_")
+            || key == "MIRAGE_OPERATOR_PUBKEY_HEX"
+            || key == "MIRAGE_MESH_ID"
+        {
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    let chain = chain_body.trim();
+    if !chain.is_empty() {
+        out.push_str(chain);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// An error, with the warning attached when there is one.
 ///
 /// The warning is not the reason the install failed, but the operator has to
@@ -1188,6 +1269,20 @@ printf 'm1r4g3-link %s\n' "$LINK"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second assembly replaces the chain and leaves the kit where it was.
+    #[test]
+    fn merge_chain_env_keeps_the_kit() {
+        let existing = "STACK=auto\nPROTOCOLS=quic,mirage\nMIRAGE_CHAIN_ID=old\nMIRAGE_MESH_ID=abc\nDNS=resolver.example\n";
+        let chain = "MIRAGE_CHAIN_ID=gui\nMIRAGE_CHAIN_LENGTH=1\n";
+        let merged = merge_chain_env(existing, chain);
+        assert!(merged.contains("STACK=auto\n"));
+        assert!(merged.contains("PROTOCOLS=quic,mirage\n"));
+        assert!(merged.contains("DNS=resolver.example\n"));
+        assert!(!merged.contains("MIRAGE_CHAIN_ID=old"));
+        assert!(!merged.contains("MIRAGE_MESH_ID=abc"));
+        assert!(merged.trim_end().ends_with("MIRAGE_CHAIN_LENGTH=1"));
+    }
 
     /// The private half is the truth: a lost public half is written down from
     /// it, and the key itself never changes.
