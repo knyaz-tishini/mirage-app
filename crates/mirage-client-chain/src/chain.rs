@@ -116,10 +116,21 @@ impl ChainRole {
     }
 }
 
+/// The door a customer dials: an address, the key that answers it, and the
+/// link it speaks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainEntrance {
+    /// `host:port` the customer knocks on.
+    pub addr: String,
+    /// The public key the customer verifies the box by, hex.
+    pub server_pubkey_hex: String,
+    /// The link the door speaks, as the server publishes it.
+    pub protocol: serde_json::Value,
+}
+
 /// One door of a box, as the box published it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChainFace {
-    /// `host:port` the box published this door on.
+pub struct ChainFace {    /// `host:port` the box published this door on.
     pub addr: String,
     /// The box's wire public key, hex — the key the chain leg verifies the
     /// box by.
@@ -177,6 +188,21 @@ pub struct Chain {
     pub boxes: Vec<ChainBox>,
     /// The key material the whole chain shares.
     pub keys: ChainKeys,
+    /// The port every hop of the chain answers its datagram leg on.
+    ///
+    /// One number for the whole chain: the boxes are different machines, and
+    /// the number only has to be free on the box that binds it. It is the
+    /// chain's own number — the server's profile table owns it, and the
+    /// client reads it out of the box it captures.
+    pub chain_udp_port: u16,
+    /// The port the packet PLANE is served on.
+    ///
+    /// One number for the whole chain, and the same number everywhere: the
+    /// customer's door at the edge (the relay that carries the customer's
+    /// QUIC into the chain) and the plane at the exit (the box the
+    /// customer's packets come out of). The customer knocks on the edge's
+    /// number; the edge carries the QUIC to the exit's.
+    pub plane_port: u16,
 }
 
 impl Chain {
@@ -215,6 +241,24 @@ impl Chain {
         self.boxes.first().map(|node| &node.face)
     }
 
+    /// The door the CUSTOMER dials: the edge's PLANE, with the exit's key.
+    ///
+    /// The customer's QUIC does not end at the edge: the edge relays it into
+    /// the chain, and the chain carries it to the box that serves the plane.
+    /// So the customer's door is the edge's plane port, and the key the
+    /// customer verifies is the EXIT's — the box that actually terminates
+    /// the customer's QUIC. A key of the edge would be the wrong key: the
+    /// edge never sees the handshake.
+    pub fn customer_entrance(&self) -> Option<ChainEntrance> {
+        let edge = self.boxes.first()?;
+        let exit = self.boxes.last()?;
+        Some(ChainEntrance {
+            addr: format!("{}:{}", host_of(&edge.face.addr), self.plane_port),
+            server_pubkey_hex: exit.face.pubkey_hex.clone(),
+            protocol: serde_json::json!({"type": "quic", "alpn": ["h3"]}),
+        })
+    }
+
     /// Build the `server.env` for the box at `index`.
     ///
     /// `base` is what the box needs for ITSELF — the stack, the protocols,
@@ -245,6 +289,14 @@ impl Chain {
         }
         env.push_str(&format!("MIRAGE_CHAIN_ID={}\n", self.chain_id));
         env.push_str(&format!("MIRAGE_CHAIN_LENGTH={}\n", hops.len()));
+        // The chain's own doors: the port every hop answers its datagram leg
+        // on, and the port the packet plane is served on. Both are the same
+        // on every box — the chain is one configuration, and the ports are
+        // part of it. Which box serves the plane and which one relays it
+        // follows from the box's place in the chain, not from the file.
+        env.push_str(&format!("MIRAGE_CHAIN_UDP_PORT={}\n", self.chain_udp_port));
+        env.push_str(&format!("MIRAGE_PLANE_PORT={}\n", self.plane_port));
+        env.push_str("MIRAGE_PLANE_ALPN=h3\n");
         // Only a hop has a place among the hops. The edge owns the chain and
         // has no position in it.
         if index > 0 {
@@ -269,7 +321,7 @@ impl Chain {
             env.push_str(&format!(
                 "MIRAGE_CHAIN_HOP_{hop}_UDP_ADDR={}:{}\n",
                 host_of(&node.face.addr),
-                CHAIN_UDP_PORT
+                self.chain_udp_port
             ));
         }
         // The trust anchor and the mesh id: on EVERY box of the chain.
@@ -298,12 +350,24 @@ impl Chain {
 
 /// The port every hop of a chain answers its datagram leg on.
 ///
+/// The number belongs to the SERVER's port table — the profile that names
+/// the protocols names this one too — and the client reads it out of the box
+/// it captures, so the two never drift apart. This is the fallback for a box
+/// whose environment does not name it.
+///
 /// A high port, out of the way of the doors a box publishes for customers
 /// (80, 443, 8080, 8443) and of the UDP doors the node binds itself (QUIC
 /// and friends). TCP and UDP have separate port spaces, so this number may
 /// coincide with a TCP face's — but not with another UDP bind on the same
 /// box, and the box refuses to start rather than shadowing one.
-const CHAIN_UDP_PORT: u16 = 51820;
+pub const CHAIN_UDP_PORT: u16 = 51822;
+
+/// The port the packet PLANE is served on.
+///
+/// The customer's door at the edge and the plane at the exit are the SAME
+/// number: the customer knocks on the edge's, and the edge carries the
+/// customer's QUIC to the exit's. One number for the whole chain.
+pub const PLANE_PORT: u16 = 51823;
 
 /// The host part of a `host:port` address.
 ///

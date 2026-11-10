@@ -212,7 +212,10 @@ pub async fn install_chain(
         states.push(state);
     }
 
-    let (chain, installed) = chain_from_links(chain_id, boxes, &links)?;
+    let chain_udp_port =
+        port_of_env(base_env, "MIRAGE_CHAIN_UDP_PORT").unwrap_or(crate::chain::CHAIN_UDP_PORT);
+    let plane_port = port_of_env(base_env, "MIRAGE_PLANE_PORT").unwrap_or(crate::chain::PLANE_PORT);
+    let (chain, installed) = chain_from_links(chain_id, boxes, &links, chain_udp_port, plane_port)?;
 
     // The chain goes into every box, and every box comes back up
     // with it. A box that kept the old configuration would be a box that
@@ -258,7 +261,12 @@ pub async fn assemble_chain(
         links.push(link);
         bases.push(base);
     }
-    let (chain, installed) = chain_from_links(chain_id, boxes, &links)?;
+    // The chain's own ports are read out of the boxes themselves: the server's
+    // port table names them, and the client does not get a second opinion.
+    let chain_udp_port =
+        port_of_env(&bases[0], "MIRAGE_CHAIN_UDP_PORT").unwrap_or(crate::chain::CHAIN_UDP_PORT);
+    let plane_port = port_of_env(&bases[0], "MIRAGE_PLANE_PORT").unwrap_or(crate::chain::PLANE_PORT);
+    let (chain, installed) = chain_from_links(chain_id, boxes, &links, chain_udp_port, plane_port)?;
     for (index, request) in boxes.iter().enumerate() {
         let chain_only = chain.server_env(index, "").map_err(|err| err.to_string())?;
         let env = provision::merge_chain_env(&bases[index], &chain_only);
@@ -280,6 +288,8 @@ fn chain_from_links(
     chain_id: &str,
     boxes: &[ChainRequest],
     links: &[String],
+    chain_udp_port: u16,
+    plane_port: u16,
 ) -> Result<(Chain, Vec<InstalledBox>), String> {
     if boxes.len() != links.len() || boxes.is_empty() {
         return Err("a chain needs a link from every box".to_owned());
@@ -320,6 +330,8 @@ fn chain_from_links(
         chain_id: chain_id.to_owned(),
         boxes: chain_boxes,
         keys,
+        chain_udp_port,
+        plane_port,
     };
     let installed = chain
         .boxes
@@ -334,6 +346,20 @@ fn chain_from_links(
         })
         .collect();
     Ok((chain, installed))
+}
+
+/// One number out of a `server.env` body.
+///
+/// The ports of a chain are named by the server's own port table, and the
+/// client reads them out of the box it captured rather than keeping a second
+/// table of its own: two tables would drift, and a chain whose door was on a
+/// different number than the box's would fail in a way nobody could read.
+fn port_of_env(env: &str, key: &str) -> Option<u16> {
+    env.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(name, _)| name.trim() == key)
+        .and_then(|(_, value)| value.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
 }
 
 /// The chain's own key material.
