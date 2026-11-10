@@ -275,6 +275,17 @@ async fn session_for_owner(
     if session.serves_plane_consumer(consumer) {
         return Some(session);
     }
+    // The tunnel rides on this plane. Taking it for the SOCKS5 flows would
+    // tear the session down and dial a new one -- and the machine would lose
+    // its way out for half a minute. So the request is refused instead, and
+    // the one who asked is told why.
+    if supervisor.plane_owner_is_pinned() {
+        warn!(
+            consumer = ?consumer,
+            "socks5: the tunnel owns the plane -- the request is refused"
+        );
+        return None;
+    }
     info!(
         consumer = ?consumer,
         "socks5: the live session's packets belong to the other owner - switching"
@@ -497,6 +508,18 @@ async fn handle_connect(
         let _ = write_reply(&mut stream, REP_NOT_ALLOWED).await;
         return;
     }
+    // The tunnel carries the machine's traffic, so the plane belongs to it.
+    //
+    // The flow is then opened with an ORDINARY socket: the machine's own
+    // routing sends it into the tunnel with everything else, and it runs at
+    // the speed of the tunnel. The alternative -- taking the plane for the
+    // userspace stack -- tears the session down, dials a new one and costs
+    // the machine half a minute of its way out, and the flow itself crawls
+    // (the stack terminates every byte in software).
+    if supervisor.plane_owner_is_pinned() {
+        connect_over_local_socket(stream, &target).await;
+        return;
+    }
     let session = match session_for_owner(&supervisor, PlaneConsumer::Stack).await {
         Some(session) => session,
         None => {
@@ -678,6 +701,69 @@ async fn connect_over_plane(
                 kind = ?e.kind(),
                 ms = started.elapsed().as_millis() as u64,
                 "socks5: CONNECT flow over the plane ended with an error"
+            );
+        }
+    }
+}
+
+/// Open a CONNECT flow with an ordinary socket of the machine.
+///
+/// The tunnel carries the machine's traffic, so an ordinary socket IS the way
+/// into the tunnel: the routing sends it there with everything else, and it
+/// runs at the speed of the tunnel instead of the speed of a software stack.
+async fn connect_over_local_socket(mut stream: TcpStream, target: &str) {
+    let started = std::time::Instant::now();
+    let Some((host, port)) = split_target(target) else {
+        warn!(target = %target, "socks5: the destination is malformed — refusing CONNECT");
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    };
+    let addresses: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(addresses) => addresses.collect(),
+        Err(error) => {
+            warn!(target = %target, error = %error, "socks5: the name did not resolve");
+            let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+            return;
+        }
+    };
+    let mut opened = None;
+    for address in addresses {
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(socket) => {
+                opened = Some(socket);
+                break;
+            }
+            Err(error) => {
+                debug!(target = %target, addr = %address, error = %error, "socks5: the address did not answer");
+            }
+        }
+    }
+    let Some(mut socket) = opened else {
+        warn!(target = %target, "socks5: no address answered — refusing CONNECT");
+        let _ = write_reply(&mut stream, REP_GENERAL_FAILURE).await;
+        return;
+    };
+    if write_reply(&mut stream, REP_SUCCESS).await.is_err() {
+        return;
+    }
+    info!(target = %target, "socks5: CONNECT flow opened through the tunnel");
+    match crate::relay::copy_bidirectional_with_flow_idle_timeout(&mut stream, &mut socket).await {
+        Ok((to_remote, from_remote)) => {
+            info!(
+                target = %target,
+                to_remote,
+                from_remote,
+                ms = started.elapsed().as_millis() as u64,
+                "socks5: CONNECT flow through the tunnel ended"
+            );
+        }
+        Err(error) => {
+            warn!(
+                target = %target,
+                error = %error,
+                kind = ?error.kind(),
+                ms = started.elapsed().as_millis() as u64,
+                "socks5: CONNECT flow through the tunnel ended with an error"
             );
         }
     }

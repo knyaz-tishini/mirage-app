@@ -515,12 +515,21 @@ impl Engine {
         // Who owns the plane's packets follows the carry: the tunnel device
         // wants them raw, the SOCKS5 flows want them in the client's own
         // userspace stack. One owner per plane - so the switch redials.
+        //
+        // While the tunnel carries, the plane is PINNED: a SOCKS5 request
+        // that arrives anyway must not take the plane away. The switch tears
+        // the session down and dials a new one, and that costs the machine
+        // its way out for half a minute -- and the box names another address
+        // afterwards, so the device comes up again too. A SOCKS5 flow in
+        // that state is served with an ordinary socket instead: the machine's
+        // own routing sends it into the tunnel with everything else.
         if let Some(client) = &self.client {
             client.supervisor.current().set_plane_consumer(if self.carry_tun {
                 PlaneConsumer::RawIp
             } else {
                 PlaneConsumer::Stack
             });
+            client.supervisor.current().pin_plane_consumer(self.carry_tun);
         }
         if self.carry_tun {
             if self.client.is_none() {
@@ -592,20 +601,7 @@ impl Engine {
         // mismatch. A box that assigns nothing (an old one) gets the address
         // the client always had.
         let tun_addr = self.assigned_tun_addr();
-        let write = tun_mode::write_config(
-            &config,
-            socks5_bind(),
-            &tun_addr,
-            &[],
-            self.tun_mode,
-            self.wire_mode(),
-            &self.services,
-            &self.apps,
-            &self.bypass_services,
-            &self.bypass_apps,
-            &self.relay_addrs,
-        );
-        if let Err(error) = write {
+        if let Err(error) = self.write_device_config(&tun_addr) {
             tracing::error!(error = %error, "engine: the device config was refused");
             return;
         }
@@ -619,6 +615,30 @@ impl Engine {
             status.tun = false;
             status.tun_alive = false;
         });
+    }
+
+    /// Write the device's configuration.
+    ///
+    /// The device reads this file when it starts, and it watches it while it
+    /// runs: the address the box assigned is in there, and the device takes
+    /// a new one on the fly. So writing this file is how a new address
+    /// reaches a device that is already up.
+    fn write_device_config(&self, tun_addr: &str) -> Result<(), String> {
+        let config = tun_config_path().map_err(|error| error.to_string())?;
+        tun_mode::write_config(
+            &config,
+            socks5_bind(),
+            tun_addr,
+            &[],
+            self.tun_mode,
+            self.wire_mode(),
+            &self.services,
+            &self.apps,
+            &self.bypass_services,
+            &self.bypass_apps,
+            &self.relay_addrs,
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// The device goes down.
@@ -722,11 +742,29 @@ impl Engine {
                 }
             };
             if since.elapsed() >= ADDRESS_SETTLE {
+                // The device takes the new address on the fly: the window
+                // writes it into the config and the device gives the adapter
+                // that address. A restart would cost the machine its way out
+                // for the better part of a minute -- and the restart breaks
+                // the session, which is how the address changed in the first
+                // place.
                 tracing::info!(
                     tun_addr = %assigned,
-                    "engine: the assigned address held still -- the device comes back"
+                    "engine: the box named another address -- the device takes it"
                 );
-                self.restart_tun();
+                match self.write_device_config(&assigned) {
+                    Ok(()) => {
+                        self.tun_addr = Some(assigned.clone());
+                        self.addr_pending = None;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "engine: the config could not be written -- the device comes back instead"
+                        );
+                        self.restart_tun();
+                    }
+                }
             }
         } else if self.tun_addr.as_deref() == Some(assigned.as_str()) {
             self.addr_pending = None;

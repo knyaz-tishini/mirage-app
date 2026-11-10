@@ -1349,18 +1349,33 @@ pub enum PlaneConsumer {
 /// [`EdgeSessionSupervisor::set_plane_consumer`].
 struct PlaneCtrl {
     consumer: Mutex<PlaneConsumer>,
+    /// The owner is pinned: a request for the other one is refused instead of
+    /// taking the plane away.
+    ///
+    /// A change of the owner tears the live session down and dials a new one
+    /// -- and that costs the machine its way out for half a minute, because
+    /// the tunnel device comes up again and the box names another address.
+    /// So while the tunnel carries, the plane belongs to the tunnel: a
+    /// SOCKS5 request that arrives anyway is told the truth instead of
+    /// breaking the tunnel for everybody.
+    pinned: AtomicBool,
     generation: AtomicU64,
 }
 
 impl PlaneCtrl {
     fn new(consumer: PlaneConsumer) -> Self {
-        Self { consumer: Mutex::new(consumer), generation: AtomicU64::new(0) }
+        Self {
+            consumer: Mutex::new(consumer),
+            pinned: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+        }
     }
 
     fn get(&self) -> PlaneConsumer {
         *self.consumer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The owner is pinned: only the holder of the pin may change it.
     fn set(&self, consumer: PlaneConsumer) {
         {
             let mut current = self.consumer.lock().unwrap_or_else(|e| e.into_inner());
@@ -1836,6 +1851,24 @@ impl EdgeSessionSupervisor {
         ctrl.set(consumer);
     }
 
+    /// Pin the owner of the plane's packets.
+    ///
+    /// While the pin is on, a request for the other owner is refused instead
+    /// of taking the plane: the switch tears the session down and dials a new
+    /// one, and the tunnel that rides on it loses its way out for half a
+    /// minute. The window pins the plane while the tunnel carries and takes
+    /// the pin off when the traffic is to go through the local port.
+    pub fn pin_plane_consumer(&self, pinned: bool) {
+        let Some(ctrl) = &self.plane else { return };
+        ctrl.pinned.store(pinned, Ordering::Relaxed);
+        info!(pinned, "socks5: the plane's owner is pinned");
+    }
+
+    /// Is the owner of the plane's packets pinned?
+    pub fn plane_owner_is_pinned(&self) -> bool {
+        self.plane.as_ref().map(|ctrl| ctrl.pinned.load(Ordering::Relaxed)).unwrap_or(false)
+    }
+
     /// Stop the dial loop. The live session, if any, is dropped with it and
     /// nothing is dialed again. Idempotent.
     ///
@@ -1903,6 +1936,15 @@ impl EdgeSessionSupervisor {
                     }
                     // The live session's packets belong to the other owner:
                     // ask for the switch and wait for the session it brings.
+                    //
+                    // Unless the owner is pinned: the tunnel rides on this
+                    // plane, and the switch tears the session down and dials
+                    // a new one -- the machine loses its way out for half a
+                    // minute and the box names another address. So the
+                    // request is refused instead.
+                    if self.plane_owner_is_pinned() {
+                        return None;
+                    }
                     self.set_plane_consumer(consumer);
                 }
             }
