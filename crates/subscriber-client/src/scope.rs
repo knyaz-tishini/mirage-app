@@ -196,6 +196,17 @@ pub(crate) fn split_host_port(spec: &str) -> Result<(String, Option<u16>), Strin
 /// every flow on that port), so it is dropped here. SOCKS and HTTP still
 /// enforce it.
 pub(crate) fn tun_service_action(spec: &str) -> Result<(&'static str, String), String> {
+    // A network is named as it is written: "10.0.0.0/8".  The device turns
+    // such a rule into a hole in the routing, so the whole network leaves
+    // the machine the way it always did.  A bare address is a host route.
+    let trimmed = spec.trim();
+    if let Some((addr, prefix)) = trimmed.split_once('/') {
+        let addr = addr.trim();
+        let prefix = prefix.trim();
+        if addr.parse::<IpAddr>().is_ok() && prefix.parse::<u8>().is_ok() {
+            return Ok(("dest_cidr", format!("{addr}/{prefix}")));
+        }
+    }
     let (host, _) = split_host_port(spec)?;
     if host.is_empty() {
         return Err(format!("empty host in --service {spec}"));
@@ -254,6 +265,23 @@ mod tests {
         assert_eq!(
             tun_service_action("api.ipify.org:443").unwrap(),
             ("dest_domain", "api.ipify.org".into())
+        );
+    }
+
+    #[test]
+    fn tun_action_keeps_a_network_a_network() {
+        assert_eq!(
+            tun_service_action("2.17.251.112/32").unwrap(),
+            ("dest_cidr", "2.17.251.112/32".into())
+        );
+        assert_eq!(
+            tun_service_action("192.168.0.0/16").unwrap(),
+            ("dest_cidr", "192.168.0.0/16".into())
+        );
+        // A name with a slash in it is still a name.
+        assert_eq!(
+            tun_service_action("example.com/path").unwrap(),
+            ("dest_domain", "example.com/path".into())
         );
     }
 

@@ -298,6 +298,15 @@ struct Engine {
     services: Vec<String>,
     /// The local programs the capture sends through.
     apps: Vec<String>,
+    /// The sites that stay DIRECT -- the device must never capture them.
+    ///
+    /// This is the "all except" side of the split: the capture carries
+    /// everything else, and these destinations leave the machine the way
+    /// they always did. The device reads the list when it starts, so the
+    /// lists are written into its config.
+    bypass_services: Vec<String>,
+    /// The local programs that stay DIRECT.
+    bypass_apps: Vec<String>,
     /// Full: everything through the chain. Split: only the listed sites.
     tun_mode: TunMode,
     /// The addresses the device must never capture.
@@ -323,6 +332,8 @@ impl Engine {
             scope: EgressScope::all(),
             services: Vec::new(),
             apps: Vec::new(),
+            bypass_services: Vec::new(),
+            bypass_apps: Vec::new(),
             tun_mode: TunMode::Full,
             relay_addrs: Vec::new(),
             watch: None,
@@ -353,6 +364,8 @@ impl Engine {
                 }
                 self.services = services.clone();
                 self.apps = apps.clone();
+                self.bypass_services = bypass_services.clone();
+                self.bypass_apps = bypass_apps.clone();
                 self.tun_mode =
                     if services.is_empty() && apps.is_empty() { TunMode::Full } else { TunMode::Split };
                 self.publish(|status| {
@@ -540,8 +553,8 @@ impl Engine {
             self.wire_mode(),
             &self.services,
             &self.apps,
-            &[],
-            &[],
+            &self.bypass_services,
+            &self.bypass_apps,
             &self.relay_addrs,
         );
         if let Err(error) = write {

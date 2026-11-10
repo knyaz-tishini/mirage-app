@@ -935,6 +935,12 @@ impl Oasis {
             }
         }
         self.engine.set_exit("auto");
+        // The scope the window holds (the sites that go through the chain, and
+        // the ones that stay direct) must be in the engine BEFORE the link
+        // goes up: the device reads its lists when it starts, and a device
+        // that starts without them captures everything -- including the
+        // destinations the person asked to keep out of the tunnel.
+        self.apply_scope();
         match self.stand.carry {
             Carry::Socks => {
                 // The person asked for the local port: the machine is not
