@@ -156,6 +156,11 @@ pub enum EdgeDialError {
     #[error("edge session: {protocol} is a protocol door, not a mirage entrance")]
     NotMirage { protocol: &'static str },
 
+    /// The entrance is the packet plane. The plane speaks version 4 only:
+    /// there is no byte stream for the older wire versions to ride.
+    #[error("edge session: {protocol} is the packet plane and speaks version 4 only")]
+    PlaneNeedsVersion4 { protocol: &'static str },
+
     /// The protocol door's handshake did not complete.
     #[error("edge session: protocol door failed: {0}")]
     Door(String),
@@ -393,7 +398,7 @@ impl EdgeSession {
         exit: ExitPreference,
         version: u8,
     ) -> Result<Self, EdgeDialError> {
-        if !is_mirage(&entrance.protocol) {
+        if !is_mirage(&entrance.protocol) && plane_alpn(&entrance.protocol).is_none() {
             return open_protocol_door(entrance, exit).await;
         }
         let (opened, welcome) =
@@ -441,6 +446,14 @@ impl EdgeSession {
         client_static_priv: [u8; 32],
         exit: ExitPreference,
     ) -> Result<Self, EdgeDialError> {
+        if plane_alpn(&entrance.protocol).is_some() {
+            // The plane speaks version 4 only: there is no byte stream for
+            // the version-1 wire to ride, and saying so by name beats a
+            // handshake that never answers.
+            return Err(EdgeDialError::PlaneNeedsVersion4 {
+                protocol: entrance.protocol.label(),
+            });
+        }
         if !is_mirage(&entrance.protocol) {
             return open_protocol_door(entrance, exit).await;
         }
@@ -858,20 +871,43 @@ async fn open_entrance(
     mesh_id: &[u8],
     client_static_priv: [u8; 32],
 ) -> Result<OpenedEntrance, EdgeDialError> {
+    let entrance = crate::envelope::front(entrance).await.map_err(EdgeDialError::Door)?;
+    // The plane comes FIRST. A QUIC entrance is not a Mirage door at all: it
+    // IS the mono-protocol plane, and its ALPN comes from the entrance's own
+    // protocol. The `is_mirage` gate that used to stand here refused every
+    // QUIC entrance by name, and the plane branch below it could therefore
+    // never be reached.
+    if let Some(alpn) = plane_alpn(&entrance.protocol) {
+        return open_plane_entrance(&entrance, &alpn, mesh_id, client_static_priv).await;
+    }
     if !is_mirage(&entrance.protocol) {
         return Err(EdgeDialError::NotMirage { protocol: entrance.protocol.label() });
     }
-    let entrance = crate::envelope::front(entrance).await.map_err(EdgeDialError::Door)?;
+    // A Mirage entrance that wears the QUIC camouflage is the plane too.
     let mask = entrance_mask(&entrance)?;
     if let Some(alpn) = quic_alpn(&mask) {
-        let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
-            EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
-        })?;
-        let server_pubkey = entrance.server_pubkey()?;
-        let dial = PlaneDial::open(&alpn, addr, &server_pubkey, &client_static_priv, mesh_id).await?;
-        return Ok(OpenedEntrance::Plane(dial));
+        return open_plane_entrance(&entrance, &alpn, mesh_id, client_static_priv).await;
     }
     Ok(OpenedEntrance::Mux(open_entrance_tunnel(&entrance, mesh_id, client_static_priv).await?))
+}
+
+/// Open the plane of one entrance: ONE QUIC connection carries the control
+/// wire AND the whole IP packets.
+async fn open_plane_entrance(
+    entrance: &ArtefactEntrance,
+    alpn: &[String],
+    mesh_id: &[u8],
+    client_static_priv: [u8; 32],
+) -> Result<OpenedEntrance, EdgeDialError> {
+    let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
+        EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
+    })?;
+    // The key the customer verifies is the TERMINATOR's key - the box behind
+    // the relay. The address is the relay's, and the address is not compared:
+    // the handshake proves the key, not the route.
+    let server_pubkey = entrance.server_pubkey()?;
+    let dial = PlaneDial::open(alpn, addr, &server_pubkey, &client_static_priv, mesh_id).await?;
+    Ok(OpenedEntrance::Plane(dial))
 }
 
 /// Build the session of an accepted hello.
@@ -993,6 +1029,22 @@ fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label
 /// Mirage is the only protocol the V9 dial speaks.
 fn is_mirage(protocol: &Protocol) -> bool {
     matches!(protocol, Protocol::Mirage { .. })
+}
+
+/// The ALPN list of an entrance that IS the packet plane.
+///
+/// A QUIC entrance is the mono-protocol plane: ONE connection carries the
+/// control wire AND the whole IP packets. The ALPN comes from the entrance's
+/// OWN protocol - the artefact says which ALPNs the face publishes - so the
+/// client never has to guess it from a camouflage.
+///
+/// A QUIC entrance without an ALPN is not a plane: there is nothing to
+/// negotiate, and the client says so instead of dialling into the dark.
+fn plane_alpn(protocol: &Protocol) -> Option<Vec<String>> {
+    match protocol {
+        Protocol::Quic { alpn } if !alpn.is_empty() => Some(alpn.clone()),
+        _ => None,
+    }
 }
 
 /// One real handshake of a protocol door, then a session that stays up.
@@ -1379,7 +1431,10 @@ impl EntranceDialer {
         for offset in 0..self.entrances.len() {
             let idx = (start + offset) % self.entrances.len();
             let entrance = &self.entrances[idx];
-            if !is_mirage(&entrance.protocol) {
+            // The plane is NOT a protocol door and NOT a mask: it is the
+            // packet plane, dialled over its own QUIC connection.
+            let plane = plane_alpn(&entrance.protocol).is_some();
+            if !is_mirage(&entrance.protocol) && !plane {
                 match crate::door::probe(entrance).await {
                     Ok(()) => {
                         let session = EdgeSession::from_protocol_door(entrance.clone(), exit);
@@ -1399,9 +1454,17 @@ impl EntranceDialer {
             }
             let probe_addr = entrance.addr.clone();
             last_probe = probe_addr.clone();
-            let mask = entrance_mask(entrance)?;
-            let session_transport = face_transport(&mask);
-            let offered = offered_ports_for_transport(&self.entrances, session_transport)?;
+            // The plane rides datagrams and offers nothing: the connection the
+            // client dials IS the session, so there is no other face to name
+            // in the hello.
+            let (session_transport, offered) = if plane {
+                (TransportKind::Udp, Vec::new())
+            } else {
+                let mask = entrance_mask(entrance)?;
+                let transport = face_transport(&mask);
+                let offered = offered_ports_for_transport(&self.entrances, transport)?;
+                (transport, offered)
+            };
             if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
                 too_many.get_or_insert(EdgeDialError::TooManyFaces {
                     count: offered.len(),
@@ -1429,30 +1492,34 @@ impl EntranceDialer {
             .await
             {
                 Ok((mut opened, welcome)) => {
-                    if let Some(port) = welcome.assigned_face_port {
-                        if port != probe_port {
-                            opened.close().await;
-                            let Some(target) = offered.iter().copied().find(|(_, face_port)| *face_port == port) else {
-                                return Err(EdgeDialError::AssignedFaceMissing { port });
-                            };
-                            let (opened, welcome) = dial_face(
-                                &self.entrances[target.0],
-                                &self.mesh_id,
-                                self.client_static_priv,
-                                exit,
-                                true,
-                                &ports,
-                                version,
-                            )
-                            .await?;
-                            let session = build_session(
-                                opened,
-                                welcome,
-                                self.entrances[target.0].addr.clone(),
-                                self.plane.get(),
-                            );
-                            log_assigned(&probe_addr, &session);
-                            return Ok((target.0, session));
+                    // The plane assigns an ADDRESS, not a face: there is
+                    // nothing to re-dial.
+                    if !plane {
+                        if let Some(port) = welcome.assigned_face_port {
+                            if port != probe_port {
+                                opened.close().await;
+                                let Some(target) = offered.iter().copied().find(|(_, face_port)| *face_port == port) else {
+                                    return Err(EdgeDialError::AssignedFaceMissing { port });
+                                };
+                                let (opened, welcome) = dial_face(
+                                    &self.entrances[target.0],
+                                    &self.mesh_id,
+                                    self.client_static_priv,
+                                    exit,
+                                    true,
+                                    &ports,
+                                    version,
+                                )
+                                .await?;
+                                let session = build_session(
+                                    opened,
+                                    welcome,
+                                    self.entrances[target.0].addr.clone(),
+                                    self.plane.get(),
+                                );
+                                log_assigned(&probe_addr, &session);
+                                return Ok((target.0, session));
+                            }
                         }
                     }
                     let session =
@@ -2014,6 +2081,7 @@ impl EdgeSessionSupervisor {
 mod tests {
     use super::*;
     use crate::status::EdgeState;
+    use mirage_core::mirage::wire::{MirageCamouflage, MirageCarrier};
     use mirage_protocol::traits::TransportInfo;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
@@ -2151,6 +2219,46 @@ mod tests {
             .await
             .expect_err("must refuse a malformed welcome");
         assert!(matches!(err, EdgeDialError::MalformedWelcome(_)));
+    }
+
+    // ── the plane: a QUIC entrance is not a protocol door ──────────────
+
+    /// The plane comes FIRST: a QUIC entrance is the packet plane, and its
+    /// ALPN comes from the entrance's own protocol - never from a mask.
+    #[test]
+    fn a_quic_entrance_is_the_plane() {
+        let alpn = plane_alpn(&Protocol::Quic { alpn: vec!["h3".to_owned()] });
+        assert_eq!(alpn, Some(vec!["h3".to_owned()]));
+        // A QUIC entrance with no ALPN is not a plane: there is nothing to
+        // negotiate, and the client must not dial into the dark.
+        assert!(plane_alpn(&Protocol::Quic { alpn: Vec::new() }).is_none());
+        // A Mirage entrance is not a plane.
+        assert!(
+            plane_alpn(&Protocol::Mirage {
+                carrier: MirageCarrier::Udp,
+                camouflage: MirageCamouflage::None,
+            })
+            .is_none()
+        );
+    }
+
+    /// The version-1 wire is a byte stream, and the plane has no byte
+    /// stream: the client says so BY NAME instead of dialling into the dark.
+    #[tokio::test]
+    async fn the_version_one_dial_refuses_a_plane_entrance_by_name() {
+        let entrance = ArtefactEntrance {
+            addr: "91.218.245.247:8443".to_owned(),
+            relay: None,
+            server_pubkey_hex: "00".repeat(32),
+            protocol: Protocol::Quic { alpn: vec!["h3".to_owned()] },
+        };
+        let err = match EdgeSession::connect_v1(&entrance, &[0u8; 32], [0u8; 32], ExitPreference::Auto)
+            .await
+        {
+            Ok(_) => panic!("the plane speaks version 4 only - a version-1 dial must be refused"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, EdgeDialError::PlaneNeedsVersion4 { .. }));
     }
 
     // ── interpret_welcome: refusal surfaced by name ─────────────────────
