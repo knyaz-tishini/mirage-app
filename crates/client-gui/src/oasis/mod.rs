@@ -22,9 +22,9 @@ use uzor_anim_js::JsAnimHost;
 use uzor_framework::host::native::{NativeOptions, run_native};
 use uzor_framework::{
     App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
-    KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig,
-    SizePx, Spec, TextIntent, UnhandledInput, WindowCmd, WindowControlsStyle, WindowId, WindowIntent,
-    WindowSpec,
+    KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RenderCmd,
+    RuntimeConfig, SizePx, Spec, TextIntent, UnhandledInput, WindowCmd, WindowControlsStyle, WindowId,
+    WindowIntent, WindowSpec,
 };
 
 use crate::backend::EngineLink;
@@ -197,6 +197,19 @@ struct Oasis {
     clock: f64,
     /// Last standalone link handed to the subscriber. Stops a re-spawn every frame.
     adopted: String,
+    /// When the next attempt to hand the link over may be made.
+    ///
+    /// The hand-over asks the engine, and the engine answers in a moment --
+    /// but only a moment. A refusal must not be repeated on every frame: the
+    /// window would stand still, five seconds at a time, and look dead.
+    adopt_retry_at: f64,
+    /// The phase the window last showed. A change is a line in the log.
+    phase_seen: String,
+    /// The frames per second the window asked for. The desert is painted
+    /// three times a frame (the sky, the stars, the rider), and sixty frames
+    /// of that took a whole core. Thirty frames are enough for a window that
+    /// shows a desert, and they leave the core to the tunnel.
+    fps_asked: bool,
     pending_submit: Option<String>,
     /// Windows that already applied [`Stand::pass_epoch`].
     pass_reset_seen: HashMap<WindowId, u64>,
@@ -246,7 +259,7 @@ impl Oasis {
         let key = PlateKey {
             pw: pwu,
             ph: phu,
-            minute: (hour * 60.0).round() as i32,
+            slot: (hour * 6.0).round() as i32,
             day: day.round() as i32,
             dst: dst.round() as i32,
         };
@@ -402,11 +415,35 @@ impl App for Oasis {
             && self.stand.carry == Carry::Tun
             && self.engine.status().tun_block.is_some()
         {
+            // The adapter cannot be taken here. Why it cannot is the thing
+            // a person asks about, so it goes into the log.
+            let reason = self.engine.status().tun_block.clone().unwrap_or_default();
+            tracing::warn!(reason = %reason, "oasis: the adapter is not available -- the local port is the way out");
             self.engine.set_listeners(true, false);
             self.fell_back = true;
         }
         if let Some(line) = self.engine.take_bind_note() {
             self.note = line;
+        }
+        // What the engine says, in the log: a change of the phase is the
+        // thing a person waits for, so it has to be written down.
+        {
+            let status = self.engine.status();
+            let seen = format!(
+                "phase={} tun={} tun_alive={} socks={} mode={}",
+                status.phase, status.tun, status.tun_alive, status.socks, status.mode
+            );
+            if seen != self.phase_seen {
+                tracing::info!(state = %seen, "oasis: the engine says");
+                self.phase_seen = seen;
+            }
+        }
+        // The frames per second. The desert is painted three times a frame
+        // and that took a whole core: the tunnel deserves it more.
+        if !self.fps_asked {
+            self.fps_asked = true;
+            cx.out.command(AppCommand::Render(RenderCmd::SetFpsLimit(30)));
+            tracing::info!("oasis: the window paints thirty frames a second");
         }
         self.stand.pull_bus();
         self.poll_scan();
@@ -445,7 +482,7 @@ impl App for Oasis {
             self.fell_back = false;
         }
         if !self.take_entrance(now) {
-            self.sync_standalone_link();
+            self.sync_standalone_link(now);
         }
 
         let mut ui = self.ui.get(&win).cloned().unwrap_or_default();
@@ -986,6 +1023,14 @@ impl Oasis {
     /// The rider is the adapter. `linked` is the click. A wish the status
     /// has not met is repeated until the picture and the adapter are the same.
     fn bind_rider(&mut self, now: f64) {
+        // Dev shot only. The customer binary has no such flag, and this path
+        // never starts the engine: the picture is the oasis, nothing dials.
+        #[cfg(feature = "dev-tools")]
+        if std::env::args().any(|arg| arg == "--connected") {
+            self.linked = true;
+            self.target = 1.0;
+            return;
+        }
         let tun_up = {
             let st = self.engine.status();
             st.online && st.tun
@@ -1028,7 +1073,8 @@ impl Oasis {
         }
         self.note.clear();
         self.adopted.clear();
-        self.sync_standalone_link();
+        self.adopt_retry_at = f64::NEG_INFINITY;
+        self.sync_standalone_link(now);
         if !self.note.is_empty() {
             let err = self.note.clone();
             self.stand.say(&err);
@@ -1047,9 +1093,14 @@ impl Oasis {
         true
     }
 
-    fn sync_standalone_link(&mut self) {
+    fn sync_standalone_link(&mut self, now: f64) {
         let link = self.stand.link.trim().to_owned();
         if link.is_empty() || link == self.adopted {
+            return;
+        }
+        // A refusal is not repeated on every frame: the window would stand
+        // still, a second and a half at a time, and look dead.
+        if now < self.adopt_retry_at {
             return;
         }
         if serde_json::from_str::<serde_json::Value>(&link).ok().filter(|v| v.is_object()).is_none() {
@@ -1075,8 +1126,11 @@ impl Oasis {
                 }
                 #[cfg(not(target_os = "ios"))]
                 {
-                    self.adopted = link;
+                    // The link is not adopted: it is tried again in a few
+                    // seconds, and the window is not held hostage until then.
+                    self.adopt_retry_at = now + 5.0;
                     self.note = err;
+                    tracing::warn!(reason = %self.note, "oasis: the link was not taken in");
                 }
             }
         }
@@ -1560,7 +1614,14 @@ fn target_plate(ctx: &mut dyn RenderContext, rect: Rect, hot: bool) {
 struct PlateKey {
     pw: u32,
     ph: u32,
-    minute: i32,
+    /// The ten minutes the desert was baked in.
+    ///
+    /// The plates are baked by the CPU renderer, on the window's own thread,
+    /// and that takes seconds. Keyed by the minute, the desert was baked
+    /// again every minute -- and a window that is baked for seconds is a
+    /// window that does not answer. The sun moves two and a half degrees in
+    /// ten minutes: nobody sees the difference, everybody feels the hitch.
+    slot: i32,
     day: i32,
     dst: i32,
 }
@@ -1647,6 +1708,7 @@ fn bake_plate(
     pw: u32,
     ph: u32,
 ) -> Option<Vec<u8>> {
+    let began = std::time::Instant::now();
     let mut ctx = uzor_render_urx::UrxRenderContext::new(1.0);
     ctx.begin_frame(pw, ph);
     let mut anim = host.anim("desert");
@@ -1658,6 +1720,15 @@ fn bake_plate(
     if uzor_urx_cpu::CpuBackend::new().render(&scene, &mut pixmap).is_err() {
         return None;
     }
+    // The bake is the CPU renderer on the window's own thread: it is the one
+    // thing that can make the window stop answering, so it says how long it
+    // took.
+    tracing::info!(
+        ms = began.elapsed().as_millis() as u64,
+        pw,
+        ph,
+        "oasis: the desert plate is baked"
+    );
     Some(straighten(pixmap.pixels()))
 }
 
@@ -1827,6 +1898,9 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             link_sent_at: f64::NEG_INFINITY,
             clock: 0.0,
             adopted: String::new(),
+            adopt_retry_at: f64::NEG_INFINITY,
+            phase_seen: String::new(),
+            fps_asked: false,
             pending_submit: None,
             pass_reset_seen: HashMap::new(),
             clear_seen: HashMap::new(),

@@ -160,10 +160,19 @@ impl LocalEngine {
         // The window asks once, at the moment of the change, and waits for the
         // answer: a configuration that was not accepted must not look like a
         // live one. The wait is short — the engine swaps the session in
-        // place, it does not dial — so the window never stands still.
-        answer
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| format!("the engine did not answer: {error}"))?
+        // place, it does not dial — so the window never stands still. The
+        // window's thread paints while it waits: a long wait here is a white
+        // window, and a white window looks dead.
+        let began = std::time::Instant::now();
+        let result = answer
+            .recv_timeout(std::time::Duration::from_millis(2500))
+            .map_err(|error| format!("the engine did not answer: {error}"))?;
+        tracing::info!(
+            ms = began.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "engine: the configuration was taken in"
+        );
+        result
     }
 }
 
@@ -285,11 +294,18 @@ struct Engine {
     artefact: Option<DeliveryArtefact>,
     /// The live session and the local listener.
     client: Option<SubscriberClient>,
-    /// The tunnel device, when it is up. The window owns the process.
-    tun: Option<TunDevice>,
+    /// The tunnel device. It has its own thread: it takes seconds to come up
+    /// and seconds to go, and the engine must answer the window all the time.
+    device: Device,
     /// The address the running device was configured with -- the one the
     /// box assigned to the live session.
     tun_addr: Option<String>,
+    /// The address the box has assigned lately, and how long it has been
+    /// that address. The device is only restarted when the new address has
+    /// held still for a while: the box names one address while the session
+    /// comes up and another one when it is live, and a device that is torn
+    /// down for every word costs seconds of the machine's way out.
+    addr_pending: Option<(String, std::time::Instant)>,
     /// The traffic leaves through the device, not through the local port.
     carry_tun: bool,
     /// The destinations the capture sends through.
@@ -326,8 +342,9 @@ impl Engine {
             status,
             artefact: None,
             client: None,
-            tun: None,
+            device: Device::start(),
             tun_addr: None,
+            addr_pending: None,
             carry_tun: false,
             scope: EgressScope::all(),
             services: Vec::new(),
@@ -443,8 +460,17 @@ impl Engine {
                 scope: self.scope.clone(),
                 ..Default::default()
             };
+            // The session takes seconds to build: the status says so BEFORE
+            // the work starts, or the window stands still with no word.
+            tracing::info!("engine: the session is coming up");
+            self.publish(|status| status.phase = "connecting".into());
+            let began = std::time::Instant::now();
             match SubscriberClient::build_from_delivery(&artefact, options).await {
                 Ok(client) => {
+                    tracing::info!(
+                        ms = began.elapsed().as_millis() as u64,
+                        "engine: the session is up"
+                    );
                     self.watch = Some(self.spawn_watch(Arc::clone(&client.supervisor)));
                     self.client = Some(client);
                     self.publish(|status| {
@@ -538,7 +564,13 @@ impl Engine {
     /// The device goes up. It is a separate process because it needs the
     /// adapter; the window keeps it and brings it back when it dies.
     fn start_tun(&mut self) {
-        if self.tun.is_some() {
+        if self.device.up || self.device.starting {
+            return;
+        }
+        if self.device.stopping {
+            // The old device is still going down: the new one comes up when
+            // it is gone. Two devices on one adapter fight for it.
+            self.device.restart_when_gone = true;
             return;
         }
         let config = match tun_config_path() {
@@ -578,22 +610,14 @@ impl Engine {
             return;
         }
         tracing::info!(tun_addr = %tun_addr, "engine: the device config was written");
-        let mut child = match tun_mode::spawn(&bin, &config) {
-            Ok(child) => child,
-            Err(error) => {
-                tracing::error!(error = %error, "engine: the device refused to start");
-                return;
-            }
-        };
-        // The pipe to the device: when it closes, the device gives the routes
-        // back and exits by itself. A device that does not go is killed.
-        let stdin = child.stdin.take();
-        tracing::info!(bin = %bin.display(), "engine: the device is up");
-        self.tun = Some(TunDevice { child, stdin });
+        // The device comes up on its own thread: it takes seconds, and the
+        // engine must answer the window all the time.
+        self.device.start_device(bin, config, tun_addr.clone());
         self.tun_addr = Some(tun_addr);
+        self.addr_pending = None;
         self.publish(|status| {
-            status.tun = true;
-            status.tun_alive = true;
+            status.tun = false;
+            status.tun_alive = false;
         });
     }
 
@@ -602,40 +626,20 @@ impl Engine {
     /// The pipe closes first: the device takes the routes back by itself. Only
     /// a device that ignores that is killed — and a killed device would leave
     /// its routes behind, which is what makes the machine's internet vanish.
+    /// The wait happens on the device's thread; the engine only hears the
+    /// news when it is over.
     fn stop_tun(&mut self) {
-        if let Some(mut device) = self.tun.take() {
-            device.stdin.take();
-            self.tun_addr = None;
-            // The device has to take the routes back before it goes. A device
-            // whose queue is full takes a while to notice the closed pipe and
-            // to drain, and three seconds was not enough: the device was
-            // killed with its routes still up, which is exactly the state
-            // where the machine's internet vanishes. Ten seconds is still
-            // shorter than the time a person waits for the window to answer.
-            // The device needs about as long as its own startup (the adapter
-            // alone takes seconds), so the patience is that long: killing it
-            // earlier leaves the routes behind.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                match device.child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            tracing::warn!("engine: the device did not go — killing it");
-                            let _ = device.child.kill();
-                            let _ = device.child.wait();
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Err(error) => {
-                        tracing::error!(error = %error, "engine: the device cannot be asked");
-                        let _ = device.child.kill();
-                        break;
-                    }
-                }
-            }
+        if !self.device.up && !self.device.starting {
+            self.publish(|status| {
+                status.tun = false;
+                status.tun_alive = false;
+            });
+            return;
         }
+        tracing::info!("engine: the device is going down");
+        self.device.stop_device();
+        self.tun_addr = None;
+        self.addr_pending = None;
         self.publish(|status| {
             status.tun = false;
             status.tun_alive = false;
@@ -644,51 +648,102 @@ impl Engine {
 
     /// Is the device still there?
     fn poll_tun(&mut self) {
+        // What the device thread said.
+        while let Some(event) = self.device.poll() {
+            match event {
+                DeviceEvent::Up { addr } => {
+                    tracing::info!(tun_addr = %addr, "engine: the device is up");
+                    self.device.up = true;
+                    self.device.starting = false;
+                    self.device.stopping = false;
+                    self.tun_addr = Some(addr);
+                    self.publish(|status| {
+                        status.tun = true;
+                        status.tun_alive = true;
+                    });
+                }
+                DeviceEvent::Failed { error } => {
+                    tracing::error!(error = %error, "engine: the device refused to start");
+                    self.device.up = false;
+                    self.device.starting = false;
+                    self.device.stopping = false;
+                    self.publish(|status| {
+                        status.tun = false;
+                        status.tun_alive = false;
+                        status.error = Some(error);
+                    });
+                }
+                DeviceEvent::Gone { killed } => {
+                    tracing::info!(killed, "engine: the device is gone");
+                    self.device.up = false;
+                    self.device.starting = false;
+                    self.device.stopping = false;
+                    self.tun_addr = None;
+                    self.publish(|status| {
+                        status.tun = false;
+                        status.tun_alive = false;
+                    });
+                    let restart = std::mem::take(&mut self.device.restart_when_gone);
+                    if restart && self.carry_tun {
+                        // The device is gone: a new one takes its place.
+                        self.start_tun();
+                    } else if self.carry_tun && !killed {
+                        // The device died on its own: it comes back.
+                        self.start_tun();
+                    }
+                }
+            }
+        }
         // The address the box assigned can change under the device: the
         // session comes up after the device did, and a session that comes
         // back may get another address. The adapter must carry the address
         // of the LIVE session, or the box drops the packets as a mismatch.
+        //
+        // The box names one address while the session is coming up and
+        // another one when it is live. A device that is torn down for every
+        // word costs the machine its way out for seconds, so the new address
+        // has to hold still first.
+        // The box names one address while the session is coming up and
+        // another one when it is live, and a session that comes back may get
+        // another one again. Every word of that used to cost the machine its
+        // way out: the device was torn down and brought up again, and the
+        // tear-down broke the session, which named another address, which
+        // tore the device down again. So the new address has to hold still
+        // before the device follows it -- and the machine keeps its way out
+        // while it waits.
         let assigned = self.assigned_tun_addr();
-        if self.tun.is_some() && self.tun_addr.as_deref() != Some(assigned.as_str()) {
-            tracing::info!(
-                tun_addr = %assigned,
-                "engine: the assigned address changed -- the device comes back"
-            );
-            self.restart_tun();
-            return;
-        }
-        let Some(device) = self.tun.as_mut() else {
-            return;
-        };
-        match device.child.try_wait() {
-            Ok(Some(_)) => {
-                tracing::warn!("engine: the device died");
-                self.tun = None;
-                self.publish(|status| {
-                    status.tun = false;
-                    status.tun_alive = false;
-                });
-                if self.carry_tun {
-                    self.start_tun();
+        if self.device.up && self.tun_addr.as_deref() != Some(assigned.as_str()) {
+            let since = match &self.addr_pending {
+                Some((known, since)) if known == &assigned => *since,
+                _ => {
+                    let now = std::time::Instant::now();
+                    self.addr_pending = Some((assigned.clone(), now));
+                    now
                 }
+            };
+            if since.elapsed() >= ADDRESS_SETTLE {
+                tracing::info!(
+                    tun_addr = %assigned,
+                    "engine: the assigned address held still -- the device comes back"
+                );
+                self.restart_tun();
             }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(error = %error, "engine: the device cannot be asked");
-            }
+        } else if self.tun_addr.as_deref() == Some(assigned.as_str()) {
+            self.addr_pending = None;
         }
     }
 
     /// The device's lists changed under it: write the config again and let it
     /// come back.
     fn restart_tun(&mut self) {
-        if self.tun.is_none() {
+        if !self.device.up && !self.device.starting {
             return;
         }
         self.stop_tun();
-        if self.carry_tun {
-            self.start_tun();
-        }
+        // The device has to be gone before a new one starts: two devices on
+        // one adapter fight for it. The new one goes up when the old one is
+        // reported gone.
+        self.device.restart_when_gone = self.carry_tun;
     }
 
     /// Watch the live session and paint what it says.
@@ -719,6 +774,7 @@ impl Engine {
 
     fn shutdown(&mut self) {
         self.stop_tun();
+        self.device.shutdown();
         if let Some(watch) = self.watch.take() {
             watch.abort();
         }
@@ -728,15 +784,219 @@ impl Engine {
     }
 }
 
-/// The device process. The window keeps it; it is not the client's child.
+/// What the device thread is told.
+enum DeviceCommand {
+    /// Bring the device up with this configuration.
+    Start {
+        bin: PathBuf,
+        config: PathBuf,
+        addr: String,
+    },
+    /// Give the routes back. The device goes by itself.
+    Stop,
+    /// The window is closing.
+    Shutdown,
+}
+
+/// What the device thread says.
+enum DeviceEvent {
+    /// The device process is up. The adapter inside it takes seconds more.
+    Up { addr: String },
+    /// The device did not start.
+    Failed { error: String },
+    /// The device is gone.
+    Gone { killed: bool },
+}
+
+/// How long the address the box names has to hold still before the device
+/// follows it.
 ///
-/// The pipe in `stdin` is the way out: the window closes it when the link
-/// goes down, and the device takes the routes back by itself. A device that
-/// ignores that is killed — and a killed device leaves its routes behind,
-/// which is what makes the machine's internet vanish.
-struct TunDevice {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
+/// The tear-down of a device costs the machine its way out for half a minute
+/// (the adapter alone takes seconds to come up), and it breaks the session,
+/// which makes the box name another address -- and then the tear-down starts
+/// all over again. Thirty seconds is longer than the box takes to settle.
+const ADDRESS_SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The tunnel device and the thread that owns it.
+///
+/// The device takes seconds to come up (the adapter alone) and seconds to go
+/// (it has to give the routes back). None of that may happen on the engine's
+/// thread: the engine answers the window, and a window that waits on a
+/// device is a window that looks dead. So the device lives here, on its own
+/// thread, and the engine only hears what happened.
+struct Device {
+    tx: std::sync::mpsc::Sender<DeviceCommand>,
+    rx: std::sync::mpsc::Receiver<DeviceEvent>,
+    /// The address the running device carries.
+    addr: Option<String>,
+    /// The device is up (the process is running).
+    up: bool,
+    /// The device is being brought up.
+    starting: bool,
+    /// The device is being taken down.
+    stopping: bool,
+    /// A new device must come up as soon as this one is gone.
+    restart_when_gone: bool,
+}
+
+impl Device {
+    fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("mirage-device".into())
+            .spawn(move || device_thread(rx, out_tx));
+        Self { tx, rx: out_rx, addr: None, up: false, starting: false, stopping: false, restart_when_gone: false }
+    }
+
+    /// Bring the device up. The answer comes later, as an event.
+    fn start_device(&mut self, bin: PathBuf, config: PathBuf, addr: String) {
+        self.starting = true;
+        self.stopping = false;
+        self.restart_when_gone = false;
+        if self.tx.send(DeviceCommand::Start { bin, config, addr }).is_err() {
+            tracing::error!("engine: the device thread is gone");
+            self.starting = false;
+        }
+    }
+
+    /// Take the device down. The answer comes later, as an event.
+    fn stop_device(&mut self) {
+        if !self.up && !self.starting {
+            return;
+        }
+        self.stopping = true;
+        if self.tx.send(DeviceCommand::Stop).is_err() {
+            tracing::error!("engine: the device thread is gone");
+            self.stopping = false;
+        }
+    }
+
+    /// What the device thread said, if it said anything.
+    fn poll(&mut self) -> Option<DeviceEvent> {
+        self.rx.try_recv().ok()
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(DeviceCommand::Shutdown);
+    }
+}
+
+/// The device's own thread: it starts the process, watches it and takes it
+/// down. Nothing here ever waits on the engine.
+fn device_thread(
+    rx: std::sync::mpsc::Receiver<DeviceCommand>,
+    tx: std::sync::mpsc::Sender<DeviceEvent>,
+) {
+    let mut child: Option<std::process::Child> = None;
+    let mut stdin: Option<std::process::ChildStdin> = None;
+    loop {
+        match rx.try_recv() {
+            Ok(DeviceCommand::Start { bin, config, addr }) => {
+                stop_child(&mut child, &mut stdin, &tx);
+                let began = std::time::Instant::now();
+                match start_child(&bin, &config) {
+                    Ok((new_child, new_stdin)) => {
+                        child = Some(new_child);
+                        stdin = Some(new_stdin);
+                        tracing::info!(
+                            ms = began.elapsed().as_millis() as u64,
+                            bin = %bin.display(),
+                            "device: the process is up"
+                        );
+                        let _ = tx.send(DeviceEvent::Up { addr });
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "device: the device refused to start");
+                        let _ = tx.send(DeviceEvent::Failed { error });
+                    }
+                }
+            }
+            Ok(DeviceCommand::Stop) => {
+                stop_child(&mut child, &mut stdin, &tx);
+            }
+            Ok(DeviceCommand::Shutdown) => {
+                stop_child(&mut child, &mut stdin, &tx);
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+        // Did the device go on its own?
+        if let Some(process) = child.as_mut() {
+            match process.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::warn!(code = status.code(), "device: the device died");
+                    child = None;
+                    stdin = None;
+                    let _ = tx.send(DeviceEvent::Gone { killed: false });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "device: the device cannot be asked");
+                    child = None;
+                    stdin = None;
+                    let _ = tx.send(DeviceEvent::Gone { killed: false });
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Write the configuration and start the device process.
+fn start_child(
+    bin: &PathBuf,
+    config: &PathBuf,
+) -> Result<(std::process::Child, std::process::ChildStdin), String> {
+    let mut child = tun_mode::spawn(bin, config)
+        .map_err(|error| format!("{}: {error}", bin.display()))?;
+    let stdin = child.stdin.take();
+    Ok((child, stdin.ok_or_else(|| "the device has no pipe".to_owned())?))
+}
+
+/// Give the routes back and wait for the device to go.
+///
+/// The device has to take the routes back before it goes. A device whose
+/// queue is full takes a while to notice the closed pipe and to drain, and
+/// three seconds was not enough: the device was killed with its routes still
+/// up, which is exactly the state where the machine's internet vanishes. So
+/// the patience is the device's own startup time (the adapter alone takes
+/// seconds): killing it earlier leaves the routes behind.
+fn stop_child(
+    child: &mut Option<std::process::Child>,
+    stdin: &mut Option<std::process::ChildStdin>,
+    tx: &std::sync::mpsc::Sender<DeviceEvent>,
+) {
+    let Some(mut process) = child.take() else {
+        return;
+    };
+    // The pipe closes first: the device gives the routes back by itself.
+    stdin.take();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut killed = false;
+    loop {
+        match process.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!("device: the device did not go — killing it");
+                    let _ = process.kill();
+                    let _ = process.wait();
+                    killed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "device: the device cannot be asked");
+                let _ = process.kill();
+                killed = true;
+                break;
+            }
+        }
+    }
+    let _ = tx.send(DeviceEvent::Gone { killed });
 }
 
 /// Where the device config lives: next to the window's own files.
