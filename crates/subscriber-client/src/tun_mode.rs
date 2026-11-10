@@ -215,6 +215,11 @@ pub fn write_config(
         "mtu": wire.mtu(),
         "chains": [chain],
         "bypass": { "cidrs": bypass_cidrs },
+        // The applications that leave the tunnel.  The policy rule above is
+        // the network-level way of saying it; this is the per-application
+        // way, done by the split-tunnel driver: the image keeps the physical
+        // interface while everything else goes through the tunnel.
+        "split_tunnel_apps": bypass_apps,
         "policy": policy,
         "relay_addrs": relay_addrs,
     });
