@@ -357,6 +357,19 @@ impl Engine {
                 self.publish(|status| status.exit = label);
             }
             Command::Scope { services, apps, bypass_services, bypass_apps } => {
+                // The same scope must not cost the device its life.
+                //
+                // The window repeats its wish while the link is not up yet, and
+                // the device takes a long time to come up (the adapter alone is
+                // seconds).  Restarting it on every repeat means the device is
+                // torn down while it is still starting -- and a device that is
+                // killed mid-start leaves its routes behind: the machine loses
+                // its way out.  So the device is only restarted when the lists
+                // really changed.
+                let unchanged = self.services == services
+                    && self.apps == apps
+                    && self.bypass_services == bypass_services
+                    && self.bypass_apps == bypass_apps;
                 self.scope = EgressScope::all();
                 let _ = self.scope.set_lists(&services, &apps);
                 if let Some(client) = &self.client {
@@ -374,6 +387,9 @@ impl Engine {
                     status.bypass_services = bypass_services.clone();
                     status.bypass_apps = bypass_apps.clone();
                 });
+                if unchanged {
+                    return;
+                }
                 // The device reads the lists when it starts. If it is up, the
                 // lists changed under it — write the config again and let it
                 // come back.
@@ -596,7 +612,10 @@ impl Engine {
             // killed with its routes still up, which is exactly the state
             // where the machine's internet vanishes. Ten seconds is still
             // shorter than the time a person waits for the window to answer.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            // The device needs about as long as its own startup (the adapter
+            // alone takes seconds), so the patience is that long: killing it
+            // earlier leaves the routes behind.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 match device.child.try_wait() {
                     Ok(Some(_)) => break,
