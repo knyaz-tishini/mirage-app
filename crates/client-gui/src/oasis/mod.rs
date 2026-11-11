@@ -793,13 +793,13 @@ impl Oasis {
     }
 
     /// The button shows the link the picture is on: the click that started
-    /// it, or an adapter that is already up.
+    /// it, or a chain that is already carrying.
     fn shelf_up(&self) -> bool {
         if self.linked {
             return true;
         }
         let st = self.engine.status();
-        st.online && st.tun
+        st.online && st.tun_alive
     }
 
     fn shelf_on(&mut self, now: f64) {
@@ -1111,7 +1111,11 @@ impl Oasis {
             }
         }
         let st = self.engine.status();
-        self.target = if st.online && st.tun { 1.0 } else { 0.0 };
+        // The picture says the CHAIN carries, not that the adapter exists.
+        // The adapter comes up first -- it has to: the lock stands up before
+        // the tunnel carries -- and a picture that says "the VPN is on" while
+        // the traffic still goes out bare is a lie the person pays for.
+        self.target = if st.online && st.tun_alive { 1.0 } else { 0.0 };
     }
 
     fn poll_scan(&mut self) {

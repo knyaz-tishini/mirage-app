@@ -694,8 +694,11 @@ impl Engine {
                     self.device.stopping = false;
                     self.tun_addr = Some(addr);
                     self.publish(|status| {
+                        // The adapter is up -- that is not the tunnel yet.  The
+                        // picture in the window says "the chain carries", and
+                        // the chain is up when the session says so.
                         status.tun = true;
-                        status.tun_alive = true;
+                        status.tun_alive = false;
                     });
                 }
                 DeviceEvent::Failed { error } => {
