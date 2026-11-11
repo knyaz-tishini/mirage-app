@@ -326,13 +326,17 @@ fn chain_from_links(
             face,
         });
     }
-    let chain = Chain {
+    let mut chain = Chain {
         chain_id: chain_id.to_owned(),
         boxes: chain_boxes,
         keys,
         chain_udp_port,
         plane_port,
+        customer: None,
     };
+    // The customer's own door: the edge's plane, with the exit's key. The
+    // chain knows it, so the client does not have to guess where to knock.
+    chain.customer = chain.customer_entrance();
     let installed = chain
         .boxes
         .iter()

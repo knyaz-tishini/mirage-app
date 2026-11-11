@@ -54,6 +54,7 @@ mirage-core         = { path = "../mirage-oss/crates/mirage-core" }
 mirage-protocol     = { path = "../mirage-oss/crates/mirage-protocol" }
 mirage-mux          = { path = "../mirage-oss/crates/mirage-mux" }
 mirage-control-plane = { path = "../mirage-oss/crates/mirage-dial-core" }
+mirage-chain-pool   = { path = "../mirage-oss/crates/mirage-chain-pool" }
 mirage-client-core  = { path = "crates/client-core" }
 tokio-tungstenite       = { version = "0.24", features = ["rustls-tls-native-roots"] }
 mirage-runtime-guard    = { path = "crates/runtime-guard" }

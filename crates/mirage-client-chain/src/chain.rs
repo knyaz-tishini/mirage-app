@@ -203,6 +203,11 @@ pub struct Chain {
     /// customer's packets come out of). The customer knocks on the edge's
     /// number; the edge carries the QUIC to the exit's.
     pub plane_port: u16,
+    /// The door the CUSTOMER dials.
+    ///
+    /// It is filled in once the chain is built: the edge's plane port, with
+    /// the exit's key. See [`Chain::customer_entrance`].
+    pub customer: Option<ChainEntrance>,
 }
 
 impl Chain {

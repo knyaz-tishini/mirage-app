@@ -12,6 +12,7 @@ name = "mirage_client_core"
 mirage-core      = { workspace = true }
 mirage-mux       = { workspace = true, features = ["tokio-compat"] }
 mirage-control-plane = { workspace = true }
+mirage-chain-pool = { workspace = true }
 futures          = { workspace = true }
 mirage-protocol  = { workspace = true }
 tokio           = { workspace = true }
