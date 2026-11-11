@@ -50,6 +50,9 @@ const LIP: f64 = 8.0;
 const SEG_H: f64 = 30.0;
 /// One row of the list of what one can connect to.
 const TARGET_ROW_H: f64 = 44.0;
+
+/// A frame that takes longer than this is a picture that stands still.
+const SLOW_FRAME_MS: f64 = 25.0;
 // Straight RGBA of assets/palm.svg at 64. The caption slot is ICON_SMALL:
 // a 256 bitmap there is what Windows crushes. The exe icon carries
 // 16/32/48/64/128/256 from the same vectors for the taskbar and Alt-Tab.
@@ -220,6 +223,24 @@ struct Oasis {
     scan: Option<crate::camera::CameraScan>,
     /// Still desert, rebuilt when the window size or the sun's minute changes.
     plates: Option<DesertPlates>,
+    /// When the last frame was painted. The gap between two frames is the
+    /// time the window spent outside our own work -- in the compositor, in
+    /// the rasterizer, or waiting for the core.
+    last_frame_at: f64,
+    /// The slowest frame of the last stretch, and the slowest gap.
+    frame_slowest_ms: f64,
+    gap_slowest_ms: f64,
+    /// Frames that took longer than [`SLOW_FRAME_MS`].
+    frames_slow: u64,
+    /// When the last summary of the frames was written.
+    frame_report_at: f64,
+    /// When the last slow frame was written to the log.
+    ///
+    /// A window that draws slowly writes about twenty warnings a second, and
+    /// the writing is itself work on the thread that draws: the log grew to
+    /// tens of megabytes of the same line.  The frame is counted all the
+    /// same; the line is written once a second.
+    frame_warned_at: f64,
 }
 
 impl Oasis {
@@ -388,9 +409,18 @@ impl App for Oasis {
     }
 
     fn panel(&mut self, cx: &mut PanelCx<'_, Vocab>) {
+        // The frame is measured: the window that stands still is a window
+        // that looks dead, and the cause has to be in the log.
+        let began = std::time::Instant::now();
         let rect = cx.rect;
         let win = cx.window;
         let now = cx.time.now.0;
+        let gap_ms = if self.last_frame_at > 0.0 {
+            (now - self.last_frame_at) * 1000.0
+        } else {
+            0.0
+        };
+        self.last_frame_at = now;
         let dt = cx.time.dt;
         self.pump_shelf(cx, now);
         let w = rect.width;
@@ -630,6 +660,40 @@ impl App for Oasis {
             self.take_entrance(now);
             let g = open_geom(w, h, panel_h);
             self.mount_fields(cx, rect, &g);
+        }
+
+        // What the frame cost. A frame that takes long is a picture that
+        // stands still; a long gap between frames is the window waiting for
+        // something that is not our painting.
+        let took_ms = began.elapsed().as_secs_f64() * 1000.0;
+        if took_ms > self.frame_slowest_ms {
+            self.frame_slowest_ms = took_ms;
+        }
+        if gap_ms > self.gap_slowest_ms {
+            self.gap_slowest_ms = gap_ms;
+        }
+        if took_ms > SLOW_FRAME_MS {
+            self.frames_slow += 1;
+            if now - self.frame_warned_at >= 1.0 {
+                self.frame_warned_at = now;
+                tracing::warn!(
+                    took_ms = (took_ms * 100.0).round() / 100.0,
+                    gap_ms = (gap_ms * 100.0).round() / 100.0,
+                    "oasis: the frame took long"
+                );
+            }
+        }
+        if now - self.frame_report_at >= 10.0 {
+            self.frame_report_at = now;
+            tracing::info!(
+                took_ms = (self.frame_slowest_ms * 100.0).round() / 100.0,
+                gap_ms = (self.gap_slowest_ms * 100.0).round() / 100.0,
+                slow = self.frames_slow,
+                "oasis: the frames of the last stretch"
+            );
+            self.frame_slowest_ms = 0.0;
+            self.gap_slowest_ms = 0.0;
+            self.frames_slow = 0;
         }
     }
 
@@ -1907,6 +1971,12 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             link_force_seen: HashMap::new(),
             scan: None,
             plates: None,
+            last_frame_at: 0.0,
+            frame_slowest_ms: 0.0,
+            gap_slowest_ms: 0.0,
+            frames_slow: 0,
+            frame_report_at: 0.0,
+            frame_warned_at: 0.0,
         },
         cfg,
         NativeOptions {
