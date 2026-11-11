@@ -460,6 +460,17 @@ impl Engine {
                 scope: self.scope.clone(),
                 ..Default::default()
             };
+            // The device comes up FIRST.
+            //
+            // The session takes seconds to build, and until it carries, the
+            // traffic of the machine would go out through the physical
+            // interface: the person asked for a tunnel and would get the
+            // internet without it. The device brings the kill-switch with it,
+            // so from this moment nothing that is not the bypass reaches the
+            // internet -- not even the seconds the session needs.
+            if self.carry_tun {
+                self.start_tun();
+            }
             // The session takes seconds to build: the status says so BEFORE
             // the work starts, or the window stands still with no word.
             tracing::info!("engine: the session is coming up");
@@ -481,6 +492,11 @@ impl Engine {
                 }
                 Err(error) => {
                     tracing::error!(error = %error, "engine: the session refused to start");
+                    // The machine must not stay closed: the tunnel that was
+                    // promised never came.
+                    if self.carry_tun {
+                        self.stop_tun();
+                    }
                     self.publish(|status| {
                         status.error = Some(error.to_string());
                         status.phase = "refused".into();

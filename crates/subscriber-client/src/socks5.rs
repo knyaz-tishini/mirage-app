@@ -435,6 +435,18 @@ async fn raw_ip_upstream(
                 continue;
             }
             if let Err(e) = plane.send_packet(&piece).await {
+                // A packet that the plane refuses because it is too big is a
+                // lost packet, not a broken plane: the stream goes on, or the
+                // whole tunnel stops for one oversized frame.
+                if is_too_large(&e) {
+                    RAW_IP_STATS.dropped_too_large.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        len = piece.len(),
+                        budget,
+                        "socks5: the plane refused a packet that does not fit it"
+                    );
+                    continue;
+                }
                 RAW_IP_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, "socks5: the packet plane refused a packet");
                 return Ok(());
@@ -442,6 +454,16 @@ async fn raw_ip_upstream(
             RAW_IP_STATS.packets_to_plane.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// The plane said the packet does not fit it.
+///
+/// The wire of the plane is a QUIC datagram, and its size depends on the path
+/// as much as on the advertisement of the peer: a packet that fit a moment
+/// ago may not fit now.
+fn is_too_large(error: &mirage_core::error::MirageError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("too large") || text.contains("too long")
 }
 
 /// The plane -> device direction: read a packet and write it as a frame.

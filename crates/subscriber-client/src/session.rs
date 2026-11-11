@@ -1860,8 +1860,13 @@ impl EdgeSessionSupervisor {
     /// the pin off when the traffic is to go through the local port.
     pub fn pin_plane_consumer(&self, pinned: bool) {
         let Some(ctrl) = &self.plane else { return };
-        ctrl.pinned.store(pinned, Ordering::Relaxed);
-        info!(pinned, "socks5: the plane's owner is pinned");
+        // The pin is asked for on every attempt of the tunnel to carry the
+        // traffic, and the attempt happens many times a second: the note
+        // belongs to the CHANGE of the pin, not to every asking.
+        let was = ctrl.pinned.swap(pinned, Ordering::Relaxed);
+        if was != pinned {
+            info!(pinned, "socks5: the plane's owner is pinned");
+        }
     }
 
     /// Is the owner of the plane's packets pinned?
