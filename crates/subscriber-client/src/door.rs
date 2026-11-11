@@ -13,7 +13,6 @@ use std::time::Duration;
 use mirage_core::mirage::wire::Protocol;
 use mirage_protocol::camouflage::{CamouflageLayer, UdpCamouflageLayer};
 use mirage_protocol::preamble::write_preamble;
-use mirage_protocol::protocols::l3::amneziawg::{self, AwgObfuscation};
 use mirage_protocol::protocols::l3::icmp::IcmpCamouflage;
 use mirage_protocol::protocols::l3::wireguard::{
     datagram_with_payload, payload_of, take_tunn_result, tunn_from_hex, CARRY_CHUNK, Tunn, TunnStep,
@@ -53,7 +52,7 @@ pub(crate) async fn probe(entrance: &ArtefactEntrance) -> Result<(), String> {
     match &entrance.protocol {
         Protocol::Mirage { .. } => Err("mirage is not a protocol door".to_owned()),
         Protocol::WireGuard { .. } => prove_wireguard(&entrance).await,
-        Protocol::AmneziaWg { .. } => prove_amneziawg(&entrance).await,
+        Protocol::AmneziaWg { .. } => Err("amneziawg is not used".to_owned()),
         Protocol::Shadowsocks { .. } => {
             let mut stream = open_shadowsocks(&entrance, "127.0.0.1", 1).await?;
             tokio::time::timeout(PROBE_TIMEOUT, async {
@@ -97,7 +96,7 @@ pub(crate) async fn open_carrying(
     match &entrance.protocol {
         Protocol::Mirage { .. } => Err("mirage is not a protocol door".to_owned()),
         Protocol::WireGuard { .. } => open_wireguard(&entrance, host, port).await,
-        Protocol::AmneziaWg { .. } => open_amneziawg(&entrance, host, port).await,
+        Protocol::AmneziaWg { .. } => Err("amneziawg is not used".to_owned()),
         Protocol::Shadowsocks { .. } => open_shadowsocks(&entrance, host, port).await,
         _ => {
             let mut stream = open_stream(&entrance).await?;
@@ -459,229 +458,6 @@ async fn write_inners_wireguard(
                 }
             }
             TunnStep::Done | TunnStep::Failed => return Ok(()),
-        }
-    }
-}
-
-async fn prove_amneziawg(entrance: &ArtefactEntrance) -> Result<(), String> {
-    let (mut tunn, peer, socket) = amneziawg_session(entrance).await?;
-    let mut scratch = vec![0u8; 65535];
-    handshake_amneziawg(&mut tunn, &socket, peer, &mut scratch).await
-}
-
-async fn open_amneziawg(entrance: &ArtefactEntrance, host: &str, port: u16) -> Result<DoorIo, String> {
-    let (mut tunn, peer, socket) = amneziawg_session(entrance).await?;
-    let mut scratch = vec![0u8; 65535];
-    handshake_amneziawg(&mut tunn, &socket, peer, &mut scratch).await?;
-    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
-    write_preamble(&mut app, host, port)
-        .await
-        .map_err(|_| "preamble was refused".to_owned())?;
-    tokio::spawn(async move {
-        let _ = bridge_amneziawg(tunnel_side, socket, tunn, peer).await;
-    });
-    Ok(Box::pin(app))
-}
-
-async fn amneziawg_session(
-    entrance: &ArtefactEntrance,
-) -> Result<(amneziawg::Tunn, SocketAddr, tokio::net::UdpSocket), String> {
-    let Protocol::AmneziaWg {
-        static_private_hex,
-        peer_public_hex,
-        preshared_key_hex,
-        jc,
-        jmin,
-        jmax,
-        s1,
-        s2,
-        s3,
-        s4,
-        h1,
-        h2,
-        h3,
-        h4,
-        ..
-    } = &entrance.protocol
-    else {
-        return Err("amneziawg door is missing its keys".to_owned());
-    };
-    let tunn = amneziawg::tunn_from_hex(
-        static_private_hex,
-        peer_public_hex,
-        preshared_key_hex.as_deref(),
-        &AwgObfuscation {
-            jc: *jc,
-            jmin: *jmin,
-            jmax: *jmax,
-            s1: *s1,
-            s2: *s2,
-            s3: *s3,
-            s4: *s4,
-            h1: h1.clone(),
-            h2: h2.clone(),
-            h3: h3.clone(),
-            h4: h4.clone(),
-        },
-        1,
-    )?;
-    let peer = resolve(&entrance.addr).await?;
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|_| "amneziawg socket failed".to_owned())?;
-    Ok((tunn, peer, socket))
-}
-
-async fn handshake_amneziawg(
-    tunn: &mut amneziawg::Tunn,
-    socket: &tokio::net::UdpSocket,
-    peer: SocketAddr,
-    scratch: &mut [u8],
-) -> Result<(), String> {
-    let init = match amneziawg::take_tunn_result(tunn.format_handshake_initiation(scratch, false)) {
-        amneziawg::TunnStep::Network(pkt) => pkt,
-        _ => return Err("amneziawg handshake did not start".to_owned()),
-    };
-    send_awg_junk(tunn, socket, peer).await?;
-    socket
-        .send_to(&init, peer)
-        .await
-        .map_err(|_| "amneziawg send failed".to_owned())?;
-    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
-    let mut buf = vec![0u8; 65535];
-    loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return Err("amneziawg handshake timed out".to_owned());
-        }
-        let (n, _) = tokio::time::timeout(left, socket.recv_from(&mut buf))
-            .await
-            .map_err(|_| "amneziawg handshake timed out".to_owned())?
-            .map_err(|_| "amneziawg recv failed".to_owned())?;
-        if finish_amneziawg(tunn, socket, peer, &buf[..n], scratch).await? {
-            return Ok(());
-        }
-    }
-}
-
-async fn finish_amneziawg(
-    tunn: &mut amneziawg::Tunn,
-    socket: &tokio::net::UdpSocket,
-    peer: SocketAddr,
-    packet: &[u8],
-    scratch: &mut [u8],
-) -> Result<bool, String> {
-    let mut datagram = packet.to_vec();
-    let mut answered = false;
-    loop {
-        let step = amneziawg::take_tunn_result(tunn.decapsulate(
-            if datagram.is_empty() {
-                None
-            } else {
-                Some(peer.ip())
-            },
-            &datagram,
-            scratch,
-        ));
-        datagram.clear();
-        send_awg_junk(tunn, socket, peer).await?;
-        match step {
-            amneziawg::TunnStep::Network(pkt) => {
-                socket
-                    .send_to(&pkt, peer)
-                    .await
-                    .map_err(|_| "amneziawg send failed".to_owned())?;
-                answered = true;
-            }
-            amneziawg::TunnStep::Inner(_) => {}
-            amneziawg::TunnStep::Done => return Ok(answered),
-            amneziawg::TunnStep::Failed => return Ok(false),
-        }
-    }
-}
-
-async fn send_awg_junk(
-    tunn: &mut amneziawg::Tunn,
-    socket: &tokio::net::UdpSocket,
-    peer: SocketAddr,
-) -> Result<(), String> {
-    while let Some(pkt) = tunn.poll_outgoing_packet() {
-        socket
-            .send_to(&pkt, peer)
-            .await
-            .map_err(|_| "amneziawg send failed".to_owned())?;
-    }
-    Ok(())
-}
-
-async fn bridge_amneziawg(
-    mut side: tokio::io::DuplexStream,
-    socket: tokio::net::UdpSocket,
-    mut tunn: amneziawg::Tunn,
-    peer: SocketAddr,
-) -> Result<(), String> {
-    let mut scratch = vec![0u8; 65535];
-    let mut udp_buf = vec![0u8; 65535];
-    let mut read_buf = [0u8; CARRY_CHUNK];
-    loop {
-        tokio::select! {
-            read = side.read(&mut read_buf) => {
-                let n = match read {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                let datagram = datagram_with_payload(&read_buf[..n]);
-                let sent = amneziawg::take_tunn_result(tunn.encapsulate(&datagram, &mut scratch));
-                send_awg_junk(&mut tunn, &socket, peer).await?;
-                if let amneziawg::TunnStep::Network(out) = sent {
-                    socket.send_to(&out, peer).await.map_err(|_| "amneziawg send failed".to_owned())?;
-                }
-            }
-            recvd = socket.recv_from(&mut udp_buf) => {
-                let (n, _) = recvd.map_err(|_| "amneziawg recv failed".to_owned())?;
-                write_inners_amneziawg(&mut tunn, &socket, peer, &udp_buf[..n], &mut scratch, &mut side).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn write_inners_amneziawg(
-    tunn: &mut amneziawg::Tunn,
-    socket: &tokio::net::UdpSocket,
-    peer: SocketAddr,
-    packet: &[u8],
-    scratch: &mut [u8],
-    side: &mut tokio::io::DuplexStream,
-) -> Result<(), String> {
-    let mut datagram = packet.to_vec();
-    loop {
-        let step = amneziawg::take_tunn_result(tunn.decapsulate(
-            if datagram.is_empty() {
-                None
-            } else {
-                Some(peer.ip())
-            },
-            &datagram,
-            scratch,
-        ));
-        datagram.clear();
-        send_awg_junk(tunn, socket, peer).await?;
-        match step {
-            amneziawg::TunnStep::Network(pkt) => {
-                socket
-                    .send_to(&pkt, peer)
-                    .await
-                    .map_err(|_| "amneziawg send failed".to_owned())?;
-            }
-            amneziawg::TunnStep::Inner(pkt) => {
-                if let Some(payload) = payload_of(&pkt) {
-                    side.write_all(payload)
-                        .await
-                        .map_err(|_| "amneziawg carry failed".to_owned())?;
-                }
-            }
-            amneziawg::TunnStep::Done | amneziawg::TunnStep::Failed => return Ok(()),
         }
     }
 }
