@@ -467,6 +467,16 @@ impl App for Oasis {
                 tracing::info!(state = %seen, "oasis: the engine says");
                 self.phase_seen = seen;
             }
+            // The engine may raise the link by itself -- the window comes
+            // back with the tunnel already under the traffic.  The picture
+            // follows the engine then: without this the picture would say
+            // "off" while the adapter is up, and the switch would turn the
+            // tunnel the person never turned off.
+            let st = self.engine.status();
+            if st.online && st.tun && !self.linked {
+                self.linked = true;
+                self.link_sent_at = now;
+            }
         }
         // The frames per second. The desert is painted three times a frame
         // and that took a whole core: the tunnel deserves it more.
