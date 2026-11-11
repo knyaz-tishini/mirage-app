@@ -11,6 +11,7 @@
 //! adapter is up, and the empty desert is the adapter being down.
 
 use std::collections::HashMap;
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use uzor::input::keyboard::KeyCode;
 use uzor::input::{Sense, WidgetKind};
@@ -241,6 +242,8 @@ struct Oasis {
     /// tens of megabytes of the same line.  The frame is counted all the
     /// same; the line is written once a second.
     frame_warned_at: f64,
+    /// The thread that bakes the desert.
+    baker: PlateBaker,
 }
 
 impl Oasis {
@@ -288,21 +291,19 @@ impl Oasis {
         let live = self.link > 0.001 || self.target > 0.001 || night >= 0.05;
         if self.plates.as_ref().is_none_or(|plate| plate.key != key) {
             self.plates = Some(DesertPlates::empty(key));
+            self.baker.forget_old(key);
         }
         if !live {
             if self.plates.as_ref().is_some_and(|plate| plate.still.is_none()) {
-                let params = desert_params(pw, ph, 0.0, hour_q, day, dst, 0.0, 0.0, 0.0);
-                let baked = bake_plate(&self.host, &mut self.scratch, &params, 0.0, pwu, phu);
-                if baked.is_none() {
-                    return self.paint_layer(render, now, pw, ph, hour, day, dst, 0.0);
-                }
-                if let Some(plate) = self.plates.as_mut() {
-                    plate.still = baked;
-                }
+                // The plate is on its way. The desert is painted live until it
+                // is here: the window does not wait for the baker, and the
+                // baker does not hold the window.
+                self.baker.want(BakeKind::Still, key, pwu, phu, hour_q, day, dst, 0.0);
+                return self.paint_layer(render, now, pw, ph, hour, day, dst, 0.0);
             }
             return self.blit_still(render, pw, ph);
         }
-        if !self.ensure_split(pw, ph, hour_q, day, dst) {
+        if !self.ensure_split(key, pw, ph, hour_q, day, dst) {
             return self.paint_layer(render, now, pw, ph, hour, day, dst, 0.0);
         }
         self.blit_named(render, pw, ph, PlatePart::Sky);
@@ -321,7 +322,7 @@ impl Oasis {
         ops
     }
 
-    fn ensure_split(&mut self, pw: f64, ph: f64, hour: f64, day: f64, dst: f64) -> bool {
+    fn ensure_split(&mut self, key: PlateKey, pw: f64, ph: f64, hour: f64, day: f64, dst: f64) -> bool {
         let pwu = pw as u32;
         let phu = ph as u32;
         for (part, layer) in [(PlatePart::Sky, 1.0), (PlatePart::Land, 2.0), (PlatePart::Front, 4.0)] {
@@ -329,13 +330,11 @@ impl Oasis {
             if !missing {
                 continue;
             }
-            let params = desert_params(pw, ph, 0.0, hour, day, dst, 0.0, 0.0, layer);
-            let Some(baked) = bake_plate(&self.host, &mut self.scratch, &params, 0.0, pwu, phu) else {
-                return false;
-            };
-            if let Some(plate) = self.plates.as_mut() {
-                plate.set_part(part, baked);
-            }
+            // The piece is on its way: the desert is painted live until it is
+            // here. Three pieces at once would keep the window busy for
+            // seconds -- the window must not wait.
+            self.baker.want(BakeKind::Part(part), key, pwu, phu, hour, day, dst, layer);
+            return false;
         }
         true
     }
@@ -631,6 +630,9 @@ impl App for Oasis {
 
         self.ease(now, dt);
         let (hour, day, dst) = local_clock();
+        // The plates the baker has finished are taken before the desert is
+        // painted: the window shows them on the very frame they arrive.
+        self.baker.collect(&mut self.plates);
         let menu_now = self.ui.get(&win).cloned().unwrap_or_default();
         let panel_h = self.sheet_panel_h(h);
         let pointer = cx.view.raw_pointer().map(|(x, y)| (x - rect.x, y - rect.y));
@@ -1704,7 +1706,7 @@ struct PlateKey {
     dst: i32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PlatePart {
     Sky,
     Land,
@@ -1776,6 +1778,152 @@ fn sun_night(hour: f64, day: f64, dst: f64) -> f64 {
     let sin_alt = (LAT.sin() * decl.sin() + LAT.cos() * decl.cos() * h_ang.cos()).clamp(-1.0, 1.0);
     let alt_deg = sin_alt.asin().to_degrees();
     (-alt_deg / 14.0).clamp(0.0, 1.0)
+}
+
+/// What is being baked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BakeKind {
+    /// The whole desert as one picture.
+    Still,
+    /// One layer of the desert: the sky, the land, the front.
+    Part(PlatePart),
+}
+
+/// A plate the baker is asked for.
+struct BakeReq {
+    key: PlateKey,
+    kind: BakeKind,
+    pw: u32,
+    ph: u32,
+    hour: f64,
+    day: f64,
+    dst: f64,
+    layer: f64,
+}
+
+/// A plate that came back from the baker.
+struct BakeResp {
+    key: PlateKey,
+    kind: BakeKind,
+    pixels: Option<Vec<u8>>,
+}
+
+/// The thread that bakes the desert.
+///
+/// The bake is the whole desert rendered to a picture by the CPU renderer: on
+/// this machine it takes a second and a half. It used to happen on the thread
+/// that draws, so the window stopped answering for a second and a half every
+/// ten minutes -- and for five and a half when the tunnel came up, because the
+/// desert is then baked in three pieces. The baker has a scene of its own and
+/// does the work while the window keeps painting.
+struct PlateBaker {
+    req: Sender<BakeReq>,
+    done: Receiver<BakeResp>,
+    /// The plates that were asked for. A plate is asked for once.
+    asked: Vec<(PlateKey, BakeKind)>,
+}
+
+impl PlateBaker {
+    fn start() -> Self {
+        let (req, rx) = channel::<BakeReq>();
+        let (tx, done) = channel::<BakeResp>();
+        if let Err(error) = std::thread::Builder::new()
+            .name("mirage-plate-baker".into())
+            .spawn(move || plate_baker_thread(rx, tx))
+        {
+            tracing::error!(error = %error, "oasis: the baker did not start");
+        }
+        Self { req, done, asked: Vec::new() }
+    }
+
+    /// Ask for a plate. The same plate is asked for once.
+    fn want(
+        &mut self,
+        kind: BakeKind,
+        key: PlateKey,
+        pw: u32,
+        ph: u32,
+        hour: f64,
+        day: f64,
+        dst: f64,
+        layer: f64,
+    ) {
+        if self.asked.iter().any(|(k, other)| *k == key && *other == kind) {
+            return;
+        }
+        self.asked.push((key, kind));
+        let _ = self.req.send(BakeReq { key, kind, pw, ph, hour, day, dst, layer });
+    }
+
+    /// Forget the plates of the deserts that are gone.
+    fn forget_old(&mut self, key: PlateKey) {
+        self.asked.retain(|(k, _)| *k == key);
+    }
+
+    /// Take the plates that came back.
+    fn collect(&mut self, plates: &mut Option<DesertPlates>) {
+        while let Ok(resp) = self.done.try_recv() {
+            let Some(plate) = plates.as_mut() else {
+                continue;
+            };
+            if plate.key != resp.key {
+                // The desert moved on while the baker was busy.
+                continue;
+            }
+            match (resp.kind, resp.pixels) {
+                (BakeKind::Still, Some(pixels)) => plate.still = Some(pixels),
+                (BakeKind::Part(part), Some(pixels)) => plate.set_part(part, pixels),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The baker's thread: a scene of its own, and the pictures it makes.
+fn plate_baker_thread(reqs: Receiver<BakeReq>, resp: Sender<BakeResp>) {
+    let host = match scene_host() {
+        Ok(host) => host,
+        Err(error) => {
+            tracing::error!(error = %error, "oasis: the baker has no scene");
+            return;
+        }
+    };
+    let mut scratch = Vec::new();
+    while let Ok(req) = reqs.recv() {
+        let params = desert_params(
+            req.pw as f64,
+            req.ph as f64,
+            0.0,
+            req.hour,
+            req.day,
+            req.dst,
+            0.0,
+            0.0,
+            req.layer,
+        );
+        let pixels = bake_plate(&host, &mut scratch, &params, 0.0, req.pw, req.ph);
+        if resp.send(BakeResp { key: req.key, kind: req.kind, pixels }).is_err() {
+            // The window is gone.
+            return;
+        }
+    }
+}
+
+/// The scene: the anim scripts and the pictures they draw.
+fn scene_host() -> Result<JsAnimHost, Box<dyn std::error::Error>> {
+    let host = JsAnimHost::new()?;
+    host.load(include_str!("veg.js"))?;
+    host.load(include_str!("figures.js"))?;
+    host.load(include_str!("toon/toon-skin.js"))?;
+    host.load(include_str!("toon/scene.js"))?;
+    if !host.has("desert") {
+        return Err("oasis: desert anim was not registered".into());
+    }
+    let (rider, rw, rh) = decode_png(include_bytes!("toon/rider-toon.png"))?;
+    let (palm, pw, ph) = decode_png(include_bytes!("toon/palm-tall.png"))?;
+    host.bind_bitmap("m1r4g3Skin", &rider, rw, rh, 0, true)?;
+    host.bind_bitmap("m1r4g3PalmImage", &palm, pw, ph, 1, false)?;
+    Ok(host)
 }
 
 fn bake_plate(
@@ -1926,18 +2074,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     if shelf::deliver_and_exit() {
         return Ok(());
     }
-    let host = JsAnimHost::new()?;
-    host.load(include_str!("veg.js"))?;
-    host.load(include_str!("figures.js"))?;
-    host.load(include_str!("toon/toon-skin.js"))?;
-    host.load(include_str!("toon/scene.js"))?;
-    if !host.has("desert") {
-        return Err("oasis: desert anim was not registered".into());
-    }
-    let (rider, rw, rh) = decode_png(include_bytes!("toon/rider-toon.png"))?;
-    let (palm, pw, ph) = decode_png(include_bytes!("toon/palm-tall.png"))?;
-    host.bind_bitmap("m1r4g3Skin", &rider, rw, rh, 0, true)?;
-    host.bind_bitmap("m1r4g3PalmImage", &palm, pw, ph, 1, false)?;
+    let host = scene_host()?;
     // One phone. Each window builds its own wgpu device and vello Renderer.
     let phone = app_window("phone", 390, 844, 16, 16);
     let cfg = RuntimeConfig {
@@ -1991,6 +2128,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             frames_slow: 0,
             frame_report_at: 0.0,
             frame_warned_at: 0.0,
+            baker: PlateBaker::start(),
         },
         cfg,
         NativeOptions {
