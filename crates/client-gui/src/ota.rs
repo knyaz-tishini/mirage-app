@@ -168,19 +168,26 @@ pub fn is_downgrade(current: &str, proposed: &str) -> bool {
 
 fn note(message: &str) {
     tracing::info!("{message}");
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let Some(dir) = exe.parent() else {
-        return;
-    };
+    let dir = crate::log_dir();
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(dir.join("ota.log")) {
         let _ = writeln!(file, "{message}");
     }
 }
 
+/// The window does not update itself.
+///
+/// The client is shipped and updated by the fleet, not by itself: the check
+/// only added a network round trip to the store every fifteen seconds -- and
+/// with it a name that had to be resolved -- to a window that has better
+/// things to do. The publisher still lives in this module; the window does
+/// not call it.
+const CHECK_ENABLED: bool = false;
+
 /// Background check. One thread for the life of the process.
 pub fn start() {
+    if !CHECK_ENABLED {
+        return;
+    }
     if cfg!(target_os = "ios") {
         return;
     }

@@ -23,3 +23,20 @@ pub fn parse_backend(name: &str) -> Option<RenderBackend> {
         _ => None,
     }
 }
+
+/// The backend the window is asked for, out of the command line.
+///
+/// `--backend <name>` or `--backend=<name>`.  Absent, the runtime
+/// autodetects: the adapter of the machine decides.
+pub fn from_args() -> Option<RenderBackend> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(name) = arg.strip_prefix("--backend=") {
+            return parse_backend(name);
+        }
+        if arg == "--backend" {
+            return args.next().as_deref().and_then(parse_backend);
+        }
+    }
+    None
+}

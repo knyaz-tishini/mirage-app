@@ -805,7 +805,7 @@ fn spawn_child_with(artefact: &std::path::Path, control_url: &str) -> std::io::R
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("mirage-subscriber-client.log"))?;
+        .open(crate::log_dir().join("mirage-subscriber-client.log"))?;
     let log_err = log.try_clone()?;
     let tun = find_tun_bin(&bin);
     let host_port = control_url.trim_start_matches("http://");

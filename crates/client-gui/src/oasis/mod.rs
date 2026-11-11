@@ -20,7 +20,7 @@ use uzor::render::{AnimParams, AnimScript, ImagePainter, RenderContext, TextAlig
 use uzor::tokens::{BuiltinSet, Tokens};
 use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
-use uzor_framework::host::native::{NativeOptions, run_native};
+use uzor_framework::host::native::{NativeOptions, RenderPreference, run_native};
 use uzor_framework::{
     App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
     KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RenderCmd,
@@ -2069,7 +2069,7 @@ fn stroke_x(render: &mut dyn RenderContext, cx: f64, cy: f64, s: f64, color: &st
     render.stroke();
 }
 
-pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
+pub fn launch(backend: Option<uzor::platform::types::RenderBackend>) -> Result<(), Box<dyn std::error::Error>> {
     // A launcher action on Linux is this exe again. It only delivers the word.
     if shelf::deliver_and_exit() {
         return Ok(());
@@ -2132,9 +2132,11 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         },
         cfg,
         NativeOptions {
-            // backend stays unset: the host walks UZOR_RENDER_FAMILY, then
-            // RenderFamily::default (URX), then the adapter probe.
-            // The shelf owns the tray. uzor's spec freezes the icon and the labels.
+            // The backend the person asked for, or the one the host picks:
+            // UZOR_RENDER_FAMILY, then RenderFamily::default (URX), then the
+            // adapter probe.  The shelf owns the tray. uzor's spec freezes the
+            // icon and the labels.
+            render: RenderPreference { backend },
             tray: None,
             ..NativeOptions::default()
         },

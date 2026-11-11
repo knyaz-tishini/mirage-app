@@ -29,8 +29,7 @@ fn attach_parent_console() {
 fn attach_parent_console() {}
 
 fn log_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join("mirage-client-gui.log"))
+    Some(mirage_client_gui::log_dir().join("mirage-client-gui.log"))
 }
 
 fn note(line: &str) {

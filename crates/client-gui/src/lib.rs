@@ -8,6 +8,7 @@ mod backend;
 mod camera;
 mod configs;
 mod engine;
+mod render_backend;
 mod text;
 mod theme;
 #[cfg(target_os = "ios")]
@@ -24,18 +25,31 @@ struct LogSink {
     file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
+/// Where the logs of the window live.
+///
+/// Not beside the binary: the release folder is on a mechanical disk that
+/// other builds saturate, and a log written there is a window that never
+/// opens -- the write waits in the disk's queue for tens of seconds.  The
+/// logs are the fast disk's business; the targets and the presets stay where
+/// they are.
+pub fn log_dir() -> std::path::PathBuf {
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::path::PathBuf::new)
+        .join("mirage2app")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 impl LogSink {
     fn open() -> Self {
-        let path = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("mirage-client-gui.log")));
-        let file = path.and_then(|path| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok()
-        });
+        let path = log_dir().join("mirage-client-gui.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
         Self { file: file.map(|file| std::sync::Arc::new(std::sync::Mutex::new(file))) }
     }
 }
@@ -118,7 +132,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    oasis::launch()?;
+    oasis::launch(crate::render_backend::from_args())?;
     Ok(())
 }
 
