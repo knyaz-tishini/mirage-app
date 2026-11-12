@@ -329,6 +329,12 @@ struct Engine {
     relay_addrs: Vec<String>,
     /// The status watcher for the live session.
     watch: Option<tokio::task::JoinHandle<()>>,
+    /// The engine wants the tunnel up. The device's own answer is only
+    /// believed when the engine wants it: a device that is going down still
+    /// answers "the tunnel is up" for a moment.
+    tun_wanted: Arc<std::sync::atomic::AtomicBool>,
+    /// The probe's stop flag.
+    probe_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Engine {
@@ -336,9 +342,12 @@ impl Engine {
         let mut snapshot = EngineStatus::default();
         snapshot.online = true;
         snapshot.phase = "off".into();
+        snapshot.session_phase = "off".into();
         snapshot.mode = "socks".into();
         *status.lock().unwrap_or_else(PoisonError::into_inner) = snapshot;
-        Self {
+        let tun_wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = Self {
             status,
             artefact: None,
             client: None,
@@ -354,7 +363,53 @@ impl Engine {
             tun_mode: TunMode::Full,
             relay_addrs: Vec::new(),
             watch: None,
-        }
+            tun_wanted: Arc::clone(&tun_wanted),
+            probe_stop: Arc::clone(&probe_stop),
+        };
+        engine.spawn_tun_probe(tun_wanted, probe_stop);
+        engine
+    }
+
+    /// The device's own answer about the tunnel.
+    ///
+    /// The device owns the adapter, the routes and the switch, so it is the
+    /// one that knows whether the traffic really goes through the tunnel. The
+    /// process being up is not the tunnel being up: the adapter takes seconds
+    /// to come up, and the window that says "connected" before that lies to
+    /// the person who is waiting for it.
+    ///
+    /// The probe runs on its own thread and asks the device's management port.
+    /// A device that is not there yet answers nothing, and that is "the tunnel
+    /// is not up".
+    fn spawn_tun_probe(
+        &self,
+        wanted: Arc<std::sync::atomic::AtomicBool>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let status = Arc::clone(&self.status);
+        let _ = std::thread::Builder::new()
+            .name("mirage-tun-probe".into())
+            .spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let active = wanted.load(std::sync::atomic::Ordering::Relaxed)
+                        && device_tunnel_active();
+                    let mut guard = status.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.tun = active;
+                    let session = guard.session_phase.clone();
+                    let tun_mode = guard.mode == "tun";
+                    // The session can be up while the tunnel is still coming
+                    // up. The window says "connecting" then, and "connected"
+                    // only when the device says the tunnel carries.
+                    guard.tun_alive = session == "connected" && (!tun_mode || active);
+                    guard.phase = if tun_mode && session == "connected" && !active {
+                        "connecting".to_owned()
+                    } else {
+                        session
+                    };
+                    drop(guard);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            });
     }
 
     async fn handle(&mut self, command: Command) {
@@ -441,7 +496,10 @@ impl Engine {
                 .await
                 .map_err(|error| error.to_string())?;
             self.watch = Some(self.spawn_watch(Arc::clone(&client.supervisor)));
-            self.publish(|status| status.phase = "connecting".into());
+            self.publish(|status| {
+                status.phase = "connecting".into();
+                status.session_phase = "connecting".into();
+            });
         }
         Ok(())
     }
@@ -474,7 +532,10 @@ impl Engine {
             // The session takes seconds to build: the status says so BEFORE
             // the work starts, or the window stands still with no word.
             tracing::info!("engine: the session is coming up");
-            self.publish(|status| status.phase = "connecting".into());
+            self.publish(|status| {
+                status.phase = "connecting".into();
+                status.session_phase = "connecting".into();
+            });
             let began = std::time::Instant::now();
             match SubscriberClient::build_from_delivery(&artefact, options).await {
                 Ok(client) => {
@@ -500,6 +561,7 @@ impl Engine {
                     self.publish(|status| {
                         status.error = Some(error.to_string());
                         status.phase = "refused".into();
+                        status.session_phase = "refused".into();
                     });
                     return;
                 }
@@ -519,6 +581,7 @@ impl Engine {
         }
         self.publish(|status| {
             status.phase = "off".into();
+            status.session_phase = "off".into();
             status.socks = false;
             status.tun = false;
             status.tun_alive = false;
@@ -625,6 +688,7 @@ impl Engine {
         // The device comes up on its own thread: it takes seconds, and the
         // engine must answer the window all the time.
         self.device.start_device(bin, config, tun_addr.clone());
+        self.tun_wanted.store(true, std::sync::atomic::Ordering::Relaxed);
         self.tun_addr = Some(tun_addr);
         self.addr_pending = None;
         self.publish(|status| {
@@ -673,6 +737,7 @@ impl Engine {
             return;
         }
         tracing::info!("engine: the device is going down");
+        self.tun_wanted.store(false, std::sync::atomic::Ordering::Relaxed);
         self.device.stop_device();
         self.tun_addr = None;
         self.addr_pending = None;
@@ -694,10 +759,11 @@ impl Engine {
                     self.device.stopping = false;
                     self.tun_addr = Some(addr);
                     self.publish(|status| {
-                        // The adapter is up -- that is not the tunnel yet.  The
-                        // picture in the window says "the chain carries", and
-                        // the chain is up when the session says so.
-                        status.tun = true;
+                        // The process is up -- that is not the tunnel yet. The
+                        // adapter takes seconds more, and until it is there the
+                        // traffic does not go through it. The probe asks the
+                        // device, and the window waits for that answer.
+                        status.tun = false;
                         status.tun_alive = false;
                     });
                 }
@@ -812,8 +878,10 @@ impl Engine {
                 let snapshot = rx.borrow().clone();
                 {
                     let mut guard = status.lock().unwrap_or_else(PoisonError::into_inner);
-                    guard.phase = phase_of(snapshot.state);
-                    guard.tun_alive = snapshot.state == EdgeState::Connected;
+                    // The session's phase is kept aside: the phase the window
+                    // shows also depends on the tunnel, and the tunnel is the
+                    // device's word -- the probe publishes it.
+                    guard.session_phase = phase_of(snapshot.state);
                     guard.error = snapshot.reason.as_ref().map(|reason| format!("{reason:?}"));
                     guard.exit = snapshot.exit.requested.clone();
                 }
@@ -832,6 +900,7 @@ impl Engine {
     fn shutdown(&mut self) {
         self.stop_tun();
         self.device.shutdown();
+        self.probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(watch) = self.watch.take() {
             watch.abort();
         }
@@ -839,6 +908,38 @@ impl Engine {
             client.shutdown();
         }
     }
+}
+
+/// Where the device answers about itself.
+const DEVICE_API: &str = "127.0.0.1:19485";
+
+/// Ask the device whether the tunnel carries.
+///
+/// The device owns the adapter and the routes, so it is the one that knows.
+/// The answer comes from its management port; a device that is not there yet
+/// answers nothing, and that is "the tunnel is not up".
+fn device_tunnel_active() -> bool {
+    use std::io::{Read, Write};
+    let mut stream = match std::net::TcpStream::connect(DEVICE_API) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(400)));
+    let request = b"GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request).is_err() {
+        return false;
+    }
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    let Some((_, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        return false;
+    };
+    value.get("tun_phase").and_then(|item| item.as_str()) == Some("tun_active")
 }
 
 /// What the device thread is told.

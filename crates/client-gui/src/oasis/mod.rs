@@ -603,7 +603,11 @@ impl App for Oasis {
             };
             // The picture is the switch. Desert turns the adapter on.
             // A visible rider turns it off.
-            if tun_up {
+            //
+            // The switch follows the picture's link and not the clock: the
+            // rider is already there while the tunnel is coming up, and a
+            // click on it is a click that takes the tunnel back down.
+            if self.linked || tun_up {
                 self.linked = false;
                 self.link_sent_at = now;
                 self.style = (self.toggles % 4) as f64;
@@ -807,9 +811,9 @@ impl Oasis {
     /// The button shows the link the picture is on: the click that started
     /// it, or a chain that is already carrying.
     fn shelf_up(&self) -> bool {
-        if self.linked {
-            return true;
-        }
+        // The engine's word, not the click's. The tray must not say
+        // "connected" while the tunnel is still coming up: the person waits
+        // for the tunnel, not for the click.
         let st = self.engine.status();
         st.online && st.tun_alive
     }

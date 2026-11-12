@@ -35,6 +35,13 @@ pub struct EngineStatus {
     pub cli_alive: bool,
     /// Control `state` string (`off`, `connecting`, `connected`, …).
     pub phase: String,
+    /// The session's own phase, before the tunnel is taken into account.
+    ///
+    /// The phase the window shows is not the session's phase: the session can
+    /// be up while the tunnel is still coming up, and a window that says
+    /// "connected" then lies. The raw phase is kept aside, and the device's
+    /// own answer decides what the window says.
+    pub session_phase: String,
     pub monitor_reachable: bool,
     pub error: Option<String>,
     /// Listener or tun process is actually up. Not the selected mode.
@@ -508,6 +515,7 @@ fn parse_status(body: &str) -> EngineStatus {
         tun_alive: state == "connected",
         cli_alive: false,
         phase: state.to_string(),
+        session_phase: state.to_string(),
         monitor_reachable: false,
         error: value
             .get("error")
