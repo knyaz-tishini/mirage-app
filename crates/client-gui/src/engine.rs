@@ -394,6 +394,11 @@ impl Engine {
                     let active = wanted.load(std::sync::atomic::Ordering::Relaxed)
                         && device_tunnel_active();
                     let mut guard = status.lock().unwrap_or_else(PoisonError::into_inner);
+                    if guard.tun != active {
+                        // The device's own word, and the change of it: the
+                        // window's "connected" is this line.
+                        tracing::info!(tun = active, "engine: the device says the tunnel");
+                    }
                     guard.tun = active;
                     let session = guard.session_phase.clone();
                     let tun_mode = guard.mode == "tun";
