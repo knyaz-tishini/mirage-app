@@ -209,11 +209,11 @@ struct Oasis {
     adopt_retry_at: f64,
     /// The phase the window last showed. A change is a line in the log.
     phase_seen: String,
-    /// The frames per second the window asked for. The desert is painted
+    /// The frames per second the window asked for last. The desert is painted
     /// three times a frame (the sky, the stars, the rider), and sixty frames
     /// of that took a whole core. Thirty frames are enough for a window that
     /// shows a desert, and they leave the core to the tunnel.
-    fps_asked: bool,
+    fps_current: u32,
     pending_submit: Option<String>,
     /// Windows that already applied [`Stand::pass_epoch`].
     pass_reset_seen: HashMap<WindowId, u64>,
@@ -479,10 +479,17 @@ impl App for Oasis {
         }
         // The frames per second. The desert is painted three times a frame
         // and that took a whole core: the tunnel deserves it more.
-        if !self.fps_asked {
-            self.fps_asked = true;
-            cx.out.command(AppCommand::Render(RenderCmd::SetFpsLimit(30)));
-            tracing::info!("oasis: the window paints thirty frames a second");
+        //
+        // With the tunnel up the desert is painted live -- the rider and the
+        // glow are two whole scenes a frame -- and a frame takes thirty
+        // milliseconds and more. The window would then spend the core on the
+        // picture while the tunnel waits for it. The desert is slow: fifteen
+        // frames a second look the same, and the core goes back to the tunnel.
+        let wanted_fps = if self.link > 0.001 { 15 } else { 30 };
+        if wanted_fps != self.fps_current {
+            self.fps_current = wanted_fps;
+            cx.out.command(AppCommand::Render(RenderCmd::SetFpsLimit(wanted_fps)));
+            tracing::info!(fps = wanted_fps, "oasis: the window paints");
         }
         self.stand.pull_bus();
         self.poll_scan();
@@ -2119,7 +2126,7 @@ pub fn launch(backend: Option<uzor::platform::types::RenderBackend>) -> Result<(
             adopted: String::new(),
             adopt_retry_at: f64::NEG_INFINITY,
             phase_seen: String::new(),
-            fps_asked: false,
+            fps_current: 0,
             pending_submit: None,
             pass_reset_seen: HashMap::new(),
             clear_seen: HashMap::new(),
