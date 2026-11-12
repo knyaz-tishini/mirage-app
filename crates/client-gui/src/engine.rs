@@ -380,7 +380,9 @@ impl Engine {
     ///
     /// The probe runs on its own thread and asks the device's management port.
     /// A device that is not there yet answers nothing, and that is "the tunnel
-    /// is not up".
+    /// is not up" -- but only after it keeps quiet: one question that comes
+    /// back late is a busy device, not a dead tunnel, and the window that
+    /// says "reconnecting" because of it flickers for nothing.
     fn spawn_tun_probe(
         &self,
         wanted: Arc<std::sync::atomic::AtomicBool>,
@@ -390,9 +392,41 @@ impl Engine {
         let _ = std::thread::Builder::new()
             .name("mirage-tun-probe".into())
             .spawn(move || {
+                // The misses in a row, and the word the window believes.
+                let mut misses = 0u32;
+                let mut believed = false;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let active = wanted.load(std::sync::atomic::Ordering::Relaxed)
-                        && device_tunnel_active();
+                    let asked = wanted.load(std::sync::atomic::Ordering::Relaxed);
+                    let answer = if asked {
+                        device_tunnel_active()
+                    } else {
+                        Ok(false)
+                    };
+                    match answer {
+                        Ok(true) => {
+                            misses = 0;
+                            believed = true;
+                        }
+                        Ok(false) => {
+                            // The device answered, and it says the tunnel is
+                            // not up.  That is a sure word.
+                            misses = 0;
+                            believed = false;
+                        }
+                        Err(reason) => {
+                            misses += 1;
+                            if misses == 1 {
+                                tracing::debug!(reason = %reason, "engine: the device did not answer about the tunnel");
+                            }
+                            if misses >= TUN_PROBE_MISSES_BEFORE_DOWN {
+                                if believed {
+                                    tracing::warn!(reason = %reason, misses, "engine: the device stopped answering about the tunnel");
+                                }
+                                believed = false;
+                            }
+                        }
+                    }
+                    let active = believed;
                     let mut guard = status.lock().unwrap_or_else(PoisonError::into_inner);
                     if guard.tun != active {
                         // The device's own word, and the change of it: the
@@ -918,33 +952,48 @@ impl Engine {
 /// Where the device answers about itself.
 const DEVICE_API: &str = "127.0.0.1:19485";
 
+/// How many questions in a row the device may leave unanswered before the
+/// window calls the tunnel down.
+///
+/// The probe asks every quarter of a second.  The device is busy now and
+/// then -- it drills holes, it resolves names -- and a question that comes
+/// back late must not be read as a dead tunnel: the window would say
+/// "reconnecting" every few seconds while the traffic keeps flowing.
+const TUN_PROBE_MISSES_BEFORE_DOWN: u32 = 3;
+
+/// How long the window waits for the device's answer.
+const DEVICE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Ask the device whether the tunnel carries.
 ///
 /// The device owns the adapter and the routes, so it is the one that knows.
-/// The answer comes from its management port; a device that is not there yet
-/// answers nothing, and that is "the tunnel is not up".
-fn device_tunnel_active() -> bool {
+/// The answer comes from its management port.  A device that answers "the
+/// tunnel is not up" is a sure word; a device that keeps quiet is only
+/// unknown, and the difference between the two is the difference between a
+/// dead tunnel and a busy one -- so the silence comes back as a reason, and
+/// the caller decides what to do with it.
+fn device_tunnel_active() -> Result<bool, String> {
     use std::io::{Read, Write};
-    let mut stream = match std::net::TcpStream::connect(DEVICE_API) {
-        Ok(stream) => stream,
-        Err(_) => return false,
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(400)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(400)));
+    let mut stream = std::net::TcpStream::connect(DEVICE_API)
+        .map_err(|e| format!("the device did not open its port: {e}"))?;
+    let _ = stream.set_read_timeout(Some(DEVICE_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(DEVICE_PROBE_TIMEOUT));
     let request = b"GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    if stream.write_all(request).is_err() {
-        return false;
-    }
+    stream
+        .write_all(request)
+        .map_err(|e| format!("the question did not reach the device: {e}"))?;
     let mut raw = Vec::new();
-    let _ = stream.read_to_end(&mut raw);
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("the device did not finish its answer: {e}"))?;
     let text = String::from_utf8_lossy(&raw);
     let Some((_, body)) = text.split_once("\r\n\r\n") else {
-        return false;
+        return Err("the answer of the device had no body".to_owned());
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
-        return false;
+        return Err(format!("the answer of the device was not json: {}", body.trim()));
     };
-    value.get("tun_phase").and_then(|item| item.as_str()) == Some("tun_active")
+    Ok(value.get("tun_phase").and_then(|item| item.as_str()) == Some("tun_active"))
 }
 
 /// What the device thread is told.
