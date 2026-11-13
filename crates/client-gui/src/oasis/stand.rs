@@ -234,6 +234,9 @@ pub struct Stand {
     /// The servers section is showing the new-box form. False is the list of
     /// boxes this client already has. Not written down.
     pub server_new: bool,
+    /// Order of the chain assembled from boxes already up. The first is the
+    /// relay, the last is the terminator. Empty means the list order.
+    chain_order: Vec<String>,
     pub user: String,
     pub pass: String,
     pub stack_auto: bool,
@@ -316,6 +319,7 @@ impl Stand {
             host: String::new(),
             open_host: String::new(),
             server_new: false,
+            chain_order: Vec::new(),
             user: "root".into(),
             pass: String::new(),
             stack_auto: true,
@@ -464,6 +468,9 @@ impl Stand {
                     if let Some(apps) = string_list(&v, "apps") {
                         stand.apps = apps;
                     }
+                    if let Some(order) = string_list(&v, "chain_order") {
+                        stand.chain_order = order;
+                    }
                 }
             }
             if let Ok(link) = std::fs::read_to_string(dir.join("link.txt")) {
@@ -531,6 +538,7 @@ impl Stand {
             "last_target": self.last_target,
             "sites": self.sites,
             "apps": self.apps,
+            "chain_order": self.chain_order,
         });
         if let Ok(body) = serde_json::to_string_pretty(&text) {
             let _ = std::fs::write(dir.join("host.json"), body);
@@ -1075,6 +1083,72 @@ impl Stand {
         self.say(tr("say.forgot"));
     }
 
+    /// Move one box in the chain. The first box is the relay, the last is
+    /// the terminator. The password is not involved and is not stored.
+    fn move_chain(&mut self, index: usize, delta: isize) {
+        let mut hosts = chain_hosts(self);
+        let next = index as isize + delta;
+        if next < 0 || next >= hosts.len() as isize {
+            return;
+        }
+        hosts.swap(index, next as usize);
+        self.chain_order = hosts;
+        self.save_profile();
+    }
+
+    /// Build a chain from the boxes that are already up, in the order on screen.
+    ///
+    /// The kit stays. The chain is written onto each box and the container
+    /// comes back up with it. The link that comes back is the relay's.
+    pub fn assemble_chain(&mut self) {
+        if self.bus.running.load(Ordering::Relaxed) {
+            return;
+        }
+        let hosts = chain_hosts(self);
+        if hosts.len() < 2 {
+            self.say(tr("say.need_two"));
+            return;
+        }
+        if self.user.trim().is_empty() {
+            self.say(tr("say.need_login"));
+            return;
+        }
+        let user = self.user.trim().to_owned();
+        let mut boxes = Vec::with_capacity(hosts.len());
+        for host in &hosts {
+            let Some((host, port)) = split_host(host) else {
+                self.say(tr("say.need_host"));
+                return;
+            };
+            boxes.push(mirage_client_chain::ChainRequest {
+                host,
+                port,
+                user: user.clone(),
+                password: String::new(),
+            });
+        }
+        let bus = Arc::clone(&self.bus);
+        if bus.running.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let done = tr("say.chain_ok").to_owned();
+        self.say(tr("b.assembling"));
+        std::thread::spawn(move || {
+            let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime.block_on(mirage_client_chain::assemble_chain("gui", &boxes, &bus)),
+                Err(err) => Err(format!("runtime: {err}")),
+            };
+            match outcome {
+                Ok(outcome) => {
+                    *bus.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome.link);
+                    *bus.text.lock().unwrap_or_else(|p| p.into_inner()) = done;
+                }
+                Err(err) => *bus.text.lock().unwrap_or_else(|p| p.into_inner()) = err,
+            }
+            bus.running.store(false, Ordering::Relaxed);
+        });
+    }
+
     pub fn export(&self) {
         if self.link.is_empty() {
             self.say(tr("say.no_link"));
@@ -1547,6 +1621,29 @@ fn known_servers(stand: &Stand) -> Vec<String> {
     hosts
 }
 
+/// The chain, in the order the person left it.
+///
+/// A box that is no longer known drops out. A box that is new goes on the
+/// end, so it becomes the terminator until the person moves it.
+fn chain_hosts(stand: &Stand) -> Vec<String> {
+    let known = known_servers(stand);
+    let mut hosts = Vec::new();
+    for host in &stand.chain_order {
+        if known.iter().any(|item| item == host) && hosts.iter().any(|item| item == host) {
+            continue;
+        }
+        if known.iter().any(|item| item == host) {
+            hosts.push(host.clone());
+        }
+    }
+    for host in known {
+        if !hosts.iter().any(|item| item == &host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
 /// Which key the client comes in by, as the profile writes it down.
 fn key_source_key(source: KeySource) -> &'static str {
     match source {
@@ -1705,6 +1802,7 @@ mod tests {
         assert!(kinds.contains(&HitKind::Install));
         assert!(kinds.contains(&HitKind::ServerPage(true)));
         assert!(kinds.contains(&HitKind::ServerPage(false)));
+        assert!(!kinds.contains(&HitKind::ChainAssemble));
         assert!(kinds.iter().all(|kind| !matches!(kind, HitKind::Unlink | HitKind::Server(_))));
         assert!(lay.fields.iter().any(|field| field.focus == Focus::Host));
         assert!(lay.fields.iter().all(|field| field.focus != Focus::Bind));
@@ -1775,6 +1873,9 @@ mod tests {
             .filter(|hit| matches!(hit.kind, HitKind::Server(_)))
             .collect();
         assert_eq!(servers.len(), 2);
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::ChainAssemble));
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::ChainUp(0)));
+        assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::ChainDown(1)));
         assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::ServerPage(true)));
         assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::ServerPage(false)));
         assert!(lay.hits.iter().all(|hit| {
@@ -1797,6 +1898,7 @@ mod tests {
         assert!(lay.fields.iter().any(|field| field.focus == Focus::Host));
         assert!(lay.hits.iter().any(|hit| hit.kind == HitKind::Install));
         assert!(lay.hits.iter().all(|hit| hit.kind != HitKind::Fetch && hit.kind != HitKind::Forget));
+        assert!(lay.hits.iter().all(|hit| hit.kind != HitKind::ChainAssemble));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1982,6 +2084,7 @@ enum ButtonText {
     Forget,
     PageNew,
     PageKnown,
+    Assemble,
 }
 
 enum Choice {
@@ -2000,6 +2103,7 @@ enum Row {
     Choice { rect: Rect, label: &'static str, which: Choice },
     Kit { rect: Rect, kit: Kit },
     Server { rect: Rect, index: usize },
+    Chain { rect: Rect, index: usize, up: Rect, down: Rect },
     Guest { rect: Rect, index: usize, revoke: Rect },
     Entry { rect: Rect, index: usize, site: bool },
     Line { x: f64, y: f64 },
@@ -2012,6 +2116,9 @@ enum HitKind {
     Fetch,
     Forget,
     Server(usize),
+    ChainUp(usize),
+    ChainDown(usize),
+    ChainAssemble,
     /// `true` opens the new-box form. `false` opens the boxes already known.
     ServerPage(bool),
     Export,
@@ -2154,6 +2261,17 @@ impl Lay {
         self.hit(id.to_owned(), rect, HitKind::Kit(kit));
     }
 
+    fn chain_row(&mut self, index: usize) {
+        let rect = self.row_rect();
+        let gap = 6.0;
+        let btn = 64.0_f64.min((rect.width * 0.22).max(0.0));
+        let down = Rect::new(rect.x + rect.width - btn, rect.y, btn, rect.height);
+        let up = Rect::new(rect.x + rect.width - btn * 2.0 - gap, rect.y, btn, rect.height);
+        self.rows.push(Row::Chain { rect, index, up, down });
+        self.hit(format!("st-chain-{index}-up"), up, HitKind::ChainUp(index));
+        self.hit(format!("st-chain-{index}-down"), down, HitKind::ChainDown(index));
+    }
+
     fn server(&mut self, index: usize) {
         let rect = self.row_rect();
         self.rows.push(Row::Server { rect, index });
@@ -2221,6 +2339,13 @@ fn layout(stand: &Stand, content: Rect, show_line: bool) -> Layout {
                 }
             } else {
                 let servers = known_servers(stand);
+                let order = chain_hosts(stand);
+                if order.len() >= 2 {
+                    for index in 0..order.len() {
+                        lay.chain_row(index);
+                    }
+                    lay.solo(("st-chain", ButtonText::Assemble, HitKind::ChainAssemble));
+                }
                 for index in 0..servers.len() {
                     lay.server(index);
                 }
@@ -2348,6 +2473,9 @@ fn apply(stand: &mut Stand, kind: HitKind) {
         HitKind::Remove => stand.remove_remote(),
         HitKind::Fetch => stand.fetch_config(),
         HitKind::Forget => stand.forget_server(),
+        HitKind::ChainAssemble => stand.assemble_chain(),
+        HitKind::ChainUp(index) => stand.move_chain(index, -1),
+        HitKind::ChainDown(index) => stand.move_chain(index, 1),
         HitKind::ServerPage(fresh) => {
             stand.server_new = fresh;
             if fresh {
@@ -2480,7 +2608,7 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             ctx.fill_text(label, rect.x + 8.0, crate::theme::label_baseline(rect.y, rect.height, 14.0));
         }
         Row::Button { rect, text } => {
-            let primary = matches!(text, ButtonText::Install);
+            let primary = matches!(text, ButtonText::Install | ButtonText::Assemble);
             let page = match text {
                 ButtonText::PageNew => Some(stand.server_new),
                 ButtonText::PageKnown => Some(!stand.server_new),
@@ -2533,6 +2661,31 @@ fn paint_row(ctx: &mut dyn RenderContext, stand: &Stand, row: &Row, line: &str) 
             ctx.set_font("14px PT Root UI");
             ctx.set_fill_color(if open { accent() } else { fg() });
             ctx.fill_text(host, rect.x + 8.0, crate::theme::label_baseline(rect.y, rect.height, 14.0));
+        }
+        Row::Chain { rect, index, up, down } => {
+            let hosts = chain_hosts(stand);
+            let Some(host) = hosts.get(*index) else {
+                return;
+            };
+            let role = if index + 1 == hosts.len() {
+                tr("role.exit")
+            } else {
+                tr("role.relay")
+            };
+            plate(ctx, *rect, false);
+            ctx.set_text_align(TextAlign::Left);
+            ctx.set_font("14px PT Root UI");
+            let y = crate::theme::label_baseline(rect.y, rect.height, 14.0);
+            ctx.set_fill_color(accent());
+            ctx.fill_text(role, rect.x + 8.0, y);
+            ctx.set_fill_color(fg());
+            ctx.fill_text(host, rect.x + LABEL_W, y);
+            plate(ctx, *up, false);
+            plate(ctx, *down, false);
+            ctx.set_text_align(TextAlign::Center);
+            ctx.set_fill_color(fg());
+            ctx.fill_text(tr("b.up"), up.x + up.width / 2.0, y);
+            ctx.fill_text(tr("b.down"), down.x + down.width / 2.0, y);
         }
         Row::Guest { rect, index, revoke } => {
             let Some(guest) = stand.guests.get(*index) else {
@@ -2633,6 +2786,13 @@ fn button_label(stand: &Stand, text: &ButtonText) -> &'static str {
         ButtonText::InviteFull => tr("b.invite_full"),
         ButtonText::MyKey => tr("b.my_key"),
         ButtonText::Unlink => tr("b.unlink"),
+        ButtonText::Assemble => {
+            if running {
+                tr("b.assembling")
+            } else {
+                tr("b.assemble")
+            }
+        }
     }
 }
 
