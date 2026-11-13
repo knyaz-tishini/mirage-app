@@ -335,6 +335,13 @@ struct Engine {
     tun_wanted: Arc<std::sync::atomic::AtomicBool>,
     /// The probe's stop flag.
     probe_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The device was put back on the byte-stream path.
+    ///
+    /// The artefact named a QUIC face, so the device asked for whole IP
+    /// packets -- but the live session carries flows, not packets, and the
+    /// raw-IP command would be refused every second. The datapath is
+    /// demoted once, and the log says why.
+    wire_demoted: bool,
 }
 
 impl Engine {
@@ -365,6 +372,7 @@ impl Engine {
             watch: None,
             tun_wanted: Arc::clone(&tun_wanted),
             probe_stop: Arc::clone(&probe_stop),
+            wire_demoted: false,
         };
         engine.spawn_tun_probe(tun_wanted, probe_stop);
         engine
@@ -529,6 +537,9 @@ impl Engine {
     async fn adopt(&mut self, json: &str) -> Result<(), String> {
         let artefact = DeliveryArtefact::from_json(json).map_err(|error| error.to_string())?;
         self.artefact = Some(artefact.clone());
+        // A new configuration gets a fresh verdict about the datapath: the
+        // demotion belonged to the old one.
+        self.wire_demoted = false;
         if let Some(client) = &self.client {
             client
                 .adopt_artefact(&artefact, stream_failure_threshold())
@@ -668,7 +679,13 @@ impl Engine {
     /// A QUIC face is the mono-protocol plane: the whole IP packets ride the
     /// QUIC datagrams of the edge session, and the device hands them over
     /// the raw-IP command. Every other face keeps the byte-stream path.
+    ///
+    /// A live session without a plane demotes the path: the device must not
+    /// ask for whole packets that nobody will carry.
     fn wire_mode(&self) -> WireMode {
+        if self.wire_demoted {
+            return WireMode::Stack;
+        }
         match &self.artefact {
             Some(artefact) => tun_mode::wire_mode_for(artefact),
             // No configuration yet: the byte-stream path.
@@ -686,6 +703,48 @@ impl Engine {
             .as_ref()
             .and_then(|client| client.assigned_client_address())
             .unwrap_or_else(|| tun_mode::DEFAULT_TUN_ADDR.to_owned())
+    }
+
+    /// The live session carries no packet plane: put the device back on the
+    /// byte-stream path.
+    ///
+    /// The device asked for whole IP packets because the artefact named a
+    /// QUIC face -- but the session that came up carries flows, not packets:
+    /// the edge's welcome did not promise them. The raw-IP command would be
+    /// refused every second, forever, and the machine would have no way
+    /// out. So the datapath is demoted once, the config is written again,
+    /// and the log says why.
+    fn demote_wire_mode(&mut self) {
+        if self.wire_demoted {
+            return;
+        }
+        // Only a raw-IP device can be demoted.
+        if self.wire_mode() != WireMode::RawIp {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        let Some(session) = client.supervisor.current().current() else {
+            return;
+        };
+        if session.has_plane() {
+            return;
+        }
+        self.wire_demoted = true;
+        tracing::warn!(
+            entrance = %session.entrance_label(),
+            "engine: the live session carries no packet plane - the device drops to the byte-stream path"
+        );
+        let tun_addr = self.assigned_tun_addr();
+        if let Err(error) = self.write_device_config(&tun_addr) {
+            tracing::error!(error = %error, "engine: the demoted device config was refused");
+            return;
+        }
+        // The device reads its datapath when it starts: the config is
+        // written, but the running device still speaks the old one. It comes
+        // back and reads the new one.
+        self.restart_tun();
     }
 
     /// The device goes up. It is a separate process because it needs the
@@ -893,6 +952,10 @@ impl Engine {
         } else if self.tun_addr.as_deref() == Some(assigned.as_str()) {
             self.addr_pending = None;
         }
+        // The datapath follows the live session: a session without a plane
+        // cannot serve whole packets, and the device must stop asking for
+        // them.
+        self.demote_wire_mode();
     }
 
     /// The device's lists changed under it: write the config again and let it

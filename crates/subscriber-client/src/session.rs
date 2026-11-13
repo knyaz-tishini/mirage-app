@@ -931,6 +931,15 @@ fn build_session(
                 // session over the same QUIC connection. The connector still
                 // has to outlive it - dropping the QUIC endpoint closes the
                 // connection.
+                //
+                // The word goes into the log: the session carries NO plane,
+                // and whoever asked for whole packets must know WHY there
+                // are none.
+                warn!(
+                    entrance = %entrance_label,
+                    carries_datagrams = ?welcome.carries_datagrams,
+                    "edge session: the plane entrance carries no whole packets - the session is a mux session over the same connection"
+                );
                 let mut session = upgrade_session(tunnel, welcome, entrance_label);
                 session.plane = Mutex::new(Some(PlaneTransport {
                     plane: None,
@@ -1040,10 +1049,44 @@ fn is_mirage(protocol: &Protocol) -> bool {
 ///
 /// A QUIC entrance without an ALPN is not a plane: there is nothing to
 /// negotiate, and the client says so instead of dialling into the dark.
-fn plane_alpn(protocol: &Protocol) -> Option<Vec<String>> {
+pub(crate) fn plane_alpn(protocol: &Protocol) -> Option<Vec<String>> {
     match protocol {
         Protocol::Quic { alpn } if !alpn.is_empty() => Some(alpn.clone()),
         _ => None,
+    }
+}
+
+/// Does the artefact name a plane?
+///
+/// A plane is a QUIC entrance with an ALPN: the whole IP packets ride its
+/// datagrams. Every other entrance -- a Mirage face, a protocol door, a
+/// QUIC door in a camouflage -- carries flows, not packets.
+fn has_plane_entrance(entrances: &[ArtefactEntrance]) -> bool {
+    entrances
+        .iter()
+        .any(|entrance| plane_alpn(&entrance.protocol).is_some())
+}
+
+/// What the walk over the entrances does with a protocol door that answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DoorVerdict {
+    /// Take the door now: the artefact names no plane at all, so the door
+    /// is the only way in.
+    Take,
+    /// Keep the door for the end of the walk: a plane entrance is still
+    /// untried, and the door must not hide it.
+    Defer,
+}
+
+/// The verdict for a protocol door that answered.
+///
+/// The door is the FALLBACK: when the artefact names a plane, the walk goes
+/// on and takes the door only when the plane did not answer.
+fn door_verdict(has_plane: bool) -> DoorVerdict {
+    if has_plane {
+        DoorVerdict::Defer
+    } else {
+        DoorVerdict::Take
     }
 }
 
@@ -1179,7 +1222,12 @@ async fn dial_face(
 }
 
 fn log_assigned(probe: &str, session: &EdgeSession) {
-    info!(probe = %probe, entrance = %session.entrance_label(), "edge session: face assigned");
+    info!(
+        probe = %probe,
+        entrance = %session.entrance_label(),
+        plane = session.has_plane(),
+        "edge session: face assigned"
+    );
 }
 
 /// Send a version-1 [`EdgeHello`] and read back the (possibly
@@ -1443,6 +1491,17 @@ impl EntranceDialer {
         let mut too_many: Option<EdgeDialError> = None;
         // The face the walk was on when it ended -- the report names it.
         let mut last_probe = String::new();
+        // Does the artefact carry a plane at all?
+        //
+        // A protocol door is a FALLBACK: it carries flows, not whole
+        // packets. When the artefact names a plane, the walk must not
+        // settle on a door while that plane is still untried -- the door
+        // would hide the plane behind it, and the client would run on a
+        // session without packets.
+        let has_plane = has_plane_entrance(&self.entrances);
+        // The door that answered, kept until the end of the walk: it is the
+        // fallback for an artefact whose plane does not answer.
+        let mut deferred_door: Option<(usize, EdgeSession)> = None;
         for offset in 0..self.entrances.len() {
             let idx = (start + offset) % self.entrances.len();
             let entrance = &self.entrances[idx];
@@ -1453,8 +1512,23 @@ impl EntranceDialer {
                 match crate::door::probe(entrance).await {
                     Ok(()) => {
                         let session = EdgeSession::from_protocol_door(entrance.clone(), exit);
-                        log_assigned(&entrance.addr, &session);
-                        return Ok((idx, session));
+                        match door_verdict(has_plane) {
+                            DoorVerdict::Take => {
+                                log_assigned(&entrance.addr, &session);
+                                return Ok((idx, session));
+                            }
+                            DoorVerdict::Defer => {
+                                // The plane is still untried: the door waits
+                                // for it. The walk goes on, and the door is
+                                // taken when the walk ends without a plane.
+                                debug!(
+                                    entrance = %entrance.addr,
+                                    "edge session: the protocol door answered, but the plane is still untried - the walk goes on"
+                                );
+                                deferred_door = Some((idx, session));
+                                continue;
+                            }
+                        }
                     }
                     Err(reason) => {
                         debug!(
@@ -1584,6 +1658,12 @@ impl EntranceDialer {
                 return Ok((fallback_idx, session));
             }
             return Err(refused);
+        }
+        // The plane did not answer and the door did: the door is the
+        // fallback, and it is taken now that every entrance is tried.
+        if let Some((idx, session)) = deferred_door {
+            log_assigned(session.entrance_label(), &session);
+            return Ok((idx, session));
         }
         // A face count that did not fit is the more specific refusal than
         // "no entrances" — report it when nothing else was tried.
@@ -2287,6 +2367,43 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    /// A TLS door beside a QUIC plane: the artefact names a plane, and only
+    /// a plane carries whole IP packets.
+    #[test]
+    fn an_artefact_with_a_quic_alpn_names_a_plane() {
+        let door = ArtefactEntrance {
+            addr: "203.0.113.10:443".to_owned(),
+            relay: None,
+            server_pubkey_hex: "ab".repeat(32),
+            protocol: Protocol::Tls { sni: "example.com".to_owned(), alpn: Vec::new() },
+        };
+        let plane = ArtefactEntrance {
+            addr: "203.0.113.10:8443".to_owned(),
+            relay: None,
+            server_pubkey_hex: "ab".repeat(32),
+            protocol: Protocol::Quic { alpn: vec!["h3".to_owned()] },
+        };
+        assert!(has_plane_entrance(&[door.clone(), plane.clone()]));
+        // A QUIC face with NO alpn is a door in a QUIC camouflage, not a
+        // plane: there is nothing to negotiate.
+        let quic_door = ArtefactEntrance {
+            protocol: Protocol::Quic { alpn: Vec::new() },
+            ..door
+        };
+        assert!(!has_plane_entrance(&[quic_door]));
+        // A door alone names no plane.
+        assert!(!has_plane_entrance(&[]));
+    }
+
+    /// The door is the fallback: it is taken when the artefact names no
+    /// plane, and it waits when a plane is still untried -- a door that
+    /// answers must not hide the plane behind it.
+    #[test]
+    fn the_door_waits_for_the_plane() {
+        assert_eq!(door_verdict(false), DoorVerdict::Take);
+        assert_eq!(door_verdict(true), DoorVerdict::Defer);
     }
 
     /// The version-1 wire is a byte stream, and the plane has no byte

@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use mirage_core::mirage::wire::Protocol;
 use serde_json::{json, Value};
 
 use crate::artefact::{ArtefactEntrance, DeliveryArtefact};
@@ -75,10 +74,16 @@ impl WireMode {
     ///
     /// A QUIC face is the mono-protocol plane: the whole IP packets ride
     /// its datagrams. Every other face keeps the byte-stream path.
+    ///
+    /// A QUIC face with an EMPTY ALPN is not a plane -- there is nothing to
+    /// negotiate, so the client must not pick the raw-IP path for it. The
+    /// test is the same one the dialer makes (`session::plane_alpn`): a
+    /// face without an ALPN is a protocol door wearing a QUIC camouflage,
+    /// and the door carries flows, not packets.
     pub fn for_entrances(entrances: &[ArtefactEntrance]) -> Self {
         let plane = entrances
             .iter()
-            .any(|entrance| matches!(entrance.protocol, Protocol::Quic { .. }));
+            .any(|entrance| crate::session::plane_alpn(&entrance.protocol).is_some());
         if plane {
             Self::RawIp
         } else {
@@ -271,6 +276,54 @@ pub fn spawn(bin: &Path, config: &Path) -> io::Result<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mirage_core::mirage::wire::Protocol;
+
+    /// A QUIC face WITH an ALPN is the plane: the device takes whole IP
+    /// packets over it.
+    #[test]
+    fn a_quic_face_with_an_alpn_is_the_raw_ip_path() {
+        let entrance = ArtefactEntrance {
+            addr: "203.0.113.10:8443".to_owned(),
+            relay: None,
+            server_pubkey_hex: "ab".repeat(32),
+            protocol: Protocol::Quic { alpn: vec!["h3".to_owned()] },
+        };
+        assert_eq!(WireMode::for_entrances(std::slice::from_ref(&entrance)), WireMode::RawIp);
+    }
+
+    /// A QUIC face with NO ALPN is not a plane: there is nothing to
+    /// negotiate, so the byte-stream path is the only one it can serve.
+    /// Picking the raw-IP path for it would leave the device asking for
+    /// whole packets that nobody will carry.
+    #[test]
+    fn a_quic_face_without_an_alpn_keeps_the_byte_stream_path() {
+        let door = ArtefactEntrance {
+            addr: "203.0.113.10:443".to_owned(),
+            relay: None,
+            server_pubkey_hex: "ab".repeat(32),
+            protocol: Protocol::Quic { alpn: Vec::new() },
+        };
+        assert_eq!(WireMode::for_entrances(&[door]), WireMode::Stack);
+    }
+
+    /// The door beside a real plane: the plane decides the path, and the
+    /// door does not take it away.
+    #[test]
+    fn a_plane_beside_a_door_keeps_the_raw_ip_path() {
+        let door = ArtefactEntrance {
+            addr: "203.0.113.10:443".to_owned(),
+            relay: None,
+            server_pubkey_hex: "ab".repeat(32),
+            protocol: Protocol::Tls { sni: "example.com".to_owned(), alpn: Vec::new() },
+        };
+        let plane = ArtefactEntrance {
+            addr: "203.0.113.10:8443".to_owned(),
+            relay: None,
+            server_pubkey_hex: "ab".repeat(32),
+            protocol: Protocol::Quic { alpn: vec!["h3".to_owned()] },
+        };
+        assert_eq!(WireMode::for_entrances(&[door, plane]), WireMode::RawIp);
+    }
 
     #[test]
     fn full_policy_has_no_service_rules_and_no_relay() {
