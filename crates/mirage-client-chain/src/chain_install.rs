@@ -254,6 +254,99 @@ pub async fn install_chain(
     })
 }
 
+/// Wire boxes that are already up into one chain.
+///
+/// Nothing is installed. Each box is read with the key the window already
+/// planted: its published link, and the `server.env` it is running. The
+/// chain is appended to that env and the container is brought back up with
+/// it. The first box is the edge. The last box is the exit.
+pub async fn assemble_chain(
+    chain_id: &str,
+    boxes: &[ChainRequest],
+    bus: &InstallBus,
+) -> Result<ChainOutcome, String> {
+    if boxes.len() < 2 {
+        return Err("a chain needs two boxes".to_owned());
+    }
+    let state = provision::client_state_dir()?;
+    let mut links = Vec::with_capacity(boxes.len());
+    let mut bases = Vec::with_capacity(boxes.len());
+    for request in boxes {
+        provision::set_text(bus, &request.host);
+        let link = provision::published_link(&request.host, request.port, &request.user)
+            .await
+            .map_err(|err| format!("{}: {err}", request.host))?;
+        let base = provision::read_remote_env(&request.host, request.port, &request.user)
+            .await
+            .map_err(|err| format!("{}: {err}", request.host))?;
+        links.push(link);
+        bases.push(base);
+    }
+
+    let mut artefacts = Vec::with_capacity(boxes.len());
+    for (request, link) in boxes.iter().zip(links.iter()) {
+        let artefact: BoxArtefact = serde_json::from_str(link)
+            .map_err(|e| format!("{}: the box's link is not readable: {e}", request.host))?;
+        artefacts.push(artefact);
+    }
+    let keys = chain_keys(&artefacts[0])?;
+    let mut chain_boxes = Vec::with_capacity(boxes.len());
+    for (index, (request, artefact)) in boxes.iter().zip(artefacts.iter()).enumerate() {
+        let face = if index == 0 {
+            pick_edge_face(artefact)
+        } else {
+            pick_face(artefact)
+        };
+        let face = face.ok_or_else(|| {
+            if index == 0 {
+                format!("{}: the box published no door at all", request.host)
+            } else {
+                format!(
+                    "{}: the box published no TCP door for the chain leg to use",
+                    request.host
+                )
+            }
+        })?;
+        chain_boxes.push(ChainBox {
+            host: request.host.clone(),
+            user: request.user.clone(),
+            face,
+        });
+    }
+    let chain = Chain {
+        chain_id: chain_id.to_owned(),
+        boxes: chain_boxes,
+        keys,
+    };
+    let installed: Vec<InstalledBox> = chain
+        .boxes
+        .iter()
+        .zip(artefacts.iter())
+        .enumerate()
+        .map(|(index, (chain_box, artefact))| InstalledBox {
+            host: chain_box.host.clone(),
+            role: chain.role_of(index),
+            faces: artefact.entrances.len(),
+            face: chain_box.face.clone(),
+        })
+        .collect();
+
+    for (index, request) in boxes.iter().enumerate() {
+        let chain_only = chain.server_env(index, "").map_err(|err| err.to_string())?;
+        let env = provision::merge_chain_env(&bases[index], &chain_only);
+        provision::reconfigure(&request.host, request.port, &request.user, &state, &env)
+            .await
+            .map_err(|err| format!("{}: {err}", request.host))?;
+    }
+    let outcome = ChainOutcome {
+        chain,
+        link: links.first().cloned().unwrap_or_default(),
+        boxes: installed,
+    };
+    let _ = save_chain(&state, &outcome);
+    Ok(outcome)
+}
+
 /// The chain's own key material.
 ///
 /// The keypair is the chain's trust anchor: the edge signs the chain leg's
