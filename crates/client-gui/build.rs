@@ -12,8 +12,16 @@ fn main() {
     {
         use embed_manifest::{embed_manifest, manifest::ExecutionLevel, new_manifest};
         if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-            let manifest = new_manifest("m1r4g3")
-                .requested_execution_level(ExecutionLevel::RequireAdministrator);
+            // A picture window (`--visual`) has no tunnel, so it must not ask
+            // for administrator. An elevated session-0 spawn cannot bind a
+            // DXGI surface. Customer builds stay RequireAdministrator.
+            println!("cargo:rerun-if-env-changed=MIRAGE_NO_ELEVATION");
+            let level = if std::env::var_os("MIRAGE_NO_ELEVATION").is_some() {
+                ExecutionLevel::AsInvoker
+            } else {
+                ExecutionLevel::RequireAdministrator
+            };
+            let manifest = new_manifest("m1r4g3").requested_execution_level(level);
             embed_manifest(manifest).expect("embed manifest");
 
             let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());

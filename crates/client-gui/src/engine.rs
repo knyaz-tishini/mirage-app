@@ -71,6 +71,8 @@ pub struct LocalEngine {
     status: Arc<Mutex<EngineStatus>>,
     /// The line from the last bind attempt. The window takes it once.
     bind_note: Arc<Mutex<Option<String>>>,
+    /// Picture only. No session, no listener, no tunnel device, no device file.
+    picture: bool,
 }
 
 impl LocalEngine {
@@ -117,7 +119,32 @@ impl LocalEngine {
         if let Err(error) = spawned {
             tracing::error!(error = %error, "engine: thread refused");
         }
-        Self { commands, status, bind_note: Arc::new(Mutex::new(None)) }
+        Self { commands, status, bind_note: Arc::new(Mutex::new(None)), picture: false }
+    }
+
+    /// The window and nothing else. Clicks move the picture. Nothing is dialed,
+    /// spawned, or written.
+    pub fn picture() -> Self {
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        let mut snapshot = EngineStatus::default();
+        snapshot.online = true;
+        snapshot.phase = "off".into();
+        snapshot.mode = "socks".into();
+        Self {
+            commands,
+            status: Arc::new(Mutex::new(snapshot)),
+            bind_note: Arc::new(Mutex::new(None)),
+            picture: true,
+        }
+    }
+
+    fn paint_link(&self, up: bool) {
+        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        status.online = true;
+        status.tun = up;
+        status.tun_alive = up;
+        status.phase = if up { "connected".into() } else { "off".into() };
     }
 
     fn send(&self, command: Command) {
@@ -131,6 +158,9 @@ impl LocalEngine {
     /// The cabinet and a configuration are two different entrances, and the
     /// session changes from one to the other in place — nothing is respawned.
     pub fn adopt_device(&self) -> Result<(), String> {
+        if self.picture {
+            return Ok(());
+        }
         let path = crate::backend::bound_device_path().map_err(|error| error.to_string())?;
         let text = std::fs::read_to_string(&path)
             .map_err(|_| crate::text::tr("bind.not_started").to_owned())?;
@@ -143,6 +173,9 @@ impl LocalEngine {
     /// where it was. The session takes it in place — the listener, the window
     /// and the tunnel device stay up.
     pub fn adopt_artefact(&self, json: &str) -> Result<(), String> {
+        if self.picture {
+            return Ok(());
+        }
         let json = json.trim();
         let value: serde_json::Value =
             serde_json::from_str(json).map_err(|_| crate::text::tr("bind.not_artefact").to_owned())?;
@@ -173,14 +206,25 @@ impl EngineLink for LocalEngine {
     }
 
     fn connect(&self) {
+        if self.picture {
+            self.paint_link(true);
+            return;
+        }
         self.send(Command::Connect);
     }
 
     fn disconnect(&self) {
+        if self.picture {
+            self.paint_link(false);
+            return;
+        }
         self.send(Command::Disconnect);
     }
 
     fn set_listeners(&self, socks: bool, _http: bool) {
+        if self.picture {
+            return;
+        }
         if socks {
             // The local port is the way out when the device is not used.
             self.send(Command::Carry { tun: false });
@@ -188,6 +232,10 @@ impl EngineLink for LocalEngine {
     }
 
     fn set_tun(&self, enabled: bool) {
+        if self.picture {
+            self.paint_link(enabled);
+            return;
+        }
         self.send(Command::Carry { tun: enabled });
     }
 
@@ -198,6 +246,9 @@ impl EngineLink for LocalEngine {
         bypass_services: &[String],
         bypass_apps: &[String],
     ) {
+        if self.picture {
+            return;
+        }
         self.send(Command::Scope {
             services: services.to_vec(),
             apps: apps.to_vec(),
@@ -207,10 +258,16 @@ impl EngineLink for LocalEngine {
     }
 
     fn set_exit(&self, exit: &str) {
+        if self.picture {
+            return;
+        }
         self.send(Command::Exit(exit.to_owned()));
     }
 
     fn bind_claim(&self, text: &str) {
+        if self.picture {
+            return;
+        }
         let text = text.trim().to_owned();
         if text.is_empty() {
             return;
@@ -267,6 +324,9 @@ impl EngineLink for LocalEngine {
     }
 
     fn unlink(&self) {
+        if self.picture {
+            return;
+        }
         self.disconnect();
         if let Ok(path) = crate::backend::bound_device_path() {
             let _ = std::fs::remove_file(path);
@@ -274,6 +334,9 @@ impl EngineLink for LocalEngine {
     }
 
     fn relay_addrs(&self, addrs: &[String]) {
+        if self.picture {
+            return;
+        }
         self.send(Command::RelayAddrs(addrs.to_vec()));
     }
 }

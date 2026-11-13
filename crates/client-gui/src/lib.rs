@@ -92,7 +92,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .payload()
             .downcast_ref::<&str>()
             .copied()
-            .unwrap_or("(non-string panic)");
+            .map(str::to_owned)
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| info.to_string());
         let loc = info
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
@@ -102,7 +104,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }));
 
-    ota::start();
+    // A picture window does not check for a replacement binary.
+    let visual = std::env::args().skip(1).any(|arg| arg == "--visual" || arg.starts_with("--visual="));
+    if !visual {
+        ota::start();
+    }
 
     // The headless mode opens no window at all: the control API is the whole
     // surface, so an install on a box can be driven from a script or an agent.

@@ -207,6 +207,8 @@ struct Oasis {
     scan: Option<crate::camera::CameraScan>,
     /// Still desert, rebuilt when the window size or the sun's minute changes.
     plates: Option<DesertPlates>,
+    /// Picture only. The click moves the rider. No session and no tunnel.
+    picture: bool,
 }
 
 impl Oasis {
@@ -424,25 +426,31 @@ impl App for Oasis {
         // The sheet carries the cabinet's claim code and the wish to be
         // unlinked; the engine does the work.
         self.stand.cabinet_bound = self.engine.is_bound();
-        if let Some(claim) = self.stand.take_claim() {
-            self.engine.bind_claim(&claim);
-        }
-        if self.stand.take_unlink() {
-            if self.unlink_armed {
-                self.engine.unlink();
-                self.unlink_armed = false;
-            } else {
-                self.unlink_armed = true;
+        if self.picture {
+            let _ = self.stand.take_claim();
+            let _ = self.stand.take_unlink();
+            let _ = self.stand.take_carry();
+        } else {
+            if let Some(claim) = self.stand.take_claim() {
+                self.engine.bind_claim(&claim);
             }
-        }
-        // The person chose how the traffic leaves: the local port or the
-        // adapter. The engine does the work.
-        if let Some(carry) = self.stand.take_carry() {
-            match carry {
-                Carry::Socks => self.engine.set_listeners(true, false),
-                Carry::Tun => self.engine.set_tun(true),
+            if self.stand.take_unlink() {
+                if self.unlink_armed {
+                    self.engine.unlink();
+                    self.unlink_armed = false;
+                } else {
+                    self.unlink_armed = true;
+                }
             }
-            self.fell_back = false;
+            // The person chose how the traffic leaves: the local port or the
+            // adapter. The engine does the work.
+            if let Some(carry) = self.stand.take_carry() {
+                match carry {
+                    Carry::Socks => self.engine.set_listeners(true, false),
+                    Carry::Tun => self.engine.set_tun(true),
+                }
+                self.fell_back = false;
+            }
         }
         if !self.take_entrance(now) {
             self.sync_standalone_link();
@@ -527,7 +535,18 @@ impl App for Oasis {
             };
             // The picture is the switch. Desert turns the adapter on.
             // A visible rider turns it off.
-            if tun_up {
+            if self.picture {
+                let on = !self.linked;
+                if on {
+                    self.engine.set_tun(true);
+                    self.engine.connect();
+                } else {
+                    self.stop_link();
+                }
+                self.mark_link(now, on);
+                self.style = (self.toggles % 4) as f64;
+                self.toggles = self.toggles.wrapping_add(1);
+            } else if tun_up {
                 self.linked = false;
                 self.link_sent_at = now;
                 self.style = (self.toggles % 4) as f64;
@@ -702,6 +721,12 @@ impl Oasis {
     }
 
     fn shelf_on(&mut self, now: f64) {
+        if self.picture {
+            self.engine.set_tun(true);
+            self.engine.connect();
+            self.mark_link(now, true);
+            return;
+        }
         if self.shelf_up() {
             tracing::info!("shelf idle up");
             return;
@@ -772,6 +797,9 @@ impl Oasis {
 
     /// Remember the target the person is on, so the window comes back to it.
     fn remember_picked(&mut self) {
+        if self.picture {
+            return;
+        }
         let key = target_key(self.picked, &self.stand);
         if self.stand.last_target != key {
             self.stand.last_target = key;
@@ -980,6 +1008,10 @@ impl Oasis {
     /// The rider is the adapter. `linked` is the click. A wish the status
     /// has not met is repeated until the picture and the adapter are the same.
     fn bind_rider(&mut self, now: f64) {
+        if self.picture {
+            self.target = if self.engine.status().tun { 1.0 } else { 0.0 };
+            return;
+        }
         let tun_up = {
             let st = self.engine.status();
             st.online && st.tun
@@ -1017,6 +1049,10 @@ impl Oasis {
     /// A camera, file, clipboard, or Enter replaced the link. JSON connects.
     /// Anything else stays on the sheet as text and a QR.
     fn take_entrance(&mut self, now: f64) -> bool {
+        if self.picture {
+            let _ = self.stand.take_relink();
+            return false;
+        }
         if !self.stand.take_relink() {
             return false;
         }
@@ -1089,9 +1125,17 @@ impl Oasis {
 
     fn on_submit(&mut self, id: &str) {
         match id {
-            "st-bind" => self.stand.submit_bind(),
+            "st-bind" => {
+                if !self.picture {
+                    self.stand.submit_bind();
+                }
+            }
             "st-link" => self.stand.mark_relink(),
-            "st-host" | "st-user" | "st-pass" => self.stand.install(),
+            "st-host" | "st-user" | "st-pass" => {
+                if !self.picture {
+                    self.stand.install();
+                }
+            }
             "st-site" => {
                 self.stand.commit_site();
             }
@@ -1783,10 +1827,31 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
     let (palm, pw, ph) = decode_png(include_bytes!("toon/palm-tall.png"))?;
     host.bind_bitmap("m1r4g3Skin", &rider, rw, rh, 0, true)?;
     host.bind_bitmap("m1r4g3PalmImage", &palm, pw, ph, 1, false)?;
-    // One phone. Each window builds its own wgpu device and vello Renderer.
-    let phone = app_window("phone", 390, 844, 16, 16);
+    // One window. Each extra window builds its own GPU device.
+    // `--visual desktop|phone` is the picture only: no session, no tunnel.
+    let visual = visual_kind();
+    let (key, title, w, h, x, y) = match visual {
+        Some(VisualKind::Desktop) => (
+            "desktop",
+            format!("m1r4g3 desktop {}", env!("CARGO_PKG_VERSION")),
+            1280u32,
+            800u32,
+            40i32,
+            40i32,
+        ),
+        Some(VisualKind::Phone) => (
+            "phone",
+            format!("m1r4g3 phone {}", env!("CARGO_PKG_VERSION")),
+            390,
+            844,
+            1360,
+            40,
+        ),
+        None => ("phone", format!("m1r4g3 {}", env!("CARGO_PKG_VERSION")), 390, 844, 16, 16),
+    };
+    let window = app_window(key, &title, w, h, x, y);
     let cfg = RuntimeConfig {
-        windows: vec![phone],
+        windows: vec![window],
         tokens: Tokens::builtin(BuiltinSet::Dark),
         dark: true,
         tick: TickRate::Capped(60),
@@ -1811,7 +1876,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             sheet: sheet_mode(),
             picked,
             running: None,
-            engine: LocalEngine::start(),
+            engine: if visual.is_some() { LocalEngine::picture() } else { LocalEngine::start() },
             unlink_armed: false,
             note: String::new(),
             fell_back: false,
@@ -1827,6 +1892,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             link_force_seen: HashMap::new(),
             scan: None,
             plates: None,
+            picture: visual.is_some(),
         },
         cfg,
         NativeOptions {
@@ -1870,12 +1936,32 @@ fn sheet_mode() -> Sheet {
     Sheet::Targets
 }
 
-fn app_window(key: &str, w: u32, h: u32, x: i32, y: i32) -> WindowSpec {
-    let mut window = WindowSpec::new(
-        key,
-        concat!("m1r4g3 ", env!("CARGO_PKG_VERSION")),
-        SizePx::new(w, h),
-    );
+enum VisualKind {
+    Desktop,
+    Phone,
+}
+
+/// `--visual desktop` or `--visual phone`. Absent on a customer launch.
+fn visual_kind() -> Option<VisualKind> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    for (i, arg) in args.iter().enumerate() {
+        let value = if let Some(rest) = arg.strip_prefix("--visual=") {
+            rest
+        } else if arg == "--visual" {
+            args.get(i + 1).map(String::as_str).unwrap_or("phone")
+        } else {
+            continue;
+        };
+        return Some(match value {
+            "desktop" => VisualKind::Desktop,
+            _ => VisualKind::Phone,
+        });
+    }
+    None
+}
+
+fn app_window(key: &str, title: &str, w: u32, h: u32, x: i32, y: i32) -> WindowSpec {
+    let mut window = WindowSpec::new(key, title, SizePx::new(w, h));
     window.tick = Some(TickRate::Capped(60));
     window.decorations = false;
     window.corner_style = uzor::CornerStyle::Rounded;

@@ -802,7 +802,8 @@
     var w = h * (img.width / img.height);
     var left = x - w * 0.5;
     var top = base - h;
-    var n = 40;
+    // Twelve bands keep the same sway curve. Forty was the cost of the live frame.
+    var n = 12;
     for (var i = 0; i < n; i++) {
       var u0 = i / n;
       var u1 = (i + 1) / n;
