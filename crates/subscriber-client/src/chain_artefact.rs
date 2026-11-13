@@ -151,6 +151,11 @@ mod tests {
                 operator_secret_hex: "cc".repeat(32),
                 mesh_id: "mirage-vpn".to_owned(),
             },
+            // The chain carries its own ports, and the customer's door is
+            // the chain's: the edge answers the customer on the plane port.
+            chain_udp_port: 51822,
+            plane_port: 51823,
+            customer: None,
         }
     }
 
