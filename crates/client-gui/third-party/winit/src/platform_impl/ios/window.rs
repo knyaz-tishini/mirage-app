@@ -73,6 +73,20 @@ declare_class!(
     }
 );
 
+fn connected_window_scene(mtm: MainThreadMarker) -> Option<Retained<AnyObject>> {
+    let app = UIApplication::sharedApplication(mtm);
+    let scenes: Retained<AnyObject> = unsafe { msg_send_id![&app, connectedScenes] };
+    let scene: Option<Retained<AnyObject>> = unsafe { msg_send_id![&scenes, anyObject] };
+    let scene = scene?;
+    let is_window_scene: bool =
+        unsafe { msg_send![&scene, isKindOfClass: class!(UIWindowScene)] };
+    if is_window_scene {
+        Some(scene)
+    } else {
+        None
+    }
+}
+
 impl WinitUIWindow {
     pub(crate) fn new(
         mtm: MainThreadMarker,
@@ -80,7 +94,13 @@ impl WinitUIWindow {
         frame: CGRect,
         view_controller: &UIViewController,
     ) -> Retained<Self> {
-        let this: Retained<Self> = unsafe { msg_send_id![mtm.alloc(), initWithFrame: frame] };
+        // iOS 27 drops a window that was not born in the scene. The scene
+        // delegate is already connected by the time the host asks for a window.
+        let this: Retained<Self> = if let Some(scene) = connected_window_scene(mtm) {
+            unsafe { msg_send_id![mtm.alloc(), initWithWindowScene: &*scene] }
+        } else {
+            unsafe { msg_send_id![mtm.alloc(), initWithFrame: frame] }
+        };
 
         this.setRootViewController(Some(view_controller));
 
@@ -522,8 +542,10 @@ impl Window {
 
         let view = WinitView::new(mtm, &window_attributes, frame);
 
-        let gl_or_metal_backed =
-            view.isKindOfClass(class!(CAMetalLayer)) || view.isKindOfClass(class!(CAEAGLLayer));
+        // `WinitView` is a UIView, so `isKindOfClass(CAMetalLayer)` is always
+        // false. The layer itself is a CAMetalLayer (`+layerClass`).
+        // `setNeedsDisplay` does nothing on that layer.
+        let gl_or_metal_backed = true;
 
         let view_controller = WinitViewController::new(mtm, &window_attributes, &view);
         let window = WinitUIWindow::new(mtm, &window_attributes, frame, &view_controller);

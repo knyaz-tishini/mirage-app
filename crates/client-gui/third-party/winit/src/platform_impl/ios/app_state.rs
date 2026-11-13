@@ -446,8 +446,10 @@ pub(crate) fn queue_gl_or_metal_redraw(mtm: MainThreadMarker, window: Retained<W
         | &mut AppStateImpl::InUserCallback { ref mut queued_gpu_redraws, .. } => {
             let _ = queued_gpu_redraws.insert(window);
         },
-        s @ &mut AppStateImpl::ProcessingRedraws { .. }
-        | s @ &mut AppStateImpl::Waiting { .. }
+        // The redraw phase has no queue. The host paints from `about_to_wait`
+        // on the same turn, and aborting here takes the whole process down.
+        &mut AppStateImpl::ProcessingRedraws { .. } => {},
+        s @ &mut AppStateImpl::Waiting { .. }
         | s @ &mut AppStateImpl::PollFinished { .. } => bug!("unexpected state {:?}", s),
         &mut AppStateImpl::Terminated => {
             panic!("Attempt to create a `Window` after the app has terminated")

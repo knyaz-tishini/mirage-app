@@ -2,8 +2,13 @@
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use objc2::runtime::{AnyClass, NSObjectProtocol, ProtocolObject};
+use objc2::{class, declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+
+// UIView asks `+layerClass` before the first layer exists. CAMetalLayer
+// lives in QuartzCore; UIKit does not guarantee that framework is loaded.
+#[link(name = "QuartzCore", kind = "framework")]
+extern "C" {}
 use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
 use objc2_ui_kit::{
     UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
@@ -48,6 +53,13 @@ declare_class!(
     }
 
     unsafe impl WinitView {
+        /// wgpu presents into the view's own layer. A plain `CALayer` accepts
+        /// `create_surface` and then never shows a frame.
+        #[method(layerClass)]
+        fn layer_class() -> &'static AnyClass {
+            class!(CAMetalLayer)
+        }
+
         #[method(drawRect:)]
         fn draw_rect(&self, rect: CGRect) {
             let mtm = MainThreadMarker::new().unwrap();
