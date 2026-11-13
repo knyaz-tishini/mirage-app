@@ -304,6 +304,13 @@ struct Engine {
     relay_addrs: Vec<String>,
     /// The status watcher for the live session.
     watch: Option<tokio::task::JoinHandle<()>>,
+    /// The device was put back on the byte-stream path.
+    ///
+    /// The artefact named a QUIC face, so the device asked for whole IP
+    /// packets -- but the live session carries flows, not packets, and the
+    /// raw-IP command would be refused every second. The datapath is
+    /// demoted once, and the log says why.
+    wire_demoted: bool,
 }
 
 impl Engine {
@@ -326,6 +333,7 @@ impl Engine {
             tun_mode: TunMode::Full,
             relay_addrs: Vec::new(),
             watch: None,
+            wire_demoted: false,
         }
     }
 
@@ -389,6 +397,9 @@ impl Engine {
     async fn adopt(&mut self, json: &str) -> Result<(), String> {
         let artefact = DeliveryArtefact::from_json(json).map_err(|error| error.to_string())?;
         self.artefact = Some(artefact.clone());
+        // A new configuration gets a fresh verdict about the datapath: the
+        // demotion belonged to the old one.
+        self.wire_demoted = false;
         if let Some(client) = &self.client {
             client
                 .adopt_artefact(&artefact, stream_failure_threshold())
@@ -486,7 +497,13 @@ impl Engine {
     /// A QUIC face is the mono-protocol plane: the whole IP packets ride the
     /// QUIC datagrams of the edge session, and the device hands them over
     /// the raw-IP command. Every other face keeps the byte-stream path.
+    ///
+    /// A live session without a plane demotes the path: the device must not
+    /// ask for whole packets that nobody will carry.
     fn wire_mode(&self) -> WireMode {
+        if self.wire_demoted {
+            return WireMode::Stack;
+        }
         match &self.artefact {
             Some(artefact) => tun_mode::wire_mode_for(artefact),
             // No configuration yet: the byte-stream path.
@@ -504,6 +521,37 @@ impl Engine {
             .as_ref()
             .and_then(|client| client.assigned_client_address())
             .unwrap_or_else(|| tun_mode::DEFAULT_TUN_ADDR.to_owned())
+    }
+
+    /// The live session carries no packet plane: put the device back on the
+    /// byte-stream path.
+    ///
+    /// The device asked for whole IP packets because the artefact named a
+    /// QUIC face, but the session that came up carries flows. The raw-IP
+    /// command would be refused every second. The datapath is demoted once
+    /// and the device comes back and reads the new config.
+    fn demote_wire_mode(&mut self) {
+        if self.wire_demoted {
+            return;
+        }
+        if self.wire_mode() != WireMode::RawIp {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        let Some(session) = client.supervisor.current().current() else {
+            return;
+        };
+        if session.has_plane() {
+            return;
+        }
+        self.wire_demoted = true;
+        tracing::warn!(
+            entrance = %session.entrance_label(),
+            "engine: the live session carries no packet plane - the device drops to the byte-stream path"
+        );
+        self.restart_tun();
     }
 
     /// The device goes up. It is a separate process because it needs the
@@ -612,6 +660,10 @@ impl Engine {
 
     /// Is the device still there?
     fn poll_tun(&mut self) {
+        // The datapath follows the live session: a session without a plane
+        // cannot serve whole packets, and the device must stop asking for
+        // them.
+        self.demote_wire_mode();
         // The address the box assigned can change under the device: the
         // session comes up after the device did, and a session that comes
         // back may get another address. The adapter must carry the address

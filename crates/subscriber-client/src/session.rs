@@ -156,6 +156,12 @@ pub enum EdgeDialError {
     #[error("edge session: {protocol} is a protocol door, not a mirage entrance")]
     NotMirage { protocol: &'static str },
 
+    /// A QUIC plane speaks version 4 only. The version-1 byte stream has
+    /// nothing to ride it, and a handshake that never answers is worse than
+    /// a named refusal.
+    #[error("edge session: {protocol} is a packet plane and speaks version 4 only")]
+    PlaneNeedsVersion4 { protocol: &'static str },
+
     /// The protocol door's handshake did not complete.
     #[error("edge session: protocol door failed: {0}")]
     Door(String),
@@ -393,7 +399,7 @@ impl EdgeSession {
         exit: ExitPreference,
         version: u8,
     ) -> Result<Self, EdgeDialError> {
-        if !is_mirage(&entrance.protocol) {
+        if !is_mirage(&entrance.protocol) && plane_alpn(&entrance.protocol).is_none() {
             return open_protocol_door(entrance, exit).await;
         }
         let (opened, welcome) =
@@ -441,6 +447,14 @@ impl EdgeSession {
         client_static_priv: [u8; 32],
         exit: ExitPreference,
     ) -> Result<Self, EdgeDialError> {
+        if plane_alpn(&entrance.protocol).is_some() {
+            // The plane speaks version 4 only: there is no byte stream for
+            // the version-1 wire to ride, and saying so by name beats a
+            // handshake that never answers.
+            return Err(EdgeDialError::PlaneNeedsVersion4 {
+                protocol: entrance.protocol.label(),
+            });
+        }
         if !is_mirage(&entrance.protocol) {
             return open_protocol_door(entrance, exit).await;
         }
@@ -858,20 +872,42 @@ async fn open_entrance(
     mesh_id: &[u8],
     client_static_priv: [u8; 32],
 ) -> Result<OpenedEntrance, EdgeDialError> {
+    let entrance = crate::envelope::front(entrance).await.map_err(EdgeDialError::Door)?;
+    // The plane comes FIRST. A QUIC entrance is not a Mirage door: it IS
+    // the mono-protocol plane, and its ALPN comes from the entrance's own
+    // protocol. The `is_mirage` gate that used to stand here refused every
+    // QUIC entrance by name, and the plane branch below it could therefore
+    // never be reached.
+    if let Some(alpn) = plane_alpn(&entrance.protocol) {
+        return open_plane_entrance(&entrance, &alpn, mesh_id, client_static_priv).await;
+    }
     if !is_mirage(&entrance.protocol) {
         return Err(EdgeDialError::NotMirage { protocol: entrance.protocol.label() });
     }
-    let entrance = crate::envelope::front(entrance).await.map_err(EdgeDialError::Door)?;
+    // A Mirage entrance that wears the QUIC camouflage is the plane too.
     let mask = entrance_mask(&entrance)?;
     if let Some(alpn) = quic_alpn(&mask) {
-        let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
-            EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
-        })?;
-        let server_pubkey = entrance.server_pubkey()?;
-        let dial = PlaneDial::open(&alpn, addr, &server_pubkey, &client_static_priv, mesh_id).await?;
-        return Ok(OpenedEntrance::Plane(dial));
+        return open_plane_entrance(&entrance, &alpn, mesh_id, client_static_priv).await;
     }
     Ok(OpenedEntrance::Mux(open_entrance_tunnel(&entrance, mesh_id, client_static_priv).await?))
+}
+
+/// Open the plane of one entrance: ONE QUIC connection carries the control
+/// wire AND the whole IP packets.
+async fn open_plane_entrance(
+    entrance: &ArtefactEntrance,
+    alpn: &[String],
+    mesh_id: &[u8],
+    client_static_priv: [u8; 32],
+) -> Result<OpenedEntrance, EdgeDialError> {
+    let addr: SocketAddr = entrance.addr.parse().map_err(|e: std::net::AddrParseError| {
+        EdgeDialError::BadAddr { addr: entrance.addr.clone(), reason: e.to_string() }
+    })?;
+    // The key the customer verifies is the terminator's key. The address
+    // may be a relay; the handshake proves the key, not the route.
+    let server_pubkey = entrance.server_pubkey()?;
+    let dial = PlaneDial::open(alpn, addr, &server_pubkey, &client_static_priv, mesh_id).await?;
+    Ok(OpenedEntrance::Plane(dial))
 }
 
 /// Build the session of an accepted hello.
@@ -895,6 +931,15 @@ fn build_session(
                 // session over the same QUIC connection. The connector still
                 // has to outlive it - dropping the QUIC endpoint closes the
                 // connection.
+                //
+                // The word goes into the log: the session carries NO plane,
+                // and whoever asked for whole packets must know WHY there
+                // are none.
+                warn!(
+                    entrance = %entrance_label,
+                    carries_datagrams = ?welcome.carries_datagrams,
+                    "edge session: the plane entrance carries no whole packets - the session is a mux session over the same connection"
+                );
                 let mut session = upgrade_session(tunnel, welcome, entrance_label);
                 session.plane = Mutex::new(Some(PlaneTransport {
                     plane: None,
@@ -993,6 +1038,50 @@ fn upgrade_session(tunnel: Box<dyn Tunnel>, welcome: EdgeWelcome, entrance_label
 /// Mirage is the only protocol the V9 dial speaks.
 fn is_mirage(protocol: &Protocol) -> bool {
     matches!(protocol, Protocol::Mirage { .. })
+}
+
+/// A QUIC entrance with an ALPN is the packet plane.
+///
+/// A QUIC entrance without an ALPN is not a plane: there is nothing to
+/// negotiate, and the client says so instead of dialling into the dark.
+pub(crate) fn plane_alpn(protocol: &Protocol) -> Option<Vec<String>> {
+    match protocol {
+        Protocol::Quic { alpn } if !alpn.is_empty() => Some(alpn.clone()),
+        _ => None,
+    }
+}
+
+/// Does the artefact name a plane?
+///
+/// A plane is a QUIC entrance with an ALPN: the whole IP packets ride its
+/// datagrams. Every other entrance carries flows, not packets.
+fn has_plane_entrance(entrances: &[ArtefactEntrance]) -> bool {
+    entrances
+        .iter()
+        .any(|entrance| plane_alpn(&entrance.protocol).is_some())
+}
+
+/// What the walk over the entrances does with a protocol door that answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DoorVerdict {
+    /// Take the door now: the artefact names no plane at all, so the door
+    /// is the only way in.
+    Take,
+    /// Keep the door for the end of the walk: a plane entrance is still
+    /// untried, and the door must not hide it.
+    Defer,
+}
+
+/// The verdict for a protocol door that answered.
+///
+/// The door is the fallback: when the artefact names a plane, the walk goes
+/// on and takes the door only when the plane did not answer.
+fn door_verdict(has_plane: bool) -> DoorVerdict {
+    if has_plane {
+        DoorVerdict::Defer
+    } else {
+        DoorVerdict::Take
+    }
 }
 
 /// One real handshake of a protocol door, then a session that stays up.
@@ -1127,7 +1216,12 @@ async fn dial_face(
 }
 
 fn log_assigned(probe: &str, session: &EdgeSession) {
-    info!(probe = %probe, entrance = %session.entrance_label(), "edge session: face assigned");
+    info!(
+        probe = %probe,
+        entrance = %session.entrance_label(),
+        plane = session.has_plane(),
+        "edge session: face assigned"
+    );
 }
 
 /// Send a version-1 [`EdgeHello`] and read back the (possibly
@@ -1376,15 +1470,35 @@ impl EntranceDialer {
         let mut too_many: Option<EdgeDialError> = None;
         // The face the walk was on when it ended -- the report names it.
         let mut last_probe = String::new();
+        // A protocol door is a fallback: it carries flows, not whole
+        // packets. When the artefact names a plane, the walk must not
+        // settle on a door while that plane is still untried.
+        let has_plane = has_plane_entrance(&self.entrances);
+        let mut deferred_door: Option<(usize, EdgeSession)> = None;
         for offset in 0..self.entrances.len() {
             let idx = (start + offset) % self.entrances.len();
             let entrance = &self.entrances[idx];
-            if !is_mirage(&entrance.protocol) {
+            // The plane is not a protocol door and not a mask: it is the
+            // packet plane, dialled over its own QUIC connection.
+            let plane = plane_alpn(&entrance.protocol).is_some();
+            if !is_mirage(&entrance.protocol) && !plane {
                 match crate::door::probe(entrance).await {
                     Ok(()) => {
                         let session = EdgeSession::from_protocol_door(entrance.clone(), exit);
-                        log_assigned(&entrance.addr, &session);
-                        return Ok((idx, session));
+                        match door_verdict(has_plane) {
+                            DoorVerdict::Take => {
+                                log_assigned(&entrance.addr, &session);
+                                return Ok((idx, session));
+                            }
+                            DoorVerdict::Defer => {
+                                debug!(
+                                    entrance = %entrance.addr,
+                                    "edge session: the protocol door answered, but the plane is still untried - the walk goes on"
+                                );
+                                deferred_door = Some((idx, session));
+                                continue;
+                            }
+                        }
                     }
                     Err(reason) => {
                         debug!(
@@ -1399,9 +1513,17 @@ impl EntranceDialer {
             }
             let probe_addr = entrance.addr.clone();
             last_probe = probe_addr.clone();
-            let mask = entrance_mask(entrance)?;
-            let session_transport = face_transport(&mask);
-            let offered = offered_ports_for_transport(&self.entrances, session_transport)?;
+            // The plane rides datagrams and offers nothing: the connection
+            // the client dials IS the session, so there is no other face to
+            // name in the hello.
+            let (session_transport, offered) = if plane {
+                (TransportKind::Udp, Vec::new())
+            } else {
+                let mask = entrance_mask(entrance)?;
+                let transport = face_transport(&mask);
+                let offered = offered_ports_for_transport(&self.entrances, transport)?;
+                (transport, offered)
+            };
             if offered.len() > EdgeHello::MAX_OFFERED_PORTS {
                 too_many.get_or_insert(EdgeDialError::TooManyFaces {
                     count: offered.len(),
@@ -1502,6 +1624,12 @@ impl EntranceDialer {
                 return Ok((fallback_idx, session));
             }
             return Err(refused);
+        }
+        // The plane did not answer and the door did: the door is the
+        // fallback, and it is taken now that every entrance is tried.
+        if let Some((idx, session)) = deferred_door {
+            log_assigned(session.entrance_label(), &session);
+            return Ok((idx, session));
         }
         // A face count that did not fit is the more specific refusal than
         // "no entrances" — report it when nothing else was tried.
@@ -2019,6 +2147,44 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
+
+    fn entrance(addr: &str, protocol: Protocol) -> ArtefactEntrance {
+        ArtefactEntrance {
+            addr: addr.to_owned(),
+            relay: None,
+            server_pubkey_hex: "ab".repeat(32),
+            protocol,
+        }
+    }
+
+    /// A TLS door beside a QUIC plane: the artefact names a plane, and only
+    /// a plane carries whole IP packets.
+    #[test]
+    fn an_artefact_with_a_quic_alpn_names_a_plane() {
+        let door = entrance(
+            "203.0.113.10:443",
+            Protocol::Tls { sni: "example.com".to_owned(), alpn: Vec::new() },
+        );
+        let plane = entrance("203.0.113.10:8443", Protocol::Quic { alpn: vec!["h3".to_owned()] });
+        assert!(has_plane_entrance(&[door.clone(), plane]));
+        // A QUIC face with NO alpn is a door in a QUIC camouflage, not a plane.
+        let quic_door = ArtefactEntrance {
+            protocol: Protocol::Quic { alpn: Vec::new() },
+            ..door
+        };
+        assert!(!has_plane_entrance(&[quic_door]));
+        assert!(!has_plane_entrance(&[]));
+        assert!(plane_alpn(&Protocol::Quic { alpn: vec!["h3".to_owned()] }).is_some());
+        assert!(plane_alpn(&Protocol::Quic { alpn: Vec::new() }).is_none());
+    }
+
+    /// The door is the fallback: it is taken when the artefact names no
+    /// plane, and it waits when a plane is still untried.
+    #[test]
+    fn the_door_waits_for_the_plane() {
+        assert_eq!(door_verdict(false), DoorVerdict::Take);
+        assert_eq!(door_verdict(true), DoorVerdict::Defer);
+    }
 
     /// A hand-rolled [`Tunnel`] over pre-scripted inbound chunks, capturing
     /// every outbound `send()` call — lets `send_hello_and_read_welcome` be
