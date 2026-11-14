@@ -422,6 +422,16 @@ impl App for Oasis {
         if !self.restored {
             self.restored = true;
             self.restore_link(now);
+            // The device comes up with the window, not with the link.
+            //
+            // The device is what lets the applications out of the tunnel, and
+            // the driver comes up with it.  While the link is not there, the
+            // device waits for it and the machine walks its own way out: the
+            // link -- the local port -- is what the button raises, and the
+            // switch comes up with the link.
+            if !self.picture && self.stand.carry == Carry::Tun {
+                self.engine.set_tun(true);
+            }
         }
         // The sheet carries the cabinet's claim code and the wish to be
         // unlinked; the engine does the work.

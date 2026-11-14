@@ -542,11 +542,13 @@ impl Engine {
             });
         }
         if self.carry_tun {
-            if self.client.is_none() {
-                // The device chains through the local port, so the port has to
-                // be there first. The link comes up on its own.
-                return;
-            }
+            // The device comes up BEFORE the link.
+            //
+            // The device chains through the local port, and the local port is
+            // the link itself.  While the link is not there, the device waits
+            // for it: the machine keeps its own way out, the switch is not
+            // up, and the driver -- the thing that lets the applications out
+            // of the tunnel -- comes up with the device.
             self.start_tun();
         } else {
             self.stop_tun();
