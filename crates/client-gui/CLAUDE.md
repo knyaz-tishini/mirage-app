@@ -37,6 +37,27 @@ timeout 2700 cargo test --release --manifest-path mirage2app/crates/client-gui/C
 Anything that must not ship to a customer goes under `src/dev/`, never behind a
 runtime flag in customer code.
 
+## The configuration next to the app
+
+The settings of the person live in files next to the binaries, not in the code:
+
+| file | what is in it | who writes it |
+|---|---|---|
+| `standalone/host.json` | the settings of the window: the carry, the kit, the ports, the lists of sites and apps, the last target | the window, at every change |
+| `standalone/guests.json` | the cabinet: the servers the person may use | the window |
+| `standalone/artefact.json` | the artefact of the link | the link |
+| `standalone/configs/<name>/` | the config of a target: the relays of the chain, the ports | the window |
+| `bypass-preset.json` | the bypass of the machine: the applications that leave the tunnel, the names, the networks, the protected names | the window (see the plan) |
+
+`config/bypass-preset.json` in this crate is the **shipped default** of the last
+file: the window puts it next to the device when there is none, and the
+person's own copy wins over it.
+
+The device (`mirage2tun`) looks for its preset in this order:
+`MIRAGE_BYPASS_PRESET` → `bypass-preset.json` next to its own binary →
+`C:\ProgramData\mirage2tun\bypass-preset.json`. The file next to the
+application is therefore the one that counts.
+
 ## Exit catalog
 
 `nodes::CATALOG` is empty by design: the customer build carries no baked-in
