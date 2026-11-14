@@ -186,6 +186,12 @@ struct Oasis {
     unlink_armed: bool,
     note: String,
     fell_back: bool,
+    /// The window raised the device by itself.
+    ///
+    /// The device and the driver come up with the window: the machine walks
+    /// its own way out until the link is there.  The link is not up yet, and
+    /// the device stays: the rider is not asked to bring it down.
+    standby: bool,
     stand: Stand,
     /// Scene button has started the configured connection. The boot picture is not this.
     linked: bool,
@@ -399,13 +405,15 @@ impl App for Oasis {
         };
         let at = |local: Rect| Rect::new(rect.x + local.x, rect.y + local.y, local.width, local.height);
 
-        if self.target >= 1.0
+        if (self.target >= 1.0 || self.standby)
             && !self.fell_back
             && self.stand.carry == Carry::Tun
             && self.engine.status().tun_block.is_some()
         {
             self.engine.set_listeners(true, false);
             self.fell_back = true;
+            // The adapter cannot be taken: there is no standby to keep.
+            self.standby = false;
         }
         if let Some(line) = self.engine.take_bind_note() {
             self.note = line;
@@ -431,6 +439,11 @@ impl App for Oasis {
             // switch comes up with the link.
             if !self.picture && self.stand.carry == Carry::Tun {
                 self.engine.set_tun(true);
+                // The window raised the device by itself: the driver comes up
+                // with it, and the machine walks its own way out until the
+                // link is there.  The link itself -- the local port -- is the
+                // button's work, and so is the switch that comes with it.
+                self.standby = true;
             }
         }
         // The sheet carries the cabinet's claim code and the wish to be
@@ -991,6 +1004,8 @@ impl Oasis {
                 }
             }
         }
+        // The link is up: the device is not on its own any more.
+        self.standby = false;
         self.engine.connect();
         #[cfg(target_os = "ios")]
         {
@@ -1008,6 +1023,7 @@ impl Oasis {
     fn stop_link(&mut self) {
         // Clearing the tun wish matters. Session-down alone leaves the wish
         // set, and the next session-up brings the adapter back with no click.
+        self.standby = false;
         self.engine.set_tun(false);
         self.engine.disconnect();
         self.fell_back = false;
@@ -1032,13 +1048,19 @@ impl Oasis {
                     self.link_sent_at = now;
                     let _ = self.raise_link();
                 }
-            } else if tun_up {
+            } else if tun_up && !self.standby {
                 self.link_sent_at = now;
                 self.stop_link();
             }
         }
         let st = self.engine.status();
-        self.target = if st.online && st.tun { 1.0 } else { 0.0 };
+        // A device the window raised on its own is not a link: the picture
+        // says so until the person raises the link.
+        self.target = if st.online && st.tun && !self.standby {
+            1.0
+        } else {
+            0.0
+        };
     }
 
     fn poll_scan(&mut self) {
@@ -1890,6 +1912,7 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
             unlink_armed: false,
             note: String::new(),
             fell_back: false,
+            standby: false,
             stand,
             linked: false,
             restored: false,
