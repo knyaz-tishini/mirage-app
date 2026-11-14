@@ -718,7 +718,7 @@ impl Oasis {
                 false
             }
             shelf::Cmd::Toggle => {
-                if self.shelf_up() {
+                if self.shelf_up() || self.linked {
                     self.shelf_off(now);
                 } else {
                     self.shelf_on(now);
@@ -733,14 +733,15 @@ impl Oasis {
         }
     }
 
-    /// The button shows the link the picture is on: the click that started
-    /// it, or an adapter that is already up.
+    /// The link is the subscriber: the tray says so when the subscriber has
+    /// loaded and the traffic can go.
+    ///
+    /// The device comes up with the window and waits for the link.  An
+    /// adapter that is up is not a connection: the tray stays gray and says
+    /// nothing until the subscriber is there.
     fn shelf_up(&self) -> bool {
-        if self.linked {
-            return true;
-        }
         let st = self.engine.status();
-        st.online && st.tun
+        st.online && st.tun_alive
     }
 
     fn shelf_on(&mut self, now: f64) {
@@ -750,7 +751,7 @@ impl Oasis {
             self.mark_link(now, true);
             return;
         }
-        if self.shelf_up() {
+        if self.shelf_up() || self.linked {
             tracing::info!("shelf idle up");
             return;
         }
@@ -763,7 +764,7 @@ impl Oasis {
     }
 
     fn shelf_off(&mut self, now: f64) {
-        if !self.shelf_up() {
+        if !self.shelf_up() && !self.linked {
             tracing::info!("shelf idle down");
             return;
         }
