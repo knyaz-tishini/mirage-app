@@ -15,12 +15,15 @@ pub const CONNECT: u32 = 1;
 pub const DISCONNECT: u32 = 2;
 pub const QUIT: u32 = 3;
 pub const TOGGLE: u32 = 4;
+/// The tray calls the window back.
+pub const SHOW: u32 = 5;
 
 const NONE: u8 = 0;
 const POST_CONNECT: u8 = 1;
 const POST_DISCONNECT: u8 = 2;
 const POST_QUIT: u8 = 3;
 const POST_TOGGLE: u8 = 4;
+const POST_SHOW: u8 = 5;
 
 static PENDING: AtomicU8 = AtomicU8::new(NONE);
 
@@ -30,6 +33,8 @@ pub enum Cmd {
     Disconnect,
     Quit,
     Toggle,
+    /// The window was closed to the tray and is called back.
+    Show,
 }
 
 pub fn from_id(id: u32) -> Option<Cmd> {
@@ -38,6 +43,7 @@ pub fn from_id(id: u32) -> Option<Cmd> {
         DISCONNECT => Some(Cmd::Disconnect),
         QUIT => Some(Cmd::Quit),
         TOGGLE => Some(Cmd::Toggle),
+        SHOW => Some(Cmd::Show),
         _ => None,
     }
 }
@@ -49,6 +55,7 @@ pub fn post(cmd: Cmd) {
         Cmd::Disconnect => POST_DISCONNECT,
         Cmd::Quit => POST_QUIT,
         Cmd::Toggle => POST_TOGGLE,
+        Cmd::Show => POST_SHOW,
     };
     PENDING.store(value, Ordering::SeqCst);
 }
@@ -59,6 +66,7 @@ pub fn take() -> Option<Cmd> {
         POST_DISCONNECT => Some(Cmd::Disconnect),
         POST_QUIT => Some(Cmd::Quit),
         POST_TOGGLE => Some(Cmd::Toggle),
+        POST_SHOW => Some(Cmd::Show),
         _ => None,
     }
 }

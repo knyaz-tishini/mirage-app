@@ -564,9 +564,12 @@ impl Engine {
         tracing::info!(bin = %bin.display(), "engine: the device is up");
         self.tun = Some(TunDevice { child, stdin });
         self.tun_addr = Some(tun_addr);
+        // The device is not the link. `tun_alive` belongs to the subscriber:
+        // only the subscriber's own connected state may raise it. The device
+        // comes up with the window, and the tray must stay gray until the
+        // subscriber is there and the traffic can go.
         self.publish(|status| {
             status.tun = true;
-            status.tun_alive = true;
         });
     }
 
@@ -608,7 +611,6 @@ impl Engine {
         }
         self.publish(|status| {
             status.tun = false;
-            status.tun_alive = false;
         });
     }
 
@@ -636,7 +638,6 @@ impl Engine {
                 self.tun = None;
                 self.publish(|status| {
                     status.tun = false;
-                    status.tun_alive = false;
                 });
                 if self.carry_tun {
                     self.start_tun();
