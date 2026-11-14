@@ -21,10 +21,10 @@ use uzor::{Rect, RgbaIcon, TextFieldConfig, WidgetId};
 use uzor_anim_js::JsAnimHost;
 use uzor_framework::host::native::{NativeOptions, run_native};
 use uzor_framework::{
-    App, AppCommand, ChromeModel, ControlsPlacement, DockTarget, FloatingControls, Intent, IntentCx,
-    KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel, PanelCx, PanelHome, RuntimeConfig,
-    SizePx, Spec, TextIntent, UnhandledInput, WindowCmd, WindowControlsStyle, WindowId, WindowIntent,
-    WindowSpec,
+    App, AppCommand, CadenceCmd, ChromeModel, ClosePolicy, ControlsPlacement, DockTarget,
+    FloatingControls, Intent, IntentCx, KeyInput, KeyState, LayoutCmd, OverlayCx, OverlayModel,
+    PanelCx, PanelHome, RuntimeConfig, SizePx, Spec, TextIntent, UnhandledInput, WindowCmd,
+    WindowControlsStyle, WindowId, WindowIntent, WindowSpec,
 };
 
 use crate::backend::EngineLink;
@@ -35,6 +35,7 @@ use crate::shell::menu::{self, MenuTab};
 mod palm_mark;
 mod shelf;
 pub(crate) mod stand;
+pub(crate) mod windowctl;
 
 use stand::{Carry, Stand};
 
@@ -590,7 +591,16 @@ impl App for Oasis {
             cx.out.command(AppCommand::Window(WindowCmd::Minimize { win, minimized: true }));
         }
         if close_click {
-            cx.out.command(AppCommand::Window(WindowCmd::Close(win)));
+            // The cross closes the window, not the application. The window
+            // goes away and the application stays in the tray, with the link
+            // and the device as they are; the tray calls the window back.
+            windowctl::hide();
+            // Nothing is on the screen: the picture does not have to run at
+            // sixty frames a second while the window is away.
+            cx.out.command(AppCommand::Cadence(CadenceCmd::SetTickRate {
+                win,
+                rate: TickRate::Capped(2),
+            }));
         }
         self.ui.insert(win, ui);
 
@@ -668,7 +678,13 @@ impl App for Oasis {
                 );
             }
             Intent::Window(WindowIntent::CloseRequested { win }) => {
-                cx.command(AppCommand::Window(WindowCmd::Close(win)));
+                // The system asked to close the window. The window goes away,
+                // the application stays in the tray.
+                windowctl::hide();
+                cx.command(AppCommand::Cadence(CadenceCmd::SetTickRate {
+                    win,
+                    rate: TickRate::Capped(2),
+                }));
             }
             Intent::Unhandled(UnhandledInput::Key { key, .. }) => {
                 if key.state == KeyState::Up {
@@ -701,6 +717,13 @@ impl Oasis {
         self.clock = now;
         shelf::tick(self.shelf_up());
         if let Some(cmd) = shelf::take() {
+            if cmd == shelf::Cmd::Show {
+                // The tray called the window back: the picture runs again.
+                cx.out.command(AppCommand::Cadence(CadenceCmd::SetTickRate {
+                    win: cx.window,
+                    rate: TickRate::Capped(60),
+                }));
+            }
             if self.apply_shelf(cmd, now) {
                 cx.out.command(AppCommand::Shutdown);
             }
@@ -729,6 +752,11 @@ impl Oasis {
                 self.mark_link(now, false);
                 self.stop_link();
                 true
+            }
+            shelf::Cmd::Show => {
+                // The tray called the window back.
+                windowctl::show();
+                false
             }
         }
     }
@@ -1888,6 +1916,10 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
         tokens: Tokens::builtin(BuiltinSet::Dark),
         dark: true,
         tick: TickRate::Capped(60),
+        // The window is closed by the cross, not by the application: the
+        // system asks the app first, and the app hides the window and stays
+        // in the tray.
+        close: ClosePolicy::AskApp,
         ..RuntimeConfig::default()
     };
     // The window comes back to where the person left it: the target they were

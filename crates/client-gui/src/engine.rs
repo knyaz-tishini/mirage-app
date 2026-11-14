@@ -677,7 +677,6 @@ impl Engine {
         self.tun_addr = Some(tun_addr);
         self.publish(|status| {
             status.tun = true;
-            status.tun_alive = true;
         });
     }
 
@@ -719,7 +718,6 @@ impl Engine {
         }
         self.publish(|status| {
             status.tun = false;
-            status.tun_alive = false;
         });
     }
 
@@ -751,7 +749,6 @@ impl Engine {
                 self.tun = None;
                 self.publish(|status| {
                     status.tun = false;
-                    status.tun_alive = false;
                 });
                 if self.carry_tun {
                     self.start_tun();

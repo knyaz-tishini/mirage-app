@@ -14,9 +14,10 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::{post, Cmd};
 
@@ -44,6 +45,8 @@ thread_local! {
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 static FAILED: AtomicBool = AtomicBool::new(false);
+/// The watcher is one thread for the life of the process.
+static WATCHER: Once = Once::new();
 
 struct Busy;
 impl Drop for Busy {
@@ -108,6 +111,7 @@ fn open(up: bool) -> Option<Live> {
         }
     };
     tracing::info!("tray shelf");
+    WATCHER.call_once(spawn_watcher);
     Some(Live {
         tray,
         link,
@@ -154,6 +158,40 @@ fn pump() {
             tracing::info!("shelf tray {}", event.id.0);
             post(cmd);
         }
+    }
+}
+
+/// The tray calls the window back.
+///
+/// The click does not wait for the picture: the window is shown right here,
+/// from the tray's own thread, so a window that was closed to the tray comes
+/// back even while nothing is on the screen. The word goes to the picture
+/// too, so the scene runs at its usual rate again.
+fn spawn_watcher() {
+    let spawned = std::thread::Builder::new()
+        .name("mirage-tray-watch".into())
+        .spawn(|| {
+            let receiver = TrayIconEvent::receiver();
+            loop {
+                match receiver.try_recv() {
+                    Ok(TrayIconEvent::Click {
+                        button,
+                        button_state,
+                        ..
+                    }) => {
+                        if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                            tracing::info!("tray shelf: the window is called back");
+                            crate::oasis::windowctl::show();
+                            post(Cmd::Show);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(40)),
+                }
+            }
+        });
+    if spawned.is_err() {
+        tracing::warn!("tray shelf: the watcher did not start");
     }
 }
 
